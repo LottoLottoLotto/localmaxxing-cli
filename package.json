@@ -1,0 +1,35 @@
+{
+  "name": "@localmaxxing/cli",
+  "version": "0.1.0",
+  "description": "CLI for authoring, running, and submitting LocalMaxxing eval suites.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "localmaxxing": "./bin/localmaxxing.js",
+    "lmx": "./bin/localmaxxing.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "docs",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/localmaxxing.ts",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
