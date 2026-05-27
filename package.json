@@ -17,6 +17,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/localmaxxing.ts",
+    "lmx": "node bin/localmaxxing.js",
     "check": "tsc -p tsconfig.json --noEmit",
     "prepack": "npm run build"
   },

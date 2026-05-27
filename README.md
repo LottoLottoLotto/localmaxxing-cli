@@ -99,6 +99,18 @@ lmx eval run my-custom-suite \
   --submit
 ```
 
+For a public OpenAI-compatible endpoint that LocalMaxxing can reach directly, use server-side execution:
+
+```bash
+lmx eval execute my-custom-suite \
+  --model Qwen/Qwen3-8B \
+  --base-url https://my-public-endpoint.example \
+  --hardware hardware.json \
+  --submit
+```
+
+Use `eval run` for localhost/private endpoints; use `eval execute` for public endpoints you want LocalMaxxing to call and score server-side.
+
 ## Run An LM-Judge Eval
 
 ```bash

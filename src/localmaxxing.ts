@@ -168,20 +168,23 @@ Usage:
   lmx eval suite submit my-eval.json --api-key bhk_...
   lmx eval run <suiteSlug> --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --submit
   lmx eval run <suiteSlug> --model <hfId> --results lm-eval-results.json --hardware hardware.json --submit
+  lmx eval execute <suiteSlug> --model <hfId> --base-url https://public-endpoint.example --hardware hardware.json --submit
 
 Options:
   --api-url <url>          LocalMaxxing origin (default: https://www.localmaxxing.com)
   --api-key <key>          API key, defaults to LMX_API_KEY, then saved config
   --model <hfId>           HuggingFace model ID
-  --base-url <url>         Local OpenAI-compatible endpoint for custom evals
+  --base-url <url>         OpenAI-compatible model endpoint for custom evals
   --model-api-key <key>    Optional bearer token for the local model endpoint
   --hardware <path>        JSON hardware object required when submitting
   --quantization <label>   Optional quantization label
+  --model-revision <rev>   Optional model revision/branch/commit (default: main)
   --results <path>         Existing lm-eval output JSON for LM_EVAL_HARNESS suites
   --suite-file <path>      Local suite JSON for offline run parsing/testing
   --judge-base-url <url>   OpenAI-compatible judge endpoint for llm_judge suites
   --judge-model <model>    Judge model override
   --judge-api-key <key>    Judge bearer token, defaults to EVAL_JUDGE_API_KEY
+  --notes <text>           Optional submission notes
   --submit                 Upload run to LocalMaxxing
   --dry-run                Validate upload without creating a run
   --out <path>             Write computed payload/result JSON (default: localmaxxing-eval-run.json)
@@ -189,6 +192,10 @@ Options:
 Benchmark submissions:
   Pass a JSON object matching POST /api/benchmarks, or a lmx-bench result with a payload field.
   Use dry-run first to validate without writing.
+
+Server-side custom evals:
+  eval execute calls POST /api/evals/execute for approved CUSTOM suites and public OpenAI-compatible endpoints.
+  Use eval run for localhost/private endpoints because LocalMaxxing cannot reach them directly.
 
 Auth and hardware:
   lmx auth --key bhk_... saves your key to ~/.config/localmaxxing/config.json
@@ -1194,6 +1201,43 @@ async function handleRunCommand(suiteSlug: string | undefined, opts: Record<stri
   }
 }
 
+async function handleExecuteCommand(suiteSlug: string | undefined, opts: Record<string, string | boolean>) {
+  if (!suiteSlug) throw new Error('eval execute requires a suite slug')
+  const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '')
+  const apiKey = await getApiKey(opts)
+  if (!apiKey) throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for eval execute', [
+    'Create an API key in the LocalMaxxing dashboard.',
+    'Pass it with --api-key bhk_... or set LMX_API_KEY.',
+  ])
+
+  const model = requireOpt(opts, 'model')
+  const baseUrl = requireOpt(opts, 'base-url')
+  const hardwarePath = optString(opts, 'hardware')
+  if (opts.submit && !hardwarePath) throw new CliError('missing_hardware', '--hardware is required when using eval execute --submit', [
+    'Create a hardware JSON file matching /api/agent-context hardwareSchemas.',
+    'Pass --hardware hardware.json, or omit --submit to execute without auto-submitting a run.',
+  ])
+
+  const payload = {
+    suiteSlug,
+    model,
+    baseUrl,
+    autoSubmit: Boolean(opts.submit),
+    ...(hardwarePath ? { hardware: await readJson<unknown>(hardwarePath) } : {}),
+    quantization: optString(opts, 'quantization'),
+    modelRevision: optString(opts, 'model-revision') ?? 'main',
+    notes: optString(opts, 'notes'),
+  }
+
+  const response = await submitJson(apiUrl, apiKey, '/api/evals/execute', payload)
+  console.log(JSON.stringify(response, null, 2))
+  printInfo('execute_submitted', {
+    suite: suiteSlug,
+    endpoint: '/api/evals/execute',
+    autoSubmit: payload.autoSubmit,
+  })
+}
+
 async function main() {
   const { positional, opts } = parseArgs(process.argv.slice(2))
   if (!['eval', 'benchmark', 'bench', 'auth', 'hardware'].includes(positional[0] ?? '') || opts.help) {
@@ -1223,6 +1267,11 @@ async function main() {
 
   if (positional[1] === 'run') {
     await handleRunCommand(positional[2], opts)
+    return
+  }
+
+  if (positional[1] === 'execute') {
+    await handleExecuteCommand(positional[2], opts)
     return
   }
 
