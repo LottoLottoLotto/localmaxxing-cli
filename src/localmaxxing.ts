@@ -1,6 +1,9 @@
 #!/usr/bin/env tsx
+import { execFileSync, execSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { readFile, writeFile } from 'node:fs/promises'
+import { homedir, platform, release, totalmem, cpus } from 'node:os'
+import { join } from 'node:path'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 
 type Runner = 'LM_EVAL_HARNESS' | 'CUSTOM'
 type ScoringMethod = 'exact_match' | 'f1' | 'pass_at_k' | 'perplexity' | 'llm_judge'
@@ -100,6 +103,11 @@ type Artifact = {
 
 type TaskScore = { score: number; nSamples?: number; nShots?: number }
 
+type CliConfig = { apiKey?: string; authProvider?: string; authSavedAt?: string }
+
+const CONFIG_DIR = join(homedir(), '.config', 'localmaxxing')
+const CONFIG_FILE = join(CONFIG_DIR, 'config.json')
+
 class CliError extends Error {
   code: string
   hints: string[]
@@ -150,6 +158,8 @@ function usage() {
   console.log(`LocalMaxxing CLI
 
 Usage:
+  lmx auth --key bhk_...
+  lmx hardware --out hardware.json
   lmx benchmark submit benchmark.json --api-key bhk_...
   lmx benchmark dry-run benchmark.json --api-key bhk_...
   lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --kind multiple_choice --out my-eval.json
@@ -161,7 +171,7 @@ Usage:
 
 Options:
   --api-url <url>          LocalMaxxing origin (default: https://www.localmaxxing.com)
-  --api-key <key>          API key, defaults to LMX_API_KEY
+  --api-key <key>          API key, defaults to LMX_API_KEY, then saved config
   --model <hfId>           HuggingFace model ID
   --base-url <url>         Local OpenAI-compatible endpoint for custom evals
   --model-api-key <key>    Optional bearer token for the local model endpoint
@@ -177,7 +187,13 @@ Options:
   --out <path>             Write computed payload/result JSON (default: localmaxxing-eval-run.json)
 
 Benchmark submissions:
-  Pass a JSON object matching POST /api/benchmarks. Use dry-run first to validate without writing.
+  Pass a JSON object matching POST /api/benchmarks, or a lmx-bench result with a payload field.
+  Use dry-run first to validate without writing.
+
+Auth and hardware:
+  lmx auth --key bhk_... saves your key to ~/.config/localmaxxing/config.json
+  lmx auth --logout clears the saved key
+  lmx hardware prints detected hardware JSON; --out writes it to a file
 
 Suite authoring:
   --kind <kind>            qa, multiple_choice, or judge (default: multiple_choice)
@@ -221,6 +237,23 @@ function parseArgs(argv: string[]) {
 function optString(opts: Record<string, string | boolean>, key: string) {
   const value = opts[key]
   return typeof value === 'string' ? value : undefined
+}
+
+async function loadConfig(): Promise<CliConfig> {
+  try {
+    return JSON.parse(await readFile(CONFIG_FILE, 'utf8')) as CliConfig
+  } catch {
+    return {}
+  }
+}
+
+async function saveConfig(config: CliConfig) {
+  await mkdir(CONFIG_DIR, { recursive: true })
+  await writeFile(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n')
+}
+
+async function getApiKey(opts: Record<string, string | boolean>) {
+  return optString(opts, 'api-key') ?? process.env.LMX_API_KEY ?? (await loadConfig()).apiKey
 }
 
 function requireOpt(opts: Record<string, string | boolean>, key: string) {
@@ -283,6 +316,232 @@ async function readJson<T>(path: string): Promise<T> {
 
 function hashPrompt(prompt: string) {
   return createHash('sha256').update(prompt).digest('hex')
+}
+
+function tryExec(cmd: string, args: string[] = []) {
+  try {
+    const output = args.length
+      ? execFileSync(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 })
+      : execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 })
+    return output.toString().trim()
+  } catch {
+    return null
+  }
+}
+
+function round1(n: number) {
+  return Math.round(n * 10) / 10
+}
+
+function detectCpu() {
+  if (platform() === 'linux') {
+    const out = tryExec("grep -m1 'model name' /proc/cpuinfo")
+    return out?.split(':')[1]?.trim()
+  }
+  if (platform() === 'darwin') return tryExec('sysctl', ['-n', 'machdep.cpu.brand_string']) ?? undefined
+  return cpus()[0]?.model
+}
+
+function detectNvidiaHardware() {
+  const out = tryExec('nvidia-smi', ['--query-gpu=name,memory.total,driver_version', '--format=csv,noheader,nounits'])
+  if (!out) return null
+  const lines = out.split('\n').filter(Boolean)
+  const gpuNames: string[] = []
+  let totalVramMb = 0
+  for (const line of lines) {
+    const [name, vram] = line.split(',').map(s => s.trim())
+    if (name) gpuNames.push(name)
+    totalVramMb += parseInt(vram ?? '0', 10) || 0
+  }
+  if (!gpuNames.length) return null
+  return {
+    hwClass: 'DISCRETE_GPU',
+    gpuName: gpuNames[0],
+    gpuCount: gpuNames.length,
+    vramGb: round1(totalVramMb / 1024),
+    cpu: detectCpu(),
+    ramGb: round1(totalmem() / 1024 ** 3),
+    os: `${platform()} ${release()}`,
+  }
+}
+
+function detectRocmHardware() {
+  const out = tryExec('rocm-smi', ['--showproductname', '--showmeminfo', 'vram', '--csv'])
+  if (!out) return null
+  const nameMatch = out.match(/Card series:\s*(.+)/i)
+  const vramMatch = out.match(/(\d+)\s*MB.*?VRAM/i)
+  if (!nameMatch || !vramMatch) return null
+  return {
+    hwClass: 'DISCRETE_GPU',
+    gpuName: nameMatch[1].trim(),
+    vramGb: round1(parseInt(vramMatch[1], 10) / 1024),
+    cpu: detectCpu(),
+    ramGb: round1(totalmem() / 1024 ** 3),
+    os: `${platform()} ${release()}`,
+  }
+}
+
+function detectAppleHardware() {
+  const out = tryExec('system_profiler', ['SPHardwareDataType'])
+  if (!out) return null
+  const chipMatch = out.match(/Chip:\s*(.+)/i)
+  const memMatch = out.match(/Memory:\s*(\d+)\s*GB/i)
+  if (!chipMatch) return null
+  const chip = chipMatch[1].trim()
+  const parts = chip.replace('Apple ', '').split(/\s+/)
+  return {
+    hwClass: 'UNIFIED',
+    chipVendor: 'Apple',
+    chipFamily: parts[0] ?? chip,
+    chipVariant: parts.slice(1).join(' ') || 'base',
+    unifiedMemoryGb: memMatch ? parseInt(memMatch[1], 10) : round1(totalmem() / 1024 ** 3),
+    cpu: chip,
+    os: `darwin ${release()}`,
+  }
+}
+
+function detectHardware() {
+  if (platform() === 'darwin') return detectAppleHardware() ?? detectCpuOnlyHardware()
+  return detectNvidiaHardware() ?? detectRocmHardware() ?? detectCpuOnlyHardware()
+}
+
+function detectCpuOnlyHardware() {
+  return {
+    hwClass: 'CPU_ONLY',
+    cpu: detectCpu() ?? cpus()[0]?.model ?? 'Unknown CPU',
+    ramGb: round1(totalmem() / 1024 ** 3),
+    os: `${platform()} ${release()}`,
+  }
+}
+
+function textField(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function firstTextField(source: Record<string, unknown>, fields: string[]) {
+  for (const field of fields) {
+    const value = textField(source[field])
+    if (value) return value
+  }
+  return undefined
+}
+
+function benchmarkText(raw: unknown, payload: Record<string, unknown>, kind: 'prompt' | 'output') {
+  const fields = kind === 'prompt'
+    ? ['prompt', 'promptText', 'input', 'inputText']
+    : ['output', 'outputText', 'generatedText', 'completion', 'response', 'text']
+  const payloadText = firstTextField(payload, fields)
+  if (payloadText) return payloadText
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const rawText = firstTextField(raw as Record<string, unknown>, fields)
+    if (rawText) return rawText
+  }
+  return undefined
+}
+
+function hasEstimatedOutputTokens(raw: unknown, payload: Record<string, unknown>) {
+  if (payload.outputTokensEstimated === true) return true
+  if (raw && typeof raw === 'object' && !Array.isArray(raw) && (raw as Record<string, unknown>).outputTokensEstimated === true) return true
+  const engineFlags = payload.engineFlags
+  if (engineFlags && typeof engineFlags === 'object' && !Array.isArray(engineFlags)) {
+    const extraFlags = (engineFlags as Record<string, unknown>).extraFlags
+    return typeof extraFlags === 'string' && /outputTokensEstimated=true/.test(extraFlags)
+  }
+  return false
+}
+
+function needsTokenFallback(value: unknown, estimated = false) {
+  return estimated || typeof value !== 'number' || !Number.isFinite(value) || value <= 0
+}
+
+function appendTokenSource(payload: Record<string, unknown>, source: string) {
+  const engineFlags = payload.engineFlags
+  if (!engineFlags || typeof engineFlags !== 'object' || Array.isArray(engineFlags)) return
+  const flags = engineFlags as Record<string, unknown>
+  const existing = typeof flags.extraFlags === 'string' ? flags.extraFlags : ''
+  flags.extraFlags = existing ? `${existing};tokenizerSource=${source}` : `tokenizerSource=${source}`
+}
+
+async function importAutoTokenizer() {
+  try {
+    const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<unknown>
+    const mod = await dynamicImport('@huggingface/transformers') as { AutoTokenizer?: { from_pretrained: (...args: unknown[]) => Promise<unknown> } }
+    if (!mod.AutoTokenizer) throw new Error('AutoTokenizer export not found')
+    return mod.AutoTokenizer
+  } catch (error) {
+    throw new CliError('tokenizer_dependency_missing', `Could not load @huggingface/transformers: ${asMessage(error)}`, [
+      'Run npm install in localmaxxing-cli before using HF tokenizer fallback.',
+      'Or provide engine-reported outputTokens in the benchmark payload.',
+    ])
+  }
+}
+
+async function hfJson(path: string, revision?: string) {
+  const ref = encodeURIComponent(revision ?? 'main')
+  const res = await fetch(`https://huggingface.co/${path}/raw/${ref}/config.json`)
+  if (!res.ok) return null
+  return await res.json() as Record<string, unknown>
+}
+
+function parentTokenizerId(config: Record<string, unknown> | null) {
+  const value = config?.tokenizer_name ?? config?.base_model_name_or_path
+  return typeof value === 'string' && /^[\w][\w.-]*\/[\w][\w.@-]*$/.test(value) ? value : undefined
+}
+
+async function countWithTokenizer(tokenizer: unknown, text: string) {
+  const t = tokenizer as { encode?: (input: string, options?: unknown) => unknown; call?: unknown }
+  if (typeof t.encode === 'function') {
+    const encoded = await t.encode(text, { add_special_tokens: false })
+    if (Array.isArray(encoded)) return encoded.length
+  }
+  if (typeof tokenizer === 'function') {
+    const encoded = await (tokenizer as (input: string, options?: unknown) => Promise<unknown>)(text, { add_special_tokens: false })
+    const ids = encoded && typeof encoded === 'object' ? (encoded as Record<string, unknown>).input_ids : undefined
+    if (Array.isArray(ids)) return ids.length
+    if (ids && typeof ids === 'object' && 'size' in ids && Array.isArray((ids as { size?: unknown }).size)) {
+      const size = (ids as { size: number[] }).size
+      return size[size.length - 1]
+    }
+  }
+  throw new Error('Loaded tokenizer did not return token IDs')
+}
+
+async function hfTokenCount(hfId: string, revision: string | undefined, text: string) {
+  const AutoTokenizer = await importAutoTokenizer()
+  try {
+    const tokenizer = await AutoTokenizer.from_pretrained(hfId, revision ? { revision } : undefined)
+    return { count: await countWithTokenizer(tokenizer, text), source: 'hf-tokenizer' }
+  } catch {
+    const parent = parentTokenizerId(await hfJson(hfId, revision))
+    if (!parent) throw new Error(`No tokenizer found for ${hfId}`)
+    const tokenizer = await AutoTokenizer.from_pretrained(parent)
+    return { count: await countWithTokenizer(tokenizer, text), source: 'parent-hf-tokenizer' }
+  }
+}
+
+async function normalizeBenchmarkPayload(raw: unknown, payload: Record<string, unknown>) {
+  const hfId = typeof payload.hfId === 'string' ? payload.hfId : undefined
+  if (!hfId) return payload
+  const revision = typeof payload.modelRevision === 'string' ? payload.modelRevision : undefined
+  const normalized = { ...payload }
+  const outputText = benchmarkText(raw, normalized, 'output')
+  const promptText = benchmarkText(raw, normalized, 'prompt')
+  let tokenizerSource: string | undefined
+
+  if (outputText && needsTokenFallback(normalized.outputTokens, hasEstimatedOutputTokens(raw, normalized))) {
+    const result = await hfTokenCount(hfId, revision, outputText)
+    normalized.outputTokens = result.count
+    tokenizerSource = result.source
+  }
+
+  if (promptText && needsTokenFallback(normalized.promptTokens)) {
+    const result = await hfTokenCount(hfId, revision, promptText)
+    normalized.promptTokens = result.count
+    tokenizerSource = tokenizerSource ?? result.source
+  }
+
+  if (tokenizerSource) appendTokenSource(normalized, tokenizerSource)
+  return normalized
 }
 
 function normalizeText(value: string) {
@@ -789,7 +1048,7 @@ async function handleSuiteCommand(action: string | undefined, target: string | u
   }
 
   if (action === 'submit') {
-    const apiKey = optString(opts, 'api-key') ?? process.env.LMX_API_KEY
+    const apiKey = await getApiKey(opts)
     if (!apiKey) throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required', ['Create an API key in the LocalMaxxing dashboard.', 'Pass it with --api-key bhk_... or set LMX_API_KEY.'])
     const response = await submitJson(apiUrl, apiKey, '/api/evals/suites', payload)
     console.log(JSON.stringify(response, null, 2))
@@ -809,19 +1068,23 @@ async function handleBenchmarkCommand(action: string | undefined, target: string
   }
   if (!target) throw new Error(`benchmark ${normalizedAction} requires a benchmark JSON path`)
 
-  const apiKey = optString(opts, 'api-key') ?? process.env.LMX_API_KEY
+  const apiKey = await getApiKey(opts)
   if (!apiKey) throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for benchmark submit/dry-run', [
     'Create an API key in the LocalMaxxing dashboard.',
     'Pass it with --api-key bhk_... or set LMX_API_KEY.',
   ])
 
-  const payload = await readJson<unknown>(target)
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+  const raw = await readJson<unknown>(target)
+  const payloadRaw = raw && typeof raw === 'object' && !Array.isArray(raw) && 'payload' in raw
+    ? (raw as { payload: unknown }).payload
+    : raw
+  if (!payloadRaw || typeof payloadRaw !== 'object' || Array.isArray(payloadRaw)) {
     throw new CliError('invalid_benchmark_payload', 'Benchmark payload must be a JSON object.', [
       'Pass a JSON object matching POST /api/benchmarks.',
       'Use docs/agent-skill.md or GET /api/agent-context for the current schema.',
     ])
   }
+  const payload = await normalizeBenchmarkPayload(raw, payloadRaw as Record<string, unknown>)
 
   const endpoint = normalizedAction === 'dry-run' ? '/api/benchmarks/dry-run' : '/api/benchmarks'
   const response = await submitJson(apiUrl, apiKey, endpoint, payload)
@@ -830,6 +1093,42 @@ async function handleBenchmarkCommand(action: string | undefined, target: string
     endpoint,
     status: normalizedAction === 'dry-run' ? 'valid' : 'submitted',
   })
+}
+
+async function handleAuthCommand(opts: Record<string, string | boolean>) {
+  const key = optString(opts, 'key') ?? optString(opts, 'api-key')
+  if (opts.logout) {
+    await saveConfig({})
+    printInfo('auth_cleared', { path: CONFIG_FILE })
+    return
+  }
+  if (key) {
+    await saveConfig({ apiKey: key, authProvider: 'manual', authSavedAt: new Date().toISOString() })
+    printInfo('auth_saved', { path: CONFIG_FILE, key: `${key.slice(0, 8)}...` })
+    return
+  }
+  const config = await loadConfig()
+  const apiKey = process.env.LMX_API_KEY ?? config.apiKey
+  if (!apiKey) {
+    printInfo('auth_missing', { next: 'Run lmx auth --key bhk_... or set LMX_API_KEY.' })
+    return
+  }
+  printInfo('auth_status', {
+    source: process.env.LMX_API_KEY ? 'LMX_API_KEY' : CONFIG_FILE,
+    key: `${apiKey.slice(0, 8)}...`,
+    provider: config.authProvider,
+  })
+}
+
+async function handleHardwareCommand(opts: Record<string, string | boolean>) {
+  const hardware = detectHardware()
+  if (opts.out) {
+    const outPath = optString(opts, 'out') ?? 'hardware.json'
+    await writeFile(outPath, JSON.stringify(hardware, null, 2) + '\n')
+    printInfo('hardware_written', { path: outPath })
+    return
+  }
+  console.log(JSON.stringify(hardware, null, 2))
 }
 
 async function handleRunCommand(suiteSlug: string | undefined, opts: Record<string, string | boolean>) {
@@ -880,7 +1179,7 @@ async function handleRunCommand(suiteSlug: string | undefined, opts: Record<stri
   })
 
   if (opts.submit || opts['dry-run']) {
-    const apiKey = optString(opts, 'api-key') ?? process.env.LMX_API_KEY
+    const apiKey = await getApiKey(opts)
     if (!apiKey) throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for submit/dry-run', ['Create an API key in the LocalMaxxing dashboard.', 'Pass it with --api-key bhk_... or set LMX_API_KEY.'])
     if (!hardwarePath) throw new CliError('missing_hardware', '--hardware is required for submit/dry-run', ['Create a hardware JSON file matching /api/agent-context hardwareSchemas.', 'Pass --hardware hardware.json.'])
     if (!optString(opts, 'model')) throw new CliError('missing_model', '--model is required for submit/dry-run', ['Pass --model <HuggingFace model id>.'])
@@ -897,9 +1196,19 @@ async function handleRunCommand(suiteSlug: string | undefined, opts: Record<stri
 
 async function main() {
   const { positional, opts } = parseArgs(process.argv.slice(2))
-  if (!['eval', 'benchmark', 'bench'].includes(positional[0] ?? '') || opts.help) {
+  if (!['eval', 'benchmark', 'bench', 'auth', 'hardware'].includes(positional[0] ?? '') || opts.help) {
     usage()
     process.exit(positional[0] ? 1 : 0)
+  }
+
+  if (positional[0] === 'auth') {
+    await handleAuthCommand(opts)
+    return
+  }
+
+  if (positional[0] === 'hardware') {
+    await handleHardwareCommand(opts)
+    return
   }
 
   if (positional[0] === 'benchmark' || positional[0] === 'bench') {

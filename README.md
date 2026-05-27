@@ -41,6 +41,14 @@ On Windows PowerShell:
 $env:LMX_API_KEY = "bhk_..."
 ```
 
+Or save it for future CLI commands:
+
+```bash
+lmx auth --key bhk_...
+lmx auth
+lmx auth --logout
+```
+
 ## Hardware File
 
 Submissions require a hardware JSON object. Example `hardware.json`:
@@ -51,6 +59,12 @@ Submissions require a hardware JSON object. Example `hardware.json`:
   "gpuName": "RTX 4090",
   "vramGb": 24
 }
+```
+
+You can generate a best-effort hardware file from the current machine:
+
+```bash
+lmx hardware --out hardware.json
 ```
 
 ## Submit An Inference Benchmark
@@ -68,6 +82,10 @@ lmx benchmark submit benchmark.json --api-key bhk_...
 ```
 
 `bench` is accepted as a shorter alias for `benchmark`.
+
+Saved `lmx-bench` result files are also accepted. If the JSON has a top-level `payload` field, the CLI submits that payload automatically.
+
+If engine token counts are missing or marked as estimated and the JSON includes generated text (`outputText`, `generatedText`, `completion`, `response`, or `text`), the CLI uses the model's Hugging Face tokenizer to fill `outputTokens`. If the submitted model has no tokenizer, it tries `tokenizer_name` or `base_model_name_or_path` from `config.json`.
 
 ## Run A Custom Eval
 

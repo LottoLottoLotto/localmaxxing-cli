@@ -20,7 +20,9 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "prepack": "npm run build"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@huggingface/transformers": "^3.8.0"
+  },
   "devDependencies": {
     "@types/node": "^20.19.0",
     "tsx": "^4.20.6",
