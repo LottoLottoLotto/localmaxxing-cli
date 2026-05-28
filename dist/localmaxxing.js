@@ -1,6 +1,9 @@
 #!/usr/bin/env tsx
+import { execFileSync, execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { homedir, platform, release, totalmem, cpus } from 'node:os';
+import { join } from 'node:path';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 const LMEVAL_METRIC_CANDIDATES_BY_SCORING = {
     exact_match: [
         'acc_norm,none',
@@ -27,6 +30,8 @@ const LMEVAL_METRIC_CANDIDATES_BY_SCORING = {
     llm_judge: ['score,none', 'score', 'acc,none', 'acc'],
     perplexity: ['word_perplexity,none', 'perplexity,none', 'ppl,none', 'word_perplexity', 'perplexity', 'ppl'],
 };
+const CONFIG_DIR = join(homedir(), '.config', 'localmaxxing');
+const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
 class CliError extends Error {
     code;
     hints;
@@ -74,29 +79,49 @@ function usage() {
     console.log(`LocalMaxxing CLI
 
 Usage:
+  lmx auth --key bhk_...
+  lmx hardware --out hardware.json
+  lmx benchmark submit benchmark.json --api-key bhk_...
+  lmx benchmark dry-run benchmark.json --api-key bhk_...
   lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --kind multiple_choice --out my-eval.json
   lmx eval suite init --slug hellaswag --name "HellaSwag" --category commonsense --runner lm-eval-harness --tasks hellaswag --out hellaswag.json
   lmx eval suite validate my-eval.json
   lmx eval suite submit my-eval.json --api-key bhk_...
   lmx eval run <suiteSlug> --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --submit
   lmx eval run <suiteSlug> --model <hfId> --results lm-eval-results.json --hardware hardware.json --submit
+  lmx eval execute <suiteSlug> --model <hfId> --base-url https://public-endpoint.example --hardware hardware.json --submit
 
 Options:
   --api-url <url>          LocalMaxxing origin (default: https://www.localmaxxing.com)
-  --api-key <key>          API key, defaults to LMX_API_KEY
+  --api-key <key>          API key, defaults to LMX_API_KEY, then saved config
   --model <hfId>           HuggingFace model ID
-  --base-url <url>         Local OpenAI-compatible endpoint for custom evals
+  --base-url <url>         OpenAI-compatible model endpoint for custom evals
   --model-api-key <key>    Optional bearer token for the local model endpoint
   --hardware <path>        JSON hardware object required when submitting
   --quantization <label>   Optional quantization label
+  --model-revision <rev>   Optional model revision/branch/commit (default: main)
   --results <path>         Existing lm-eval output JSON for LM_EVAL_HARNESS suites
   --suite-file <path>      Local suite JSON for offline run parsing/testing
   --judge-base-url <url>   OpenAI-compatible judge endpoint for llm_judge suites
   --judge-model <model>    Judge model override
   --judge-api-key <key>    Judge bearer token, defaults to EVAL_JUDGE_API_KEY
+  --notes <text>           Optional submission notes
   --submit                 Upload run to LocalMaxxing
   --dry-run                Validate upload without creating a run
   --out <path>             Write computed payload/result JSON (default: localmaxxing-eval-run.json)
+
+Benchmark submissions:
+  Pass a JSON object matching POST /api/benchmarks, or a lmx-bench result with a payload field.
+  Use dry-run first to validate without writing.
+
+Server-side custom evals:
+  eval execute calls POST /api/evals/execute for approved CUSTOM suites and public OpenAI-compatible endpoints.
+  Use eval run for localhost/private endpoints because LocalMaxxing cannot reach them directly.
+
+Auth and hardware:
+  lmx auth --key bhk_... saves your key to ~/.config/localmaxxing/config.json
+  lmx auth --logout clears the saved key
+  lmx hardware prints detected hardware JSON; --out writes it to a file
 
 Suite authoring:
   --kind <kind>            qa, multiple_choice, or judge (default: multiple_choice)
@@ -139,6 +164,21 @@ function parseArgs(argv) {
 function optString(opts, key) {
     const value = opts[key];
     return typeof value === 'string' ? value : undefined;
+}
+async function loadConfig() {
+    try {
+        return JSON.parse(await readFile(CONFIG_FILE, 'utf8'));
+    }
+    catch {
+        return {};
+    }
+}
+async function saveConfig(config) {
+    await mkdir(CONFIG_DIR, { recursive: true });
+    await writeFile(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n');
+}
+async function getApiKey(opts) {
+    return optString(opts, 'api-key') ?? process.env.LMX_API_KEY ?? (await loadConfig()).apiKey;
 }
 function requireOpt(opts, key) {
     const value = optString(opts, key);
@@ -202,6 +242,234 @@ async function readJson(path) {
 }
 function hashPrompt(prompt) {
     return createHash('sha256').update(prompt).digest('hex');
+}
+function tryExec(cmd, args = []) {
+    try {
+        const output = args.length
+            ? execFileSync(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 })
+            : execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
+        return output.toString().trim();
+    }
+    catch {
+        return null;
+    }
+}
+function round1(n) {
+    return Math.round(n * 10) / 10;
+}
+function detectCpu() {
+    if (platform() === 'linux') {
+        const out = tryExec("grep -m1 'model name' /proc/cpuinfo");
+        return out?.split(':')[1]?.trim();
+    }
+    if (platform() === 'darwin')
+        return tryExec('sysctl', ['-n', 'machdep.cpu.brand_string']) ?? undefined;
+    return cpus()[0]?.model;
+}
+function detectNvidiaHardware() {
+    const out = tryExec('nvidia-smi', ['--query-gpu=name,memory.total,driver_version', '--format=csv,noheader,nounits']);
+    if (!out)
+        return null;
+    const lines = out.split('\n').filter(Boolean);
+    const gpuNames = [];
+    let totalVramMb = 0;
+    for (const line of lines) {
+        const [name, vram] = line.split(',').map(s => s.trim());
+        if (name)
+            gpuNames.push(name);
+        totalVramMb += parseInt(vram ?? '0', 10) || 0;
+    }
+    if (!gpuNames.length)
+        return null;
+    return {
+        hwClass: 'DISCRETE_GPU',
+        gpuName: gpuNames[0],
+        gpuCount: gpuNames.length,
+        vramGb: round1(totalVramMb / 1024),
+        cpu: detectCpu(),
+        ramGb: round1(totalmem() / 1024 ** 3),
+        os: `${platform()} ${release()}`,
+    };
+}
+function detectRocmHardware() {
+    const out = tryExec('rocm-smi', ['--showproductname', '--showmeminfo', 'vram', '--csv']);
+    if (!out)
+        return null;
+    const nameMatch = out.match(/Card series:\s*(.+)/i);
+    const vramMatch = out.match(/(\d+)\s*MB.*?VRAM/i);
+    if (!nameMatch || !vramMatch)
+        return null;
+    return {
+        hwClass: 'DISCRETE_GPU',
+        gpuName: nameMatch[1].trim(),
+        vramGb: round1(parseInt(vramMatch[1], 10) / 1024),
+        cpu: detectCpu(),
+        ramGb: round1(totalmem() / 1024 ** 3),
+        os: `${platform()} ${release()}`,
+    };
+}
+function detectAppleHardware() {
+    const out = tryExec('system_profiler', ['SPHardwareDataType']);
+    if (!out)
+        return null;
+    const chipMatch = out.match(/Chip:\s*(.+)/i);
+    const memMatch = out.match(/Memory:\s*(\d+)\s*GB/i);
+    if (!chipMatch)
+        return null;
+    const chip = chipMatch[1].trim();
+    const parts = chip.replace('Apple ', '').split(/\s+/);
+    return {
+        hwClass: 'UNIFIED',
+        chipVendor: 'Apple',
+        chipFamily: parts[0] ?? chip,
+        chipVariant: parts.slice(1).join(' ') || 'base',
+        unifiedMemoryGb: memMatch ? parseInt(memMatch[1], 10) : round1(totalmem() / 1024 ** 3),
+        cpu: chip,
+        os: `darwin ${release()}`,
+    };
+}
+function detectHardware() {
+    if (platform() === 'darwin')
+        return detectAppleHardware() ?? detectCpuOnlyHardware();
+    return detectNvidiaHardware() ?? detectRocmHardware() ?? detectCpuOnlyHardware();
+}
+function detectCpuOnlyHardware() {
+    return {
+        hwClass: 'CPU_ONLY',
+        cpu: detectCpu() ?? cpus()[0]?.model ?? 'Unknown CPU',
+        ramGb: round1(totalmem() / 1024 ** 3),
+        os: `${platform()} ${release()}`,
+    };
+}
+function textField(value) {
+    return typeof value === 'string' && value.trim() ? value : undefined;
+}
+function firstTextField(source, fields) {
+    for (const field of fields) {
+        const value = textField(source[field]);
+        if (value)
+            return value;
+    }
+    return undefined;
+}
+function benchmarkText(raw, payload, kind) {
+    const fields = kind === 'prompt'
+        ? ['prompt', 'promptText', 'input', 'inputText']
+        : ['output', 'outputText', 'generatedText', 'completion', 'response', 'text'];
+    const payloadText = firstTextField(payload, fields);
+    if (payloadText)
+        return payloadText;
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        const rawText = firstTextField(raw, fields);
+        if (rawText)
+            return rawText;
+    }
+    return undefined;
+}
+function hasEstimatedOutputTokens(raw, payload) {
+    if (payload.outputTokensEstimated === true)
+        return true;
+    if (raw && typeof raw === 'object' && !Array.isArray(raw) && raw.outputTokensEstimated === true)
+        return true;
+    const engineFlags = payload.engineFlags;
+    if (engineFlags && typeof engineFlags === 'object' && !Array.isArray(engineFlags)) {
+        const extraFlags = engineFlags.extraFlags;
+        return typeof extraFlags === 'string' && /outputTokensEstimated=true/.test(extraFlags);
+    }
+    return false;
+}
+function needsTokenFallback(value, estimated = false) {
+    return estimated || typeof value !== 'number' || !Number.isFinite(value) || value <= 0;
+}
+function appendTokenSource(payload, source) {
+    const engineFlags = payload.engineFlags;
+    if (!engineFlags || typeof engineFlags !== 'object' || Array.isArray(engineFlags))
+        return;
+    const flags = engineFlags;
+    const existing = typeof flags.extraFlags === 'string' ? flags.extraFlags : '';
+    flags.extraFlags = existing ? `${existing};tokenizerSource=${source}` : `tokenizerSource=${source}`;
+}
+async function importAutoTokenizer() {
+    try {
+        const dynamicImport = new Function('specifier', 'return import(specifier)');
+        const mod = await dynamicImport('@huggingface/transformers');
+        if (!mod.AutoTokenizer)
+            throw new Error('AutoTokenizer export not found');
+        return mod.AutoTokenizer;
+    }
+    catch (error) {
+        throw new CliError('tokenizer_dependency_missing', `Could not load @huggingface/transformers: ${asMessage(error)}`, [
+            'Run npm install in localmaxxing-cli before using HF tokenizer fallback.',
+            'Or provide engine-reported outputTokens in the benchmark payload.',
+        ]);
+    }
+}
+async function hfJson(path, revision) {
+    const ref = encodeURIComponent(revision ?? 'main');
+    const res = await fetch(`https://huggingface.co/${path}/raw/${ref}/config.json`);
+    if (!res.ok)
+        return null;
+    return await res.json();
+}
+function parentTokenizerId(config) {
+    const value = config?.tokenizer_name ?? config?.base_model_name_or_path;
+    return typeof value === 'string' && /^[\w][\w.-]*\/[\w][\w.@-]*$/.test(value) ? value : undefined;
+}
+async function countWithTokenizer(tokenizer, text) {
+    const t = tokenizer;
+    if (typeof t.encode === 'function') {
+        const encoded = await t.encode(text, { add_special_tokens: false });
+        if (Array.isArray(encoded))
+            return encoded.length;
+    }
+    if (typeof tokenizer === 'function') {
+        const encoded = await tokenizer(text, { add_special_tokens: false });
+        const ids = encoded && typeof encoded === 'object' ? encoded.input_ids : undefined;
+        if (Array.isArray(ids))
+            return ids.length;
+        if (ids && typeof ids === 'object' && 'size' in ids && Array.isArray(ids.size)) {
+            const size = ids.size;
+            return size[size.length - 1];
+        }
+    }
+    throw new Error('Loaded tokenizer did not return token IDs');
+}
+async function hfTokenCount(hfId, revision, text) {
+    const AutoTokenizer = await importAutoTokenizer();
+    try {
+        const tokenizer = await AutoTokenizer.from_pretrained(hfId, revision ? { revision } : undefined);
+        return { count: await countWithTokenizer(tokenizer, text), source: 'hf-tokenizer' };
+    }
+    catch {
+        const parent = parentTokenizerId(await hfJson(hfId, revision));
+        if (!parent)
+            throw new Error(`No tokenizer found for ${hfId}`);
+        const tokenizer = await AutoTokenizer.from_pretrained(parent);
+        return { count: await countWithTokenizer(tokenizer, text), source: 'parent-hf-tokenizer' };
+    }
+}
+async function normalizeBenchmarkPayload(raw, payload) {
+    const hfId = typeof payload.hfId === 'string' ? payload.hfId : undefined;
+    if (!hfId)
+        return payload;
+    const revision = typeof payload.modelRevision === 'string' ? payload.modelRevision : undefined;
+    const normalized = { ...payload };
+    const outputText = benchmarkText(raw, normalized, 'output');
+    const promptText = benchmarkText(raw, normalized, 'prompt');
+    let tokenizerSource;
+    if (outputText && needsTokenFallback(normalized.outputTokens, hasEstimatedOutputTokens(raw, normalized))) {
+        const result = await hfTokenCount(hfId, revision, outputText);
+        normalized.outputTokens = result.count;
+        tokenizerSource = result.source;
+    }
+    if (promptText && needsTokenFallback(normalized.promptTokens)) {
+        const result = await hfTokenCount(hfId, revision, promptText);
+        normalized.promptTokens = result.count;
+        tokenizerSource = tokenizerSource ?? result.source;
+    }
+    if (tokenizerSource)
+        appendTokenSource(normalized, tokenizerSource);
+    return normalized;
 }
 function normalizeText(value) {
     return value.toLowerCase().replace(/[^\w\s]/g, '').trim();
@@ -731,7 +999,7 @@ async function handleSuiteCommand(action, target, opts) {
         return;
     }
     if (action === 'submit') {
-        const apiKey = optString(opts, 'api-key') ?? process.env.LMX_API_KEY;
+        const apiKey = await getApiKey(opts);
         if (!apiKey)
             throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required', ['Create an API key in the LocalMaxxing dashboard.', 'Pass it with --api-key bhk_... or set LMX_API_KEY.']);
         const response = await submitJson(apiUrl, apiKey, '/api/evals/suites', payload);
@@ -740,6 +1008,73 @@ async function handleSuiteCommand(action, target, opts) {
         return;
     }
     throw new Error('Unknown suite command. Use init, validate, or submit.');
+}
+async function handleBenchmarkCommand(action, target, opts) {
+    const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
+    const normalizedAction = action === 'validate' ? 'dry-run' : action;
+    if (normalizedAction !== 'submit' && normalizedAction !== 'dry-run') {
+        throw new Error('Unknown benchmark command. Use submit or dry-run.');
+    }
+    if (!target)
+        throw new Error(`benchmark ${normalizedAction} requires a benchmark JSON path`);
+    const apiKey = await getApiKey(opts);
+    if (!apiKey)
+        throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for benchmark submit/dry-run', [
+            'Create an API key in the LocalMaxxing dashboard.',
+            'Pass it with --api-key bhk_... or set LMX_API_KEY.',
+        ]);
+    const raw = await readJson(target);
+    const payloadRaw = raw && typeof raw === 'object' && !Array.isArray(raw) && 'payload' in raw
+        ? raw.payload
+        : raw;
+    if (!payloadRaw || typeof payloadRaw !== 'object' || Array.isArray(payloadRaw)) {
+        throw new CliError('invalid_benchmark_payload', 'Benchmark payload must be a JSON object.', [
+            'Pass a JSON object matching POST /api/benchmarks.',
+            'Use docs/agent-skill.md or GET /api/agent-context for the current schema.',
+        ]);
+    }
+    const payload = await normalizeBenchmarkPayload(raw, payloadRaw);
+    const endpoint = normalizedAction === 'dry-run' ? '/api/benchmarks/dry-run' : '/api/benchmarks';
+    const response = await submitJson(apiUrl, apiKey, endpoint, payload);
+    console.log(JSON.stringify(response, null, 2));
+    printInfo(normalizedAction === 'dry-run' ? 'benchmark_dry_run_valid' : 'benchmark_submitted', {
+        endpoint,
+        status: normalizedAction === 'dry-run' ? 'valid' : 'submitted',
+    });
+}
+async function handleAuthCommand(opts) {
+    const key = optString(opts, 'key') ?? optString(opts, 'api-key');
+    if (opts.logout) {
+        await saveConfig({});
+        printInfo('auth_cleared', { path: CONFIG_FILE });
+        return;
+    }
+    if (key) {
+        await saveConfig({ apiKey: key, authProvider: 'manual', authSavedAt: new Date().toISOString() });
+        printInfo('auth_saved', { path: CONFIG_FILE, key: `${key.slice(0, 8)}...` });
+        return;
+    }
+    const config = await loadConfig();
+    const apiKey = process.env.LMX_API_KEY ?? config.apiKey;
+    if (!apiKey) {
+        printInfo('auth_missing', { next: 'Run lmx auth --key bhk_... or set LMX_API_KEY.' });
+        return;
+    }
+    printInfo('auth_status', {
+        source: process.env.LMX_API_KEY ? 'LMX_API_KEY' : CONFIG_FILE,
+        key: `${apiKey.slice(0, 8)}...`,
+        provider: config.authProvider,
+    });
+}
+async function handleHardwareCommand(opts) {
+    const hardware = detectHardware();
+    if (opts.out) {
+        const outPath = optString(opts, 'out') ?? 'hardware.json';
+        await writeFile(outPath, JSON.stringify(hardware, null, 2) + '\n');
+        printInfo('hardware_written', { path: outPath });
+        return;
+    }
+    console.log(JSON.stringify(hardware, null, 2));
 }
 async function handleRunCommand(suiteSlug, opts) {
     if (!suiteSlug)
@@ -787,7 +1122,7 @@ async function handleRunCommand(suiteSlug, opts) {
         artifacts: result.artifacts.length,
     });
     if (opts.submit || opts['dry-run']) {
-        const apiKey = optString(opts, 'api-key') ?? process.env.LMX_API_KEY;
+        const apiKey = await getApiKey(opts);
         if (!apiKey)
             throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for submit/dry-run', ['Create an API key in the LocalMaxxing dashboard.', 'Pass it with --api-key bhk_... or set LMX_API_KEY.']);
         if (!hardwarePath)
@@ -804,11 +1139,59 @@ async function handleRunCommand(suiteSlug, opts) {
         });
     }
 }
+async function handleExecuteCommand(suiteSlug, opts) {
+    if (!suiteSlug)
+        throw new Error('eval execute requires a suite slug');
+    const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
+    const model = requireOpt(opts, 'model');
+    const baseUrl = requireOpt(opts, 'base-url');
+    const hardwarePath = optString(opts, 'hardware');
+    if (opts.submit && !hardwarePath)
+        throw new CliError('missing_hardware', '--hardware is required when using eval execute --submit', [
+            'Create a hardware JSON file matching /api/agent-context hardwareSchemas.',
+            'Pass --hardware hardware.json, or omit --submit to execute without auto-submitting a run.',
+        ]);
+    const apiKey = await getApiKey(opts);
+    if (!apiKey)
+        throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for eval execute', [
+            'Create an API key in the LocalMaxxing dashboard.',
+            'Pass it with --api-key bhk_... or set LMX_API_KEY.',
+        ]);
+    const payload = {
+        suiteSlug,
+        model,
+        baseUrl,
+        autoSubmit: Boolean(opts.submit),
+        ...(hardwarePath ? { hardware: await readJson(hardwarePath) } : {}),
+        quantization: optString(opts, 'quantization'),
+        modelRevision: optString(opts, 'model-revision') ?? 'main',
+        notes: optString(opts, 'notes'),
+    };
+    const response = await submitJson(apiUrl, apiKey, '/api/evals/execute', payload);
+    console.log(JSON.stringify(response, null, 2));
+    printInfo('execute_submitted', {
+        suite: suiteSlug,
+        endpoint: '/api/evals/execute',
+        autoSubmit: payload.autoSubmit,
+    });
+}
 async function main() {
     const { positional, opts } = parseArgs(process.argv.slice(2));
-    if (positional[0] !== 'eval' || opts.help) {
+    if (!['eval', 'benchmark', 'bench', 'auth', 'hardware'].includes(positional[0] ?? '') || opts.help) {
         usage();
         process.exit(positional[0] ? 1 : 0);
+    }
+    if (positional[0] === 'auth') {
+        await handleAuthCommand(opts);
+        return;
+    }
+    if (positional[0] === 'hardware') {
+        await handleHardwareCommand(opts);
+        return;
+    }
+    if (positional[0] === 'benchmark' || positional[0] === 'bench') {
+        await handleBenchmarkCommand(positional[1], positional[2], opts);
+        return;
     }
     if (positional[1] === 'suite') {
         await handleSuiteCommand(positional[2], positional[3], opts);
@@ -816,6 +1199,10 @@ async function main() {
     }
     if (positional[1] === 'run') {
         await handleRunCommand(positional[2], opts);
+        return;
+    }
+    if (positional[1] === 'execute') {
+        await handleExecuteCommand(positional[2], opts);
         return;
     }
     usage();

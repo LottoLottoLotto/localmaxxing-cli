@@ -1204,18 +1204,17 @@ async function handleRunCommand(suiteSlug: string | undefined, opts: Record<stri
 async function handleExecuteCommand(suiteSlug: string | undefined, opts: Record<string, string | boolean>) {
   if (!suiteSlug) throw new Error('eval execute requires a suite slug')
   const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '')
-  const apiKey = await getApiKey(opts)
-  if (!apiKey) throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for eval execute', [
-    'Create an API key in the LocalMaxxing dashboard.',
-    'Pass it with --api-key bhk_... or set LMX_API_KEY.',
-  ])
-
   const model = requireOpt(opts, 'model')
   const baseUrl = requireOpt(opts, 'base-url')
   const hardwarePath = optString(opts, 'hardware')
   if (opts.submit && !hardwarePath) throw new CliError('missing_hardware', '--hardware is required when using eval execute --submit', [
     'Create a hardware JSON file matching /api/agent-context hardwareSchemas.',
     'Pass --hardware hardware.json, or omit --submit to execute without auto-submitting a run.',
+  ])
+  const apiKey = await getApiKey(opts)
+  if (!apiKey) throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for eval execute', [
+    'Create an API key in the LocalMaxxing dashboard.',
+    'Pass it with --api-key bhk_... or set LMX_API_KEY.',
   ])
 
   const payload = {
