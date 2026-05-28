@@ -21,6 +21,8 @@ npx @localmaxxing/cli --help
 From this repository checkout:
 
 ```bash
+git clone https://github.com/LottoLottoLotto/localmaxxing-cli.git
+cd localmaxxing-cli
 npm install
 npm run build
 npm link
