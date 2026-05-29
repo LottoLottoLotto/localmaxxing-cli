@@ -89,6 +89,44 @@ Saved `lmx-bench` result files are also accepted. If the JSON has a top-level `p
 
 If engine token counts are missing or marked as estimated and the JSON includes generated text (`outputText`, `generatedText`, `completion`, `response`, or `text`), the CLI uses the model's Hugging Face tokenizer to fill `outputTokens`. If the submitted model has no tokenizer, it tries `tokenizer_name` or `base_model_name_or_path` from `config.json`.
 
+## Discover Eval Requirements
+
+Agents can pull the current LocalMaxxing schemas, endpoints, benchmark requirements, methodology tips, approved suite list, and per-suite run instructions directly from the API:
+
+```bash
+lmx context --out localmaxxing-agent-context.json
+lmx eval suite list --out localmaxxing-suites.json
+lmx eval suite search reasoning --out reasoning-suites.json
+lmx eval suite show hellaswag --out hellaswag-suite.json
+lmx model search qwen3-8b --out models.json
+```
+
+`eval suite show` returns the suite document, task keys, scoring method, aggregation mode, and `agentInstructions` such as lm-eval command templates or server-side custom eval payloads.
+
+Suite discovery output and eval run artifacts are redacted defensively so fields such as `gold`, `answer`, and `referenceAnswer` are not written to agent-facing files or uploaded as run artifacts.
+
+## Artifact Bundles And Storage
+
+Large eval traces should be uploaded as bucket-backed artifacts instead of inline run artifacts:
+
+```bash
+lmx eval artifacts upload traces.jsonl \
+  --format jsonl \
+  --item-count 1000 \
+  --out artifact-bundle.json
+```
+
+The lower-level storage commands support both artifact bundles and bucket-backed datasets:
+
+```bash
+lmx eval storage upload dataset.jsonl \
+  --kind dataset \
+  --format jsonl \
+  --out dataset-storage.json
+
+lmx eval storage download <storageKey> --out traces.jsonl
+```
+
 ## Run A Custom Eval
 
 Start a local OpenAI-compatible server, then run:
@@ -128,10 +166,33 @@ lmx eval run my-judge-suite \
 
 ## Run An LM-Eval Suite
 
-Run lm-eval-harness yourself:
+Run lm-eval-harness through the CLI wrapper:
 
 ```bash
-lm-eval run \
+lmx eval lm-eval hellaswag \
+  --model Qwen/Qwen3-8B \
+  --backend hf \
+  --hardware hardware.json \
+  --dry-run
+```
+
+For `--backend hf`, the CLI defaults `--model-args` to `pretrained=<model>`. Override it for other backends:
+
+```bash
+lmx eval lm-eval hellaswag \
+  --model Qwen/Qwen3-8B \
+  --backend vllm \
+  --model-args pretrained=Qwen/Qwen3-8B,tensor_parallel_size=1 \
+  --hardware hardware.json \
+  --submit
+```
+
+The wrapper fetches the suite, runs `lm_eval`, parses the output JSON, writes a LocalMaxxing run payload, then dry-runs or submits it.
+
+You can still run lm-eval-harness yourself:
+
+```bash
+lm_eval \
   --model hf \
   --model_args pretrained=Qwen/Qwen3-8B \
   --tasks arc_challenge,hellaswag,mmlu \
@@ -185,6 +246,7 @@ Agents should read the error code, apply the `Fix:` hints, and rerun the command
 
 ## Docs
 
+- `docs/running-evals.md`
 - `docs/eval-suite-authoring.md`
 - `docs/lm-eval-compatibility.md`
 

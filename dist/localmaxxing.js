@@ -2,8 +2,8 @@
 import { execFileSync, execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { homedir, platform, release, totalmem, cpus } from 'node:os';
-import { join } from 'node:path';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 const LMEVAL_METRIC_CANDIDATES_BY_SCORING = {
     exact_match: [
         'acc_norm,none',
@@ -32,6 +32,7 @@ const LMEVAL_METRIC_CANDIDATES_BY_SCORING = {
 };
 const CONFIG_DIR = join(homedir(), '.config', 'localmaxxing');
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
+const GOLD_FIELD_NAMES = new Set(['gold', 'answer', 'referenceAnswer', 'expectedAnswer', 'correctAnswer', 'label', 'target']);
 class CliError extends Error {
     code;
     hints;
@@ -75,14 +76,35 @@ function printError(error) {
     console.error('[localmaxxing:error] unexpected_error');
     console.error(asMessage(error));
 }
+function redactGoldFields(value) {
+    if (Array.isArray(value))
+        return value.map(redactGoldFields);
+    if (!value || typeof value !== 'object')
+        return value;
+    const redacted = {};
+    for (const [key, child] of Object.entries(value)) {
+        if (GOLD_FIELD_NAMES.has(key))
+            continue;
+        redacted[key] = redactGoldFields(child);
+    }
+    return redacted;
+}
 function usage() {
     console.log(`LocalMaxxing CLI
 
 Usage:
+  lmx context --out localmaxxing-agent-context.json
   lmx auth --key bhk_...
   lmx hardware --out hardware.json
   lmx benchmark submit benchmark.json --api-key bhk_...
   lmx benchmark dry-run benchmark.json --api-key bhk_...
+  lmx eval suite list --out suites.json
+  lmx eval suite search reasoning --out reasoning-suites.json
+  lmx eval suite show hellaswag --out hellaswag-suite.json
+  lmx model search qwen3-8b --out models.json
+  lmx eval storage upload traces.jsonl --kind artifact --format jsonl --out artifact-bundle.json
+  lmx eval storage download <storageKey> --out traces.jsonl
+  lmx eval lm-eval hellaswag --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run
   lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --kind multiple_choice --out my-eval.json
   lmx eval suite init --slug hellaswag --name "HellaSwag" --category commonsense --runner lm-eval-harness --tasks hellaswag --out hellaswag.json
   lmx eval suite validate my-eval.json
@@ -95,6 +117,10 @@ Options:
   --api-url <url>          LocalMaxxing origin (default: https://www.localmaxxing.com)
   --api-key <key>          API key, defaults to LMX_API_KEY, then saved config
   --model <hfId>           HuggingFace model ID
+  --backend <name>         lm-eval backend name for eval lm-eval (default: hf)
+  --model-args <args>      lm-eval --model_args value (default for hf: pretrained=<model>)
+  --num-fewshot <n>        lm-eval --num_fewshot override
+  --lm-eval-bin <path>     lm-eval executable (default: lm_eval)
   --base-url <url>         OpenAI-compatible model endpoint for custom evals
   --model-api-key <key>    Optional bearer token for the local model endpoint
   --hardware <path>        JSON hardware object required when submitting
@@ -106,6 +132,11 @@ Options:
   --judge-model <model>    Judge model override
   --judge-api-key <key>    Judge bearer token, defaults to EVAL_JUDGE_API_KEY
   --notes <text>           Optional submission notes
+  --kind <kind>            Storage upload kind, usually artifact or dataset
+  --format <format>        Storage file format, e.g. json, jsonl, parquet, zip
+  --content-type <type>    Storage upload content type override
+  --item-count <n>         Optional record/sample count for storage metadata
+  --limit <n>              Optional search/list result limit
   --submit                 Upload run to LocalMaxxing
   --dry-run                Validate upload without creating a run
   --out <path>             Write computed payload/result JSON (default: localmaxxing-eval-run.json)
@@ -113,6 +144,15 @@ Options:
 Benchmark submissions:
   Pass a JSON object matching POST /api/benchmarks, or a lmx-bench result with a payload field.
   Use dry-run first to validate without writing.
+
+Discovery for agents:
+  lmx context fetches /api/agent-context with benchmark schemas, endpoints, and methodology tips.
+  lmx eval suite list fetches approved eval suites.
+  lmx eval suite search <query> filters approved suites by slug, name, category, runner, or task key.
+  lmx eval suite show <slug> fetches suiteDoc, task keys, scoring rules, and agentInstructions.
+  lmx model search <query> resolves fuzzy model names to canonical HuggingFace IDs.
+  lmx eval storage upload/download manages bucket-backed datasets and artifact bundles.
+  lmx eval lm-eval <suiteSlug> runs lm_eval, parses its JSON output, and dry-runs or submits the run.
 
 Server-side custom evals:
   eval execute calls POST /api/evals/execute for approved CUSTOM suites and public OpenAI-compatible endpoints.
@@ -252,6 +292,19 @@ function tryExec(cmd, args = []) {
     }
     catch {
         return null;
+    }
+}
+function runStreamingCommand(cmd, args) {
+    try {
+        execFileSync(cmd, args, { stdio: 'inherit' });
+    }
+    catch (error) {
+        const status = error && typeof error === 'object' && 'status' in error ? error.status : undefined;
+        throw new CliError('command_failed', `${cmd} failed${typeof status === 'number' ? ` with exit code ${status}` : ''}`, [
+            'Check that the executable is installed and available on PATH.',
+            'For lm-eval, install it with: pip install lm-eval',
+            'Rerun with --lm-eval-bin <path> if the executable has a custom location.',
+        ]);
     }
 }
 function round1(n) {
@@ -962,6 +1015,160 @@ async function submitJson(apiUrl, apiKey, endpoint, payload) {
         body: JSON.stringify(payload),
     });
 }
+async function fetchAuthedJson(apiUrl, apiKey, endpoint) {
+    return fetchJson(`${apiUrl}${endpoint}`, apiKey ? { headers: { Authorization: `Bearer ${apiKey}` } } : undefined);
+}
+async function writeOrPrintJson(title, opts, payload) {
+    const outPath = optString(opts, 'out');
+    if (!outPath) {
+        console.log(JSON.stringify(payload, null, 2));
+        return;
+    }
+    await writeFile(outPath, JSON.stringify(payload, null, 2) + '\n');
+    printInfo(`${title}_written`, { path: outPath });
+}
+async function handleContextCommand(opts) {
+    const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
+    const context = await fetchJson(`${apiUrl}/api/agent-context`);
+    await writeOrPrintJson('context', opts, context);
+}
+function optInt(opts, key) {
+    const value = optString(opts, key);
+    if (!value)
+        return undefined;
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed) || parsed < 0)
+        throw new CliError('invalid_option', `--${key} must be a non-negative integer`, [`Pass --${key} <number>.`]);
+    return parsed;
+}
+function defaultContentType(format) {
+    if (format === 'json')
+        return 'application/json';
+    if (format === 'jsonl')
+        return 'application/jsonl';
+    if (format === 'txt')
+        return 'text/plain';
+    if (format === 'zip')
+        return 'application/zip';
+    return 'application/octet-stream';
+}
+function suitesFromResponse(value) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const suites = value.suites;
+        if (Array.isArray(suites))
+            return suites;
+    }
+    return Array.isArray(value) ? value : [];
+}
+function suiteMatches(suite, query) {
+    const haystack = JSON.stringify({
+        slug: suite.slug,
+        name: suite.name,
+        description: suite.description,
+        category: suite.category,
+        runner: suite.runner,
+        tasks: suite.suiteDoc && typeof suite.suiteDoc === 'object' ? suite.suiteDoc.tasks : undefined,
+    }).toLowerCase();
+    return haystack.includes(query.toLowerCase());
+}
+async function handleModelCommand(action, target, opts) {
+    if (action !== 'search')
+        throw new Error('Unknown model command. Use search.');
+    const query = target ?? optString(opts, 'q') ?? optString(opts, 'query');
+    if (!query)
+        throw new CliError('missing_query', 'model search requires a query', ['Run lmx model search qwen3-8b.']);
+    const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
+    const limit = optString(opts, 'limit') ?? '10';
+    const models = await fetchJson(`${apiUrl}/api/models/search?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(limit)}`);
+    await writeOrPrintJson('models', opts, models);
+}
+function stringField(value, key) {
+    return value && typeof value === 'object' && !Array.isArray(value) && typeof value[key] === 'string'
+        ? value[key]
+        : undefined;
+}
+function recordField(value, key) {
+    const field = value && typeof value === 'object' && !Array.isArray(value) ? value[key] : undefined;
+    return field && typeof field === 'object' && !Array.isArray(field) ? field : undefined;
+}
+function stringHeaders(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return {};
+    return Object.fromEntries(Object.entries(value).map(([key, headerValue]) => [key, String(headerValue)]));
+}
+async function handleStorageCommand(action, target, opts, forcedKind) {
+    const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
+    if (action === 'upload') {
+        if (!target)
+            throw new Error('eval storage upload requires a file path');
+        const apiKey = await getApiKey(opts);
+        if (!apiKey)
+            throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for storage upload', [
+                'Create an API key in the LocalMaxxing dashboard.',
+                'Pass it with --api-key bhk_... or set LMX_API_KEY.',
+            ]);
+        const data = await readFile(target);
+        const info = await stat(target);
+        const format = optString(opts, 'format') ?? basename(target).split('.').pop() ?? 'other';
+        const contentType = optString(opts, 'content-type') ?? defaultContentType(format);
+        const metadata = {
+            kind: forcedKind ?? optString(opts, 'kind') ?? 'artifact',
+            filename: optString(opts, 'filename') ?? basename(target),
+            contentType,
+            format,
+            byteSize: info.size,
+            sha256: createHash('sha256').update(data).digest('hex'),
+            itemCount: optInt(opts, 'item-count'),
+        };
+        const upload = await submitJson(apiUrl, apiKey, '/api/evals/storage/upload-url', metadata);
+        const uploadUrl = stringField(upload, 'uploadUrl') ?? stringField(upload, 'url');
+        if (!uploadUrl)
+            throw new CliError('storage_upload_url_missing', 'Storage upload-url response did not include uploadUrl', [
+                'Check that the LocalMaxxing API supports /api/evals/storage/upload-url.',
+                'Try again or inspect the response details.',
+            ], upload);
+        const headers = stringHeaders(recordField(upload, 'headers'));
+        if (!Object.keys(headers).some(key => key.toLowerCase() === 'content-type'))
+            headers['Content-Type'] = contentType;
+        const put = await fetch(uploadUrl, { method: 'PUT', headers, body: data });
+        if (!put.ok)
+            throw new CliError('storage_put_failed', `Storage PUT failed: ${put.status} ${put.statusText}`, [
+                'Retry the upload; signed upload URLs can expire.',
+                'Check --content-type and file size.',
+            ], await put.text());
+        const storageRef = recordField(upload, 'storageRef') ?? stringField(upload, 'storageRef') ?? stringField(upload, 'key');
+        if (!storageRef)
+            throw new CliError('storage_ref_missing', 'Storage upload-url response did not include storageRef or key', [
+                'Check that the LocalMaxxing API returned a storage reference for completion.',
+            ], upload);
+        const completed = await submitJson(apiUrl, apiKey, '/api/evals/storage/complete', { storageRef });
+        await writeOrPrintJson('storage_upload', opts, { metadata, storageRef, completed });
+        return;
+    }
+    if (action === 'download') {
+        if (!target)
+            throw new Error('eval storage download requires a storage key');
+        const outPath = optString(opts, 'out');
+        if (!outPath)
+            throw new CliError('missing_option', '--out is required for storage download', ['Pass --out <path> to write the downloaded object.']);
+        const apiKey = await getApiKey(opts);
+        const signed = await fetchAuthedJson(apiUrl, apiKey, `/api/evals/storage/download-url?key=${encodeURIComponent(target)}`);
+        const downloadUrl = stringField(signed, 'downloadUrl') ?? stringField(signed, 'url');
+        if (!downloadUrl)
+            throw new CliError('storage_download_url_missing', 'Storage download-url response did not include downloadUrl', [
+                'Check the storage key and API URL.',
+            ], signed);
+        const res = await fetch(downloadUrl);
+        if (!res.ok)
+            throw new CliError('storage_download_failed', `Storage download failed: ${res.status} ${res.statusText}`, [
+                'Check the storage key and retry; signed download URLs can expire.',
+            ], await res.text());
+        await writeFile(outPath, new Uint8Array(await res.arrayBuffer()));
+        printInfo('storage_downloaded', { path: outPath, key: target });
+        return;
+    }
+    throw new Error('Unknown storage command. Use upload or download.');
+}
 async function handleSuiteCommand(action, target, opts) {
     const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
     if (action === 'init') {
@@ -979,6 +1186,34 @@ async function handleSuiteCommand(action, target, opts) {
         console.log('Edit the inline dataset items, then run:');
         console.log(`  lmx eval suite validate ${outPath}`);
         console.log(`  lmx eval suite submit ${outPath} --api-key bhk_...`);
+        return;
+    }
+    if (action === 'list') {
+        const suites = await fetchJson(`${apiUrl}/api/evals/suites`);
+        await writeOrPrintJson('suites', opts, redactGoldFields(suites));
+        return;
+    }
+    if (action === 'search') {
+        const query = target ?? optString(opts, 'q') ?? optString(opts, 'query');
+        if (!query)
+            throw new CliError('missing_query', 'eval suite search requires a query', ['Run lmx eval suite search reasoning.']);
+        const raw = await fetchJson(`${apiUrl}/api/evals/suites`);
+        const limit = optInt(opts, 'limit') ?? 20;
+        const runner = optString(opts, 'runner')?.toUpperCase();
+        const category = optString(opts, 'category')?.toLowerCase();
+        const suites = suitesFromResponse(raw)
+            .filter(suite => suiteMatches(suite, query))
+            .filter(suite => !runner || String(suite.runner).toUpperCase() === runner)
+            .filter(suite => !category || String(suite.category).toLowerCase() === category)
+            .slice(0, limit);
+        await writeOrPrintJson('suites', opts, redactGoldFields({ suites, total: suites.length, query }));
+        return;
+    }
+    if (action === 'show' || action === 'get') {
+        if (!target)
+            throw new Error('eval suite show requires a suite slug');
+        const suite = await fetchJson(`${apiUrl}/api/evals/suites/${encodeURIComponent(target)}`);
+        await writeOrPrintJson('suite', opts, redactGoldFields(suite));
         return;
     }
     if (!target)
@@ -1076,12 +1311,8 @@ async function handleHardwareCommand(opts) {
     }
     console.log(JSON.stringify(hardware, null, 2));
 }
-async function handleRunCommand(suiteSlug, opts) {
-    if (!suiteSlug)
-        throw new Error('eval run requires a suite slug');
-    const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
-    const suiteFile = optString(opts, 'suite-file');
-    const suite = suiteFile
+async function loadSuite(apiUrl, suiteSlug, suiteFile) {
+    return suiteFile
         ? await readJson(suiteFile).then((payload) => ({
             slug: payload.slug,
             name: payload.name,
@@ -1089,6 +1320,8 @@ async function handleRunCommand(suiteSlug, opts) {
             suiteDoc: payload.suiteDoc,
         }))
         : await fetchJson(`${apiUrl}/api/evals/suites/${encodeURIComponent(suiteSlug)}`);
+}
+function validateRemoteSuite(suite) {
     validateSuitePayload({
         slug: suite.slug,
         name: suite.name,
@@ -1096,6 +1329,63 @@ async function handleRunCommand(suiteSlug, opts) {
         runner: suite.runner,
         suiteDoc: suite.suiteDoc,
     });
+}
+function inferredFewShot(doc, opts) {
+    const explicit = optString(opts, 'num-fewshot') ?? optString(opts, 'fewshot');
+    if (explicit !== undefined)
+        return explicit;
+    if (typeof doc.runConfig?.fewShot === 'number')
+        return String(doc.runConfig.fewShot);
+    const shots = [...new Set(doc.tasks.map(task => task.nShots).filter((value) => typeof value === 'number'))];
+    return shots.length === 1 ? String(shots[0]) : undefined;
+}
+function lmEvalArgs(suite, opts) {
+    const backend = optString(opts, 'backend') ?? 'hf';
+    const model = requireOpt(opts, 'model');
+    const tasks = optString(opts, 'tasks') ?? suite.suiteDoc.tasks.map(task => task.key).join(',');
+    const resultsPath = optString(opts, 'results') ?? 'localmaxxing-lm-eval-results.json';
+    const modelArgs = optString(opts, 'model-args') ?? (backend === 'hf' ? `pretrained=${model}` : undefined);
+    const fewShot = inferredFewShot(suite.suiteDoc, opts);
+    const args = ['--model', backend];
+    if (modelArgs)
+        args.push('--model_args', modelArgs);
+    args.push('--tasks', tasks);
+    if (fewShot !== undefined)
+        args.push('--num_fewshot', fewShot);
+    args.push('--output_path', resultsPath);
+    return { args, backend, tasks, resultsPath, modelArgs, fewShot };
+}
+async function handleLmEvalCommand(suiteSlug, opts) {
+    if (!suiteSlug)
+        throw new Error('eval lm-eval requires a suite slug');
+    const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
+    const suite = await loadSuite(apiUrl, suiteSlug, optString(opts, 'suite-file'));
+    if (suite.runner !== 'LM_EVAL_HARNESS')
+        throw new CliError('suite_runner_mismatch', `Suite "${suiteSlug}" is ${suite.runner}, not LM_EVAL_HARNESS`, [
+            'Use lmx eval run for CUSTOM suites.',
+            'Use lmx eval suite list or show to find LM_EVAL_HARNESS suites.',
+        ]);
+    validateRemoteSuite(suite);
+    const command = optString(opts, 'lm-eval-bin') ?? 'lm_eval';
+    const { args, backend, tasks, resultsPath, modelArgs, fewShot } = lmEvalArgs(suite, opts);
+    printInfo('lm_eval_start', {
+        suite: suiteSlug,
+        command,
+        backend,
+        modelArgs,
+        tasks,
+        numFewshot: fewShot ?? 'suite/default',
+        output: resultsPath,
+    });
+    runStreamingCommand(command, args);
+    await handleRunCommand(suiteSlug, { ...opts, results: resultsPath });
+}
+async function handleRunCommand(suiteSlug, opts) {
+    if (!suiteSlug)
+        throw new Error('eval run requires a suite slug');
+    const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
+    const suite = await loadSuite(apiUrl, suiteSlug, optString(opts, 'suite-file'));
+    validateRemoteSuite(suite);
     const result = suite.runner === 'LM_EVAL_HARNESS'
         ? await loadLmEvalResults(optString(opts, 'results') ?? (() => { throw new Error('LM-Eval suites require --results <lm-eval-output.json>'); })(), suite)
         : await runCustomLocal(suite, opts);
@@ -1109,7 +1399,7 @@ async function handleRunCommand(suiteSlug, opts) {
         judgeMode: suite.suiteDoc.scoringMethod === 'llm_judge' ? 'LOCAL_REPORTED' : 'NONE',
         runnerVersion: suite.runner === 'CUSTOM' ? 'localmaxxing-cli custom-local' : 'localmaxxing-cli lm-eval-upload',
         results: result.scores,
-        artifacts: result.artifacts,
+        artifacts: redactGoldFields(result.artifacts),
         runConfig: { aggregatePreview: result.aggregate },
     };
     const outPath = optString(opts, 'out') ?? 'localmaxxing-eval-run.json';
@@ -1177,7 +1467,7 @@ async function handleExecuteCommand(suiteSlug, opts) {
 }
 async function main() {
     const { positional, opts } = parseArgs(process.argv.slice(2));
-    if (!['eval', 'benchmark', 'bench', 'auth', 'hardware'].includes(positional[0] ?? '') || opts.help) {
+    if (!['eval', 'benchmark', 'bench', 'auth', 'hardware', 'context', 'agent-context', 'model'].includes(positional[0] ?? '') || opts.help) {
         usage();
         process.exit(positional[0] ? 1 : 0);
     }
@@ -1189,8 +1479,24 @@ async function main() {
         await handleHardwareCommand(opts);
         return;
     }
+    if (positional[0] === 'context' || positional[0] === 'agent-context') {
+        await handleContextCommand(opts);
+        return;
+    }
+    if (positional[0] === 'model') {
+        await handleModelCommand(positional[1], positional[2], opts);
+        return;
+    }
     if (positional[0] === 'benchmark' || positional[0] === 'bench') {
         await handleBenchmarkCommand(positional[1], positional[2], opts);
+        return;
+    }
+    if (positional[1] === 'storage') {
+        await handleStorageCommand(positional[2], positional[3], opts);
+        return;
+    }
+    if (positional[1] === 'artifact' || positional[1] === 'artifacts') {
+        await handleStorageCommand(positional[2], positional[3], opts, 'artifact');
         return;
     }
     if (positional[1] === 'suite') {
@@ -1199,6 +1505,10 @@ async function main() {
     }
     if (positional[1] === 'run') {
         await handleRunCommand(positional[2], opts);
+        return;
+    }
+    if (positional[1] === 'lm-eval' || positional[1] === 'lmeval') {
+        await handleLmEvalCommand(positional[2], opts);
         return;
     }
     if (positional[1] === 'execute') {
