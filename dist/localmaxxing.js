@@ -1,5 +1,5 @@
 #!/usr/bin/env tsx
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync, execSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { homedir, platform, release, totalmem, cpus } from 'node:os';
 import { basename, join } from 'node:path';
@@ -96,6 +96,9 @@ Usage:
   lmx context --out localmaxxing-agent-context.json
   lmx auth --key bhk_...
   lmx hardware --out hardware.json
+  lmx benchmark run llama.cpp --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run
+  lmx benchmark run vllm --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind throughput --input-len 512 --output-len 128 --dry-run
+  lmx benchmark run sglang --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind serving --base-url http://127.0.0.1:30000 --dry-run
   lmx benchmark submit benchmark.json --api-key bhk_...
   lmx benchmark dry-run benchmark.json --api-key bhk_...
   lmx eval suite list --out suites.json
@@ -123,8 +126,14 @@ Options:
   --lm-eval-bin <path>     lm-eval executable (default: lm_eval)
   --base-url <url>         OpenAI-compatible model endpoint for custom evals
   --model-api-key <key>    Optional bearer token for the local model endpoint
+  --command <cmd>          Benchmark command to execute for benchmark run
+  --bench-kind <kind>      Built-in benchmark: vLLM serve/throughput/latency; SGLang serving/offline/one-batch
+  --benchmark-bin <path>   Benchmark executable (default: vllm for vLLM, python for SGLang)
+  --benchmark-output <path> Engine benchmark JSON output path
+  --extra-bench-args <args> Raw extra args appended to built-in benchmark commands
+  --hf-id <hfId>           Alias for --model in benchmark commands
   --hardware <path>        JSON hardware object required when submitting
-  --quantization <label>   Optional quantization label
+  --quantization <label>   Quantization label, required for benchmark run
   --model-revision <rev>   Optional model revision/branch/commit (default: main)
   --results <path>         Existing lm-eval output JSON for LM_EVAL_HARNESS suites
   --suite-file <path>      Local suite JSON for offline run parsing/testing
@@ -142,6 +151,7 @@ Options:
   --out <path>             Write computed payload/result JSON (default: localmaxxing-eval-run.json)
 
 Benchmark submissions:
+  benchmark run builds a payload from explicit metric fields, built-in vLLM/SGLang presets, --command, --results, or --base-url measurement.
   Pass a JSON object matching POST /api/benchmarks, or a lmx-bench result with a payload field.
   Use dry-run first to validate without writing.
 
@@ -524,6 +534,503 @@ async function normalizeBenchmarkPayload(raw, payload) {
         appendTokenSource(normalized, tokenizerSource);
     return normalized;
 }
+function optNumber(opts, key) {
+    const value = optString(opts, key);
+    if (value === undefined)
+        return undefined;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0)
+        throw new CliError('invalid_option', `--${key} must be a non-negative number`, [`Pass --${key} <number>.`]);
+    return parsed;
+}
+function requireBenchmarkModel(opts) {
+    return optString(opts, 'hf-id') ?? optString(opts, 'model') ?? (() => { throw new CliError('missing_model', 'benchmark run requires --hf-id or --model', ['Pass the canonical HuggingFace model ID, e.g. --hf-id Qwen/Qwen3-8B.']); })();
+}
+function normalizeEngineName(value) {
+    const raw = value?.trim().toLowerCase();
+    if (!raw || raw === 'endpoint')
+        return undefined;
+    if (['llama', 'llama.cpp', 'llamacpp', 'llama-bench', 'llama.cpp-bench'].includes(raw))
+        return 'llama.cpp';
+    if (['vllm', 'vllm-bench', 'vllm benchmark'].includes(raw))
+        return 'vllm';
+    if (['sglang', 'sgl', 'sglang-bench', 'sglang benchmark'].includes(raw))
+        return 'sglang';
+    return value;
+}
+function normalizedMetricKey(key) {
+    return key.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+function walkNumbers(value, visit, path = '') {
+    if (!value || typeof value !== 'object')
+        return;
+    if (Array.isArray(value)) {
+        for (const child of value)
+            walkNumbers(child, visit, path);
+        return;
+    }
+    for (const [key, child] of Object.entries(value)) {
+        const nextPath = path ? `${path}.${key}` : key;
+        if (typeof child === 'number' && Number.isFinite(child))
+            visit(nextPath, child);
+        else
+            walkNumbers(child, visit, nextPath);
+    }
+}
+function numberFromJsonAliases(value, aliases) {
+    const normalizedAliases = aliases.map(normalizedMetricKey);
+    let found;
+    walkNumbers(value, (key, n) => {
+        if (found !== undefined)
+            return;
+        const normalized = normalizedMetricKey(key);
+        if (normalizedAliases.some(alias => normalized.endsWith(alias) || normalized.includes(alias)))
+            found = n;
+    });
+    return found;
+}
+function parseJsonFromOutput(text) {
+    const trimmed = text.trim();
+    if (!trimmed)
+        return undefined;
+    try {
+        return JSON.parse(trimmed);
+    }
+    catch { }
+    for (const [startChar, endChar] of [['{', '}'], ['[', ']']]) {
+        const start = trimmed.indexOf(startChar);
+        const end = trimmed.lastIndexOf(endChar);
+        if (start >= 0 && end > start) {
+            try {
+                return JSON.parse(trimmed.slice(start, end + 1));
+            }
+            catch { }
+        }
+    }
+    return undefined;
+}
+function firstRegexNumber(text, patterns) {
+    for (const pattern of patterns) {
+        const match = text.match(pattern);
+        if (!match)
+            continue;
+        const parsed = Number(match[1]);
+        if (Number.isFinite(parsed))
+            return parsed;
+    }
+    return undefined;
+}
+function shellArg(value) {
+    const text = String(value);
+    if (/^[\w@%+=:,./-]+$/.test(text))
+        return text;
+    return `"${text.replace(/(["\\])/g, '\\$1')}"`;
+}
+function appendArg(args, flag, value) {
+    if (value === undefined || value === '')
+        return;
+    args.push(flag, String(value));
+}
+function appendRawArgs(args, raw) {
+    if (raw?.trim())
+        args.push(`__RAW__${raw.trim()}`);
+}
+function commandFromArgs(command, args) {
+    return [shellArg(command), ...args.map(arg => arg.startsWith('__RAW__') ? arg.slice('__RAW__'.length) : arg.startsWith('--') ? arg : shellArg(arg))].join(' ');
+}
+function benchmarkKind(opts, fallback) {
+    return (optString(opts, 'bench-kind') ?? optString(opts, 'benchmark') ?? fallback).toLowerCase();
+}
+function benchmarkOutputPath(opts) {
+    return optString(opts, 'benchmark-output') ?? optString(opts, 'bench-output');
+}
+function buildVllmBenchmarkCommand(opts, hfId) {
+    const kind = benchmarkKind(opts, optString(opts, 'base-url') ? 'serve' : 'throughput');
+    const command = optString(opts, 'benchmark-bin') ?? 'vllm';
+    const outputPath = benchmarkOutputPath(opts);
+    const servedModel = optString(opts, 'served-model') ?? optString(opts, 'model-name') ?? hfId;
+    const inputLen = optInt(opts, 'input-len') ?? 512;
+    const outputLen = optInt(opts, 'output-len') ?? 128;
+    const numPrompts = optInt(opts, 'num-prompts') ?? 100;
+    const args = ['bench', kind];
+    if (kind === 'serve') {
+        appendArg(args, '--backend', optString(opts, 'benchmark-backend') ?? 'openai');
+        appendArg(args, '--model', servedModel);
+        appendArg(args, '--base-url', optString(opts, 'base-url'));
+        appendArg(args, '--host', optString(opts, 'host'));
+        appendArg(args, '--port', optInt(opts, 'port'));
+        appendArg(args, '--endpoint', optString(opts, 'endpoint'));
+        appendArg(args, '--dataset-name', optString(opts, 'dataset-name') ?? 'random');
+        appendArg(args, '--dataset-path', optString(opts, 'dataset-path'));
+        appendArg(args, '--input-len', inputLen);
+        appendArg(args, '--output-len', outputLen);
+        appendArg(args, '--num-prompts', numPrompts);
+        appendArg(args, '--request-rate', optString(opts, 'request-rate'));
+        appendArg(args, '--max-concurrency', optInt(opts, 'max-concurrency'));
+        if (outputPath)
+            args.push('--save-result', '--result-filename', outputPath);
+    }
+    else if (kind === 'throughput') {
+        appendArg(args, '--backend', optString(opts, 'benchmark-backend') ?? 'vllm');
+        appendArg(args, '--model', hfId);
+        appendArg(args, '--dataset-name', optString(opts, 'dataset-name') ?? 'random');
+        appendArg(args, '--dataset-path', optString(opts, 'dataset-path'));
+        appendArg(args, '--input-len', inputLen);
+        appendArg(args, '--output-len', outputLen);
+        appendArg(args, '--num-prompts', numPrompts);
+        appendArg(args, '--num-warmups', optInt(opts, 'num-warmups'));
+        appendArg(args, '--tensor-parallel-size', optInt(opts, 'tensor-parallel'));
+        appendArg(args, '--max-model-len', optInt(opts, 'context-length'));
+        if (outputPath)
+            args.push('--output-json', outputPath);
+    }
+    else if (kind === 'latency') {
+        appendArg(args, '--model', hfId);
+        appendArg(args, '--input-len', inputLen);
+        appendArg(args, '--output-len', outputLen);
+        appendArg(args, '--batch-size', optInt(opts, 'batch-size') ?? 1);
+        appendArg(args, '--num-iters-warmup', optInt(opts, 'num-warmups'));
+        appendArg(args, '--num-iters', optInt(opts, 'num-iters'));
+        appendArg(args, '--tensor-parallel-size', optInt(opts, 'tensor-parallel'));
+        appendArg(args, '--max-model-len', optInt(opts, 'context-length'));
+        if (outputPath)
+            args.push('--output-json', outputPath);
+    }
+    else {
+        throw new CliError('unsupported_benchmark_kind', `Unsupported vLLM benchmark kind "${kind}"`, ['Use --bench-kind serve, throughput, or latency.', 'Or pass the exact command with --command.']);
+    }
+    appendRawArgs(args, optString(opts, 'extra-bench-args'));
+    return commandFromArgs(command, args);
+}
+function buildSglangBenchmarkCommand(opts, hfId) {
+    const kind = benchmarkKind(opts, optString(opts, 'base-url') ? 'serving' : 'offline');
+    const command = optString(opts, 'benchmark-bin') ?? optString(opts, 'python-bin') ?? 'python';
+    const outputPath = benchmarkOutputPath(opts);
+    const servedModel = optString(opts, 'served-model') ?? optString(opts, 'model-name') ?? hfId;
+    const inputLen = optInt(opts, 'input-len') ?? 512;
+    const outputLen = optInt(opts, 'output-len') ?? 128;
+    const numPrompts = optInt(opts, 'num-prompts') ?? 100;
+    const args = ['-m'];
+    if (kind === 'serving' || kind === 'serve') {
+        args.push('sglang.bench_serving');
+        appendArg(args, '--backend', optString(opts, 'benchmark-backend') ?? 'sglang');
+        appendArg(args, '--model', servedModel);
+        appendArg(args, '--base-url', optString(opts, 'base-url'));
+        appendArg(args, '--host', optString(opts, 'host'));
+        appendArg(args, '--port', optInt(opts, 'port'));
+        appendArg(args, '--dataset-name', optString(opts, 'dataset-name') ?? 'random');
+        appendArg(args, '--random-input-len', inputLen);
+        appendArg(args, '--random-output-len', outputLen);
+        appendArg(args, '--num-prompts', numPrompts);
+        appendArg(args, '--request-rate', optString(opts, 'request-rate'));
+        appendArg(args, '--max-concurrency', optInt(opts, 'max-concurrency'));
+        if (outputPath)
+            appendArg(args, '--output-file', outputPath);
+    }
+    else if (kind === 'offline' || kind === 'offline-throughput') {
+        args.push('sglang.bench_offline_throughput');
+        appendArg(args, '--model-path', hfId);
+        appendArg(args, '--dataset-name', optString(opts, 'dataset-name') ?? 'random');
+        appendArg(args, '--num-prompts', numPrompts);
+        appendArg(args, '--random-input-len', inputLen);
+        appendArg(args, '--random-output-len', outputLen);
+    }
+    else if (kind === 'one-batch') {
+        args.push('sglang.bench_one_batch');
+        appendArg(args, '--model-path', hfId);
+        appendArg(args, '--batch-size', optInt(opts, 'batch-size') ?? 1);
+        appendArg(args, '--input-len', inputLen);
+        appendArg(args, '--output-len', outputLen);
+    }
+    else if (kind === 'one-batch-server') {
+        args.push('sglang.bench_one_batch_server');
+        appendArg(args, '--base-url', optString(opts, 'base-url'));
+        appendArg(args, '--model-path', hfId);
+        appendArg(args, '--batch-size', optInt(opts, 'batch-size') ?? 1);
+        appendArg(args, '--input-len', inputLen);
+        appendArg(args, '--output-len', outputLen);
+    }
+    else {
+        throw new CliError('unsupported_benchmark_kind', `Unsupported SGLang benchmark kind "${kind}"`, ['Use --bench-kind serving, offline, one-batch, or one-batch-server.', 'Or pass the exact command with --command.']);
+    }
+    appendRawArgs(args, optString(opts, 'extra-bench-args'));
+    return commandFromArgs(command, args);
+}
+function builtInBenchmarkCommand(engineName, opts, hfId) {
+    if (engineName === 'vllm')
+        return buildVllmBenchmarkCommand(opts, hfId);
+    if (engineName === 'sglang')
+        return buildSglangBenchmarkCommand(opts, hfId);
+    return undefined;
+}
+function parseLlamaBenchTable(text) {
+    const metrics = {};
+    for (const line of text.split(/\r?\n/)) {
+        const cells = line.split('|').map(cell => cell.trim()).filter(Boolean);
+        const testIndex = cells.findIndex(cell => /^(pp|tg)\d+\b/i.test(cell));
+        if (testIndex < 0)
+            continue;
+        const test = cells[testIndex];
+        const valueCell = cells.slice(testIndex + 1).find(cell => /^\d+(?:\.\d+)?(?:\s*[+-]|\s*±|\s*$)/.test(cell));
+        const value = valueCell ? Number(valueCell.match(/^(\d+(?:\.\d+)?)/)?.[1]) : NaN;
+        if (!Number.isFinite(value))
+            continue;
+        const tokens = Number(test.match(/\d+/)?.[0]);
+        if (/^pp/i.test(test)) {
+            metrics.tokSPrefill = metrics.tokSPrefill ?? value;
+            if (Number.isFinite(tokens))
+                metrics.promptTokens = metrics.promptTokens ?? tokens;
+        }
+        if (/^tg/i.test(test)) {
+            metrics.tokSOut = metrics.tokSOut ?? value;
+            if (Number.isFinite(tokens))
+                metrics.outputTokens = metrics.outputTokens ?? tokens;
+        }
+    }
+    return metrics;
+}
+function parseBenchmarkOutput(text) {
+    const json = parseJsonFromOutput(text);
+    const metrics = {
+        ...parseLlamaBenchTable(text),
+    };
+    if (json !== undefined) {
+        metrics.tokSOut = metrics.tokSOut ?? numberFromJsonAliases(json, ['tokSOut', 'outputTokensPerSecond', 'outputTokenThroughput', 'outputThroughput', 'generationTokensPerSecond', 'decodeThroughput', 'genThroughput']);
+        metrics.tokSPrefill = metrics.tokSPrefill ?? numberFromJsonAliases(json, ['tokSPrefill', 'prefillTokensPerSecond', 'promptTokensPerSecond', 'inputTokensPerSecond', 'prefillThroughput', 'promptThroughput']);
+        metrics.tokSTotal = metrics.tokSTotal ?? numberFromJsonAliases(json, ['tokSTotal', 'totalTokensPerSecond', 'totalTokenThroughput', 'totalThroughput', 'tokensPerSecond']);
+        metrics.ttftMs = metrics.ttftMs ?? numberFromJsonAliases(json, ['ttftMs', 'timeToFirstTokenMs', 'meanTtftMs', 'medianTtftMs', 'meanTtft', 'medianTtft']);
+        metrics.peakVramGb = metrics.peakVramGb ?? numberFromJsonAliases(json, ['peakVramGb', 'peakGpuMemoryGb', 'maxVramGb']);
+        metrics.promptTokens = metrics.promptTokens ?? numberFromJsonAliases(json, ['promptTokens', 'inputTokens', 'totalInputTokens', 'totalPromptTokens', 'numPromptTokens']);
+        metrics.outputTokens = metrics.outputTokens ?? numberFromJsonAliases(json, ['outputTokens', 'completionTokens', 'generatedTokens', 'totalOutputTokens', 'totalGeneratedTokens', 'numOutputTokens']);
+    }
+    metrics.tokSOut = metrics.tokSOut ?? firstRegexNumber(text, [
+        /output\s+token\s+throughput[^\d]*(\d+(?:\.\d+)?)/i,
+        /output\s+throughput[^\d]*(\d+(?:\.\d+)?)[^\n]*(?:tok|token)\/s/i,
+        /decode\s+throughput[^\d]*(\d+(?:\.\d+)?)[^\n]*(?:tok|token)\/s/i,
+        /generation\s+throughput[^\d]*(\d+(?:\.\d+)?)[^\n]*(?:tok|token)\/s/i,
+        /generated\s+tokens\s+per\s+second[^\d]*(\d+(?:\.\d+)?)/i,
+        /(\d+(?:\.\d+)?)\s+output\s+tokens\/s/i,
+    ]);
+    metrics.tokSPrefill = metrics.tokSPrefill ?? firstRegexNumber(text, [
+        /prefill\s+throughput[^\d]*(\d+(?:\.\d+)?)[^\n]*(?:tok|token)\/s/i,
+        /prompt\s+throughput[^\d]*(\d+(?:\.\d+)?)[^\n]*(?:tok|token)\/s/i,
+        /input\s+token\s+throughput[^\d]*(\d+(?:\.\d+)?)/i,
+    ]);
+    metrics.tokSTotal = metrics.tokSTotal ?? firstRegexNumber(text, [
+        /total\s+token\s+throughput[^\d]*(\d+(?:\.\d+)?)/i,
+        /total\s+throughput[^\d]*(\d+(?:\.\d+)?)[^\n]*(?:tok|token)\/s/i,
+        /(\d+(?:\.\d+)?)\s+total\s+tokens\/s/i,
+    ]);
+    metrics.ttftMs = metrics.ttftMs ?? firstRegexNumber(text, [
+        /(?:mean|median)?\s*ttft[^\d]*(\d+(?:\.\d+)?)[^\n]*ms/i,
+        /time\s+to\s+first\s+token[^\d]*(\d+(?:\.\d+)?)[^\n]*ms/i,
+    ]);
+    metrics.peakVramGb = metrics.peakVramGb ?? firstRegexNumber(text, [
+        /peak\s+(?:gpu\s+)?(?:vram|memory)[^\d]*(\d+(?:\.\d+)?)[^\n]*gb/i,
+    ]);
+    metrics.promptTokens = metrics.promptTokens ?? firstRegexNumber(text, [
+        /total\s+(?:input|prompt)\s+tokens[^\d]*(\d+)/i,
+        /total\s+num\s+prompt\s+tokens[^\d]*(\d+)/i,
+    ]);
+    metrics.outputTokens = metrics.outputTokens ?? firstRegexNumber(text, [
+        /total\s+(?:generated|output)\s+tokens[^\d]*(\d+)/i,
+        /total\s+num\s+output\s+tokens[^\d]*(\d+)/i,
+    ]);
+    return metrics;
+}
+function runBenchmarkCommand(commandSnippet) {
+    const result = spawnSync(commandSnippet, { encoding: 'utf8', shell: true, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 50 * 1024 * 1024 });
+    const stdout = result.stdout ?? '';
+    const stderr = result.stderr ?? '';
+    const output = [stdout, stderr].filter(Boolean).join('\n').trim();
+    if (result.error || (typeof result.status === 'number' && result.status !== 0)) {
+        throw new CliError('benchmark_command_failed', 'Benchmark command failed.', [
+            'Check that the benchmark executable is installed and available on PATH.',
+            'For llama.cpp, pass a complete llama-bench command with --command.',
+            'For vLLM/SGLang, prefer their JSON output if available, then pass --results <path>.',
+        ], output || result.error?.message);
+    }
+    return output;
+}
+function openAiUsageTokens(usage) {
+    if (!usage || typeof usage !== 'object' || Array.isArray(usage))
+        return {};
+    const obj = usage;
+    const promptTokens = typeof obj.prompt_tokens === 'number' ? obj.prompt_tokens : undefined;
+    const outputTokens = typeof obj.completion_tokens === 'number' ? obj.completion_tokens : typeof obj.output_tokens === 'number' ? obj.output_tokens : undefined;
+    return { promptTokens, outputTokens };
+}
+async function ensureTokenCount(hfId, revision, text, known, kind) {
+    if (known && known > 0)
+        return known;
+    try {
+        return (await hfTokenCount(hfId, revision, text)).count;
+    }
+    catch (error) {
+        throw new CliError('token_count_missing', `Could not determine ${kind} token count: ${asMessage(error)}`, [
+            `Pass --${kind === 'prompt' ? 'prompt-tokens' : 'output-tokens'} <n> from the engine benchmark output.`,
+            'Or use a model/tokenizer that can be loaded by @huggingface/transformers.',
+        ]);
+    }
+}
+async function measureOpenAiEndpoint(opts, hfId) {
+    const baseUrl = requireOpt(opts, 'base-url').replace(/\/$/, '');
+    const model = optString(opts, 'served-model') ?? optString(opts, 'model-name') ?? hfId;
+    const prompt = optString(opts, 'prompt') ?? 'Explain why local inference benchmarks should report prompt prefill throughput, decode throughput, and time to first token.';
+    const maxTokens = optInt(opts, 'max-tokens') ?? 256;
+    const started = Date.now();
+    let firstTokenAt;
+    let completedAt = started;
+    let outputText = '';
+    let usage;
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...(optString(opts, 'model-api-key') ? { Authorization: `Bearer ${optString(opts, 'model-api-key')}` } : {}),
+        },
+        body: JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: maxTokens,
+            temperature: optNumber(opts, 'temperature') ?? 0,
+            stream: !opts['no-stream'],
+            ...(!opts['no-stream'] ? { stream_options: { include_usage: true } } : {}),
+        }),
+    });
+    if (!res.ok)
+        throw new CliError('endpoint_benchmark_failed', `OpenAI-compatible endpoint returned ${res.status}: ${await res.text()}`, [
+            'Check --base-url, --served-model, and --model-api-key.',
+            'Confirm the endpoint supports POST /v1/chat/completions.',
+        ]);
+    if (opts['no-stream']) {
+        const json = await res.json();
+        const choices = Array.isArray(json.choices) ? json.choices : [];
+        const first = choices[0] && typeof choices[0] === 'object' ? choices[0] : {};
+        const message = first.message && typeof first.message === 'object' ? first.message : {};
+        outputText = typeof message.content === 'string' ? message.content : '';
+        usage = json.usage;
+        completedAt = Date.now();
+    }
+    else {
+        if (!res.body)
+            throw new CliError('endpoint_stream_missing', 'Endpoint response did not include a stream body.', ['Retry with --no-stream, or use an OpenAI-compatible endpoint that supports streaming.']);
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done)
+                break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop() ?? '';
+            for (const line of lines) {
+                if (!line.startsWith('data:'))
+                    continue;
+                const data = line.slice(5).trim();
+                if (!data || data === '[DONE]')
+                    continue;
+                const chunk = JSON.parse(data);
+                if (chunk.usage)
+                    usage = chunk.usage;
+                const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+                const first = choices[0] && typeof choices[0] === 'object' ? choices[0] : {};
+                const delta = first.delta && typeof first.delta === 'object' ? first.delta : {};
+                const content = typeof delta.content === 'string' ? delta.content : '';
+                if (content) {
+                    firstTokenAt = firstTokenAt ?? Date.now();
+                    outputText += content;
+                }
+            }
+        }
+        completedAt = Date.now();
+    }
+    const revision = optString(opts, 'model-revision') ?? 'main';
+    const usageTokens = openAiUsageTokens(usage);
+    const promptTokens = optInt(opts, 'prompt-tokens') ?? await ensureTokenCount(hfId, revision, prompt, usageTokens.promptTokens, 'prompt');
+    const outputTokens = optInt(opts, 'output-tokens') ?? await ensureTokenCount(hfId, revision, outputText, usageTokens.outputTokens, 'output');
+    const ttftMs = firstTokenAt ? firstTokenAt - started : undefined;
+    const generationMs = firstTokenAt ? Math.max(1, completedAt - firstTokenAt) : Math.max(1, completedAt - started);
+    const totalMs = Math.max(1, completedAt - started);
+    return {
+        prompt,
+        outputText,
+        promptTokens,
+        outputTokens,
+        ttftMs,
+        tokSOut: round1(outputTokens / (generationMs / 1000)),
+        tokSTotal: round1((promptTokens + outputTokens) / (totalMs / 1000)),
+        tokSPrefill: ttftMs && ttftMs > 0 ? round1(promptTokens / (ttftMs / 1000)) : undefined,
+    };
+}
+async function benchmarkPayloadFromRun(engineArg, opts) {
+    const hfId = requireBenchmarkModel(opts);
+    const engineName = normalizeEngineName(optString(opts, 'engine') ?? engineArg);
+    if (!engineName)
+        throw new CliError('missing_engine', 'benchmark run requires an engine name', ['Pass it positionally, e.g. lmx benchmark run llama.cpp, or with --engine vllm.']);
+    const quantization = requireOpt(opts, 'quantization');
+    const hardwarePath = optString(opts, 'hardware');
+    const hardware = hardwarePath ? await readJson(hardwarePath) : detectHardware();
+    const resultsPath = optString(opts, 'results');
+    const explicitMetric = optString(opts, 'tok-s-out') !== undefined || optString(opts, 'tok-s-prefill') !== undefined || optString(opts, 'tok-s-total') !== undefined || optString(opts, 'ttft-ms') !== undefined;
+    const hasBuiltInSignal = optString(opts, 'bench-kind') !== undefined || optString(opts, 'benchmark') !== undefined || benchmarkOutputPath(opts) !== undefined;
+    const wantsBuiltInCommand = !resultsPath && (hasBuiltInSignal || (!explicitMetric && !optString(opts, 'base-url')));
+    const commandSnippet = optString(opts, 'command') ?? (wantsBuiltInCommand ? builtInBenchmarkCommand(engineName, opts, hfId) : undefined);
+    const endpointMetrics = !commandSnippet && !resultsPath && optString(opts, 'base-url') ? await measureOpenAiEndpoint(opts, hfId) : undefined;
+    const commandStdout = resultsPath ? undefined : commandSnippet ? runBenchmarkCommand(commandSnippet) : undefined;
+    const generatedOutputPath = commandStdout ? benchmarkOutputPath(opts) : undefined;
+    let generatedOutput;
+    if (generatedOutputPath) {
+        try {
+            generatedOutput = await readFile(generatedOutputPath, 'utf8');
+        }
+        catch { }
+    }
+    const commandOutput = resultsPath ? await readFile(resultsPath, 'utf8') : [commandStdout, generatedOutput].filter(Boolean).join('\n') || undefined;
+    const parsedMetrics = commandOutput ? parseBenchmarkOutput(commandOutput) : {};
+    const metrics = { ...parsedMetrics, ...endpointMetrics };
+    const payload = await normalizeBenchmarkPayload({ ...metrics, payload: metrics }, {
+        hfId,
+        modelRevision: optString(opts, 'model-revision') ?? 'main',
+        hardware,
+        engineName,
+        engineVersion: optString(opts, 'engine-version'),
+        quantization,
+        backend: optString(opts, 'backend'),
+        promptTokens: optInt(opts, 'prompt-tokens') ?? metrics.promptTokens,
+        outputTokens: optInt(opts, 'output-tokens') ?? metrics.outputTokens,
+        contextLength: optInt(opts, 'context-length'),
+        batchSize: optInt(opts, 'batch-size'),
+        prefillTokens: optInt(opts, 'prefill-tokens'),
+        tokSOut: optNumber(opts, 'tok-s-out') ?? metrics.tokSOut,
+        tokSPrefill: optNumber(opts, 'tok-s-prefill') ?? metrics.tokSPrefill,
+        tokSTotal: optNumber(opts, 'tok-s-total') ?? metrics.tokSTotal,
+        ttftMs: optNumber(opts, 'ttft-ms') ?? metrics.ttftMs,
+        peakVramGb: optNumber(opts, 'peak-vram-gb') ?? metrics.peakVramGb,
+        notes: optString(opts, 'notes'),
+        ...(endpointMetrics ? { prompt: endpointMetrics.prompt, outputText: endpointMetrics.outputText } : {}),
+        engineFlags: {
+            ...(commandSnippet ? { commandSnippet } : {}),
+            ...(optString(opts, 'base-url') ? { commandSnippet: commandSnippet ?? `OpenAI-compatible endpoint ${optString(opts, 'base-url')}` } : {}),
+            concurrency: optInt(opts, 'concurrency'),
+            numParallel: optInt(opts, 'num-parallel'),
+            tensorParallel: optInt(opts, 'tensor-parallel'),
+            gpuLayers: optInt(opts, 'gpu-layers'),
+            temperature: optNumber(opts, 'temperature'),
+            topP: optNumber(opts, 'top-p'),
+            extraFlags: optString(opts, 'extra-flags'),
+        },
+    });
+    if (typeof payload.tokSOut !== 'number' || !Number.isFinite(payload.tokSOut) || payload.tokSOut <= 0) {
+        throw new CliError('benchmark_metric_missing', 'Could not determine tokSOut from the benchmark output.', [
+            'Pass --tok-s-out <tokens_per_second> explicitly.',
+            'For llama-bench, include text table output with a tg<N> row.',
+            'For vLLM/SGLang benchmark scripts, prefer JSON output or include "Output token throughput" text.',
+        ], commandOutput?.slice(0, 4000));
+    }
+    return payload;
+}
 function normalizeText(value) {
     return value.toLowerCase().replace(/[^\w\s]/g, '').trim();
 }
@@ -578,13 +1085,55 @@ function renderQuestion(item) {
         return String(item.input).trim();
     return `${item.input}\n\n${item.choices.map((choice, i) => `${choiceLabel(i)}. ${choice}`).join('\n')}`.trim();
 }
+function firstDatasetDownloadUrl(dataset) {
+    if (dataset.downloadUrl)
+        return dataset.downloadUrl;
+    return downloadUrlFromValue(dataset.downloadUrls);
+}
+function parseDatasetItems(text, url, format) {
+    if (format === 'jsonl' || url.toLowerCase().endsWith('.jsonl')) {
+        return text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+    }
+    try {
+        return JSON.parse(text);
+    }
+    catch (jsonError) {
+        try {
+            return text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+        }
+        catch {
+            throw jsonError;
+        }
+    }
+}
+async function fetchDatasetItems(url, format) {
+    let res;
+    try {
+        res = await fetch(url);
+    }
+    catch (error) {
+        throw new CliError('network_error', `Could not reach dataset URL: ${asMessage(error)}`, ['Check that the dataset download URL is reachable and retry.']);
+    }
+    const text = await res.text();
+    if (!res.ok)
+        throw new CliError('dataset_download_failed', `Dataset download failed: ${res.status} ${res.statusText}`, ['Signed dataset download URLs can expire; retry eval run to fetch a fresh run bundle.'], text);
+    try {
+        return parseDatasetItems(text, url, format);
+    }
+    catch (error) {
+        throw new CliError('dataset_parse_failed', `Could not parse dataset downloaded from ${url}: ${asMessage(error)}`, ['Use JSON array or JSONL dataset files.']);
+    }
+}
 async function loadDataset(dataset) {
     if (dataset.source === 'inline')
         return dataset.items ?? [];
+    const downloadUrl = firstDatasetDownloadUrl(dataset);
+    if (downloadUrl)
+        return fetchDatasetItems(downloadUrl, dataset.format);
     if (dataset.source === 'url') {
         if (!dataset.url)
             throw new CliError('dataset_missing_url', 'url dataset missing url', ['Add dataset.url to the suite task.']);
-        return fetchJson(dataset.url);
+        return fetchDatasetItems(dataset.url, dataset.format);
     }
     if (dataset.source === 'huggingface') {
         if (!dataset.hfPath)
@@ -1247,8 +1796,37 @@ async function handleSuiteCommand(action, target, opts) {
 async function handleBenchmarkCommand(action, target, opts) {
     const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
     const normalizedAction = action === 'validate' ? 'dry-run' : action;
+    if (normalizedAction === 'run' || normalizedAction === 'measure') {
+        const payload = await benchmarkPayloadFromRun(target, opts);
+        const outPath = optString(opts, 'out') ?? 'localmaxxing-benchmark.json';
+        await writeFile(outPath, JSON.stringify(payload, null, 2) + '\n');
+        printInfo('benchmark_payload_written', {
+            path: outPath,
+            engine: payload.engineName,
+            tokSOut: payload.tokSOut,
+            tokSPrefill: payload.tokSPrefill,
+            tokSTotal: payload.tokSTotal,
+            ttftMs: payload.ttftMs,
+        });
+        if (opts.submit || opts['dry-run']) {
+            const apiKey = await getApiKey(opts);
+            if (!apiKey)
+                throw new CliError('missing_api_key', '--api-key or LMX_API_KEY is required for benchmark submit/dry-run', [
+                    'Create an API key in the LocalMaxxing dashboard.',
+                    'Pass it with --api-key bhk_... or set LMX_API_KEY.',
+                ]);
+            const endpoint = opts['dry-run'] ? '/api/benchmarks/dry-run' : '/api/benchmarks';
+            const response = await submitJson(apiUrl, apiKey, endpoint, payload);
+            console.log(JSON.stringify(response, null, 2));
+            printInfo(opts['dry-run'] ? 'benchmark_dry_run_valid' : 'benchmark_submitted', {
+                endpoint,
+                status: opts['dry-run'] ? 'valid' : 'submitted',
+            });
+        }
+        return;
+    }
     if (normalizedAction !== 'submit' && normalizedAction !== 'dry-run') {
-        throw new Error('Unknown benchmark command. Use submit or dry-run.');
+        throw new Error('Unknown benchmark command. Use run, submit, or dry-run.');
     }
     if (!target)
         throw new Error(`benchmark ${normalizedAction} requires a benchmark JSON path`);
@@ -1321,6 +1899,95 @@ async function loadSuite(apiUrl, suiteSlug, suiteFile) {
         }))
         : await fetchJson(`${apiUrl}/api/evals/suites/${encodeURIComponent(suiteSlug)}`);
 }
+function downloadUrlFromValue(value) {
+    if (typeof value === 'string')
+        return value;
+    if (Array.isArray(value)) {
+        for (const child of value) {
+            const url = downloadUrlFromValue(child);
+            if (url)
+                return url;
+        }
+        return undefined;
+    }
+    if (!value || typeof value !== 'object')
+        return undefined;
+    const record = value;
+    return stringField(record, 'downloadUrl')
+        ?? stringField(record, 'url')
+        ?? stringField(record, 'signedUrl')
+        ?? downloadUrlFromValue(record.downloadUrls);
+}
+function downloadUrlForTask(value, task, taskIndex) {
+    if (Array.isArray(value)) {
+        const indexed = downloadUrlFromValue(value[taskIndex]);
+        if (indexed)
+            return indexed;
+        for (const child of value) {
+            if (!child || typeof child !== 'object')
+                continue;
+            const record = child;
+            const key = stringField(record, 'taskKey') ?? stringField(record, 'task') ?? stringField(record, 'key');
+            if (key === task.key)
+                return downloadUrlFromValue(record);
+        }
+        return undefined;
+    }
+    if (!value || typeof value !== 'object')
+        return undefined;
+    const record = value;
+    const dataset = task.dataset && typeof task.dataset === 'object' ? task.dataset : {};
+    const datasetKeys = ['storageKey', 'storageRef', 'datasetKey', 'id']
+        .map(key => typeof dataset[key] === 'string' ? dataset[key] : undefined)
+        .filter((key) => !!key);
+    for (const key of [task.key, String(taskIndex), ...datasetKeys]) {
+        const url = downloadUrlFromValue(record[key]);
+        if (url)
+            return url;
+    }
+    return undefined;
+}
+function applyRunBundleDownloadUrls(suite, bundle) {
+    const candidates = [bundle.downloadUrls, bundle.datasetDownloadUrls, bundle.datasets];
+    for (let taskIndex = 0; taskIndex < suite.suiteDoc.tasks.length; taskIndex++) {
+        const task = suite.suiteDoc.tasks[taskIndex];
+        const existing = task.dataset ? firstDatasetDownloadUrl(task.dataset) : undefined;
+        const url = existing ?? candidates.map(candidate => downloadUrlForTask(candidate, task, taskIndex)).find(Boolean)
+            ?? (suite.suiteDoc.tasks.length === 1 ? candidates.map(downloadUrlFromValue).find(Boolean) : undefined);
+        if (!url)
+            continue;
+        task.dataset = { ...(task.dataset ?? { source: 'url' }), source: 'url', url, downloadUrl: url };
+    }
+}
+function suiteFromRunBundle(bundle, suiteSlug) {
+    const suiteRecord = recordField(bundle, 'suite') ?? bundle;
+    const suiteDoc = (recordField(suiteRecord, 'suiteDoc') ?? recordField(bundle, 'suiteDoc'));
+    const runner = stringField(suiteRecord, 'runner') ?? stringField(bundle, 'runner');
+    if (!suiteDoc || (runner !== 'CUSTOM' && runner !== 'LM_EVAL_HARNESS')) {
+        throw new CliError('run_bundle_invalid', 'Run bundle response did not include a runnable suite document.', [
+            'Check that the LocalMaxxing API supports /run-bundle for this suite.',
+            'Retry with a valid API key or inspect the suite with eval suite show.',
+        ], bundle);
+    }
+    const suite = {
+        slug: stringField(suiteRecord, 'slug') ?? stringField(bundle, 'slug') ?? suiteSlug,
+        name: stringField(suiteRecord, 'name') ?? stringField(bundle, 'name') ?? suiteSlug,
+        runner,
+        suiteDoc,
+    };
+    applyRunBundleDownloadUrls(suite, bundle);
+    return suite;
+}
+async function loadSuiteForRun(apiUrl, suiteSlug, opts) {
+    const suiteFile = optString(opts, 'suite-file');
+    if (suiteFile)
+        return loadSuite(apiUrl, suiteSlug, suiteFile);
+    const apiKey = await getApiKey(opts);
+    if (!apiKey)
+        return loadSuite(apiUrl, suiteSlug);
+    const bundle = await fetchAuthedJson(apiUrl, apiKey, `/api/evals/suites/${encodeURIComponent(suiteSlug)}/run-bundle`);
+    return suiteFromRunBundle(bundle, suiteSlug);
+}
 function validateRemoteSuite(suite) {
     validateSuitePayload({
         slug: suite.slug,
@@ -1384,7 +2051,7 @@ async function handleRunCommand(suiteSlug, opts) {
     if (!suiteSlug)
         throw new Error('eval run requires a suite slug');
     const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '');
-    const suite = await loadSuite(apiUrl, suiteSlug, optString(opts, 'suite-file'));
+    const suite = await loadSuiteForRun(apiUrl, suiteSlug, opts);
     validateRemoteSuite(suite);
     const result = suite.runner === 'LM_EVAL_HARNESS'
         ? await loadLmEvalResults(optString(opts, 'results') ?? (() => { throw new Error('LM-Eval suites require --results <lm-eval-output.json>'); })(), suite)

@@ -71,6 +71,75 @@ lmx hardware --out hardware.json
 
 ## Submit An Inference Benchmark
 
+Agent-first path: run any benchmark tool, then route the observed values into LocalMaxxing fields explicitly. The CLI writes a payload and uses the API dry-run as the source of truth for schema validation:
+
+```bash
+lmx benchmark run vllm \
+  --hf-id Qwen/Qwen3-8B \
+  --quantization fp16 \
+  --hardware hardware.json \
+  --tok-s-out 120.4 \
+  --tok-s-prefill 1840.2 \
+  --tok-s-total 101.9 \
+  --ttft-ms 86 \
+  --peak-vram-gb 18.7 \
+  --context-length 8192 \
+  --batch-size 1 \
+  --dry-run
+```
+
+You can also give the CLI a local benchmark command and let it pre-fill fields from common output labels. Treat this as convenience only; explicit flags and editable JSON are the robust path:
+
+```bash
+lmx benchmark run llama.cpp \
+  --hf-id Qwen/Qwen3-8B \
+  --quantization Q4_K_M \
+  --hardware hardware.json \
+  --command "llama-bench -m Qwen3-8B-Q4_K_M.gguf -p 512 -n 128" \
+  --dry-run
+```
+
+The same wrapper accepts vLLM and SGLang benchmark output. Prefer their JSON output when available:
+
+```bash
+lmx benchmark run vllm \
+  --hf-id Qwen/Qwen3-8B \
+  --quantization fp16 \
+  --hardware hardware.json \
+  --bench-kind throughput \
+  --input-len 512 \
+  --output-len 128 \
+  --num-prompts 100 \
+  --benchmark-output vllm-throughput.json \
+  --dry-run
+
+lmx benchmark run sglang \
+  --hf-id meta-llama/Llama-3.1-8B-Instruct \
+  --quantization fp8 \
+  --hardware hardware.json \
+  --bench-kind serving \
+  --base-url http://127.0.0.1:30000 \
+  --input-len 512 \
+  --output-len 128 \
+  --num-prompts 100 \
+  --dry-run
+```
+
+Built-in vLLM presets generate `vllm bench serve`, `vllm bench throughput`, or `vllm bench latency`. Built-in SGLang presets generate `python -m sglang.bench_serving`, `sglang.bench_offline_throughput`, `sglang.bench_one_batch`, or `sglang.bench_one_batch_server`. Use `--extra-bench-args "..."` for engine-specific flags or `--command "..."` to bypass the preset completely.
+
+For an already running OpenAI-compatible endpoint, the CLI measures streaming TTFT, output TPS, total TPS, and prefill TPS when token counts are available from the endpoint or Hugging Face tokenizer:
+
+```bash
+lmx benchmark run vllm \
+  --hf-id Qwen/Qwen3-8B \
+  --served-model Qwen/Qwen3-8B \
+  --quantization fp16 \
+  --hardware hardware.json \
+  --base-url http://localhost:8000 \
+  --max-tokens 256 \
+  --dry-run
+```
+
 Create a benchmark payload JSON matching `POST /api/benchmarks`, then validate it without writing:
 
 ```bash
@@ -88,6 +157,10 @@ lmx benchmark submit benchmark.json --api-key bhk_...
 Saved `lmx-bench` result files are also accepted. If the JSON has a top-level `payload` field, the CLI submits that payload automatically.
 
 If engine token counts are missing or marked as estimated and the JSON includes generated text (`outputText`, `generatedText`, `completion`, `response`, or `text`), the CLI uses the model's Hugging Face tokenizer to fill `outputTokens`. If the submitted model has no tokenizer, it tries `tokenizer_name` or `base_model_name_or_path` from `config.json`.
+
+`benchmark run` writes `localmaxxing-benchmark.json` by default. Use `--out <path>` to save elsewhere, `--submit` after the dry-run passes, or explicit metric overrides such as `--tok-s-out`, `--tok-s-prefill`, `--tok-s-total`, `--ttft-ms`, and `--peak-vram-gb` when a benchmark tool prints an unsupported label.
+
+Agents can skip `benchmark run` entirely: create any JSON object matching `POST /api/benchmarks`, then call `lmx benchmark dry-run benchmark.json` and `lmx benchmark submit benchmark.json`. Fetch `lmx context --out localmaxxing-agent-context.json` first for the current schema, accepted engines, and methodology tips.
 
 ## Discover Eval Requirements
 
