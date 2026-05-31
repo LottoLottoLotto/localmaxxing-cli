@@ -418,7 +418,7 @@ function firstTextField(source, fields) {
 function benchmarkText(raw, payload, kind) {
     const fields = kind === 'prompt'
         ? ['prompt', 'promptText', 'input', 'inputText']
-        : ['output', 'outputText', 'generatedText', 'completion', 'response', 'text'];
+        : ['output', 'outputText', 'generatedText', 'completion', 'response', 'text', 'reasoning_content'];
     const payloadText = firstTextField(payload, fields);
     if (payloadText)
         return payloadText;
@@ -908,7 +908,8 @@ async function measureOpenAiEndpoint(opts, hfId) {
         const choices = Array.isArray(json.choices) ? json.choices : [];
         const first = choices[0] && typeof choices[0] === 'object' ? choices[0] : {};
         const message = first.message && typeof first.message === 'object' ? first.message : {};
-        outputText = typeof message.content === 'string' ? message.content : '';
+        outputText = typeof message.content === 'string' && message.content ? message.content
+            : typeof message.reasoning_content === 'string' ? message.reasoning_content : '';
         usage = json.usage;
         completedAt = Date.now();
     }
@@ -937,7 +938,8 @@ async function measureOpenAiEndpoint(opts, hfId) {
                 const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
                 const first = choices[0] && typeof choices[0] === 'object' ? choices[0] : {};
                 const delta = first.delta && typeof first.delta === 'object' ? first.delta : {};
-                const content = typeof delta.content === 'string' ? delta.content : '';
+                const content = typeof delta.content === 'string' && delta.content ? delta.content
+                    : typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '';
                 if (content) {
                     firstTokenAt = firstTokenAt ?? Date.now();
                     outputText += content;
@@ -1173,7 +1175,7 @@ async function callOpenAIChat(baseUrl, model, prompt, options) {
             'If the server requires auth, pass --model-api-key.',
         ]);
     const json = await res.json();
-    return json.choices?.[0]?.message?.content?.trim() ?? '';
+    return (json.choices?.[0]?.message?.content ?? json.choices?.[0]?.message?.reasoning_content)?.trim() ?? '';
 }
 function parseJudgeResponse(raw) {
     const match = raw.match(/\{[\s\S]*\}/);

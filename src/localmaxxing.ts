@@ -504,7 +504,7 @@ function firstTextField(source: Record<string, unknown>, fields: string[]) {
 function benchmarkText(raw: unknown, payload: Record<string, unknown>, kind: 'prompt' | 'output') {
   const fields = kind === 'prompt'
     ? ['prompt', 'promptText', 'input', 'inputText']
-    : ['output', 'outputText', 'generatedText', 'completion', 'response', 'text']
+    : ['output', 'outputText', 'generatedText', 'completion', 'response', 'text', 'reasoning_content']
   const payloadText = firstTextField(payload, fields)
   if (payloadText) return payloadText
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
@@ -982,7 +982,8 @@ async function measureOpenAiEndpoint(opts: Record<string, string | boolean>, hfI
     const choices = Array.isArray(json.choices) ? json.choices : []
     const first = choices[0] && typeof choices[0] === 'object' ? choices[0] as Record<string, unknown> : {}
     const message = first.message && typeof first.message === 'object' ? first.message as Record<string, unknown> : {}
-    outputText = typeof message.content === 'string' ? message.content : ''
+    outputText = typeof message.content === 'string' && message.content ? message.content
+      : typeof message.reasoning_content === 'string' ? message.reasoning_content : ''
     usage = json.usage
     completedAt = Date.now()
   } else {
@@ -1005,7 +1006,8 @@ async function measureOpenAiEndpoint(opts: Record<string, string | boolean>, hfI
         const choices = Array.isArray(chunk.choices) ? chunk.choices : []
         const first = choices[0] && typeof choices[0] === 'object' ? choices[0] as Record<string, unknown> : {}
         const delta = first.delta && typeof first.delta === 'object' ? first.delta as Record<string, unknown> : {}
-        const content = typeof delta.content === 'string' ? delta.content : ''
+        const content = typeof delta.content === 'string' && delta.content ? delta.content
+          : typeof delta.reasoning_content === 'string' ? delta.reasoning_content : ''
         if (content) {
           firstTokenAt = firstTokenAt ?? Date.now()
           outputText += content
@@ -1234,8 +1236,8 @@ async function callOpenAIChat(baseUrl: string, model: string, prompt: string, op
     'Confirm the server supports POST /v1/chat/completions.',
     'If the server requires auth, pass --model-api-key.',
   ])
-  const json = await res.json() as { choices?: Array<{ message?: { content?: string } }> }
-  return json.choices?.[0]?.message?.content?.trim() ?? ''
+  const json = await res.json() as { choices?: Array<{ message?: { content?: string; reasoning_content?: string } }> }
+  return (json.choices?.[0]?.message?.content ?? json.choices?.[0]?.message?.reasoning_content)?.trim() ?? ''
 }
 
 function parseJudgeResponse(raw: string) {
