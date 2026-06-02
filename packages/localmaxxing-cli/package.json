@@ -1,0 +1,41 @@
+{
+  "name": "localmaxxing",
+  "version": "0.1.0",
+  "description": "CLI for authoring, running, and submitting LocalMaxxing eval suites.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LottoLottoLotto/localmaxxing-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LottoLottoLotto/localmaxxing-cli/issues"
+  },
+  "homepage": "https://github.com/LottoLottoLotto/localmaxxing-cli#readme",
+  "bin": {
+    "localmaxxing": "dist/index.js",
+    "lmx": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

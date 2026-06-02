@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env node
 import { execFileSync, execSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { homedir, platform, release, totalmem, cpus } from 'node:os'
