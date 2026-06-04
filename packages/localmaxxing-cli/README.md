@@ -4,6 +4,22 @@ Public CLI for authoring, running, validating, and submitting LocalMaxxing eval 
 
 This package is standalone. It does not include the private LocalMaxxing web app, database, Prisma schema, deployment configuration, or server internals.
 
+## Implementation Status
+
+The CLI is being rewritten with Go as the primary executable and optional Python helpers for ML-specific behavior such as Hugging Face token counting. The previous TypeScript CLI remains in `src/index.ts` as the reference implementation during the migration.
+
+Build the Go CLI from this repository:
+
+```bash
+go build -o dist/lmx ./cmd/lmx
+```
+
+Optional tokenizer fallback requires Python plus `transformers`:
+
+```bash
+python -m pip install transformers
+```
+
 ## Install
 
 From npm after publish:
@@ -70,6 +86,97 @@ lmx hardware --out hardware.json
 ```
 
 ## Submit An Inference Benchmark
+
+The Go CLI supports two benchmark modes:
+
+Remote endpoint mode measures TPS from the client against an OpenAI-compatible server. Use this when you do not have shell access to the host running the model:
+
+```bash
+lmx benchmark run vllm \
+  --mode remote \
+  --base-url http://server:8000 \
+  --hf-id Qwen/Qwen3-8B \
+  --served-model Qwen/Qwen3-8B \
+  --quantization fp16 \
+  --max-tokens 256 \
+  --dry-run
+```
+
+If `--served-model` is omitted, the CLI tries `GET /v1/models` and uses the matching or first returned model ID before falling back to `--hf-id`.
+
+Local host mode runs a benchmark command on the machine where the model/runtime is installed. Use this when you are on the server and can run `llama-bench` or another benchmark executable:
+
+```bash
+lmx benchmark run llama.cpp \
+  --mode local \
+  --hf-id Qwen/Qwen3-8B \
+  --quantization Q4_K_M \
+  --command "llama-bench -m model.gguf -p 512 -n 128" \
+  --dry-run
+```
+
+For llama.cpp, the CLI can generate the `llama-bench` command:
+
+```bash
+lmx benchmark run llama.cpp \
+  --mode local \
+  --hf-id Qwen/Qwen3-8B \
+  --quantization Q4_K_M \
+  --model-path model.gguf \
+  --prompt-tokens 512 \
+  --output-tokens 128 \
+  --dry-run
+```
+
+If `--mode` is omitted, the CLI infers remote mode from `--base-url` and local mode from `--command` or `--results`.
+
+Local and remote benchmark payloads use the same conceptual metric fields:
+
+```text
+tokSPrefill = promptTokens / prefillSeconds
+tokSOut     = outputTokens / decodeSeconds
+tokSTotal   = (promptTokens + outputTokens) / totalSeconds
+ttftMs      = request-to-first-token time, or local estimate from prefill
+```
+
+For local `llama-bench`, `pp<N>` provides prefill throughput and `tg<N>` provides decode throughput. The CLI derives comparable values when missing:
+
+```text
+ttftMs    ~= promptTokens / tokSPrefill * 1000
+tokSTotal ~= (promptTokens + outputTokens) / ((promptTokens / tokSPrefill) + (outputTokens / tokSOut))
+```
+
+Payloads include `metricSource`, `timingSource`, and `ttftSource` so dashboard comparisons can distinguish local runtime measurements from client-observed remote endpoint measurements.
+
+For agent workflows, pass `--json-status` to emit machine-readable progress events on stderr, or `--quiet` to suppress progress events:
+
+```bash
+lmx benchmark run vllm \
+  --mode remote \
+  --base-url http://server:8000 \
+  --hf-id Qwen/Qwen3-8B \
+  --quantization fp16 \
+  --json-status \
+  --out benchmark.json
+```
+
+Save repeated options in a profile:
+
+```bash
+lmx profile save my-4090 \
+  --mode local \
+  --hf-id Qwen/Qwen3-8B \
+  --quantization Q4_K_M \
+  --hardware hardware.json
+
+lmx benchmark run llama.cpp --profile my-4090 --model-path model.gguf --dry-run
+```
+
+Create a hardware file with:
+
+```bash
+lmx hardware init --out hardware.json
+```
 
 Agent-first path: run any benchmark tool, then route the observed values into LocalMaxxing fields explicitly. The CLI writes a payload and uses the API dry-run as the source of truth for schema validation:
 
