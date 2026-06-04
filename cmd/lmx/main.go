@@ -384,7 +384,7 @@ func handleProfile(action, name string, args cliArgs) error {
 			return errors.New("profile save requires a profile name")
 		}
 		profileOpts := map[string]any{}
-		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "output-tokens", "engine", "backend"} {
+		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "input-len", "output-len", "num-prompts", "tensor-parallel", "context-length"} {
 			if value := opt(args, key); value != "" {
 				profileOpts[key] = value
 			}
@@ -862,7 +862,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	if mode == "remote" && opt(args, "command") != "" {
 		return nil, cliError{"invalid_benchmark_mode", "Remote benchmark mode cannot run local commands.", []string{"Use --mode local when running llama-bench on the host server.", "Use --mode remote --base-url <url> for OpenAI-compatible endpoint TPS measurement."}, nil}
 	}
-	if mode == "local" && opt(args, "base-url") != "" && opt(args, "command") == "" && opt(args, "results") == "" {
+	if mode == "local" && opt(args, "base-url") != "" && opt(args, "command") == "" && opt(args, "results") == "" && localBenchmarkCommand(engineName, args) == "" {
 		return nil, cliError{"invalid_benchmark_mode", "Local benchmark mode needs --command, --results, or explicit metric flags.", []string{"Use --mode remote with --base-url when benchmarking an endpoint from another machine.", "Use --mode local --command \"llama-bench ...\" when running on the host server."}, nil}
 	}
 	var commandOutput string
@@ -890,6 +890,12 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 			return nil, err
 		}
 		commandOutput = output
+		if outputPath := benchmarkOutputPath(args); outputPath != "" {
+			if data, err := os.ReadFile(outputPath); err == nil {
+				commandOutput = strings.TrimSpace(commandOutput + "\n" + string(data))
+				printStatus(args, "benchmark_results_read_complete", map[string]any{"path": outputPath, "bytes": len(data)})
+			}
+		}
 		metrics["engineFlags"] = map[string]any{"mode": "local", "commandSnippet": commandSnippet}
 		printStatus(args, "benchmark_local_command_complete", map[string]any{"outputBytes": len(output)})
 	}
@@ -927,7 +933,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	if notes := opt(args, "notes"); notes != "" {
 		payload["notes"] = notes
 	}
-	applyComparableBenchmarkMetrics(payload, mode)
+	applyComparableBenchmarkMetrics(payload, mode, engineName)
 	payload["provenance"] = map[string]any{"cli": "localmaxxing-go", "benchmarkMode": mode, "metricSource": payload["metricSource"], "timingSource": payload["timingSource"], "ttftSource": payload["ttftSource"], "createdAt": time.Now().UTC().Format(time.RFC3339)}
 	if tokSOut, ok := payload["tokSOut"].(float64); !ok || tokSOut <= 0 {
 		details := commandOutput
@@ -940,14 +946,14 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	return payload, nil
 }
 
-func applyComparableBenchmarkMetrics(payload map[string]any, mode string) {
+func applyComparableBenchmarkMetrics(payload map[string]any, mode, engineName string) {
 	promptTokens := numberField(payload, "promptTokens")
 	outputTokens := numberField(payload, "outputTokens")
 	tokSPrefill := numberField(payload, "tokSPrefill")
 	tokSOut := numberField(payload, "tokSOut")
 	if mode == "local" {
 		payload["metricSource"] = "local_runtime"
-		payload["timingSource"] = "llama_bench_runtime"
+		payload["timingSource"] = strings.ReplaceAll(engineName, ".", "_") + "_runtime"
 		if numberField(payload, "ttftMs") == 0 && promptTokens > 0 && tokSPrefill > 0 {
 			payload["ttftMs"] = round1((promptTokens / tokSPrefill) * 1000)
 			payload["ttftSource"] = "estimated_from_prefill"
@@ -996,6 +1002,9 @@ func localBenchmarkCommand(engineName string, args cliArgs) string {
 	if command := opt(args, "command"); command != "" {
 		return command
 	}
+	if engineName == "vllm" {
+		return vllmBenchmarkCommand(args)
+	}
 	if engineName != "llama.cpp" || opt(args, "model-path") == "" {
 		return ""
 	}
@@ -1014,6 +1023,92 @@ func localBenchmarkCommand(engineName string, args cliArgs) string {
 	}
 	if value := opt(args, "extra-bench-args"); value != "" {
 		cmd = append(cmd, value)
+	}
+	return strings.Join(cmd, " ")
+}
+
+func benchmarkKind(args cliArgs, fallback string) string {
+	return strings.ToLower(firstNonEmpty(opt(args, "bench-kind"), opt(args, "benchmark"), fallback))
+}
+
+func benchmarkOutputPath(args cliArgs) string {
+	return firstNonEmpty(opt(args, "benchmark-output"), opt(args, "bench-output"))
+}
+
+func appendShellArg(cmd *[]string, flag, value string) {
+	if value == "" {
+		return
+	}
+	*cmd = append(*cmd, flag, shellQuote(value))
+}
+
+func vllmBenchmarkCommand(args cliArgs) string {
+	model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
+	if model == "" {
+		return ""
+	}
+	kind := benchmarkKind(args, func() string {
+		if opt(args, "base-url") != "" {
+			return "serve"
+		}
+		return "throughput"
+	}())
+	bin := firstNonEmpty(opt(args, "benchmark-bin"), "vllm")
+	inputLen := firstNonEmpty(opt(args, "input-len"), opt(args, "prompt-tokens"), "512")
+	outputLen := firstNonEmpty(opt(args, "output-len"), opt(args, "output-tokens"), "128")
+	numPrompts := firstNonEmpty(opt(args, "num-prompts"), "100")
+	outputPath := benchmarkOutputPath(args)
+	cmd := []string{shellQuote(bin), "bench", kind}
+
+	switch kind {
+	case "serve", "serving":
+		appendShellArg(&cmd, "--backend", firstNonEmpty(opt(args, "benchmark-backend"), "openai"))
+		appendShellArg(&cmd, "--model", firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), model))
+		appendShellArg(&cmd, "--base-url", opt(args, "base-url"))
+		appendShellArg(&cmd, "--host", opt(args, "host"))
+		appendShellArg(&cmd, "--port", opt(args, "port"))
+		appendShellArg(&cmd, "--endpoint", opt(args, "endpoint"))
+		appendShellArg(&cmd, "--dataset-name", firstNonEmpty(opt(args, "dataset-name"), "random"))
+		appendShellArg(&cmd, "--dataset-path", opt(args, "dataset-path"))
+		appendShellArg(&cmd, "--input-len", inputLen)
+		appendShellArg(&cmd, "--output-len", outputLen)
+		appendShellArg(&cmd, "--num-prompts", numPrompts)
+		appendShellArg(&cmd, "--request-rate", opt(args, "request-rate"))
+		appendShellArg(&cmd, "--max-concurrency", opt(args, "max-concurrency"))
+		if outputPath != "" {
+			cmd = append(cmd, "--save-result", "--result-filename", shellQuote(outputPath))
+		}
+	case "throughput":
+		appendShellArg(&cmd, "--backend", firstNonEmpty(opt(args, "benchmark-backend"), "vllm"))
+		appendShellArg(&cmd, "--model", model)
+		appendShellArg(&cmd, "--dataset-name", firstNonEmpty(opt(args, "dataset-name"), "random"))
+		appendShellArg(&cmd, "--dataset-path", opt(args, "dataset-path"))
+		appendShellArg(&cmd, "--input-len", inputLen)
+		appendShellArg(&cmd, "--output-len", outputLen)
+		appendShellArg(&cmd, "--num-prompts", numPrompts)
+		appendShellArg(&cmd, "--num-warmups", opt(args, "num-warmups"))
+		appendShellArg(&cmd, "--tensor-parallel-size", opt(args, "tensor-parallel"))
+		appendShellArg(&cmd, "--max-model-len", opt(args, "context-length"))
+		if outputPath != "" {
+			cmd = append(cmd, "--output-json", shellQuote(outputPath))
+		}
+	case "latency":
+		appendShellArg(&cmd, "--model", model)
+		appendShellArg(&cmd, "--input-len", inputLen)
+		appendShellArg(&cmd, "--output-len", outputLen)
+		appendShellArg(&cmd, "--batch-size", firstNonEmpty(opt(args, "batch-size"), "1"))
+		appendShellArg(&cmd, "--num-iters-warmup", opt(args, "num-warmups"))
+		appendShellArg(&cmd, "--num-iters", opt(args, "num-iters"))
+		appendShellArg(&cmd, "--tensor-parallel-size", opt(args, "tensor-parallel"))
+		appendShellArg(&cmd, "--max-model-len", opt(args, "context-length"))
+		if outputPath != "" {
+			cmd = append(cmd, "--output-json", shellQuote(outputPath))
+		}
+	default:
+		return ""
+	}
+	if extra := opt(args, "extra-bench-args"); extra != "" {
+		cmd = append(cmd, extra)
 	}
 	return strings.Join(cmd, " ")
 }
@@ -1449,6 +1544,11 @@ func runBenchmarkCommand(commandSnippet string) (string, error) {
 
 func parseBenchmarkOutput(text string) map[string]float64 {
 	metrics := parseLlamaBenchTable(text)
+	for key, value := range parseBenchmarkJSONMetrics(text) {
+		if metrics[key] == 0 {
+			metrics[key] = value
+		}
+	}
 	if value, ok := firstRegexNumber(text, []string{
 		`(?i)output\s+token\s+throughput[^\d]*(\d+(?:\.\d+)?)`,
 		`(?i)output\s+throughput[^\d]*(\d+(?:\.\d+)?)[^\n]*(?:tok|token)/s`,
@@ -1486,6 +1586,101 @@ func parseBenchmarkOutput(text string) map[string]float64 {
 		metrics["outputTokens"] = value
 	}
 	return compactMetrics(metrics)
+}
+
+func parseBenchmarkJSONMetrics(text string) map[string]float64 {
+	var value any
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return map[string]float64{}
+	}
+	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+		startObj := strings.Index(trimmed, "{")
+		endObj := strings.LastIndex(trimmed, "}")
+		startArray := strings.Index(trimmed, "[")
+		endArray := strings.LastIndex(trimmed, "]")
+		snippet := ""
+		if startObj >= 0 && endObj > startObj {
+			snippet = trimmed[startObj : endObj+1]
+		} else if startArray >= 0 && endArray > startArray {
+			snippet = trimmed[startArray : endArray+1]
+		}
+		if snippet == "" || json.Unmarshal([]byte(snippet), &value) != nil {
+			return map[string]float64{}
+		}
+	}
+
+	aliases := map[string][]string{
+		"tokSOut":      []string{"tokSOut", "outputTokensPerSecond", "outputTokenThroughput", "outputThroughput", "generationTokensPerSecond", "decodeThroughput", "genThroughput"},
+		"tokSPrefill":  []string{"tokSPrefill", "prefillTokensPerSecond", "promptTokensPerSecond", "inputTokensPerSecond", "prefillThroughput", "promptThroughput"},
+		"tokSTotal":    []string{"tokSTotal", "totalTokensPerSecond", "totalTokenThroughput", "totalThroughput", "tokensPerSecond", "requestThroughput"},
+		"ttftMs":       []string{"ttftMs", "timeToFirstTokenMs", "meanTtftMs", "medianTtftMs", "meanTTFTMs", "medianTTFTMs", "meanTtft", "medianTtft", "meanTTFT", "medianTTFT"},
+		"peakVramGb":   []string{"peakVramGb", "peakGpuMemoryGb", "maxVramGb"},
+		"promptTokens": []string{"promptTokens", "inputTokens", "totalInputTokens", "totalPromptTokens", "numPromptTokens"},
+		"outputTokens": []string{"outputTokens", "completionTokens", "generatedTokens", "totalOutputTokens", "totalGeneratedTokens", "numOutputTokens"},
+	}
+	metrics := map[string]float64{}
+	for field, names := range aliases {
+		if found, ok := jsonNumberByAliases(value, names); ok {
+			metrics[field] = found
+		}
+	}
+	return compactMetrics(metrics)
+}
+
+func jsonNumberByAliases(value any, aliases []string) (float64, bool) {
+	aliasSet := map[string]bool{}
+	for _, alias := range aliases {
+		aliasSet[normalizeMetricKey(alias)] = true
+	}
+	var walk func(any) (float64, bool)
+	walk = func(current any) (float64, bool) {
+		switch typed := current.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				if aliasSet[normalizeMetricKey(key)] {
+					if number, ok := anyNumber(child); ok {
+						return number, true
+					}
+				}
+			}
+			for _, child := range typed {
+				if number, ok := walk(child); ok {
+					return number, true
+				}
+			}
+		case []any:
+			for _, child := range typed {
+				if number, ok := walk(child); ok {
+					return number, true
+				}
+			}
+		}
+		return 0, false
+	}
+	return walk(value)
+}
+
+func normalizeMetricKey(value string) string {
+	return strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(value))
+}
+
+func anyNumber(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, typed > 0
+	case float32:
+		return float64(typed), typed > 0
+	case int:
+		return float64(typed), typed > 0
+	case int64:
+		return float64(typed), typed > 0
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		return parsed, err == nil && parsed > 0
+	default:
+		return 0, false
+	}
 }
 
 func parseLlamaBenchTable(text string) map[string]float64 {
@@ -1883,6 +2078,7 @@ Usage:
   lmx hardware --out hardware.json
   lmx hardware init --out hardware.json
   lmx benchmark run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --dry-run
+  lmx benchmark run vllm --mode local --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind throughput --benchmark-output vllm.json --dry-run
   lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run
   lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --model-path model.gguf --dry-run
   lmx benchmark submit benchmark.json --api-key bhk_...
@@ -1917,6 +2113,12 @@ Options:
   --no-stream              Disable streaming for remote endpoint benchmark
   --command <cmd>          Local benchmark command, e.g. llama-bench
   --model-path <path>      llama.cpp model path; generates llama-bench command
+  --bench-kind <kind>      Built-in vLLM benchmark: serve, throughput, or latency
+  --benchmark-output <p>   Engine benchmark JSON output path
+  --benchmark-bin <path>   Benchmark executable (default: vllm for vLLM)
+  --input-len <n>          Prompt/input tokens for built-in benchmark commands
+  --output-len <n>         Generated/output tokens for built-in benchmark commands
+  --num-prompts <n>        Number of prompts for vLLM serve/throughput benchmarks
   --json-status            Emit progress events as JSON lines on stderr
   --quiet                  Suppress progress events
   --hardware <path>        JSON hardware object required when submitting
