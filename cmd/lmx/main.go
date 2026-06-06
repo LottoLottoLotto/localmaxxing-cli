@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,12 +16,15 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 const defaultAPIURL = "https://www.localmaxxing.com"
+const defaultHFAPIURL = "https://huggingface.co"
+const defaultEndpointTimeout = 10 * time.Minute
 
 var goldFieldNames = map[string]bool{
 	"gold": true, "answer": true, "referenceAnswer": true, "expectedAnswer": true,
@@ -43,6 +47,15 @@ type cliError struct {
 type tokenCountResult struct {
 	Count  int
 	Source string
+}
+
+type detectedEngine struct {
+	Name             string            `json:"name"`
+	Installed        bool              `json:"installed"`
+	Binaries         map[string]string `json:"binaries,omitempty"`
+	ServerCommand    string            `json:"serverCommand,omitempty"`
+	BenchmarkCommand string            `json:"benchmarkCommand,omitempty"`
+	Notes            []string          `json:"notes,omitempty"`
 }
 
 func (e cliError) Error() string { return e.Message }
@@ -79,6 +92,12 @@ func run(argv []string) error {
 		return handleModel(positional(args, 1), positional(args, 2), args)
 	case "profile":
 		return handleProfile(positional(args, 1), positional(args, 2), args)
+	case "engines", "engine":
+		return handleEngines(args)
+	case "server":
+		return handleServer(positional(args, 1), positional(args, 2), args)
+	case "kvcache", "kv-cache", "context-sweep":
+		return handleKVCache(positional(args, 1), positional(args, 2), args)
 	case "benchmark", "bench":
 		return handleBenchmark(positional(args, 1), positional(args, 2), args)
 	case "eval":
@@ -105,7 +124,7 @@ func run(argv []string) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "benchmark", "bench", "auth", "hardware", "context", "agent-context", "model", "profile":
+	case "eval", "benchmark", "bench", "auth", "hardware", "context", "agent-context", "model", "profile", "engines", "engine", "server", "kvcache", "kv-cache", "context-sweep":
 		return true
 	default:
 		return false
@@ -142,7 +161,7 @@ func positional(args cliArgs, index int) string {
 	return args.positional[index]
 }
 
-func opt(args cliArgs, key string) string { return args.opts[key] }
+func opt(args cliArgs, key string) string   { return args.opts[key] }
 func hasFlag(args cliArgs, key string) bool { return args.flags[key] }
 
 func requireOpt(args cliArgs, key string) (string, error) {
@@ -384,7 +403,7 @@ func handleProfile(action, name string, args cliArgs) error {
 			return errors.New("profile save requires a profile name")
 		}
 		profileOpts := map[string]any{}
-		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "input-len", "output-len", "num-prompts", "tensor-parallel", "context-length"} {
+		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len", "output-len", "num-prompts", "tensor-parallel", "context-length", "gpu-layers", "extra-server-args", "extra-bench-args"} {
 			if value := opt(args, key); value != "" {
 				profileOpts[key] = value
 			}
@@ -407,6 +426,7 @@ func handleProfile(action, name string, args cliArgs) error {
 		printInfo("profile_saved", map[string]any{"profile": name, "path": profileFile(name)})
 		fmt.Println("Use it with:")
 		fmt.Println("  lmx benchmark run <engine> --profile " + name)
+		fmt.Println("  lmx server run <engine> --profile " + name)
 		return nil
 	case "list":
 		entries, err := os.ReadDir(profilesDir())
@@ -474,23 +494,258 @@ func handleHardware(action string, args cliArgs) error {
 	return nil
 }
 
+func handleEngines(args cliArgs) error {
+	return writeOrPrintJSON("engines", args, map[string]any{"engines": detectInferenceEngines(args)})
+}
+
+func handleServer(action, target string, args cliArgs) error {
+	if action != "run" && action != "start" && action != "dry-run" {
+		return errors.New("Unknown server command. Use run or dry-run.")
+	}
+	if action == "dry-run" {
+		args.flags["dry-run"] = true
+	}
+	engineName, err := resolveEngineName(target, args, false)
+	if err != nil {
+		return err
+	}
+	commandSnippet := localServerCommand(engineName, args)
+	if commandSnippet == "" {
+		return cliError{"server_command_unavailable", "Could not build a local server command for " + engineName + ".", []string{"Pass --model-path for llama.cpp or SGLang.", "Pass --hf-id or --model for vLLM/SGLang.", "Pass --command <server command> to run a custom engine."}, map[string]any{"detectedEngines": detectInferenceEngines(args)}}
+	}
+	payload := map[string]any{"engineName": engineName, "command": commandSnippet, "detectedEngines": detectInferenceEngines(args)}
+	if hasFlag(args, "dry-run") || opt(args, "out") != "" {
+		return writeOrPrintJSON("server_plan", args, payload)
+	}
+	printInfo("server_command_start", map[string]any{"engine": engineName, "command": commandSnippet})
+	return runLongCommand(commandSnippet)
+}
+
+func detectInferenceEngines(args cliArgs) []detectedEngine {
+	engines := []detectedEngine{
+		detectVLLM(args),
+		detectLlamaCPP(args),
+		detectSGLang(args),
+		detectOllama(args),
+	}
+	installed := []detectedEngine{}
+	for _, engine := range engines {
+		if engine.Installed {
+			installed = append(installed, engine)
+		}
+	}
+	return installed
+}
+
+func detectVLLM(args cliArgs) detectedEngine {
+	binaries := map[string]string{}
+	if path, ok := lookupExecutable("vllm"); ok {
+		binaries["vllm"] = path
+	}
+	engine := detectedEngine{Name: "vllm", Installed: len(binaries) > 0, Binaries: binaries}
+	if engine.Installed {
+		engine.ServerCommand = localServerCommand("vllm", args)
+		engine.BenchmarkCommand = localBenchmarkCommand("vllm", args)
+	}
+	return engine
+}
+
+func detectLlamaCPP(args cliArgs) detectedEngine {
+	binaries := map[string]string{}
+	for _, name := range []string{"llama-server", "llama-bench", "llama-cli"} {
+		if path, ok := lookupExecutable(name); ok {
+			binaries[name] = path
+		}
+	}
+	engine := detectedEngine{Name: "llama.cpp", Installed: len(binaries) > 0, Binaries: binaries}
+	if engine.Installed {
+		engine.ServerCommand = localServerCommand("llama.cpp", args)
+		engine.BenchmarkCommand = localBenchmarkCommand("llama.cpp", args)
+		if _, ok := binaries["llama-bench"]; !ok {
+			engine.Notes = append(engine.Notes, "llama-bench was not found; benchmark run needs --command or explicit metrics.")
+		}
+	}
+	return engine
+}
+
+func detectSGLang(args cliArgs) detectedEngine {
+	binaries := map[string]string{}
+	if path, ok := lookupExecutable("sglang"); ok {
+		binaries["sglang"] = path
+	}
+	pythonPath := ""
+	if path, ok := lookupExecutable(firstNonEmpty(opt(args, "python-bin"), "python3")); ok {
+		pythonPath = path
+		binaries["python"] = path
+	}
+	engine := detectedEngine{Name: "sglang", Installed: binaries["sglang"] != "" || hasPythonModule(pythonPath, "sglang"), Binaries: binaries}
+	if engine.Installed {
+		engine.ServerCommand = localServerCommand("sglang", args)
+		engine.BenchmarkCommand = localBenchmarkCommand("sglang", args)
+		engine.Notes = append(engine.Notes, "SGLang detection confirms Python is available; command execution will fail if the sglang module is not installed.")
+	}
+	return engine
+}
+
+func detectOllama(args cliArgs) detectedEngine {
+	binaries := map[string]string{}
+	if path, ok := lookupExecutable("ollama"); ok {
+		binaries["ollama"] = path
+	}
+	engine := detectedEngine{Name: "ollama", Installed: len(binaries) > 0, Binaries: binaries}
+	if engine.Installed {
+		engine.ServerCommand = localServerCommand("ollama", args)
+		engine.Notes = append(engine.Notes, "Ollama is detected for serving; benchmark with --mode remote --base-url http://localhost:11434/v1.")
+	}
+	return engine
+}
+
+func lookupExecutable(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	path, err := exec.LookPath(name)
+	return path, err == nil
+}
+
+func hasPythonModule(pythonPath, module string) bool {
+	if pythonPath == "" || module == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, pythonPath, "-c", "import "+module).Run() == nil
+}
+
+func resolveEngineName(target string, args cliArgs, requireBenchmark bool) (string, error) {
+	engineName := normalizeEngineName(firstNonEmpty(opt(args, "engine"), target))
+	if engineName != "" {
+		return engineName, nil
+	}
+	for _, engine := range detectInferenceEngines(args) {
+		if requireBenchmark && engine.BenchmarkCommand == "" {
+			continue
+		}
+		return engine.Name, nil
+	}
+	hints := []string{"Install vLLM, llama.cpp, SGLang, or Ollama, then retry.", "Pass an engine positionally, e.g. lmx benchmark run llama.cpp, or with --engine vllm."}
+	if requireBenchmark {
+		hints = append(hints, "For local benchmark generation, install vllm or llama-bench, or pass --command <benchmark command>.")
+	}
+	return "", cliError{"missing_engine", "Could not detect an installed local inference engine.", hints, nil}
+}
+
+func localServerCommand(engineName string, args cliArgs) string {
+	if command := opt(args, "command"); command != "" {
+		return command
+	}
+	model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
+	host := firstNonEmpty(opt(args, "host"), "0.0.0.0")
+	port := firstNonEmpty(opt(args, "port"), "8000")
+	switch engineName {
+	case "vllm":
+		if model == "" {
+			return ""
+		}
+		cmd := []string{shellQuote(firstNonEmpty(opt(args, "server-bin"), "vllm")), "serve", shellQuote(model), "--host", shellQuote(host), "--port", shellQuote(port)}
+		appendShellArg(&cmd, "--served-model-name", firstNonEmpty(opt(args, "served-model"), opt(args, "model-name")))
+		appendShellArg(&cmd, "--tensor-parallel-size", opt(args, "tensor-parallel"))
+		appendShellArg(&cmd, "--max-model-len", opt(args, "context-length"))
+		appendExtraArgs(&cmd, opt(args, "extra-server-args"))
+		return strings.Join(cmd, " ")
+	case "llama.cpp":
+		if opt(args, "model-path") == "" {
+			return ""
+		}
+		cmd := []string{shellQuote(firstNonEmpty(opt(args, "server-bin"), "llama-server")), "-m", shellQuote(opt(args, "model-path")), "--host", shellQuote(host), "--port", shellQuote(port)}
+		appendShellArg(&cmd, "-c", opt(args, "context-length"))
+		appendShellArg(&cmd, "-ngl", opt(args, "gpu-layers"))
+		appendExtraArgs(&cmd, opt(args, "extra-server-args"))
+		return strings.Join(cmd, " ")
+	case "sglang":
+		modelPath := firstNonEmpty(opt(args, "model-path"), model)
+		if modelPath == "" {
+			return ""
+		}
+		port := firstNonEmpty(opt(args, "port"), "30000")
+		cmd := []string{shellQuote(firstNonEmpty(opt(args, "python-bin"), "python3")), "-m", "sglang.launch_server", "--model-path", shellQuote(modelPath), "--host", shellQuote(host), "--port", shellQuote(port)}
+		appendShellArg(&cmd, "--served-model-name", firstNonEmpty(opt(args, "served-model"), opt(args, "model-name")))
+		appendShellArg(&cmd, "--tp", opt(args, "tensor-parallel"))
+		appendShellArg(&cmd, "--context-length", opt(args, "context-length"))
+		appendExtraArgs(&cmd, opt(args, "extra-server-args"))
+		return strings.Join(cmd, " ")
+	case "ollama":
+		return strings.Join([]string{shellQuote(firstNonEmpty(opt(args, "server-bin"), "ollama")), "serve"}, " ")
+	default:
+		return ""
+	}
+}
+
+func appendExtraArgs(cmd *[]string, value string) {
+	if value != "" {
+		*cmd = append(*cmd, value)
+	}
+}
+
+func runLongCommand(commandSnippet string) error {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/C", commandSnippet)
+	} else {
+		cmd = exec.Command("sh", "-c", commandSnippet)
+	}
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return cliError{"server_command_failed", "Server command failed.", []string{"Check that the server executable is installed and available on PATH.", "Run lmx server dry-run <engine> with the same options to inspect the command."}, err.Error()}
+	}
+	return nil
+}
+
 func detectHardware() map[string]any {
 	base := map[string]any{"hwClass": "CPU_ONLY", "cpuName": runtime.GOARCH, "systemOs": runtime.GOOS, "systemArch": runtime.GOARCH, "cpuThreads": runtime.NumCPU()}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		base["hwClass"] = "APPLE_SILICON"
 	}
 	if out, err := exec.Command("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits").Output(); err == nil {
-		line := strings.TrimSpace(strings.Split(string(out), "\n")[0])
-		parts := strings.Split(line, ",")
-		if len(parts) >= 2 {
-			base["hwClass"] = "DISCRETE_GPU"
-			base["gpuName"] = strings.TrimSpace(parts[0])
-			if mb, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64); err == nil {
-				base["vramGb"] = round1(mb / 1024)
-			}
-		}
+		applyNvidiaSMIHardware(base, string(out))
 	}
 	return base
+}
+
+func applyNvidiaSMIHardware(base map[string]any, output string) {
+	gpus := []map[string]any{}
+	totalVramMb := 0.0
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, ",")
+		if len(parts) < 2 {
+			continue
+		}
+		gpu := map[string]any{"name": strings.TrimSpace(parts[0])}
+		if mb, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64); err == nil {
+			gpu["vramGb"] = round1(mb / 1024)
+			totalVramMb += mb
+		}
+		gpus = append(gpus, gpu)
+	}
+	if len(gpus) == 0 {
+		return
+	}
+	base["hwClass"] = "DISCRETE_GPU"
+	base["gpuCount"] = len(gpus)
+	base["gpus"] = gpus
+	base["gpuName"] = gpus[0]["name"]
+	if vramGb, ok := gpus[0]["vramGb"]; ok {
+		base["vramGb"] = vramGb
+	}
+	if totalVramMb > 0 {
+		base["totalVramGb"] = round1(totalVramMb / 1024)
+	}
 }
 
 func round1(n float64) float64 { return float64(int(n*10+0.5)) / 10 }
@@ -514,9 +769,11 @@ func handleModel(action, target string, args cliArgs) error {
 	if query == "" {
 		return cliError{"missing_query", "model search requires a query", []string{"Run lmx model search qwen3-8b."}, nil}
 	}
-	limit := firstNonEmpty(opt(args, "limit"), "10")
-	endpoint := apiURL(args) + "/api/models/search?q=" + url.QueryEscape(query) + "&limit=" + url.QueryEscape(limit)
-	value, err := fetchJSON("GET", endpoint, "", nil)
+	limit, err := strconv.Atoi(firstNonEmpty(opt(args, "limit"), "10"))
+	if err != nil || limit <= 0 {
+		return cliError{"invalid_option", "--limit must be a positive integer", []string{"Pass --limit <number>."}, nil}
+	}
+	value, err := searchModels(args, query, limit)
 	if err != nil {
 		return err
 	}
@@ -800,17 +1057,36 @@ func handleBenchmark(action, target string, args cliArgs) error {
 	if action == "validate" {
 		action = "dry-run"
 	}
+	if action == "runs" || action == "run-file" || action == "run-files" {
+		return handleBenchmarkRuns(target, positional(args, 3), args)
+	}
+	if action == "list" || action == "show" || action == "edit" || action == "rerun" {
+		return handleBenchmarkRuns(action, target, args)
+	}
+	if action == "kvcache" || action == "kv-cache" || action == "context-sweep" {
+		return handleKVCache("run", target, args)
+	}
 	if action == "run" || action == "measure" {
 		payload, err := benchmarkPayloadFromFlags(target, args)
 		if err != nil {
 			return err
 		}
-		out := firstNonEmpty(opt(args, "out"), "localmaxxing-benchmark.json")
+		out := firstNonEmpty(opt(args, "out"), benchmarkRunPath(payload))
+		feedback := benchmarkAgentFeedback(payload, out, hasFlag(args, "dry-run"), hasFlag(args, "submit"))
+		payload["agentFeedback"] = feedback
+		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+			return err
+		}
 		if err := writeJSON(out, payload); err != nil {
 			return err
 		}
 		printInfo("benchmark_payload_written", map[string]any{"path": out, "engine": payload["engineName"]})
-		if hasFlag(args, "submit") || hasFlag(args, "dry-run") {
+		printStatus(args, "benchmark_payload_written", feedback)
+		if hasFlag(args, "dry-run") && !hasFlag(args, "submit") {
+			fmt.Println(stringValue(feedback["message"]))
+			return nil
+		}
+		if hasFlag(args, "submit") {
 			endpoint := "/api/benchmarks"
 			if hasFlag(args, "dry-run") {
 				endpoint = "/api/benchmarks/dry-run"
@@ -821,7 +1097,7 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		return nil
 	}
 	if action != "submit" && action != "dry-run" {
-		return errors.New("Unknown benchmark command. Use run, submit, or dry-run.")
+		return errors.New("Unknown benchmark command. Use run, runs, list, show, edit, rerun, submit, or dry-run.")
 	}
 	if target == "" {
 		return fmt.Errorf("benchmark %s requires a benchmark JSON path", action)
@@ -842,14 +1118,808 @@ func handleBenchmark(action, target string, args cliArgs) error {
 	return submitPayload(endpoint, action == "dry-run", "benchmark", args, value)
 }
 
+func handleBenchmarkRuns(action, target string, args cliArgs) error {
+	if action == "" {
+		action = "list"
+	}
+	switch action {
+	case "list", "ls":
+		return listBenchmarkRuns(args)
+	case "show", "cat":
+		path, err := resolveBenchmarkRunPath(target, args)
+		if err != nil {
+			return err
+		}
+		value, err := readJSON(path)
+		if err != nil {
+			return err
+		}
+		printJSON(value)
+		return nil
+	case "edit", "patch":
+		path, err := resolveBenchmarkRunPath(target, args)
+		if err != nil {
+			return err
+		}
+		return editBenchmarkRun(path, args)
+	case "rerun", "replay":
+		path, err := resolveBenchmarkRunPath(target, args)
+		if err != nil {
+			return err
+		}
+		return rerunBenchmarkRun(path, args)
+	case "submit", "dry-run", "validate":
+		if action == "validate" {
+			action = "dry-run"
+		}
+		path, err := resolveBenchmarkRunPath(target, args)
+		if err != nil {
+			return err
+		}
+		return handleBenchmark(action, path, args)
+	default:
+		return errors.New("Unknown benchmark runs command. Use list, show, edit, rerun, submit, or dry-run.")
+	}
+}
+
+func listBenchmarkRuns(args cliArgs) error {
+	root := firstNonEmpty(opt(args, "runs-dir"), "runs")
+	limit := 50
+	if value := opt(args, "limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return cliError{"invalid_option", "--limit must be a positive integer", []string{"Pass --limit <n>."}, nil}
+		}
+		limit = parsed
+	}
+	runs, err := benchmarkRunSummaries(root)
+	if err != nil {
+		return err
+	}
+	if len(runs) > limit {
+		runs = runs[:limit]
+	}
+	printJSON(map[string]any{"runsDir": root, "count": len(runs), "runs": runs})
+	return nil
+}
+
+func benchmarkRunSummaries(root string) ([]any, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []any{}, nil
+		}
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, cliError{"invalid_runs_dir", root + " is not a directory", []string{"Pass --runs-dir <dir> if saved runs are elsewhere."}, nil}
+	}
+	paths := []string{}
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || strings.ToLower(filepath.Ext(path)) != ".json" {
+			return nil
+		}
+		paths = append(paths, path)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		left, leftErr := os.Stat(paths[i])
+		right, rightErr := os.Stat(paths[j])
+		if leftErr != nil || rightErr != nil {
+			return paths[i] > paths[j]
+		}
+		return left.ModTime().After(right.ModTime())
+	})
+	runs := []any{}
+	for _, path := range paths {
+		value, err := readJSON(path)
+		if err != nil {
+			continue
+		}
+		payload := benchmarkPayloadObject(value)
+		if payload == nil {
+			continue
+		}
+		info, _ := os.Stat(path)
+		runs = append(runs, map[string]any{
+			"path":          path,
+			"model":         payload["hfId"],
+			"engine":        payload["engineName"],
+			"mode":          payload["benchmarkMode"],
+			"quantization":  payload["quantization"],
+			"tokSOut":       payload["tokSOut"],
+			"canSubmit":     numberField(payload, "tokSOut") > 0,
+			"updatedAt":     info.ModTime().UTC().Format(time.RFC3339),
+			"submitCommand": "lmx benchmark runs submit " + shellQuote(path),
+			"rerunCommand":  "lmx benchmark runs rerun " + shellQuote(path),
+			"editCommand":   "lmx benchmark runs edit " + shellQuote(path) + " --set-json '{\"notes\":\"...\"}'",
+		})
+	}
+	return runs, nil
+}
+
+func resolveBenchmarkRunPath(target string, args cliArgs) (string, error) {
+	path := firstNonEmpty(target, opt(args, "path"), opt(args, "run"))
+	if path == "" {
+		return "", cliError{"missing_run_path", "Saved benchmark run path is required.", []string{"Use lmx benchmark runs list, then pass a path to show/edit/rerun/submit."}, nil}
+	}
+	return path, nil
+}
+
+func editBenchmarkRun(path string, args cliArgs) error {
+	value, err := readJSON(path)
+	if err != nil {
+		return err
+	}
+	payload := benchmarkPayloadObject(value)
+	if payload == nil {
+		return cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+	}
+	changed := false
+	if patchPath := opt(args, "patch"); patchPath != "" {
+		patch, err := readJSON(patchPath)
+		if err != nil {
+			return err
+		}
+		patchObj := asObject(patch)
+		if patchObj == nil {
+			return cliError{"invalid_patch", "--patch must point to a JSON object.", nil, patch}
+		}
+		mergeObject(payload, patchObj)
+		changed = true
+	}
+	if patchText := opt(args, "set-json"); patchText != "" {
+		var patch any
+		if err := json.Unmarshal([]byte(patchText), &patch); err != nil {
+			return cliError{"json_parse_error", "--set-json must be a JSON object.", nil, err.Error()}
+		}
+		patchObj := asObject(patch)
+		if patchObj == nil {
+			return cliError{"invalid_patch", "--set-json must be a JSON object.", nil, patch}
+		}
+		mergeObject(payload, patchObj)
+		changed = true
+	}
+	if set := opt(args, "set"); set != "" {
+		field, raw, ok := strings.Cut(set, "=")
+		if !ok || strings.TrimSpace(field) == "" {
+			return cliError{"invalid_option", "--set must be field=value", []string{"Example: --set tokSOut=120.5", "For multiple fields, use --set-json '{\"tokSOut\":120.5,\"notes\":\"fixed\"}'."}, nil}
+		}
+		payload[strings.TrimSpace(field)] = parseEditValue(raw)
+		changed = true
+	}
+	if unset := opt(args, "unset"); unset != "" {
+		for _, field := range strings.Split(unset, ",") {
+			field = strings.TrimSpace(field)
+			if field != "" {
+				delete(payload, field)
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return cliError{"missing_edit", "No edit was provided.", []string{"Use --set field=value, --set-json '{...}', --patch patch.json, or --unset field1,field2."}, nil}
+	}
+	payload["agentFeedback"] = benchmarkAgentFeedback(payload, path, hasFlag(args, "dry-run"), hasFlag(args, "submit"))
+	if err := writeJSON(path, value); err != nil {
+		return err
+	}
+	printInfo("benchmark_run_edited", map[string]any{"path": path})
+	if hasFlag(args, "print") || hasFlag(args, "json") {
+		printJSON(value)
+	}
+	return nil
+}
+
+func rerunBenchmarkRun(path string, args cliArgs) error {
+	value, err := readJSON(path)
+	if err != nil {
+		return err
+	}
+	payload := benchmarkPayloadObject(value)
+	if payload == nil {
+		return cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+	}
+	runArgs := benchmarkArgsFromPayload(payload, args)
+	return handleBenchmark("run", stringValue(payload["engineName"]), runArgs)
+}
+
+func benchmarkArgsFromPayload(payload map[string]any, overrides cliArgs) cliArgs {
+	args := cliArgs{opts: map[string]string{}, flags: map[string]bool{}}
+	for key, value := range map[string]any{
+		"mode":           payload["benchmarkMode"],
+		"hf-id":          payload["hfId"],
+		"model-revision": payload["modelRevision"],
+		"quantization":   payload["quantization"],
+		"hardware":       overrides.opts["hardware"],
+	} {
+		if text := stringValue(value); text != "" {
+			args.opts[key] = text
+		}
+	}
+	if engineFlags := asObject(payload["engineFlags"]); engineFlags != nil {
+		for key, field := range map[string]string{"baseUrl": "base-url", "servedModel": "served-model", "maxTokens": "max-tokens", "commandSnippet": "command"} {
+			if text := stringValue(engineFlags[key]); text != "" {
+				args.opts[field] = text
+			}
+		}
+	}
+	for key, value := range overrides.opts {
+		if key == "path" || key == "run" || key == "set" || key == "set-json" || key == "patch" || key == "unset" {
+			continue
+		}
+		args.opts[key] = value
+	}
+	for key, value := range overrides.flags {
+		args.flags[key] = value
+	}
+	args.flags["quiet"] = hasFlag(overrides, "quiet")
+	return args
+}
+
+func benchmarkPayloadObject(value any) map[string]any {
+	obj := asObject(value)
+	if obj == nil {
+		return nil
+	}
+	if payload := asObject(obj["payload"]); payload != nil {
+		return payload
+	}
+	return obj
+}
+
+func mergeObject(dst, src map[string]any) {
+	for key, value := range src {
+		if srcObj := asObject(value); srcObj != nil {
+			if dstObj := asObject(dst[key]); dstObj != nil {
+				mergeObject(dstObj, srcObj)
+				continue
+			}
+		}
+		dst[key] = value
+	}
+}
+
+func parseEditValue(value string) any {
+	value = strings.TrimSpace(value)
+	if value == "true" {
+		return true
+	}
+	if value == "false" {
+		return false
+	}
+	if value == "null" {
+		return nil
+	}
+	if n, err := strconv.ParseFloat(value, 64); err == nil {
+		return n
+	}
+	var parsed any
+	if strings.HasPrefix(value, "{") || strings.HasPrefix(value, "[") {
+		if json.Unmarshal([]byte(value), &parsed) == nil {
+			return parsed
+		}
+	}
+	return value
+}
+
+func benchmarkRunPath(payload map[string]any) string {
+	modelID := safePathSegment(stringValue(payload["hfId"]))
+	if modelID == "" {
+		modelID = "unknown-model"
+	}
+	timestamp := time.Now().UTC().Format("20060102T150405Z")
+	return filepath.Join("runs", modelID, timestamp+".json")
+}
+
+func safePathSegment(value string) string {
+	value = strings.TrimSpace(value)
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		valid := r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-'
+		if valid {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-.")
+}
+
+func handleKVCache(action, target string, args cliArgs) error {
+	if action == "" {
+		action = "run"
+	}
+	if action != "run" && action != "measure" {
+		return errors.New("kvcache requires run")
+	}
+	model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
+	if model == "" {
+		return cliError{"missing_model", "kvcache run requires --hf-id or --model", []string{"Pass --hf-id <HuggingFace model id>."}, nil}
+	}
+	levels, err := parseIntList(firstNonEmpty(opt(args, "levels"), opt(args, "context-levels"), opt(args, "contexts")))
+	if err != nil {
+		return err
+	}
+	if len(levels) == 0 {
+		levels = []int{10000, 20000, 30000, 40000}
+	}
+	mode := benchmarkMode(args)
+	engineName := normalizeEngineName(firstNonEmpty(opt(args, "engine"), target))
+	if engineName == "" {
+		resolved, err := resolveEngineName(target, args, mode == "local")
+		if err != nil {
+			return err
+		}
+		engineName = resolved
+	}
+	quantization := opt(args, "quantization")
+	hardwarePath := opt(args, "hardware")
+
+	var hardware map[string]any
+	if hardwarePath != "" {
+		hw, err := readJSON(hardwarePath)
+		if err != nil {
+			return err
+		}
+		hardware = hw.(map[string]any)
+	} else if !hasFlag(args, "dry-run") {
+		hardware = detectHardware()
+	}
+
+	runsDir := firstNonEmpty(opt(args, "runs-dir"), "runs")
+	modelID := safePathSegment(model)
+	baseDir := filepath.Join(runsDir, modelID)
+
+	savedPaths := []string{}
+	for _, level := range levels {
+		printStatus(args, "kvcache_point_start", map[string]any{"level": level, "mode": mode})
+		var point map[string]any
+		if mode == "remote" {
+			point, err = measureRemoteKVCachePoint(args, model, level)
+		} else {
+			point, err = measureLocalKVCachePoint(args, engineName, level)
+		}
+		if err != nil {
+			return err
+		}
+
+		runPayload := map[string]any{
+			"kind":            "kvcache_context_sweep",
+			"benchmarkMode":   mode,
+			"engineName":      engineName,
+			"hfId":            model,
+			"modelRevision":   firstNonEmpty(opt(args, "model-revision"), "main"),
+			"quantization":    quantization,
+			"contextTokens":   float64(level),
+			"outputTokens":    point["outputTokens"],
+			"promptTokens":    point["promptTokens"],
+			"tokSOut":         point["tokSOut"],
+			"tokSPrefill":     point["tokSPrefill"],
+			"tokSTotal":       point["tokSTotal"],
+			"ttftMs":          point["ttftMs"],
+			"peakVramGb":      point["peakVramGb"],
+			"metricSource":    point["metricSource"],
+			"timingSource":    point["timingSource"],
+			"provenance": map[string]any{
+				"benchmarkMode": mode,
+				"cli":           "localmaxxing-go",
+				"createdAt":     time.Now().UTC().Format(time.RFC3339),
+				"metricSource":  point["metricSource"],
+				"timingSource":  point["timingSource"],
+				"ttftSource":    "estimated_from_prefill",
+			},
+		}
+		if hardware != nil {
+			runPayload["hardware"] = hardware
+		}
+
+		if hasFlag(args, "dry-run") {
+			runPayload["dryRun"] = true
+		}
+
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		runPath := filepath.Join(baseDir, fmt.Sprintf("kvcache-%d-%s.json", level, timestamp))
+		if err := os.MkdirAll(filepath.Dir(runPath), 0o755); err != nil {
+			return err
+		}
+		if err := writeJSON(runPath, map[string]any{"payload": runPayload}); err != nil {
+			return err
+		}
+		savedPaths = append(savedPaths, runPath)
+		printStatus(args, "kvcache_point_complete", map[string]any{"level": level, "tokSOut": point["tokSOut"], "ttftMs": point["ttftMs"], "path": runPath})
+	}
+
+	if !hasFlag(args, "quiet") {
+		fmt.Println("Saved runs:")
+		for _, p := range savedPaths {
+			fmt.Println("  " + p)
+		}
+		fmt.Println("\nSubmit individually with:")
+		for _, p := range savedPaths {
+			fmt.Println("  lmx benchmark submit " + shellQuote(p) + " --api-key <key>")
+		}
+		fmt.Println("\nOr dry-run validate with:")
+		for _, p := range savedPaths {
+			fmt.Println("  lmx benchmark dry-run " + shellQuote(p))
+		}
+	}
+	return nil
+}
+
+func kvCachePayloadFromFlags(target string, args cliArgs) (map[string]any, error) {
+	model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
+	if model == "" {
+		return nil, cliError{"missing_model", "kvcache run requires --hf-id or --model", []string{"Pass --hf-id <HuggingFace model id>."}, nil}
+	}
+	levels, err := parseIntList(firstNonEmpty(opt(args, "levels"), opt(args, "context-levels"), opt(args, "contexts")))
+	if err != nil {
+		return nil, err
+	}
+	if len(levels) == 0 {
+		levels = []int{10000, 20000, 30000, 40000}
+	}
+	mode := benchmarkMode(args)
+	engineName := normalizeEngineName(firstNonEmpty(opt(args, "engine"), target))
+	if engineName == "" {
+		resolved, err := resolveEngineName(target, args, mode == "local")
+		if err != nil {
+			return nil, err
+		}
+		engineName = resolved
+	}
+	payload := map[string]any{
+		"kind":          "kvcache_context_sweep",
+		"mode":          mode,
+		"engineName":    engineName,
+		"hfId":          model,
+		"modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"),
+		"levels":        levels,
+		"outputTokens":  kvOutputTokens(args),
+		"createdAt":     time.Now().UTC().Format(time.RFC3339),
+		"points":        []any{},
+	}
+	if q := opt(args, "quantization"); q != "" {
+		payload["quantization"] = q
+	}
+	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
+		hardware, err := readJSON(hardwarePath)
+		if err != nil {
+			return nil, err
+		}
+		payload["hardware"] = hardware
+	} else if !hasFlag(args, "dry-run") {
+		payload["hardware"] = detectHardware()
+	}
+
+	points := []any{}
+	for _, level := range levels {
+		printStatus(args, "kvcache_point_start", map[string]any{"level": level, "mode": mode})
+		var point map[string]any
+		if mode == "remote" {
+			point, err = measureRemoteKVCachePoint(args, model, level)
+		} else {
+			point, err = measureLocalKVCachePoint(args, engineName, level)
+		}
+		if err != nil {
+			return nil, err
+		}
+		points = append(points, point)
+		printStatus(args, "kvcache_point_complete", map[string]any{"level": level, "tokSOut": point["tokSOut"], "ttftMs": point["ttftMs"]})
+	}
+	payload["points"] = points
+	return payload, nil
+}
+
+func parseIntList(value string) ([]int, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' || r == ';' })
+	levels := []int{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		parsed, err := strconv.Atoi(part)
+		if err != nil || parsed <= 0 {
+			return nil, cliError{"invalid_option", "--levels must be a comma-separated list of positive integers", []string{"Example: --levels 10000,20000,30000,40000"}, nil}
+		}
+		levels = append(levels, parsed)
+	}
+	return levels, nil
+}
+
+func kvOutputTokens(args cliArgs) int {
+	value := firstNonEmpty(opt(args, "output-tokens"), opt(args, "output-len"), opt(args, "max-tokens"), "128")
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 128
+	}
+	return parsed
+}
+
+func kvPromptTokens(args cliArgs) int {
+	value := firstNonEmpty(opt(args, "prompt-tokens"), opt(args, "input-len"), "512")
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return 512
+	}
+	return parsed
+}
+
+func measureLocalKVCachePoint(args cliArgs, engineName string, level int) (map[string]any, error) {
+	commandSnippet := localKVCacheCommand(engineName, args, level)
+	if commandSnippet == "" {
+		return nil, cliError{"kvcache_command_unavailable", "Could not build a local KV-cache benchmark command.", []string{"Use llama.cpp with --model-path, vLLM/SGLang with --hf-id, or pass --command-template containing {input} and optionally {output}."}, nil}
+	}
+	point := map[string]any{"contextTokens": float64(level), "commandSnippet": commandSnippet, "mode": "local", "engineName": engineName}
+	if hasFlag(args, "dry-run") {
+		point["dryRun"] = true
+		return point, nil
+	}
+	output, err := runBenchmarkCommand(commandSnippet)
+	if err != nil {
+		return nil, err
+	}
+	if outputPath := localKVCacheOutputPath(engineName, args, level); outputPath != "" {
+		if data, err := os.ReadFile(outputPath); err == nil {
+			output = strings.TrimSpace(output + "\n" + string(data))
+			point["benchmarkOutput"] = outputPath
+		}
+	}
+	parsed := parseBenchmarkOutput(output)
+	for key, value := range parsed {
+		point[key] = value
+	}
+	if point["promptTokens"] == nil {
+		point["promptTokens"] = float64(kvPromptTokens(args))
+	}
+	if point["outputTokens"] == nil {
+		point["outputTokens"] = float64(kvOutputTokens(args))
+	}
+	applyComparableBenchmarkMetrics(point, "local", engineName)
+	return point, nil
+}
+
+func localKVCacheCommand(engineName string, args cliArgs, inputTokens int) string {
+	outputTokens := strconv.Itoa(kvOutputTokens(args))
+	input := strconv.Itoa(inputTokens)
+	if template := opt(args, "command-template"); template != "" {
+		replacer := strings.NewReplacer("{input}", input, "{prompt}", input, "{context}", input, "{output}", outputTokens, "{max_tokens}", outputTokens)
+		return replacer.Replace(template)
+	}
+	if command := opt(args, "command"); command != "" {
+		return command
+	}
+	switch engineName {
+	case "llama.cpp":
+		if opt(args, "model-path") == "" {
+			return ""
+		}
+		cmd := []string{"llama-bench", "-m", shellQuote(opt(args, "model-path")), "-p", strconv.Itoa(kvPromptTokens(args)), "-n", outputTokens, "-d", input, "-o", "json"}
+		if value := opt(args, "threads"); value != "" {
+			cmd = append(cmd, "-t", shellQuote(value))
+		}
+		if value := opt(args, "gpu-layers"); value != "" {
+			cmd = append(cmd, "-ngl", shellQuote(value))
+		}
+		appendExtraArgs(&cmd, opt(args, "extra-bench-args"))
+		return strings.Join(cmd, " ")
+	case "vllm":
+		return vllmKVCacheCommand(args, input, outputTokens, inputTokens)
+	case "sglang":
+		return sglangKVCacheCommand(args, input, outputTokens)
+	default:
+		return ""
+	}
+}
+
+func vllmKVCacheCommand(args cliArgs, input, output string, inputTokens int) string {
+	model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
+	if model == "" {
+		return ""
+	}
+	bin := firstNonEmpty(opt(args, "benchmark-bin"), "vllm")
+	kind := firstNonEmpty(opt(args, "bench-kind"), "latency")
+	cmd := []string{shellQuote(bin), "bench", kind}
+	if kind == "serve" || kind == "serving" {
+		appendShellArg(&cmd, "--backend", firstNonEmpty(opt(args, "benchmark-backend"), "openai"))
+		appendShellArg(&cmd, "--model", firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), model))
+		appendShellArg(&cmd, "--base-url", opt(args, "base-url"))
+		appendShellArg(&cmd, "--dataset-name", firstNonEmpty(opt(args, "dataset-name"), "random"))
+		appendShellArg(&cmd, "--input-len", input)
+		appendShellArg(&cmd, "--output-len", output)
+		appendShellArg(&cmd, "--num-prompts", firstNonEmpty(opt(args, "num-prompts"), "1"))
+	} else {
+		appendShellArg(&cmd, "--model", model)
+		appendShellArg(&cmd, "--input-len", input)
+		appendShellArg(&cmd, "--output-len", output)
+		appendShellArg(&cmd, "--batch-size", firstNonEmpty(opt(args, "batch-size"), "1"))
+		appendShellArg(&cmd, "--num-iters-warmup", opt(args, "num-warmups"))
+		appendShellArg(&cmd, "--num-iters", opt(args, "num-iters"))
+		appendShellArg(&cmd, "--tensor-parallel-size", opt(args, "tensor-parallel"))
+		appendShellArg(&cmd, "--dtype", opt(args, "dtype"))
+		appendShellArg(&cmd, "--quantization", opt(args, "quantization"))
+		appendShellArg(&cmd, "--kv-cache-dtype", opt(args, "kv-cache-dtype"))
+		appendShellArg(&cmd, "--max-model-len", firstNonEmpty(opt(args, "context-length"), strconv.Itoa(inputTokens+kvOutputTokens(args))))
+		if hasFlag(args, "enable-prefix-caching") {
+			cmd = append(cmd, "--enable-prefix-caching")
+		}
+		if outputPath := localKVCacheOutputPath("vllm", args, inputTokens); outputPath != "" {
+			appendShellArg(&cmd, "--output-json", outputPath)
+		}
+	}
+	appendExtraArgs(&cmd, opt(args, "extra-bench-args"))
+	return strings.Join(cmd, " ")
+}
+
+func localKVCacheOutputPath(engineName string, args cliArgs, level int) string {
+	if engineName != "vllm" {
+		return ""
+	}
+	base := firstNonEmpty(opt(args, "benchmark-output"), opt(args, "bench-output"))
+	if base == "" {
+		return filepath.Join(os.TempDir(), fmt.Sprintf("localmaxxing-vllm-kvcache-%d.json", level))
+	}
+	ext := filepath.Ext(base)
+	if ext == "" {
+		return fmt.Sprintf("%s-%d", base, level)
+	}
+	return strings.TrimSuffix(base, ext) + fmt.Sprintf("-%d%s", level, ext)
+}
+
+func sglangKVCacheCommand(args cliArgs, input, output string) string {
+	modelPath := firstNonEmpty(opt(args, "model-path"), opt(args, "hf-id"), opt(args, "model"))
+	if modelPath == "" {
+		return ""
+	}
+	baseURL := opt(args, "base-url")
+	if baseURL == "" {
+		baseURL = "http://localhost:" + firstNonEmpty(opt(args, "port"), "30000")
+	}
+	cmd := []string{shellQuote(firstNonEmpty(opt(args, "python-bin"), "python3")), "-m", "sglang.bench_serving"}
+	appendShellArg(&cmd, "--backend", firstNonEmpty(opt(args, "benchmark-backend"), "sglang"))
+	appendShellArg(&cmd, "--model", firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), modelPath))
+	appendShellArg(&cmd, "--base-url", baseURL)
+	appendShellArg(&cmd, "--dataset-name", firstNonEmpty(opt(args, "dataset-name"), "random"))
+	appendShellArg(&cmd, "--random-input-len", input)
+	appendShellArg(&cmd, "--random-output-len", output)
+	appendShellArg(&cmd, "--num-prompts", firstNonEmpty(opt(args, "num-prompts"), "1"))
+	appendShellArg(&cmd, "--max-concurrency", opt(args, "max-concurrency"))
+	appendExtraArgs(&cmd, opt(args, "extra-bench-args"))
+	return strings.Join(cmd, " ")
+}
+
+func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string]any, error) {
+	baseURL, err := requireOpt(args, "base-url")
+	if err != nil {
+		return nil, err
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), hfID)
+	maxTokens := kvOutputTokens(args)
+	if hasFlag(args, "dry-run") {
+		return map[string]any{"contextTokens": float64(level), "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "maxTokens": float64(maxTokens), "dryRun": true, "methodology": "streaming request with retained chat history/filler sized to target context"}, nil
+	}
+	prompt := kvCachePrompt(args, level)
+	messages := []any{
+		map[string]any{"role": "system", "content": "You are measuring decode speed after a long retained context. Answer the final question concisely."},
+		map[string]any{"role": "user", "content": prompt},
+		map[string]any{"role": "assistant", "content": "Context received."},
+		map[string]any{"role": "user", "content": firstNonEmpty(opt(args, "probe-prompt"), "Continue with a concise benchmark response.")},
+	}
+	body := map[string]any{"model": servedModel, "messages": messages, "max_tokens": maxTokens, "temperature": 0, "stream": true, "stream_options": map[string]any{"include_usage": true}}
+	timeout, err := endpointTimeout(args)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	bodyData, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat/completions", bytes.NewReader(bodyData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := opt(args, "model-api-key"); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, cliError{"kvcache_remote_failed", fmt.Sprintf("Could not reach OpenAI-compatible endpoint: %v", err), []string{"Check --base-url and confirm the endpoint is reachable from this machine."}, nil}
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		text, _ := io.ReadAll(res.Body)
+		return nil, cliError{"kvcache_remote_failed", fmt.Sprintf("OpenAI-compatible endpoint returned %s", res.Status), []string{"Check --base-url, --served-model, --model-api-key, and the target context level."}, string(text)}
+	}
+	streamResult, err := readOpenAIStream(args, res.Body, started)
+	if err != nil {
+		return nil, err
+	}
+	completedAt := streamResult.completedAt
+	if completedAt.IsZero() {
+		completedAt = time.Now()
+	}
+	generationStart := streamResult.firstTokenAt
+	if generationStart.IsZero() {
+		generationStart = started
+	}
+	usagePromptTokens := usageToken(streamResult.usage, "prompt_tokens")
+	usageOutputTokens := firstNonZero(usageToken(streamResult.usage, "completion_tokens"), usageToken(streamResult.usage, "output_tokens"))
+	outputTokens := usageOutputTokens
+	if outputTokens == 0 {
+		count, err := tokenCount(args, hfID, firstNonEmpty(opt(args, "model-revision"), "main"), streamResult.outputText, 0, "output")
+		if err != nil {
+			return nil, err
+		}
+		outputTokens = count.Count
+	}
+	promptTokens := usagePromptTokens
+	if promptTokens == 0 {
+		promptTokens = level
+	}
+	totalMs := maxDurationMS(completedAt.Sub(started))
+	generationMs := maxDurationMS(completedAt.Sub(generationStart))
+	point := map[string]any{
+		"contextTokens":     float64(level),
+		"promptTokens":      float64(promptTokens),
+		"outputTokens":      float64(outputTokens),
+		"tokSOut":           round1(float64(outputTokens) / (generationMs / 1000)),
+		"tokSTotal":         round1(float64(promptTokens+outputTokens) / (totalMs / 1000)),
+		"outputText":        streamResult.outputText,
+		"mode":              "remote",
+		"baseUrl":           baseURL,
+		"servedModel":       servedModel,
+		"methodology":       "streaming request with retained chat history/filler sized to target context",
+		"timingSource":      "client_observed_http",
+		"tokSPrefillSource": "estimated_from_ttft",
+	}
+	if !streamResult.firstTokenAt.IsZero() {
+		ttftMs := float64(streamResult.firstTokenAt.Sub(started).Milliseconds())
+		point["ttftMs"] = ttftMs
+		if ttftMs > 0 {
+			point["tokSPrefill"] = round1(float64(promptTokens) / (ttftMs / 1000))
+		}
+	}
+	return point, nil
+}
+
+func kvCachePrompt(args cliArgs, targetTokens int) string {
+	if prompt := opt(args, "prompt"); prompt != "" {
+		return prompt
+	}
+	word := firstNonEmpty(opt(args, "filler-token"), "context")
+	if targetTokens < 1 {
+		targetTokens = 1
+	}
+	return strings.TrimSpace(strings.Repeat(word+" ", targetTokens))
+}
+
 func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, error) {
 	model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
 	if model == "" {
 		return nil, cliError{"missing_model", "benchmark run requires --hf-id or --model", []string{"Pass --hf-id <HuggingFace model id>."}, nil}
 	}
-	engineName := normalizeEngineName(firstNonEmpty(opt(args, "engine"), engine))
-	if engineName == "" {
-		return nil, cliError{"missing_engine", "benchmark run requires an engine name", []string{"Pass it positionally, e.g. lmx benchmark run llama.cpp, or with --engine vllm."}, nil}
+	engineName, err := resolveEngineName(engine, args, true)
+	if err != nil {
+		return nil, err
 	}
 	quantization := opt(args, "quantization")
 	if quantization == "" {
@@ -866,7 +1936,9 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		return nil, cliError{"invalid_benchmark_mode", "Local benchmark mode needs --command, --results, or explicit metric flags.", []string{"Use --mode remote with --base-url when benchmarking an endpoint from another machine.", "Use --mode local --command \"llama-bench ...\" when running on the host server."}, nil}
 	}
 	var commandOutput string
-	if mode == "remote" {
+	if hasFlag(args, "dry-run") {
+		applyBenchmarkPlanMetrics(metrics, mode, engineName, args, model)
+	} else if mode == "remote" {
 		printStatus(args, "benchmark_remote_start", map[string]any{"baseUrl": opt(args, "base-url"), "servedModel": firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), model)})
 		endpointMetrics, err := measureOpenAIEndpoint(args, model)
 		if err != nil {
@@ -896,7 +1968,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 				printStatus(args, "benchmark_results_read_complete", map[string]any{"path": outputPath, "bytes": len(data)})
 			}
 		}
-		metrics["engineFlags"] = map[string]any{"mode": "local", "commandSnippet": commandSnippet}
+		metrics["engineFlags"] = map[string]string{"mode": "local", "commandSnippet": commandSnippet}
 		printStatus(args, "benchmark_local_command_complete", map[string]any{"outputBytes": len(output)})
 	}
 	if commandOutput != "" {
@@ -916,12 +1988,12 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		hardware = loaded
 	}
 
-	payload := map[string]any{"engineName": engineName, "hfId": model, "modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"), "hardware": hardware, "quantization": quantization}
+	payload := map[string]any{"engineName": engineName, "hfId": model, "modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"), "hardware": hardware, "quantization": quantization, "detectedEngines": detectInferenceEngines(args)}
 	payload["benchmarkMode"] = mode
 	for key, value := range metrics {
 		payload[key] = value
 	}
-	for flag, field := range map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "num-prompts": "numPrompts"} {
+	for flag, field := range map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "prompt-tokens": "promptTokens", "prefill-tokens": "promptTokens", "output-tokens": "outputTokens", "num-prompts": "numPrompts"} {
 		if value := opt(args, flag); value != "" {
 			if n, err := strconv.ParseFloat(value, 64); err == nil {
 				payload[field] = n
@@ -934,7 +2006,11 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		payload["notes"] = notes
 	}
 	applyComparableBenchmarkMetrics(payload, mode, engineName)
-	payload["provenance"] = map[string]any{"cli": "localmaxxing-go", "benchmarkMode": mode, "metricSource": payload["metricSource"], "timingSource": payload["timingSource"], "ttftSource": payload["ttftSource"], "createdAt": time.Now().UTC().Format(time.RFC3339)}
+	payload["provenance"] = benchmarkProvenance(payload, mode)
+	if hasFlag(args, "dry-run") && numberField(payload, "tokSOut") == 0 {
+		printStatus(args, "benchmark_plan_ready", map[string]any{"mode": mode, "engine": engineName, "next": "Run without --dry-run to measure, or pass explicit --tok-s-out metrics."})
+		return payload, nil
+	}
 	if tokSOut, ok := payload["tokSOut"].(float64); !ok || tokSOut <= 0 {
 		details := commandOutput
 		if len(details) > 4000 {
@@ -944,6 +2020,67 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	}
 	printStatus(args, "benchmark_payload_ready", map[string]any{"mode": mode, "tokSOut": payload["tokSOut"], "tokSPrefill": payload["tokSPrefill"], "tokSTotal": payload["tokSTotal"], "ttftMs": payload["ttftMs"]})
 	return payload, nil
+}
+
+func benchmarkAgentFeedback(payload map[string]any, out string, dryRun, submit bool) map[string]any {
+	ready := numberField(payload, "tokSOut") > 0
+	status := "ready_for_api_validation"
+	message := "Benchmark payload is ready for API validation."
+	nextCommand := "lmx benchmark dry-run " + out
+	if submit {
+		status = "api_submission_requested"
+		message = "Benchmark payload is being sent to the API."
+		nextCommand = ""
+	} else if dryRun && !ready {
+		status = "plan_needs_metrics"
+		message = "Dry-run plan written. Run without --dry-run to measure, or add explicit metrics before API validation."
+		nextCommand = "lmx benchmark run <engine> <same options without --dry-run>"
+	} else if dryRun {
+		status = "plan_ready_for_api_validation"
+		message = "Dry-run payload written with metrics. Validate it with lmx benchmark dry-run before submitting."
+	}
+	feedback := map[string]any{
+		"status":          status,
+		"message":         message,
+		"outputPath":      out,
+		"canApiValidate":  ready,
+		"canSubmit":       ready,
+		"requiresMetrics": !ready,
+	}
+	if nextCommand != "" {
+		feedback["nextCommand"] = nextCommand
+	}
+	if ready && !submit {
+		feedback["submitCommand"] = "lmx benchmark submit " + out
+	}
+	if engine := stringValue(payload["engineName"]); engine != "" {
+		feedback["engine"] = engine
+	}
+	if mode := stringValue(payload["benchmarkMode"]); mode != "" {
+		feedback["mode"] = mode
+	}
+	return feedback
+}
+
+func applyBenchmarkPlanMetrics(metrics map[string]any, mode, engineName string, args cliArgs, model string) {
+	metrics["dryRun"] = true
+	if mode == "remote" {
+		metrics["engineFlags"] = map[string]string{"mode": "remote", "baseUrl": opt(args, "base-url"), "servedModel": firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), model)}
+		return
+	}
+	if commandSnippet := localBenchmarkCommand(engineName, args); commandSnippet != "" {
+		metrics["engineFlags"] = map[string]string{"mode": "local", "commandSnippet": commandSnippet}
+	}
+}
+
+func benchmarkProvenance(payload map[string]any, mode string) map[string]any {
+	provenance := map[string]any{"cli": "localmaxxing-go", "benchmarkMode": mode, "createdAt": time.Now().UTC().Format(time.RFC3339)}
+	for _, key := range []string{"metricSource", "timingSource", "ttftSource"} {
+		if value, ok := payload[key]; ok && value != nil && value != "" {
+			provenance[key] = value
+		}
+	}
+	return provenance
 }
 
 func applyComparableBenchmarkMetrics(payload map[string]any, mode, engineName string) {
@@ -1004,6 +2141,9 @@ func localBenchmarkCommand(engineName string, args cliArgs) string {
 	}
 	if engineName == "vllm" {
 		return vllmBenchmarkCommand(args)
+	}
+	if engineName == "sglang" {
+		return sglangBenchmarkCommand(args)
 	}
 	if engineName != "llama.cpp" || opt(args, "model-path") == "" {
 		return ""
@@ -1113,6 +2253,37 @@ func vllmBenchmarkCommand(args cliArgs) string {
 	return strings.Join(cmd, " ")
 }
 
+func sglangBenchmarkCommand(args cliArgs) string {
+	modelPath := firstNonEmpty(opt(args, "model-path"), opt(args, "hf-id"), opt(args, "model"))
+	if modelPath == "" {
+		return ""
+	}
+	kind := benchmarkKind(args, "serve")
+	if kind != "serve" && kind != "serving" {
+		return ""
+	}
+	baseURL := opt(args, "base-url")
+	if baseURL == "" {
+		baseURL = "http://localhost:" + firstNonEmpty(opt(args, "port"), "30000")
+	}
+	cmd := []string{shellQuote(firstNonEmpty(opt(args, "python-bin"), "python3")), "-m", "sglang.bench_serving"}
+	appendShellArg(&cmd, "--backend", firstNonEmpty(opt(args, "benchmark-backend"), "sglang"))
+	appendShellArg(&cmd, "--model", firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), modelPath))
+	appendShellArg(&cmd, "--base-url", baseURL)
+	appendShellArg(&cmd, "--dataset-name", firstNonEmpty(opt(args, "dataset-name"), "random"))
+	appendShellArg(&cmd, "--dataset-path", opt(args, "dataset-path"))
+	appendShellArg(&cmd, "--random-input-len", firstNonEmpty(opt(args, "input-len"), opt(args, "prompt-tokens"), "512"))
+	appendShellArg(&cmd, "--random-output-len", firstNonEmpty(opt(args, "output-len"), opt(args, "output-tokens"), "128"))
+	appendShellArg(&cmd, "--num-prompts", firstNonEmpty(opt(args, "num-prompts"), "100"))
+	appendShellArg(&cmd, "--request-rate", opt(args, "request-rate"))
+	appendShellArg(&cmd, "--max-concurrency", opt(args, "max-concurrency"))
+	if outputPath := benchmarkOutputPath(args); outputPath != "" {
+		cmd = append(cmd, "--output-file", shellQuote(outputPath))
+	}
+	appendExtraArgs(&cmd, opt(args, "extra-bench-args"))
+	return strings.Join(cmd, " ")
+}
+
 func shellQuote(value string) string {
 	if value == "" {
 		return `""`
@@ -1148,10 +2319,12 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
 	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"))
 	servedModelSource := "explicit"
+	var servedModelInfo map[string]any
 	if servedModel == "" {
-		detected, err := detectServedModel(baseURL, opt(args, "model-api-key"), hfID)
+		detected, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), hfID)
 		if err == nil && detected != "" {
 			servedModel = detected
+			servedModelInfo = info
 			servedModelSource = "v1_models"
 			printStatus(args, "served_model_detected", map[string]any{"servedModel": servedModel, "source": servedModelSource})
 		} else {
@@ -1159,6 +2332,8 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 			servedModelSource = "hf_id_fallback"
 			printStatus(args, "served_model_fallback", map[string]any{"servedModel": servedModel, "source": servedModelSource, "reason": errString(err)})
 		}
+	} else if _, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), servedModel); err == nil {
+		servedModelInfo = info
 	}
 	prompt := firstNonEmpty(opt(args, "prompt"), "Explain why local inference benchmarks should report prompt prefill throughput, decode throughput, and time to first token.")
 	maxTokens := 256
@@ -1179,21 +2354,29 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	}
 	stream := !hasFlag(args, "no-stream")
 	body := map[string]any{
-		"model": servedModel,
-		"messages": []any{map[string]any{"role": "user", "content": prompt}},
-		"max_tokens": maxTokens,
+		"model":       servedModel,
+		"messages":    []any{map[string]any{"role": "user", "content": prompt}},
+		"max_tokens":  maxTokens,
 		"temperature": temperature,
-		"stream": stream,
+		"stream":      stream,
 	}
 	if stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
+	quantizationResolution := remoteQuantizationResolution(args, baseURL, opt(args, "model-api-key"), opt(args, "quantization"), servedModelInfo)
+	modelResolution := remoteModelResolution(args, servedModel, servedModelSource, hfID, stringValue(quantizationResolution["modelPath"]))
+	timeout, err := endpointTimeout(args)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	bodyData, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	started := time.Now()
-	req, err := http.NewRequest("POST", baseURL+"/v1/chat/completions", bytes.NewReader(bodyData))
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat/completions", bytes.NewReader(bodyData))
 	if err != nil {
 		return nil, err
 	}
@@ -1259,70 +2442,361 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	}
 	generationMs := maxDurationMS(completedAt.Sub(generationStart))
 	metrics := map[string]any{
-		"prompt": prompt,
-		"outputText": outputText,
+		"prompt":       prompt,
+		"outputText":   outputText,
 		"promptTokens": float64(promptTokens),
 		"outputTokens": float64(outputTokens),
-		"tokSOut": round1(float64(outputTokens) / (generationMs / 1000)),
-		"tokSTotal": round1(float64(promptTokens+outputTokens) / (totalMs / 1000)),
-		"engineFlags": map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens},
+		"tokSOut":      round1(float64(outputTokens) / (generationMs / 1000)),
+		"tokSTotal":    round1(float64(promptTokens+outputTokens) / (totalMs / 1000)),
+		"engineFlags":  map[string]string{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": strconv.FormatBool(stream), "maxTokens": strconv.Itoa(maxTokens), "timeoutSeconds": strconv.Itoa(int(timeout.Seconds()))},
 		"tokenSources": map[string]any{"prompt": promptTokenResult.Source, "output": outputTokenResult.Source},
 		"timingSource": "client_observed_http",
 		"metricSource": "remote_endpoint",
-		"ttftSource": map[bool]string{true: "stream_first_token", false: "unavailable_no_stream"}[!firstTokenAt.IsZero()],
+		"ttftSource":   map[bool]string{true: "stream_first_token", false: "unavailable_no_stream"}[!firstTokenAt.IsZero()],
+	}
+	if modelResolution != nil {
+		metrics["modelResolution"] = modelResolution
+	}
+	if quantizationResolution != nil {
+		metrics["quantizationResolution"] = quantizationResolution
 	}
 	if !firstTokenAt.IsZero() {
 		ttftMs := float64(firstTokenAt.Sub(started).Milliseconds())
 		metrics["ttftMs"] = ttftMs
 		if ttftMs > 0 {
 			metrics["tokSPrefill"] = round1(float64(promptTokens) / (ttftMs / 1000))
+			metrics["tokSPrefillSource"] = "estimated_from_ttft"
 		}
 	}
 	return metrics, nil
 }
 
-func detectServedModel(baseURL, apiKey, preferred string) (string, error) {
-	req, err := http.NewRequest("GET", strings.TrimRight(baseURL, "/")+"/v1/models", nil)
+func endpointTimeout(args cliArgs) (time.Duration, error) {
+	value := firstNonEmpty(opt(args, "endpoint-timeout-seconds"), opt(args, "timeout-seconds"))
+	if value == "" {
+		return defaultEndpointTimeout, nil
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		return 0, cliError{"invalid_option", "--endpoint-timeout-seconds must be a positive integer", []string{"Pass --endpoint-timeout-seconds <seconds>."}, nil}
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, modelPath string) map[string]any {
+	if servedModel == "" || hfID == "" || (modelPath == "" && strings.EqualFold(servedModel, hfID)) {
+		return nil
+	}
+	status := "alias"
+	if strings.EqualFold(servedModel, hfID) {
+		status = "matched"
+	}
+	resolution := map[string]any{"hfId": hfID, "servedModel": servedModel, "servedModelSource": servedModelSource, "status": status}
+	if modelPath != "" {
+		resolution["declaredBaseModel"] = hfID
+		resolution["loadedFilename"] = filepath.Base(modelPath)
+	}
+	if status == "alias" {
+		printStatus(args, "remote_model_alias", map[string]any{"hfId": hfID, "servedModel": servedModel, "hint": "Endpoint model names are often server aliases; verify --hf-id only if the underlying model is different."})
+	}
+	queryCommand := "lmx model search " + shellQuote(servedModel)
+	value, err := searchModels(args, servedModel, 5)
 	if err != nil {
-		return "", err
+		resolution["searchError"] = err.Error()
+		resolution["searchCommand"] = queryCommand
+		printStatus(args, "hf_id_search_unavailable", map[string]any{"query": servedModel, "next": queryCommand})
+		return resolution
+	}
+	candidates := modelCandidates(value, 5)
+	resolution["candidates"] = candidates
+	resolution["searchCommand"] = queryCommand
+	if len(candidates) == 0 {
+		printStatus(args, "hf_id_candidates_empty", map[string]any{"query": servedModel, "next": queryCommand})
+		return resolution
+	}
+	fields := map[string]any{"query": servedModel, "count": len(candidates), "next": "If the exact GGUF repo matters, rerun with that --hf-id."}
+	for i, candidate := range candidates {
+		if obj := asObject(candidate); obj != nil {
+			fields[fmt.Sprintf("candidate%d", i+1)] = firstNonEmpty(stringValue(obj["hfId"]), stringValue(obj["id"]), stringValue(obj["modelId"]))
+		}
+	}
+	if filename := stringValue(resolution["loadedFilename"]); filename != "" {
+		match, err := sourceRepoFromFilename(args, candidates, filename)
+		if err != nil {
+			resolution["sourceRepoSearchError"] = err.Error()
+		} else if match != "" {
+			resolution["sourceRepo"] = match
+			resolution["sourceRepoMatch"] = "exact_filename"
+			resolution["status"] = "source_repo_detected"
+			fields["sourceRepo"] = match
+			fields["sourceRepoMatch"] = "exact_filename"
+		}
+	}
+	printStatus(args, "hf_id_candidates_found", fields)
+	return resolution
+}
+
+func sourceRepoFromFilename(args cliArgs, candidates []any, filename string) (string, error) {
+	var firstErr error
+	for _, candidate := range candidates {
+		repo := candidateRepoID(candidate)
+		if repo == "" {
+			continue
+		}
+		matched, err := hfRepoContainsFilename(args, repo, filename)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if matched {
+			return repo, nil
+		}
+	}
+	return "", firstErr
+}
+
+func candidateRepoID(candidate any) string {
+	if obj := asObject(candidate); obj != nil {
+		return firstNonEmpty(stringValue(obj["hfId"]), stringValue(obj["id"]), stringValue(obj["modelId"]))
+	}
+	return stringValue(candidate)
+}
+
+func hfRepoContainsFilename(args cliArgs, repo, filename string) (bool, error) {
+	body, err := fetchEndpointJSON(strings.TrimRight(hfAPIURL(args), "/")+"/api/models/"+hfRepoPath(repo), "")
+	if err != nil {
+		return false, err
+	}
+	obj := asObject(body)
+	if obj == nil {
+		return false, nil
+	}
+	for _, sibling := range modelFileItems(obj) {
+		if file := firstNonEmpty(stringValue(sibling["rfilename"]), stringValue(sibling["filename"]), stringValue(sibling["path"])); file == filename || strings.EqualFold(file, filename) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func modelFileItems(obj map[string]any) []map[string]any {
+	items := []map[string]any{}
+	for _, key := range []string{"siblings", "files"} {
+		arr, _ := obj[key].([]any)
+		for _, item := range arr {
+			if file := asObject(item); file != nil {
+				items = append(items, file)
+			}
+		}
+	}
+	return items
+}
+
+func hfRepoPath(repo string) string {
+	parts := strings.Split(repo, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, "/")
+}
+
+func hfAPIURL(args cliArgs) string {
+	if value := opt(args, "hf-api-url"); value != "" {
+		return value
+	}
+	return defaultHFAPIURL
+}
+
+func searchModels(args cliArgs, query string, limit int) (any, error) {
+	endpoint := apiURL(args) + "/api/models/search?q=" + url.QueryEscape(query) + "&limit=" + url.QueryEscape(strconv.Itoa(limit))
+	return fetchJSON("GET", endpoint, "", nil)
+}
+
+func modelCandidates(value any, limit int) []any {
+	var items []any
+	if arr, ok := value.([]any); ok {
+		items = arr
+	} else if obj := asObject(value); obj != nil {
+		for _, key := range []string{"models", "results", "data"} {
+			if arr, ok := obj[key].([]any); ok {
+				items = arr
+				break
+			}
+		}
+	}
+	if len(items) > limit {
+		return items[:limit]
+	}
+	return items
+}
+
+func remoteQuantizationResolution(args cliArgs, baseURL, apiKey, cliQuantization string, servedModelInfo map[string]any) map[string]any {
+	resolution := map[string]any{"cli": cliQuantization}
+	if quant := quantizationFromModelInfo(servedModelInfo); quant != "" {
+		resolution["v1Models"] = quant
+	}
+	if props, err := fetchEndpointJSON(baseURL+"/props", apiKey); err == nil {
+		if obj := asObject(props); obj != nil {
+			modelPath := stringValue(obj["model_path"])
+			if modelPath != "" {
+				resolution["modelPath"] = modelPath
+				if quant := quantizationFromFilename(modelPath); quant != "" {
+					resolution["filename"] = quant
+				}
+			}
+		}
+	}
+	trusted := firstNonEmpty(stringValue(resolution["filename"]), stringValue(resolution["v1Models"]), cliQuantization)
+	if trusted == "" {
+		return nil
+	}
+	resolution["trusted"] = trusted
+	resolution["trustedSource"] = map[bool]string{true: "filename", false: "v1_models"}[stringValue(resolution["filename"]) != ""]
+	if stringValue(resolution["filename"]) == "" && stringValue(resolution["v1Models"]) == "" {
+		resolution["trustedSource"] = "cli"
+	}
+	mismatches := quantizationMismatches(resolution, cliQuantization)
+	if len(mismatches) == 0 {
+		resolution["status"] = "matched"
+		if stringValue(resolution["filename"]) != "" || stringValue(resolution["v1Models"]) != "" {
+			printStatus(args, "remote_quantization_detected", map[string]any{"quantization": trusted, "source": resolution["trustedSource"]})
+		}
+		return resolution
+	}
+	resolution["status"] = "mismatch"
+	resolution["mismatches"] = mismatches
+	printStatus(args, "remote_quantization_mismatch", map[string]any{"cli": cliQuantization, "filename": resolution["filename"], "v1Models": resolution["v1Models"], "trusted": trusted, "hint": "Filename-derived quantization is trusted for llama.cpp endpoints; rerun with matching --quantization before submitting."})
+	return resolution
+}
+
+func quantizationMismatches(resolution map[string]any, cliQuantization string) []any {
+	sources := map[string]string{"cli": cliQuantization, "filename": stringValue(resolution["filename"]), "v1Models": stringValue(resolution["v1Models"])}
+	mismatches := []any{}
+	keys := []string{"cli", "filename", "v1Models"}
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			left, right := sources[keys[i]], sources[keys[j]]
+			if left == "" || right == "" || quantizationEqual(left, right) {
+				continue
+			}
+			mismatches = append(mismatches, map[string]any{"leftSource": keys[i], "left": left, "rightSource": keys[j], "right": right})
+		}
+	}
+	return mismatches
+}
+
+func quantizationEqual(left, right string) bool {
+	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
+}
+
+func quantizationFromModelInfo(info map[string]any) string {
+	if info == nil {
+		return ""
+	}
+	if value := firstNonEmpty(stringValue(info["quantization"]), stringValue(info["quantization_level"])); value != "" {
+		return value
+	}
+	if details := asObject(info["details"]); details != nil {
+		if value := firstNonEmpty(stringValue(details["quantization_level"]), stringValue(details["quantization"])); value != "" {
+			return value
+		}
+	}
+	if meta := asObject(info["meta"]); meta != nil {
+		return firstNonEmpty(stringValue(meta["quantization"]), stringValue(meta["quantization_level"]))
+	}
+	return ""
+}
+
+func quantizationFromFilename(path string) string {
+	name := filepath.Base(path)
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	pattern := regexp.MustCompile(`(?i)(?:^|[-_.])((?:IQ|Q)[0-9][A-Z0-9_]*|(?:BF|F|FP)[0-9]+)(?:[-_.]|$)`)
+	matches := pattern.FindAllStringSubmatch(name, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return strings.ToUpper(matches[len(matches)-1][1])
+}
+
+func fetchEndpointJSON(rawURL, apiKey string) (any, error) {
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return nil, err
 	}
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", fmt.Errorf("/v1/models returned %s", res.Status)
+		return nil, fmt.Errorf("%s returned %s", rawURL, res.Status)
+	}
+	var body any
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func detectServedModel(baseURL, apiKey, preferred string) (string, map[string]any, error) {
+	req, err := http.NewRequest("GET", strings.TrimRight(baseURL, "/")+"/v1/models", nil)
+	if err != nil {
+		return "", nil, err
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", nil, fmt.Errorf("/v1/models returned %s", res.Status)
 	}
 	var body map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	data, _ := body["data"].([]any)
+	data := modelInfoItems(body)
 	first := ""
+	var firstInfo map[string]any
 	for _, item := range data {
 		obj := asObject(item)
 		if obj == nil {
 			continue
 		}
-		id := stringValue(obj["id"])
+		id := firstNonEmpty(stringValue(obj["id"]), stringValue(obj["name"]), stringValue(obj["model"]))
 		if id == "" {
 			continue
 		}
 		if first == "" {
 			first = id
+			firstInfo = obj
 		}
 		if id == preferred || strings.EqualFold(id, preferred) {
-			return id, nil
+			return id, obj, nil
 		}
 	}
 	if first != "" {
-		return first, nil
+		return first, firstInfo, nil
 	}
-	return "", errors.New("/v1/models did not return any model ids")
+	return "", nil, errors.New("/v1/models did not return any model ids")
+}
+
+func modelInfoItems(body map[string]any) []any {
+	items := []any{}
+	for _, key := range []string{"data", "models"} {
+		if arr, ok := body[key].([]any); ok {
+			items = append(items, arr...)
+		}
+	}
+	return items
 }
 
 type openAIStreamResult struct {
@@ -1595,15 +3069,15 @@ func parseBenchmarkJSONMetrics(text string) map[string]float64 {
 		return map[string]float64{}
 	}
 	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
-		startObj := strings.Index(trimmed, "{")
-		endObj := strings.LastIndex(trimmed, "}")
 		startArray := strings.Index(trimmed, "[")
 		endArray := strings.LastIndex(trimmed, "]")
+		startObj := strings.Index(trimmed, "{")
+		endObj := strings.LastIndex(trimmed, "}")
 		snippet := ""
-		if startObj >= 0 && endObj > startObj {
-			snippet = trimmed[startObj : endObj+1]
-		} else if startArray >= 0 && endArray > startArray {
+		if startArray >= 0 && endArray > startArray {
 			snippet = trimmed[startArray : endArray+1]
+		} else if startObj >= 0 && endObj > startObj {
+			snippet = trimmed[startObj : endObj+1]
 		}
 		if snippet == "" || json.Unmarshal([]byte(snippet), &value) != nil {
 			return map[string]float64{}
@@ -1619,13 +3093,128 @@ func parseBenchmarkJSONMetrics(text string) map[string]float64 {
 		"promptTokens": []string{"promptTokens", "inputTokens", "totalInputTokens", "totalPromptTokens", "numPromptTokens"},
 		"outputTokens": []string{"outputTokens", "completionTokens", "generatedTokens", "totalOutputTokens", "totalGeneratedTokens", "numOutputTokens"},
 	}
-	metrics := map[string]float64{}
+	metrics := parseLlamaBenchJSONMetrics(value)
+	for key, value := range parseVLLMBenchmarkJSONMetrics(value) {
+		if metrics[key] == 0 {
+			metrics[key] = value
+		}
+	}
 	for field, names := range aliases {
+		if metrics[field] != 0 {
+			continue
+		}
 		if found, ok := jsonNumberByAliases(value, names); ok {
 			metrics[field] = found
 		}
 	}
 	return compactMetrics(metrics)
+}
+
+func parseLlamaBenchJSONMetrics(value any) map[string]float64 {
+	metrics := map[string]float64{}
+	for _, row := range jsonObjectRows(value) {
+		avgTS, ok := anyNumber(row["avg_ts"])
+		if !ok {
+			continue
+		}
+		nPrompt, _ := anyNumber(row["n_prompt"])
+		nGen, _ := anyNumber(row["n_gen"])
+		nDepth, _ := anyNumber(row["n_depth"])
+		if nDepth > 0 && metrics["contextTokens"] == 0 {
+			metrics["contextTokens"] = nDepth
+		}
+		if nPrompt > 0 && nGen == 0 {
+			if metrics["tokSPrefill"] == 0 {
+				metrics["tokSPrefill"] = avgTS
+			}
+			if metrics["promptTokens"] == 0 {
+				metrics["promptTokens"] = nPrompt
+			}
+		}
+		if nGen > 0 && nPrompt == 0 {
+			if metrics["tokSOut"] == 0 {
+				metrics["tokSOut"] = avgTS
+			}
+			if metrics["outputTokens"] == 0 {
+				metrics["outputTokens"] = nGen
+			}
+		}
+	}
+	return compactMetrics(metrics)
+}
+
+func jsonObjectRows(value any) []map[string]any {
+	rows := []map[string]any{}
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			if obj := asObject(item); obj != nil {
+				rows = append(rows, obj)
+			}
+		}
+	case map[string]any:
+		rows = append(rows, typed)
+	}
+	return rows
+}
+
+func parseVLLMBenchmarkJSONMetrics(value any) map[string]float64 {
+	metrics := map[string]float64{}
+	for _, row := range jsonObjectRows(value) {
+		inputTokens := firstJSONNumber(row, "input_len", "inputLen", "prompt_len", "promptLen", "num_input_tokens", "numPromptTokens")
+		outputTokens := firstJSONNumber(row, "output_len", "outputLen", "generation_len", "generationLen", "num_output_tokens", "numOutputTokens")
+		batchSize := firstJSONNumber(row, "batch_size", "batchSize")
+		if batchSize == 0 {
+			batchSize = 1
+		}
+		if inputTokens > 0 && metrics["promptTokens"] == 0 {
+			metrics["promptTokens"] = inputTokens
+		}
+		if inputTokens > 0 && metrics["contextTokens"] == 0 {
+			metrics["contextTokens"] = inputTokens
+		}
+		if outputTokens > 0 && metrics["outputTokens"] == 0 {
+			metrics["outputTokens"] = outputTokens
+		}
+		if throughput := firstJSONNumber(row, "output_token_throughput", "outputTokenThroughput", "output_throughput", "generation_throughput", "tokens_per_second"); throughput > 0 && metrics["tokSOut"] == 0 {
+			metrics["tokSOut"] = throughput
+		}
+		if throughput := firstJSONNumber(row, "total_token_throughput", "totalTokenThroughput", "total_throughput"); throughput > 0 && metrics["tokSTotal"] == 0 {
+			metrics["tokSTotal"] = throughput
+		}
+		latencyMs := firstJSONNumber(row, "avg_latency_ms", "mean_latency_ms", "median_latency_ms", "latency_ms")
+		if latencyMs == 0 {
+			latencyMs = secondsToMs(firstJSONNumber(row, "avg_latency", "mean_latency", "median_latency", "latency", "avg_latency_s", "mean_latency_s", "median_latency_s"))
+		}
+		if latencyMs > 0 {
+			if metrics["latencyMs"] == 0 {
+				metrics["latencyMs"] = latencyMs
+			}
+			if inputTokens+outputTokens > 0 && metrics["tokSTotal"] == 0 {
+				metrics["tokSTotal"] = round1(((inputTokens + outputTokens) * batchSize) / (latencyMs / 1000))
+			}
+			if outputTokens > 0 && metrics["tokSOut"] == 0 {
+				metrics["tokSOut"] = round1((outputTokens * batchSize) / (latencyMs / 1000))
+			}
+		}
+	}
+	return compactMetrics(metrics)
+}
+
+func firstJSONNumber(obj map[string]any, names ...string) float64 {
+	for _, name := range names {
+		if value, ok := jsonNumberByAliases(obj, []string{name}); ok {
+			return value
+		}
+	}
+	return 0
+}
+
+func secondsToMs(value float64) float64 {
+	if value == 0 {
+		return 0
+	}
+	return round1(value * 1000)
 }
 
 func jsonNumberByAliases(value any, aliases []string) (float64, bool) {
@@ -1685,7 +3274,8 @@ func anyNumber(value any) (float64, bool) {
 
 func parseLlamaBenchTable(text string) map[string]float64 {
 	metrics := map[string]float64{}
-	testPattern := regexp.MustCompile(`(?i)^(pp|tg)(\d+)\b`)
+	testPattern := regexp.MustCompile(`(?i)^(pp|tg)\s*(\d+)\b`)
+	depthPattern := regexp.MustCompile(`(?i)@\s*d\s*(\d+)`)
 	valuePattern := regexp.MustCompile(`^(\d+(?:\.\d+)?)(?:\s*[+-]|\s*±|\s*$)`)
 	for _, line := range strings.FieldsFunc(text, func(r rune) bool { return r == '\n' || r == '\r' }) {
 		cells := []string{}
@@ -1699,6 +3289,11 @@ func parseLlamaBenchTable(text string) map[string]float64 {
 			match := testPattern.FindStringSubmatch(cell)
 			if match == nil {
 				continue
+			}
+			if depthMatch := depthPattern.FindStringSubmatch(cell); len(depthMatch) >= 2 && metrics["contextTokens"] == 0 {
+				if depth, err := strconv.ParseFloat(depthMatch[1], 64); err == nil {
+					metrics["contextTokens"] = depth
+				}
 			}
 			var value float64
 			found := false
@@ -1871,7 +3466,7 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 func submitPayload(endpoint string, dryRun bool, label string, args cliArgs, payload any) error {
 	key := apiKey(args)
 	if key == "" {
-		return missingAPIKey("--api-key or LMX_API_KEY is required for "+label+" submit/dry-run")
+		return missingAPIKey("--api-key or LMX_API_KEY is required for " + label + " submit/dry-run")
 	}
 	value, err := fetchJSON("POST", apiURL(args)+endpoint, key, payload)
 	if err != nil {
@@ -2077,10 +3672,19 @@ Usage:
   lmx profile save my-4090 --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --hardware hardware.json
   lmx hardware --out hardware.json
   lmx hardware init --out hardware.json
+  lmx engines
+  lmx server dry-run vllm --hf-id Qwen/Qwen3-8B --quantization fp16
+  lmx server dry-run llama.cpp --model-path model.gguf
   lmx benchmark run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --dry-run
   lmx benchmark run vllm --mode local --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind throughput --benchmark-output vllm.json --dry-run
   lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run
   lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --model-path model.gguf --dry-run
+  lmx benchmark runs list
+  lmx benchmark runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'
+  lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run
+  lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json --api-key bhk_...
+  lmx kvcache run llama.cpp --hf-id Qwen/Qwen3-8B --model-path model.gguf --levels 10000,20000,30000,40000
+  lmx kvcache run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --levels 10000,20000,30000,40000
   lmx benchmark submit benchmark.json --api-key bhk_...
   lmx benchmark dry-run benchmark.json --api-key bhk_...
   lmx eval suite list --out suites.json
@@ -2110,15 +3714,31 @@ Options:
   --model-api-key <key>    Optional bearer token for remote endpoint benchmarking
   --prompt <text>          Prompt for remote endpoint benchmark
   --max-tokens <n>         Max generated tokens for remote endpoint benchmark
+  --endpoint-timeout-seconds <n> Timeout for remote endpoint benchmark (default: 600)
   --no-stream              Disable streaming for remote endpoint benchmark
   --command <cmd>          Local benchmark command, e.g. llama-bench
+  --host <addr>            Local model server host for generated server commands
+  --port <n>               Local model server port for generated server/benchmark commands
   --model-path <path>      llama.cpp model path; generates llama-bench command
+  --server-bin <path>      Server executable override, e.g. llama-server
   --bench-kind <kind>      Built-in vLLM benchmark: serve, throughput, or latency
   --benchmark-output <p>   Engine benchmark JSON output path
   --benchmark-bin <path>   Benchmark executable (default: vllm for vLLM)
+  --python-bin <path>      Python executable for SGLang commands
   --input-len <n>          Prompt/input tokens for built-in benchmark commands
   --output-len <n>         Generated/output tokens for built-in benchmark commands
+  --levels <list>          KV-cache/context sweep levels, e.g. 10000,20000,30000
+  --command-template <cmd> Local sweep command template using {input} and {output}
+  --probe-prompt <text>    Final remote prompt after loading retained context
+  --filler-token <text>    Repeated token used for remote context filler
+  --kv-cache-dtype <dtype> vLLM KV cache dtype for local latency sweeps
+  --enable-prefix-caching  Enable vLLM prefix caching for local latency sweeps
   --num-prompts <n>        Number of prompts for vLLM serve/throughput benchmarks
+  --runs-dir <dir>         Saved benchmark runs directory (default: runs)
+  --set field=value        Edit one field in a saved benchmark run
+  --set-json <json>        Merge JSON object into a saved benchmark run
+  --patch <path>           Merge JSON object file into a saved benchmark run
+  --unset <fields>         Comma-separated saved-run fields to remove
   --json-status            Emit progress events as JSON lines on stderr
   --quiet                  Suppress progress events
   --hardware <path>        JSON hardware object required when submitting

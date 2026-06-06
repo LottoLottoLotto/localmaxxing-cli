@@ -5,3 +5,5 @@ dist/
 .env.*
 localmaxxing-eval-run.json
 *.eval-suite.local.json
+runs/
+localmaxxing-kvcache.json
