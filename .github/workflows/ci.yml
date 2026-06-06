@@ -14,6 +14,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Test Go CLI
+        run: go test ./...
+
+      - name: Build Go CLI
+        run: go build ./cmd/lmx
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:

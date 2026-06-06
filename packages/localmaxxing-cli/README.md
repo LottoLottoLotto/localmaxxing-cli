@@ -269,6 +269,58 @@ If engine token counts are missing or marked as estimated and the JSON includes 
 
 Agents can skip `benchmark run` entirely: create any JSON object matching `POST /api/benchmarks`, then call `lmx benchmark dry-run benchmark.json` and `lmx benchmark submit benchmark.json`. Fetch `lmx context --out localmaxxing-agent-context.json` first for the current schema, accepted engines, and methodology tips.
 
+## Measure KV-Cache Slowdown Across Context Lengths
+
+Use `kvcache run` to load progressively larger contexts and record how prefill, TTFT, decode TPS, and total TPS change. It writes `localmaxxing-kvcache.json` by default.
+
+Local mode runs one engine benchmark per requested context level. For `llama.cpp`, `--levels` maps to `llama-bench -d <n>` so the KV cache is prefilled to that depth; `--prompt-tokens` controls the measured prompt-processing chunk and defaults to `512`:
+
+```bash
+lmx kvcache run llama.cpp \
+  --mode local \
+  --hf-id Qwen/Qwen3-8B \
+  --quantization Q4_K_M \
+  --model-path model.gguf \
+  --levels 10000,20000,30000,40000 \
+  --prompt-tokens 512 \
+  --output-tokens 128
+```
+
+For local custom tools, provide a template. `{input}` is replaced with the current context level and `{output}` with the decode length:
+
+```bash
+lmx kvcache run custom \
+  --mode local \
+  --hf-id Qwen/Qwen3-8B \
+  --command-template "my-bench --input {input} --output {output}" \
+  --levels 10000,20000,30000,40000
+```
+
+For local vLLM, `--levels` maps to `vllm bench latency --input-len <n>`. vLLM does not expose a separate llama-bench-style `-d` depth flag, so this measures latency/throughput with a long input context. The CLI sets `--max-model-len` to at least `input + output` when `--context-length` is not provided and writes one `--output-json` file per level:
+
+```bash
+lmx kvcache run vllm \
+  --mode local \
+  --hf-id Qwen/Qwen3-8B \
+  --levels 10000,20000,30000,40000 \
+  --output-tokens 128 \
+  --batch-size 1
+```
+
+Remote mode sends a streaming OpenAI-compatible chat completion with retained chat history/filler sized to the target context, then measures client-observed TTFT and decode speed after that loaded context:
+
+```bash
+lmx kvcache run vllm \
+  --mode remote \
+  --base-url http://server:8000 \
+  --hf-id Qwen/Qwen3-8B \
+  --served-model Qwen/Qwen3-8B \
+  --levels 10000,20000,30000,40000 \
+  --output-tokens 128
+```
+
+Remote context sizing is approximate unless the endpoint returns `usage.prompt_tokens`. The output includes `methodology`, `timingSource`, `ttftMs`, `tokSPrefill`, `tokSOut`, and `tokSTotal` per point so results can be compared across context depths.
+
 ## Discover Eval Requirements
 
 Agents can pull the current LocalMaxxing schemas, endpoints, benchmark requirements, methodology tips, approved suite list, and per-suite run instructions directly from the API:
