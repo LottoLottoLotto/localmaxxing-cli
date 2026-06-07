@@ -108,15 +108,65 @@ func TestMeasureOpenAIEndpointMarksEstimatedPrefillAndStringEngineFlags(t *testi
 	if metrics["tokSPrefillSource"] != "estimated_from_ttft" {
 		t.Fatalf("tokSPrefillSource = %v, want estimated_from_ttft", metrics["tokSPrefillSource"])
 	}
-	engineFlags, ok := metrics["engineFlags"].(map[string]string)
+	engineFlags, ok := metrics["engineFlags"].(map[string]any)
 	if !ok {
-		t.Fatalf("engineFlags type = %T, want map[string]string", metrics["engineFlags"])
+		t.Fatalf("engineFlags type = %T, want map[string]any", metrics["engineFlags"])
 	}
-	if engineFlags["stream"] != "true" || engineFlags["maxTokens"] != "16" || engineFlags["servedModel"] != "served-model" {
+	if engineFlags["stream"] != true || engineFlags["maxTokens"] != 16 || engineFlags["servedModel"] != "served-model" {
 		t.Fatalf("engineFlags = %#v", engineFlags)
 	}
 	if metrics["tokSPrefill"] == nil || metrics["ttftMs"] == nil {
 		t.Fatalf("expected tokSPrefill and ttftMs, got %#v", metrics)
+	}
+}
+
+func TestOpenAIBaseURLAcceptsV1Suffix(t *testing.T) {
+	if got := openAIBaseURL("http://localhost:8080/v1/"); got != "http://localhost:8080" {
+		t.Fatalf("openAIBaseURL = %q, want http://localhost:8080", got)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[{"id":"served-model"}]}`)
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2}}`)
+			fmt.Fprintln(w, `data: [DONE]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	metrics, err := measureOpenAIEndpoint(cliArgs{opts: map[string]string{"base-url": server.URL + "/v1", "served-model": "served-model", "max-tokens": "16"}, flags: map[string]bool{"quiet": true}}, "org/model")
+	if err != nil {
+		t.Fatalf("measureOpenAIEndpoint with /v1 base-url returned error: %v", err)
+	}
+	engineFlags := metrics["engineFlags"].(map[string]any)
+	if engineFlags["baseUrl"] != server.URL {
+		t.Fatalf("baseUrl = %v, want %v", engineFlags["baseUrl"], server.URL)
+	}
+}
+
+func TestEndpointDiscoveryUsesProvidedBaseURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"data":[{"id":"served-model","quantization":"fp16"}]}`)
+	}))
+	defer server.Close()
+
+	result := endpointDiscoveryCandidates(cliArgs{opts: map[string]string{"base-url": server.URL + "/v1"}, flags: map[string]bool{}})
+	if len(result) != 1 || result[0] != server.URL {
+		t.Fatalf("endpointDiscoveryCandidates = %#v, want normalized server URL", result)
+	}
+	args := cliArgs{opts: map[string]string{"base-url": server.URL + "/v1", "hf-id": "org/model", "quantization": "fp16"}, flags: map[string]bool{"quiet": true}}
+	normalizeEndpointArgs(&args)
+	if err := handleEndpoint("discover", args); err != nil {
+		t.Fatalf("handleEndpoint returned error: %v", err)
 	}
 }
 
@@ -176,12 +226,62 @@ func TestBenchmarkDryRunDoesNotExecuteGeneratedLocalCommand(t *testing.T) {
 	if payload["tokSOut"] != nil {
 		t.Fatalf("tokSOut = %v, want nil for dry-run plan without metrics", payload["tokSOut"])
 	}
-	engineFlags, ok := payload["engineFlags"].(map[string]string)
+	engineFlags, ok := payload["engineFlags"].(map[string]any)
 	if !ok {
-		t.Fatalf("engineFlags type = %T, want map[string]string", payload["engineFlags"])
+		t.Fatalf("engineFlags type = %T, want map[string]any", payload["engineFlags"])
 	}
-	if !strings.Contains(engineFlags["commandSnippet"], "/definitely/missing/model.gguf") {
+	if !strings.Contains(stringValue(engineFlags["commandSnippet"]), "/definitely/missing/model.gguf") {
 		t.Fatalf("commandSnippet = %q, want generated command", engineFlags["commandSnippet"])
+	}
+	if payload["promptTokens"] != 512.0 || payload["outputTokens"] != 128.0 {
+		t.Fatalf("token fields = prompt %v output %v, want generated defaults", payload["promptTokens"], payload["outputTokens"])
+	}
+}
+
+func TestBenchmarkDryRunInfersTokensFromExplicitCommand(t *testing.T) {
+	payload, err := benchmarkPayloadFromFlags("llama.cpp", cliArgs{
+		opts: map[string]string{
+			"mode":         "local",
+			"hf-id":        "Qwen/Qwen3-8B",
+			"quantization": "Q4_K_M",
+			"command":      "llama-bench -m qwen.gguf -p 64 -n 16",
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	if payload["promptTokens"] != 64.0 || payload["outputTokens"] != 16.0 {
+		t.Fatalf("token fields = prompt %v output %v", payload["promptTokens"], payload["outputTokens"])
+	}
+	detected := payload["detectedEngines"].([]detectedEngine)
+	for _, engine := range detected {
+		if engine.Name == "llama.cpp" && engine.ServerCommand == "llama-bench -m qwen.gguf -p 64 -n 16" {
+			t.Fatalf("serverCommand reused benchmark command: %#v", engine)
+		}
+	}
+}
+
+func TestBenchmarkManualMetricsDeriveTotalsFromCommandTokens(t *testing.T) {
+	payload, err := benchmarkPayloadFromFlags("llama.cpp", cliArgs{
+		opts: map[string]string{
+			"mode":          "local",
+			"hf-id":         "Qwen/Qwen3-8B",
+			"quantization":  "Q4_K_M",
+			"command":       "llama-bench -m qwen.gguf -p 64 -n 16",
+			"tok-s-out":     "120",
+			"tok-s-prefill": "1800",
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	if payload["promptTokens"] != 64.0 || payload["outputTokens"] != 16.0 {
+		t.Fatalf("token fields = prompt %v output %v", payload["promptTokens"], payload["outputTokens"])
+	}
+	if payload["ttftMs"] == nil || payload["tokSTotal"] == nil {
+		t.Fatalf("expected derived comparable metrics, got %#v", payload)
 	}
 }
 
@@ -204,8 +304,8 @@ func TestBenchmarkDryRunAutoDetectsVLLMEngine(t *testing.T) {
 	if payload["engineName"] != "vllm" {
 		t.Fatalf("engineName = %v, want vllm", payload["engineName"])
 	}
-	engineFlags, ok := payload["engineFlags"].(map[string]string)
-	if !ok || !strings.Contains(engineFlags["commandSnippet"], "vllm bench throughput") {
+	engineFlags, ok := payload["engineFlags"].(map[string]any)
+	if !ok || !strings.Contains(stringValue(engineFlags["commandSnippet"]), "vllm bench throughput") {
 		t.Fatalf("engineFlags = %#v, want generated vLLM command", payload["engineFlags"])
 	}
 }
@@ -225,6 +325,41 @@ func TestLocalServerCommandBuildsLlamaServerCommand(t *testing.T) {
 		if !strings.Contains(command, want) {
 			t.Fatalf("server command = %q, missing %q", command, want)
 		}
+	}
+}
+
+func TestLlamaBenchmarkCommandSupportsCommonBenchFlags(t *testing.T) {
+	command := localBenchmarkCommand("llama.cpp", cliArgs{
+		opts: map[string]string{
+			"model-path":       "/models/qwen.gguf",
+			"prompt-tokens":    "256",
+			"output-tokens":    "64",
+			"threads":          "8",
+			"gpu-layers":       "99",
+			"depth":            "1024",
+			"batch-size":       "512",
+			"micro-batch-size": "128",
+			"repetitions":      "5",
+			"benchmark-format": "json",
+			"cache-type-k":     "q8_0",
+			"cache-type-v":     "f16",
+		},
+		flags: map[string]bool{"flash-attn": true},
+	})
+	for _, want := range []string{"llama-bench", "-m /models/qwen.gguf", "-p 256", "-n 64", "-t 8", "-ngl 99", "-d 1024", "-b 512", "-ub 128", "-r 5", "-o json", "-fa 1", "-ctk q8_0", "-ctv f16"} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("benchmark command = %q, missing %q", command, want)
+		}
+	}
+}
+
+func TestLlamaBenchmarkCommandSupportsNoFlashAttention(t *testing.T) {
+	command := localBenchmarkCommand("llama.cpp", cliArgs{
+		opts:  map[string]string{"model-path": "/models/qwen.gguf"},
+		flags: map[string]bool{"no-flash-attn": true},
+	})
+	if !strings.Contains(command, "-fa 0") {
+		t.Fatalf("benchmark command = %q, want -fa 0", command)
 	}
 }
 
@@ -302,6 +437,32 @@ func TestBenchmarkExplicitTokenFlagsDeriveComparableMetrics(t *testing.T) {
 	}
 	if _, exists := provenance["ttftSource"]; !exists || provenance["ttftSource"] != "estimated_from_prefill" {
 		t.Fatalf("provenance ttftSource = %v", provenance["ttftSource"])
+	}
+}
+
+func TestBenchmarkResultsFileAddsEngineFlags(t *testing.T) {
+	results := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(results, []byte(`{"output_token_throughput":222.2,"input_len":256,"output_len":64}`), 0o644); err != nil {
+		t.Fatalf("write results: %v", err)
+	}
+	payload, err := benchmarkPayloadFromFlags("vllm", cliArgs{
+		opts: map[string]string{
+			"mode":         "local",
+			"hf-id":        "Qwen/Qwen3-8B",
+			"quantization": "fp16",
+			"results":      results,
+		},
+		flags: map[string]bool{"quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	engineFlags, ok := payload["engineFlags"].(map[string]any)
+	if !ok {
+		t.Fatalf("engineFlags type = %T", payload["engineFlags"])
+	}
+	if engineFlags["resultsPath"] != results || !strings.Contains(stringValue(engineFlags["commandSnippet"]), results) {
+		t.Fatalf("engineFlags = %#v", engineFlags)
 	}
 }
 
@@ -402,6 +563,104 @@ func TestBenchmarkRunSummariesListsSavedRuns(t *testing.T) {
 	if summary["path"] != path || summary["canSubmit"] != true || !strings.Contains(summary["rerunCommand"].(string), path) {
 		t.Fatalf("summary = %#v", summary)
 	}
+	if !strings.Contains(summary["showCommand"].(string), path) || !strings.Contains(summary["deleteCommand"].(string), "--yes") {
+		t.Fatalf("summary commands = %#v", summary)
+	}
+}
+
+func TestBenchmarkRunStatsGroupsByQuantization(t *testing.T) {
+	root := t.TempDir()
+	writeBenchmarkRunForTest(t, filepath.Join(root, "run-fp16.json"), map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "vllm", "benchmarkMode": "local", "quantization": "fp16", "tokSOut": 100.0})
+	writeBenchmarkRunForTest(t, filepath.Join(root, "run-q4-a.json"), map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "llama.cpp", "benchmarkMode": "local", "quantization": "Q4_K_M", "tokSOut": 120.0})
+	writeBenchmarkRunForTest(t, filepath.Join(root, "run-q4-b.json"), map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "llama.cpp", "benchmarkMode": "local", "quantization": "Q4_K_M", "tokSOut": 80.0})
+
+	records, err := benchmarkRunRecords(root, cliArgs{opts: map[string]string{}, flags: map[string]bool{}})
+	if err != nil {
+		t.Fatalf("benchmarkRunRecords returned error: %v", err)
+	}
+	stats := benchmarkRunStatsResult(records, cliArgs{opts: map[string]string{"group-by": "quantization"}, flags: map[string]bool{}})
+	groups := stats["groups"].([]any)
+	if len(groups) != 2 {
+		t.Fatalf("groups len = %d, want 2", len(groups))
+	}
+	first := groups[0].(map[string]any)
+	if first["key"] != "Q4_K_M" || first["best"] != 120.0 || first["mean"] != 100.0 {
+		t.Fatalf("first group = %#v", first)
+	}
+}
+
+func TestBenchmarkRunExportCSVIncludesHardwareLabel(t *testing.T) {
+	record := benchmarkRunRecord{
+		Path:      "run.json",
+		UpdatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		Payload: map[string]any{
+			"hfId":         "Qwen/Qwen3-8B",
+			"engineName":   "vllm",
+			"quantization": "fp16",
+			"tokSOut":      42.5,
+			"hardware":     map[string]any{"gpuName": "NVIDIA RTX 4090", "vramGb": 24.0},
+		},
+	}
+	fields := []string{"path", "model", "hardware", "tokSOut"}
+	rows := benchmarkRunExportRows([]benchmarkRunRecord{record}, fields)
+	text, err := benchmarkRunRowsCSV(fields, rows)
+	if err != nil {
+		t.Fatalf("benchmarkRunRowsCSV returned error: %v", err)
+	}
+	if !strings.Contains(text, "Qwen/Qwen3-8B") || !strings.Contains(text, "NVIDIA RTX 4090 24GB") || !strings.Contains(text, "42.5") {
+		t.Fatalf("csv = %q", text)
+	}
+}
+
+func TestCompareTwoBenchmarkRunsReportsPercent(t *testing.T) {
+	left := benchmarkRunRecord{Path: "base.json", UpdatedAt: time.Now(), Payload: map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "vllm", "quantization": "fp16", "tokSOut": 100.0, "ttftMs": 50.0}}
+	right := benchmarkRunRecord{Path: "candidate.json", UpdatedAt: time.Now(), Payload: map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "vllm", "quantization": "fp16", "tokSOut": 125.0, "ttftMs": 25.0}}
+	result := compareTwoBenchmarkRuns(left, right, cliArgs{opts: map[string]string{"metrics": "tokSOut,ttftMs"}, flags: map[string]bool{}})
+	comparisons := result["comparisons"].([]any)
+	if len(comparisons) != 2 {
+		t.Fatalf("comparisons len = %d, want 2", len(comparisons))
+	}
+	throughput := comparisons[0].(map[string]any)
+	latency := comparisons[1].(map[string]any)
+	if throughput["percent"] != 25.0 || throughput["better"] != true {
+		t.Fatalf("throughput comparison = %#v", throughput)
+	}
+	if latency["percent"] != 50.0 || latency["better"] != true {
+		t.Fatalf("latency comparison = %#v", latency)
+	}
+}
+
+func writeBenchmarkRunForTest(t *testing.T, path string, payload map[string]any) {
+	t.Helper()
+	if err := writeJSON(path, payload); err != nil {
+		t.Fatalf("write benchmark run: %v", err)
+	}
+}
+
+func TestBenchmarkRunDeleteRequiresConfirmation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "run.json")
+	if err := writeJSON(path, map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "vllm", "tokSOut": 42.0}); err != nil {
+		t.Fatalf("write run: %v", err)
+	}
+	if err := deleteBenchmarkRun(path, cliArgs{opts: map[string]string{}, flags: map[string]bool{}}); err == nil {
+		t.Fatal("deleteBenchmarkRun succeeded without confirmation")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("run file was removed without confirmation: %v", err)
+	}
+}
+
+func TestBenchmarkRunDeleteRemovesFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "run.json")
+	if err := writeJSON(path, map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "vllm", "tokSOut": 42.0}); err != nil {
+		t.Fatalf("write run: %v", err)
+	}
+	if err := deleteBenchmarkRun(path, cliArgs{opts: map[string]string{}, flags: map[string]bool{"yes": true}}); err != nil {
+		t.Fatalf("deleteBenchmarkRun returned error: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("run file still exists after delete: %v", err)
+	}
 }
 
 func TestBenchmarkRunRerunUsesSavedCommand(t *testing.T) {
@@ -450,6 +709,47 @@ func TestBenchmarkRunRerunUsesSavedCommand(t *testing.T) {
 	}
 }
 
+func TestBenchmarkRunRerunHonorsRunsDir(t *testing.T) {
+	tmp := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir temp: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(wd); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	}()
+
+	saved := filepath.Join(tmp, "saved.json")
+	customRuns := filepath.Join(tmp, "custom-runs")
+	if err := writeJSON(saved, map[string]any{
+		"hfId":          "Qwen/Qwen3-8B",
+		"engineName":    "llama.cpp",
+		"benchmarkMode": "local",
+		"quantization":  "Q4_K_M",
+		"engineFlags":   map[string]any{"commandSnippet": "llama-bench -m model.gguf"},
+	}); err != nil {
+		t.Fatalf("write saved run: %v", err)
+	}
+	if err := rerunBenchmarkRun(saved, cliArgs{opts: map[string]string{"runs-dir": customRuns}, flags: map[string]bool{"dry-run": true, "quiet": true}}); err != nil {
+		t.Fatalf("rerunBenchmarkRun returned error: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(customRuns, "Qwen-Qwen3-8B"))
+	if err != nil {
+		t.Fatalf("read custom run dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("custom run files = %d, want 1", len(entries))
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "runs")); !os.IsNotExist(err) {
+		t.Fatalf("default runs dir exists after --runs-dir rerun: %v", err)
+	}
+}
+
 func TestKVCacheDryRunBuildsLlamaCommandsPerLevel(t *testing.T) {
 	payload, err := kvCachePayloadFromFlags("llama.cpp", cliArgs{
 		opts: map[string]string{
@@ -460,8 +760,13 @@ func TestKVCacheDryRunBuildsLlamaCommandsPerLevel(t *testing.T) {
 			"levels":        "10000,20000",
 			"prompt-tokens": "512",
 			"output-tokens": "64",
+			"batch-size":    "256",
+			"ubatch-size":   "64",
+			"repetitions":   "3",
+			"cache-type-k":  "q8_0",
+			"cache-type-v":  "f16",
 		},
-		flags: map[string]bool{"dry-run": true, "quiet": true},
+		flags: map[string]bool{"dry-run": true, "quiet": true, "flash-attn": true},
 	})
 	if err != nil {
 		t.Fatalf("kvCachePayloadFromFlags returned error: %v", err)
@@ -472,7 +777,7 @@ func TestKVCacheDryRunBuildsLlamaCommandsPerLevel(t *testing.T) {
 	}
 	first := points[0].(map[string]any)
 	command := first["commandSnippet"].(string)
-	for _, want := range []string{"llama-bench", "-p 512", "-n 64", "-d 10000", "-o json"} {
+	for _, want := range []string{"llama-bench", "-p 512", "-n 64", "-d 10000", "-o json", "-b 256", "-ub 64", "-r 3", "-fa 1", "-ctk q8_0", "-ctv f16"} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("command = %q, missing %q", command, want)
 		}
@@ -480,6 +785,53 @@ func TestKVCacheDryRunBuildsLlamaCommandsPerLevel(t *testing.T) {
 	second := points[1].(map[string]any)
 	if !strings.Contains(second["commandSnippet"].(string), "-d 20000") {
 		t.Fatalf("second command = %q, want -d 20000", second["commandSnippet"])
+	}
+}
+
+func TestHandleKVCacheHonorsOutAndRunsDir(t *testing.T) {
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "sweep.json")
+	runsDir := filepath.Join(tmp, "runs-out")
+	args := cliArgs{
+		opts: map[string]string{
+			"mode":          "local",
+			"hf-id":         "Qwen/Qwen3-8B",
+			"quantization":  "Q4_K_M",
+			"model-path":    "/models/qwen.gguf",
+			"levels":        "512,1024",
+			"prompt-tokens": "128",
+			"output-tokens": "32",
+			"out":           out,
+			"runs-dir":      runsDir,
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	}
+	if err := handleKVCache("run", "llama.cpp", args); err != nil {
+		t.Fatalf("handleKVCache returned error: %v", err)
+	}
+	aggregate, err := readJSON(out)
+	if err != nil {
+		t.Fatalf("read aggregate: %v", err)
+	}
+	obj := aggregate.(map[string]any)
+	if len(obj["points"].([]any)) != 2 || len(obj["savedRuns"].([]any)) != 2 {
+		t.Fatalf("aggregate = %#v", obj)
+	}
+	entries, err := os.ReadDir(filepath.Join(runsDir, "Qwen-Qwen3-8B"))
+	if err != nil {
+		t.Fatalf("read custom kvcache run dir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("custom kvcache run files = %d, want 2", len(entries))
+	}
+	value, err := readJSON(filepath.Join(runsDir, "Qwen-Qwen3-8B", entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read saved kvcache run: %v", err)
+	}
+	payload := value.(map[string]any)["payload"].(map[string]any)
+	engineFlags := payload["engineFlags"].(map[string]any)
+	if !strings.Contains(stringValue(engineFlags["commandSnippet"]), "llama-bench") {
+		t.Fatalf("engineFlags = %#v", engineFlags)
 	}
 }
 
@@ -562,7 +914,7 @@ func TestRemoteKVCachePointMeasuresStreamingChatHistory(t *testing.T) {
 }
 
 func TestBenchmarkAgentFeedbackDistinguishesPlanFromReadyPayload(t *testing.T) {
-	plan := benchmarkAgentFeedback(map[string]any{"engineName": "llama.cpp", "benchmarkMode": "local", "dryRun": true}, "plan.json", true, false)
+	plan := benchmarkAgentFeedback(map[string]any{"engineName": "llama.cpp", "benchmarkMode": "local", "dryRun": true}, "plan.json", cliArgs{opts: map[string]string{}, flags: map[string]bool{}}, true, false)
 	if plan["status"] != "plan_needs_metrics" {
 		t.Fatalf("plan status = %v, want plan_needs_metrics", plan["status"])
 	}
@@ -573,11 +925,21 @@ func TestBenchmarkAgentFeedbackDistinguishesPlanFromReadyPayload(t *testing.T) {
 		t.Fatalf("plan nextCommand is empty")
 	}
 
-	ready := benchmarkAgentFeedback(map[string]any{"engineName": "llama.cpp", "benchmarkMode": "local", "tokSOut": 120.0}, "ready.json", false, false)
+	ready := benchmarkAgentFeedback(map[string]any{"engineName": "llama.cpp", "benchmarkMode": "local", "tokSOut": 120.0}, "ready.json", cliArgs{opts: map[string]string{"api-key": "bhk_test"}, flags: map[string]bool{}}, false, false)
 	if ready["status"] != "ready_for_api_validation" {
 		t.Fatalf("ready status = %v, want ready_for_api_validation", ready["status"])
 	}
 	if ready["canApiValidate"] != true || ready["submitCommand"] != "lmx benchmark submit ready.json" {
 		t.Fatalf("ready feedback = %#v", ready)
+	}
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LMX_API_KEY", "")
+	unauthenticated := benchmarkAgentFeedback(map[string]any{"engineName": "llama.cpp", "benchmarkMode": "local", "tokSOut": 120.0}, "ready.json", cliArgs{opts: map[string]string{}, flags: map[string]bool{}}, false, false)
+	if unauthenticated["authRequired"] != true || unauthenticated["nextCommand"] != "lmx auth --key bhk_..." {
+		t.Fatalf("unauthenticated feedback = %#v", unauthenticated)
+	}
+	if unauthenticated["validationCommand"] != "lmx benchmark dry-run ready.json" {
+		t.Fatalf("validationCommand = %v", unauthenticated["validationCommand"])
 	}
 }

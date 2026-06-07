@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -72,6 +73,7 @@ func run(argv []string) error {
 	if err := applyProfile(&args); err != nil {
 		return err
 	}
+	normalizeEndpointArgs(&args)
 	cmd := positional(args, 0)
 	if cmd == "" || hasFlag(args, "help") || !knownTopLevel(cmd) {
 		usage()
@@ -96,6 +98,8 @@ func run(argv []string) error {
 		return handleEngines(args)
 	case "server":
 		return handleServer(positional(args, 1), positional(args, 2), args)
+	case "endpoint":
+		return handleEndpoint(positional(args, 1), args)
 	case "kvcache", "kv-cache", "context-sweep":
 		return handleKVCache(positional(args, 1), positional(args, 2), args)
 	case "benchmark", "bench":
@@ -124,7 +128,7 @@ func run(argv []string) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "benchmark", "bench", "auth", "hardware", "context", "agent-context", "model", "profile", "engines", "engine", "server", "kvcache", "kv-cache", "context-sweep":
+	case "eval", "benchmark", "bench", "auth", "hardware", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep":
 		return true
 	default:
 		return false
@@ -178,6 +182,20 @@ func apiURL(args cliArgs) string {
 		value = defaultAPIURL
 	}
 	return strings.TrimRight(value, "/")
+}
+
+func openAIBaseURL(raw string) string {
+	value := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if strings.HasSuffix(value, "/v1") {
+		return strings.TrimSuffix(value, "/v1")
+	}
+	return value
+}
+
+func normalizeEndpointArgs(args *cliArgs) {
+	if value := opt(*args, "base-url"); value != "" {
+		args.opts["base-url"] = openAIBaseURL(value)
+	}
 }
 
 func configFile() string {
@@ -403,12 +421,12 @@ func handleProfile(action, name string, args cliArgs) error {
 			return errors.New("profile save requires a profile name")
 		}
 		profileOpts := map[string]any{}
-		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len", "output-len", "num-prompts", "tensor-parallel", "context-length", "gpu-layers", "extra-server-args", "extra-bench-args"} {
+		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len", "output-len", "num-prompts", "tensor-parallel", "context-length", "gpu-layers", "depth", "context-depth", "batch-size", "micro-batch-size", "ubatch-size", "repetitions", "runs", "benchmark-format", "bench-format", "output-format", "cache-type-k", "cache-type-v", "extra-server-args", "extra-bench-args"} {
 			if value := opt(args, key); value != "" {
 				profileOpts[key] = value
 			}
 		}
-		for _, key := range []string{"no-stream"} {
+		for _, key := range []string{"no-stream", "flash-attn", "no-flash-attn"} {
 			if hasFlag(args, key) {
 				profileOpts[key] = true
 			}
@@ -484,7 +502,12 @@ func handleHardware(action string, args cliArgs) error {
 		if err := writeJSON(out, hardware); err != nil {
 			return err
 		}
-		printInfo("hardware_written", map[string]any{"path": out, "hwClass": hardware["hwClass"], "gpuName": hardware["gpuName"], "vramGb": hardware["vramGb"]})
+		fields := map[string]any{"path": out, "hwClass": hardware["hwClass"], "gpuName": hardware["gpuName"], "vramGb": hardware["vramGb"]}
+		if gpuCount := numberField(hardware, "gpuCount"); gpuCount > 1 {
+			fields["gpuCount"] = gpuCount
+			fields["note"] = "Multiple GPUs detected; verify the benchmark runtime used the intended GPU count before submitting."
+		}
+		printInfo("hardware_written", fields)
 		fmt.Println("Use it with:")
 		fmt.Println("  lmx benchmark run <engine> --hardware " + out)
 		return nil
@@ -519,6 +542,52 @@ func handleServer(action, target string, args cliArgs) error {
 	}
 	printInfo("server_command_start", map[string]any{"engine": engineName, "command": commandSnippet})
 	return runLongCommand(commandSnippet)
+}
+
+func handleEndpoint(action string, args cliArgs) error {
+	if action == "" {
+		action = "discover"
+	}
+	if action != "discover" && action != "scan" {
+		return errors.New("Unknown endpoint command. Use discover.")
+	}
+	candidates := endpointDiscoveryCandidates(args)
+	results := []any{}
+	for _, baseURL := range candidates {
+		model, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), firstNonEmpty(opt(args, "served-model"), opt(args, "model-name")))
+		result := map[string]any{"baseUrl": baseURL, "ok": err == nil}
+		if err != nil {
+			result["error"] = err.Error()
+			results = append(results, result)
+			continue
+		}
+		result["servedModel"] = model
+		if quant := quantizationFromModelInfo(info); quant != "" {
+			result["quantization"] = quant
+		}
+		if hfID := firstNonEmpty(opt(args, "hf-id"), opt(args, "model")); hfID != "" {
+			cmd := []string{"lmx", "benchmark", "run", firstNonEmpty(opt(args, "engine"), "llama.cpp"), "--mode", "remote"}
+			appendShellArg(&cmd, "--base-url", baseURL)
+			appendShellArg(&cmd, "--served-model", model)
+			appendShellArg(&cmd, "--hf-id", hfID)
+			if quant := firstNonEmpty(opt(args, "quantization"), stringValue(result["quantization"])); quant != "" {
+				appendShellArg(&cmd, "--quantization", quant)
+			}
+			if hardware := opt(args, "hardware"); hardware != "" {
+				appendShellArg(&cmd, "--hardware", hardware)
+			}
+			result["benchmarkCommand"] = strings.Join(cmd, " ")
+		}
+		results = append(results, result)
+	}
+	return writeOrPrintJSON("endpoint_discovery", args, map[string]any{"endpoints": results})
+}
+
+func endpointDiscoveryCandidates(args cliArgs) []string {
+	if baseURL := opt(args, "base-url"); baseURL != "" {
+		return []string{openAIBaseURL(baseURL)}
+	}
+	return []string{"http://localhost:8080", "http://localhost:8000", "http://localhost:11434", "http://127.0.0.1:30000"}
 }
 
 func detectInferenceEngines(args cliArgs) []detectedEngine {
@@ -636,9 +705,6 @@ func resolveEngineName(target string, args cliArgs, requireBenchmark bool) (stri
 }
 
 func localServerCommand(engineName string, args cliArgs) string {
-	if command := opt(args, "command"); command != "" {
-		return command
-	}
 	model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
 	host := firstNonEmpty(opt(args, "host"), "0.0.0.0")
 	port := firstNonEmpty(opt(args, "port"), "8000")
@@ -704,9 +770,10 @@ func runLongCommand(commandSnippet string) error {
 }
 
 func detectHardware() map[string]any {
-	base := map[string]any{"hwClass": "CPU_ONLY", "cpuName": runtime.GOARCH, "systemOs": runtime.GOOS, "systemArch": runtime.GOARCH, "cpuThreads": runtime.NumCPU()}
+	base := map[string]any{"hwClass": "CPU_ONLY", "cpu": runtime.GOARCH, "os": runtime.GOOS, "cpuThreads": runtime.NumCPU()}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-		base["hwClass"] = "APPLE_SILICON"
+		base["hwClass"] = "UNIFIED"
+		base["chipVendor"] = "Apple"
 	}
 	if out, err := exec.Command("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits").Output(); err == nil {
 		applyNvidiaSMIHardware(base, string(out))
@@ -1060,7 +1127,7 @@ func handleBenchmark(action, target string, args cliArgs) error {
 	if action == "runs" || action == "run-file" || action == "run-files" {
 		return handleBenchmarkRuns(target, positional(args, 3), args)
 	}
-	if action == "list" || action == "show" || action == "edit" || action == "rerun" {
+	if action == "list" || action == "show" || action == "edit" || action == "rerun" || action == "delete" || action == "rm" || action == "remove" {
 		return handleBenchmarkRuns(action, target, args)
 	}
 	if action == "kvcache" || action == "kv-cache" || action == "context-sweep" {
@@ -1071,8 +1138,8 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		if err != nil {
 			return err
 		}
-		out := firstNonEmpty(opt(args, "out"), benchmarkRunPath(payload))
-		feedback := benchmarkAgentFeedback(payload, out, hasFlag(args, "dry-run"), hasFlag(args, "submit"))
+		out := firstNonEmpty(opt(args, "out"), benchmarkRunPathInDir(payload, firstNonEmpty(opt(args, "runs-dir"), "runs")))
+		feedback := benchmarkAgentFeedback(payload, out, args, hasFlag(args, "dry-run"), hasFlag(args, "submit"))
 		payload["agentFeedback"] = feedback
 		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 			return err
@@ -1080,8 +1147,8 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		if err := writeJSON(out, payload); err != nil {
 			return err
 		}
-		printInfo("benchmark_payload_written", map[string]any{"path": out, "engine": payload["engineName"]})
-		printStatus(args, "benchmark_payload_written", feedback)
+		printInfo("benchmark_payload_file_written", map[string]any{"path": out, "engine": payload["engineName"]})
+		printStatus(args, "benchmark_payload_status", feedback)
 		if hasFlag(args, "dry-run") && !hasFlag(args, "submit") {
 			fmt.Println(stringValue(feedback["message"]))
 			return nil
@@ -1091,13 +1158,14 @@ func handleBenchmark(action, target string, args cliArgs) error {
 			if hasFlag(args, "dry-run") {
 				endpoint = "/api/benchmarks/dry-run"
 			}
-			return submitPayload(endpoint, hasFlag(args, "dry-run"), "benchmark", args, payload)
+			apiPayload := toBenchmarkSubmit(payload)
+			return submitPayload(endpoint, hasFlag(args, "dry-run"), "benchmark", args, apiPayload)
 		}
-		printNextSteps("benchmark", out)
+		printBenchmarkNextSteps(feedback, out)
 		return nil
 	}
 	if action != "submit" && action != "dry-run" {
-		return errors.New("Unknown benchmark command. Use run, runs, list, show, edit, rerun, submit, or dry-run.")
+		return errors.New("Unknown benchmark command. Use run, runs, list, show, edit, rerun, submit, dry-run, delete, stats, export, or compare.")
 	}
 	if target == "" {
 		return fmt.Errorf("benchmark %s requires a benchmark JSON path", action)
@@ -1115,7 +1183,8 @@ func handleBenchmark(action, target string, args cliArgs) error {
 	if action == "dry-run" {
 		endpoint = "/api/benchmarks/dry-run"
 	}
-	return submitPayload(endpoint, action == "dry-run", "benchmark", args, value)
+	apiPayload := toBenchmarkSubmit(asObject(value))
+	return submitPayload(endpoint, action == "dry-run", "benchmark", args, apiPayload)
 }
 
 func handleBenchmarkRuns(action, target string, args cliArgs) error {
@@ -1157,8 +1226,20 @@ func handleBenchmarkRuns(action, target string, args cliArgs) error {
 			return err
 		}
 		return handleBenchmark(action, path, args)
+	case "delete", "rm", "remove":
+		path, err := resolveBenchmarkRunPath(target, args)
+		if err != nil {
+			return err
+		}
+		return deleteBenchmarkRun(path, args)
+	case "stats", "stat", "summary", "summarize":
+		return statsBenchmarkRuns(target, args)
+	case "export", "extract":
+		return exportBenchmarkRuns(target, args)
+	case "compare", "diff":
+		return compareBenchmarkRuns(target, positional(args, 4), args)
 	default:
-		return errors.New("Unknown benchmark runs command. Use list, show, edit, rerun, submit, or dry-run.")
+		return errors.New("Unknown benchmark runs command. Use list, show, edit, rerun, submit, dry-run, delete, stats, export, or compare.")
 	}
 }
 
@@ -1181,6 +1262,475 @@ func listBenchmarkRuns(args cliArgs) error {
 	}
 	printJSON(map[string]any{"runsDir": root, "count": len(runs), "runs": runs})
 	return nil
+}
+
+type benchmarkRunRecord struct {
+	Path      string
+	UpdatedAt time.Time
+	Payload   map[string]any
+}
+
+func statsBenchmarkRuns(target string, args cliArgs) error {
+	records, err := benchmarkRunRecords(target, args)
+	if err != nil {
+		return err
+	}
+	result := benchmarkRunStatsResult(records, args)
+	return writeOrPrintJSON("benchmark_run_stats", args, result)
+}
+
+func exportBenchmarkRuns(target string, args cliArgs) error {
+	records, err := benchmarkRunRecords(target, args)
+	if err != nil {
+		return err
+	}
+	fields := parseCSVList(firstNonEmpty(opt(args, "fields"), "path,updatedAt,kind,hfId,modelRevision,engineName,benchmarkMode,quantization,hardware,tokSOut,tokSPrefill,tokSTotal,ttftMs,peakVramGb,promptTokens,outputTokens,contextLength,contextTokens,batchSize,metricSource,timingSource,notes"))
+	rows := benchmarkRunExportRows(records, fields)
+	format := strings.ToLower(firstNonEmpty(opt(args, "format"), "json"))
+	if format == "csv" {
+		text, err := benchmarkRunRowsCSV(fields, rows)
+		if err != nil {
+			return err
+		}
+		if out := opt(args, "out"); out != "" {
+			if err := os.WriteFile(out, []byte(text), 0o644); err != nil {
+				return err
+			}
+			printInfo("benchmark_run_export_written", map[string]any{"path": out, "format": "csv", "rows": len(rows)})
+			return nil
+		}
+		fmt.Print(text)
+		return nil
+	}
+	if format != "json" {
+		return cliError{"invalid_option", "--format must be json or csv", []string{"Use --format json or --format csv."}, nil}
+	}
+	return writeOrPrintJSON("benchmark_run_export", args, map[string]any{"count": len(rows), "fields": fields, "runs": rows})
+}
+
+func compareBenchmarkRuns(target, other string, args cliArgs) error {
+	if target != "" && other != "" {
+		left, err := benchmarkRunRecordFromPath(target)
+		if err != nil {
+			return err
+		}
+		right, err := benchmarkRunRecordFromPath(other)
+		if err != nil {
+			return err
+		}
+		result := compareTwoBenchmarkRuns(left, right, args)
+		return writeOrPrintJSON("benchmark_run_compare", args, result)
+	}
+	records, err := benchmarkRunRecords(target, args)
+	if err != nil {
+		return err
+	}
+	result := compareBenchmarkRunGroups(records, args)
+	return writeOrPrintJSON("benchmark_run_compare", args, result)
+}
+
+func benchmarkRunRecords(target string, args cliArgs) ([]benchmarkRunRecord, error) {
+	paths, strict, err := benchmarkRunRecordPaths(target, firstNonEmpty(opt(args, "runs-dir"), "runs"))
+	if err != nil {
+		return nil, err
+	}
+	records := []benchmarkRunRecord{}
+	for _, path := range paths {
+		record, err := benchmarkRunRecordFromPath(path)
+		if err != nil {
+			if strict {
+				return nil, err
+			}
+			continue
+		}
+		if !benchmarkRunRecordMatches(record, args) {
+			continue
+		}
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].UpdatedAt.After(records[j].UpdatedAt) })
+	return records, nil
+}
+
+func benchmarkRunRecordPaths(target, runsDir string) ([]string, bool, error) {
+	root := firstNonEmpty(target, runsDir)
+	info, err := os.Stat(root)
+	if err != nil {
+		if os.IsNotExist(err) && target == "" {
+			return []string{}, false, nil
+		}
+		return nil, target != "", err
+	}
+	if !info.IsDir() {
+		return []string{root}, true, nil
+	}
+	paths := []string{}
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || strings.ToLower(filepath.Ext(path)) != ".json" {
+			return nil
+		}
+		paths = append(paths, path)
+		return nil
+	}); err != nil {
+		return nil, false, err
+	}
+	return paths, false, nil
+}
+
+func benchmarkRunRecordFromPath(path string) (benchmarkRunRecord, error) {
+	value, err := readJSON(path)
+	if err != nil {
+		return benchmarkRunRecord{}, err
+	}
+	payload := benchmarkPayloadObject(value)
+	if payload == nil {
+		return benchmarkRunRecord{}, cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return benchmarkRunRecord{}, err
+	}
+	return benchmarkRunRecord{Path: path, UpdatedAt: info.ModTime(), Payload: payload}, nil
+}
+
+func benchmarkRunRecordMatches(record benchmarkRunRecord, args cliArgs) bool {
+	payload := record.Payload
+	if model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model")); model != "" && !strings.EqualFold(stringValue(payload["hfId"]), model) {
+		return false
+	}
+	if engine := opt(args, "engine"); engine != "" && !strings.EqualFold(stringValue(payload["engineName"]), normalizeEngineName(engine)) {
+		return false
+	}
+	if mode := opt(args, "mode"); mode != "" && !strings.EqualFold(stringValue(payload["benchmarkMode"]), mode) {
+		return false
+	}
+	if quantization := opt(args, "quantization"); quantization != "" && !strings.EqualFold(stringValue(payload["quantization"]), quantization) {
+		return false
+	}
+	if kind := opt(args, "kind"); kind != "" && !strings.EqualFold(stringValue(payload["kind"]), kind) {
+		return false
+	}
+	if hardware := opt(args, "hardware-name"); hardware != "" && !strings.Contains(strings.ToLower(hardwareLabel(asObject(payload["hardware"]))), strings.ToLower(hardware)) {
+		return false
+	}
+	return true
+}
+
+func benchmarkRunStatsResult(records []benchmarkRunRecord, args cliArgs) map[string]any {
+	metric := firstNonEmpty(opt(args, "metric"), "tokSOut")
+	groupBy := firstNonEmpty(opt(args, "group-by"), opt(args, "by"), "all")
+	groups := map[string][]benchmarkRunRecord{}
+	for _, record := range records {
+		key := benchmarkRunGroupKey(record, groupBy)
+		groups[key] = append(groups[key], record)
+	}
+	stats := []any{}
+	for key, group := range groups {
+		stats = append(stats, benchmarkRunGroupStats(key, group, metric))
+	}
+	sort.Slice(stats, func(i, j int) bool {
+		left := stats[i].(map[string]any)
+		right := stats[j].(map[string]any)
+		leftBest := numberField(left, "best")
+		rightBest := numberField(right, "best")
+		if lowerIsBetterMetric(metric) {
+			return leftBest < rightBest
+		}
+		return leftBest > rightBest
+	})
+	return map[string]any{"count": len(records), "metric": metric, "groupBy": groupBy, "groups": stats}
+}
+
+func benchmarkRunGroupStats(key string, records []benchmarkRunRecord, metric string) map[string]any {
+	values := []float64{}
+	var best benchmarkRunRecord
+	bestSet := false
+	for _, record := range records {
+		value := numberField(record.Payload, metric)
+		if value <= 0 {
+			continue
+		}
+		values = append(values, value)
+		if !bestSet || metricBetter(value, numberField(best.Payload, metric), metric) {
+			best = record
+			bestSet = true
+		}
+	}
+	sort.Float64s(values)
+	result := map[string]any{"key": key, "runs": len(records), "metricRuns": len(values)}
+	if len(values) == 0 {
+		return result
+	}
+	sum := 0.0
+	for _, value := range values {
+		sum += value
+	}
+	median := values[len(values)/2]
+	if len(values)%2 == 0 {
+		median = (values[len(values)/2-1] + values[len(values)/2]) / 2
+	}
+	result["min"] = roundMetric(values[0])
+	result["p50"] = roundMetric(median)
+	result["mean"] = roundMetric(sum / float64(len(values)))
+	result["max"] = roundMetric(values[len(values)-1])
+	if bestSet {
+		bestValue := numberField(best.Payload, metric)
+		result["best"] = roundMetric(bestValue)
+		result["bestRun"] = benchmarkRunIdentity(best)
+	}
+	return result
+}
+
+func compareBenchmarkRunGroups(records []benchmarkRunRecord, args cliArgs) map[string]any {
+	if args.opts == nil {
+		args.opts = map[string]string{}
+	}
+	if _, ok := args.opts["by"]; !ok {
+		if _, ok := args.opts["group-by"]; !ok {
+			args.opts["by"] = "quantization"
+		}
+	}
+	stats := benchmarkRunStatsResult(records, args)
+	groups := anySlice(stats["groups"])
+	if len(groups) == 0 {
+		stats["comparisons"] = []any{}
+		return stats
+	}
+	baseline := asObject(groups[0])
+	if baselineName := opt(args, "baseline"); baselineName != "" {
+		for _, item := range groups {
+			group := asObject(item)
+			if strings.EqualFold(stringValue(group["key"]), baselineName) {
+				baseline = group
+				break
+			}
+		}
+	}
+	metric := stringValue(stats["metric"])
+	baseValue := numberField(baseline, "best")
+	comparisons := []any{}
+	for _, item := range groups {
+		group := asObject(item)
+		value := numberField(group, "best")
+		comparisons = append(comparisons, metricComparison(stringValue(group["key"]), value, stringValue(baseline["key"]), baseValue, metric))
+	}
+	stats["baseline"] = baseline["key"]
+	stats["comparisons"] = comparisons
+	return stats
+}
+
+func compareTwoBenchmarkRuns(left, right benchmarkRunRecord, args cliArgs) map[string]any {
+	metrics := parseCSVList(firstNonEmpty(opt(args, "metrics"), opt(args, "metric"), "tokSOut,tokSPrefill,tokSTotal,ttftMs,peakVramGb"))
+	comparisons := []any{}
+	for _, metric := range metrics {
+		leftValue := numberField(left.Payload, metric)
+		rightValue := numberField(right.Payload, metric)
+		if leftValue == 0 && rightValue == 0 {
+			continue
+		}
+		comparisons = append(comparisons, metricComparison(metric, rightValue, "baseline", leftValue, metric))
+	}
+	return map[string]any{"baseline": benchmarkRunIdentity(left), "candidate": benchmarkRunIdentity(right), "comparisons": comparisons}
+}
+
+func metricComparison(name string, value float64, baselineName string, baselineValue float64, metric string) map[string]any {
+	comparison := map[string]any{"name": name, "metric": metric, "value": roundMetric(value), "baseline": baselineName, "baselineValue": roundMetric(baselineValue)}
+	if baselineValue > 0 && value > 0 {
+		delta := value - baselineValue
+		if lowerIsBetterMetric(metric) {
+			delta = baselineValue - value
+		}
+		comparison["delta"] = roundMetric(delta)
+		comparison["ratio"] = roundMetric(value / baselineValue)
+		comparison["percent"] = roundMetric((delta / baselineValue) * 100)
+		comparison["better"] = metricBetter(value, baselineValue, metric)
+	}
+	return comparison
+}
+
+func benchmarkRunExportRows(records []benchmarkRunRecord, fields []string) []map[string]any {
+	rows := []map[string]any{}
+	for _, record := range records {
+		row := map[string]any{}
+		for _, field := range fields {
+			row[field] = benchmarkRunField(record, field)
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func benchmarkRunRowsCSV(fields []string, rows []map[string]any) (string, error) {
+	var buf bytes.Buffer
+	writer := csv.NewWriter(&buf)
+	if err := writer.Write(fields); err != nil {
+		return "", err
+	}
+	for _, row := range rows {
+		record := make([]string, len(fields))
+		for i, field := range fields {
+			record[i] = csvValue(row[field])
+		}
+		if err := writer.Write(record); err != nil {
+			return "", err
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func benchmarkRunField(record benchmarkRunRecord, field string) any {
+	field = strings.TrimSpace(field)
+	switch field {
+	case "path":
+		return record.Path
+	case "updatedAt":
+		return record.UpdatedAt.UTC().Format(time.RFC3339)
+	case "model":
+		return record.Payload["hfId"]
+	case "hardware":
+		return hardwareLabel(asObject(record.Payload["hardware"]))
+	default:
+		return dottedValue(record.Payload, field)
+	}
+}
+
+func benchmarkRunGroupKey(record benchmarkRunRecord, groupBy string) string {
+	groupBy = strings.TrimSpace(groupBy)
+	if groupBy == "" || groupBy == "all" || groupBy == "none" {
+		return "all"
+	}
+	if groupBy == "quant" {
+		groupBy = "quantization"
+	}
+	value := benchmarkRunField(record, groupBy)
+	text := csvValue(value)
+	if strings.TrimSpace(text) == "" {
+		return "unknown"
+	}
+	return text
+}
+
+func benchmarkRunIdentity(record benchmarkRunRecord) map[string]any {
+	return map[string]any{
+		"path":         record.Path,
+		"model":        record.Payload["hfId"],
+		"engine":       record.Payload["engineName"],
+		"mode":         record.Payload["benchmarkMode"],
+		"quantization": record.Payload["quantization"],
+		"hardware":     hardwareLabel(asObject(record.Payload["hardware"])),
+		"tokSOut":      record.Payload["tokSOut"],
+		"updatedAt":    record.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+func hardwareLabel(hw map[string]any) string {
+	if hw == nil {
+		return "unknown"
+	}
+	if gpus := anySlice(hw["gpus"]); len(gpus) > 0 {
+		parts := []string{}
+		for _, item := range gpus {
+			gpu := asObject(item)
+			name := firstNonEmpty(stringValue(gpu["name"]), stringValue(gpu["gpuName"]), "GPU")
+			if vram := numberField(gpu, "vramGb"); vram > 0 {
+				name += " " + strconv.FormatFloat(vram, 'f', -1, 64) + "GB"
+			}
+			parts = append(parts, name)
+		}
+		return strings.Join(parts, " + ")
+	}
+	if gpu := stringValue(hw["gpuName"]); gpu != "" {
+		if count := numberField(hw, "gpuCount"); count > 1 {
+			gpu = strconv.FormatFloat(count, 'f', -1, 64) + "x " + gpu
+		}
+		if vram := numberField(hw, "vramGb"); vram > 0 {
+			gpu += " " + strconv.FormatFloat(vram, 'f', -1, 64) + "GB"
+		}
+		return gpu
+	}
+	unified := strings.TrimSpace(strings.Join([]string{stringValue(hw["chipVendor"]), stringValue(hw["chipFamily"]), stringValue(hw["chipVariant"])}, " "))
+	if unified != "" {
+		if mem := numberField(hw, "unifiedMemoryGb"); mem > 0 {
+			unified += " " + strconv.FormatFloat(mem, 'f', -1, 64) + "GB"
+		}
+		return unified
+	}
+	return firstNonEmpty(stringValue(hw["cpu"]), stringValue(hw["hwClass"]), "unknown")
+}
+
+func dottedValue(obj map[string]any, path string) any {
+	if obj == nil || path == "" {
+		return nil
+	}
+	parts := strings.Split(path, ".")
+	var value any = obj
+	for _, part := range parts {
+		child := asObject(value)
+		if child == nil {
+			return nil
+		}
+		value = child[part]
+	}
+	return value
+}
+
+func parseCSVList(value string) []string {
+	items := []string{}
+	for _, item := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ';' }) {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func csvValue(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 64)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case bool:
+		return strconv.FormatBool(v)
+	default:
+		data, _ := json.Marshal(v)
+		return string(data)
+	}
+}
+
+func roundMetric(value float64) float64 {
+	return float64(int(value*100+0.5)) / 100
+}
+
+func lowerIsBetterMetric(metric string) bool {
+	metric = strings.ToLower(metric)
+	return strings.Contains(metric, "latency") || strings.Contains(metric, "ttft") || strings.Contains(metric, "ms")
+}
+
+func metricBetter(value, baseline float64, metric string) bool {
+	if baseline == 0 {
+		return value > 0
+	}
+	if lowerIsBetterMetric(metric) {
+		return value > 0 && value < baseline
+	}
+	return value > baseline
 }
 
 func benchmarkRunSummaries(root string) ([]any, error) {
@@ -1235,9 +1785,11 @@ func benchmarkRunSummaries(root string) ([]any, error) {
 			"tokSOut":       payload["tokSOut"],
 			"canSubmit":     numberField(payload, "tokSOut") > 0,
 			"updatedAt":     info.ModTime().UTC().Format(time.RFC3339),
+			"showCommand":   "lmx benchmark runs show " + shellQuote(path),
 			"submitCommand": "lmx benchmark runs submit " + shellQuote(path),
 			"rerunCommand":  "lmx benchmark runs rerun " + shellQuote(path),
 			"editCommand":   "lmx benchmark runs edit " + shellQuote(path) + " --set-json '{\"notes\":\"...\"}'",
+			"deleteCommand": "lmx benchmark runs delete " + shellQuote(path) + " --yes",
 		})
 	}
 	return runs, nil
@@ -1305,7 +1857,7 @@ func editBenchmarkRun(path string, args cliArgs) error {
 	if !changed {
 		return cliError{"missing_edit", "No edit was provided.", []string{"Use --set field=value, --set-json '{...}', --patch patch.json, or --unset field1,field2."}, nil}
 	}
-	payload["agentFeedback"] = benchmarkAgentFeedback(payload, path, hasFlag(args, "dry-run"), hasFlag(args, "submit"))
+	payload["agentFeedback"] = benchmarkAgentFeedback(payload, path, args, hasFlag(args, "dry-run"), hasFlag(args, "submit"))
 	if err := writeJSON(path, value); err != nil {
 		return err
 	}
@@ -1313,6 +1865,24 @@ func editBenchmarkRun(path string, args cliArgs) error {
 	if hasFlag(args, "print") || hasFlag(args, "json") {
 		printJSON(value)
 	}
+	return nil
+}
+
+func deleteBenchmarkRun(path string, args cliArgs) error {
+	if !hasFlag(args, "yes") && !hasFlag(args, "force") {
+		return cliError{"confirmation_required", "Deleting a saved benchmark run requires --yes.", []string{"Run lmx benchmark runs delete " + shellQuote(path) + " --yes to remove this file."}, nil}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return cliError{"invalid_run_path", "Saved benchmark run path must be a file, not a directory.", []string{"Use lmx benchmark runs list to choose a saved run JSON file."}, nil}
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	printInfo("benchmark_run_deleted", map[string]any{"path": path})
 	return nil
 }
 
@@ -1409,12 +1979,16 @@ func parseEditValue(value string) any {
 }
 
 func benchmarkRunPath(payload map[string]any) string {
+	return benchmarkRunPathInDir(payload, "runs")
+}
+
+func benchmarkRunPathInDir(payload map[string]any, runsDir string) string {
 	modelID := safePathSegment(stringValue(payload["hfId"]))
 	if modelID == "" {
 		modelID = "unknown-model"
 	}
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
-	return filepath.Join("runs", modelID, timestamp+".json")
+	return filepath.Join(runsDir, modelID, timestamp+".json")
 }
 
 func safePathSegment(value string) string {
@@ -1482,6 +2056,7 @@ func handleKVCache(action, target string, args cliArgs) error {
 	baseDir := filepath.Join(runsDir, modelID)
 
 	savedPaths := []string{}
+	points := []any{}
 	for _, level := range levels {
 		printStatus(args, "kvcache_point_start", map[string]any{"level": level, "mode": mode})
 		var point map[string]any
@@ -1495,22 +2070,22 @@ func handleKVCache(action, target string, args cliArgs) error {
 		}
 
 		runPayload := map[string]any{
-			"kind":            "kvcache_context_sweep",
-			"benchmarkMode":   mode,
-			"engineName":      engineName,
-			"hfId":            model,
-			"modelRevision":   firstNonEmpty(opt(args, "model-revision"), "main"),
-			"quantization":    quantization,
-			"contextTokens":   float64(level),
-			"outputTokens":    point["outputTokens"],
-			"promptTokens":    point["promptTokens"],
-			"tokSOut":         point["tokSOut"],
-			"tokSPrefill":     point["tokSPrefill"],
-			"tokSTotal":       point["tokSTotal"],
-			"ttftMs":          point["ttftMs"],
-			"peakVramGb":      point["peakVramGb"],
-			"metricSource":    point["metricSource"],
-			"timingSource":    point["timingSource"],
+			"kind":          "kvcache_context_sweep",
+			"benchmarkMode": mode,
+			"engineName":    engineName,
+			"hfId":          model,
+			"modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"),
+			"quantization":  quantization,
+			"contextTokens": float64(level),
+			"outputTokens":  point["outputTokens"],
+			"promptTokens":  point["promptTokens"],
+			"tokSOut":       point["tokSOut"],
+			"tokSPrefill":   point["tokSPrefill"],
+			"tokSTotal":     point["tokSTotal"],
+			"ttftMs":        point["ttftMs"],
+			"peakVramGb":    point["peakVramGb"],
+			"metricSource":  point["metricSource"],
+			"timingSource":  point["timingSource"],
 			"provenance": map[string]any{
 				"benchmarkMode": mode,
 				"cli":           "localmaxxing-go",
@@ -1523,10 +2098,14 @@ func handleKVCache(action, target string, args cliArgs) error {
 		if hardware != nil {
 			runPayload["hardware"] = hardware
 		}
+		if commandSnippet := stringValue(point["commandSnippet"]); commandSnippet != "" {
+			runPayload["engineFlags"] = map[string]any{"mode": mode, "commandSnippet": commandSnippet}
+		}
 
 		if hasFlag(args, "dry-run") {
 			runPayload["dryRun"] = true
 		}
+		points = append(points, point)
 
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
 		runPath := filepath.Join(baseDir, fmt.Sprintf("kvcache-%d-%s.json", level, timestamp))
@@ -1540,7 +2119,37 @@ func handleKVCache(action, target string, args cliArgs) error {
 		printStatus(args, "kvcache_point_complete", map[string]any{"level": level, "tokSOut": point["tokSOut"], "ttftMs": point["ttftMs"], "path": runPath})
 	}
 
+	aggregatePath := firstNonEmpty(opt(args, "out"), "localmaxxing-kvcache.json")
+	aggregate := map[string]any{
+		"kind":          "kvcache_context_sweep",
+		"mode":          mode,
+		"engineName":    engineName,
+		"hfId":          model,
+		"modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"),
+		"quantization":  quantization,
+		"levels":        levels,
+		"points":        points,
+		"savedRuns":     savedPaths,
+		"createdAt":     time.Now().UTC().Format(time.RFC3339),
+	}
+	if hardware != nil {
+		aggregate["hardware"] = hardware
+	}
+	if hasFlag(args, "dry-run") {
+		aggregate["dryRun"] = true
+	}
+	if err := os.MkdirAll(filepath.Dir(aggregatePath), 0o755); err != nil {
+		return err
+	}
+	if err := writeJSON(aggregatePath, aggregate); err != nil {
+		return err
+	}
+	printStatus(args, "kvcache_sweep_written", map[string]any{"path": aggregatePath, "points": len(points)})
+
 	if !hasFlag(args, "quiet") {
+		fmt.Println("KV-cache sweep written:")
+		fmt.Println("  " + aggregatePath)
+		fmt.Println()
 		fmt.Println("Saved runs:")
 		for _, p := range savedPaths {
 			fmt.Println("  " + p)
@@ -1708,13 +2317,14 @@ func localKVCacheCommand(engineName string, args cliArgs, inputTokens int) strin
 		if opt(args, "model-path") == "" {
 			return ""
 		}
-		cmd := []string{"llama-bench", "-m", shellQuote(opt(args, "model-path")), "-p", strconv.Itoa(kvPromptTokens(args)), "-n", outputTokens, "-d", input, "-o", "json"}
+		cmd := []string{"llama-bench", "-m", shellQuote(opt(args, "model-path")), "-p", strconv.Itoa(kvPromptTokens(args)), "-n", outputTokens, "-d", input, "-o", firstNonEmpty(opt(args, "benchmark-format"), opt(args, "bench-format"), opt(args, "output-format"), "json")}
 		if value := opt(args, "threads"); value != "" {
 			cmd = append(cmd, "-t", shellQuote(value))
 		}
 		if value := opt(args, "gpu-layers"); value != "" {
 			cmd = append(cmd, "-ngl", shellQuote(value))
 		}
+		appendLlamaBenchArgs(&cmd, args, false)
 		appendExtraArgs(&cmd, opt(args, "extra-bench-args"))
 		return strings.Join(cmd, " ")
 	case "vllm":
@@ -1807,7 +2417,7 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 	if err != nil {
 		return nil, err
 	}
-	baseURL = strings.TrimRight(baseURL, "/")
+	baseURL = openAIBaseURL(baseURL)
 	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), hfID)
 	maxTokens := kvOutputTokens(args)
 	if hasFlag(args, "dry-run") {
@@ -1921,6 +2531,10 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	if err != nil {
 		return nil, err
 	}
+	backend := opt(args, "backend")
+	if backend == "" {
+		backend = engineBackendDefault(engineName)
+	}
 	quantization := opt(args, "quantization")
 	if quantization == "" {
 		return nil, cliError{"missing_option", "--quantization is required", []string{"Pass --quantization <label>, e.g. fp16, Q4_K_M, or int8."}, nil}
@@ -1954,6 +2568,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 			return nil, err
 		}
 		commandOutput = string(data)
+		metrics["engineFlags"] = map[string]any{"mode": mode, "commandSnippet": "# Metrics imported from " + resultsPath, "resultsPath": resultsPath}
 		printStatus(args, "benchmark_results_read_complete", map[string]any{"path": resultsPath, "bytes": len(data)})
 	} else if commandSnippet := localBenchmarkCommand(engineName, args); commandSnippet != "" {
 		printStatus(args, "benchmark_local_command_start", map[string]any{"command": commandSnippet})
@@ -1968,7 +2583,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 				printStatus(args, "benchmark_results_read_complete", map[string]any{"path": outputPath, "bytes": len(data)})
 			}
 		}
-		metrics["engineFlags"] = map[string]string{"mode": "local", "commandSnippet": commandSnippet}
+		metrics["engineFlags"] = map[string]any{"mode": "local", "commandSnippet": commandSnippet}
 		printStatus(args, "benchmark_local_command_complete", map[string]any{"outputBytes": len(output)})
 	}
 	if commandOutput != "" {
@@ -1989,6 +2604,9 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	}
 
 	payload := map[string]any{"engineName": engineName, "hfId": model, "modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"), "hardware": hardware, "quantization": quantization, "detectedEngines": detectInferenceEngines(args)}
+	if backend != "" {
+		payload["backend"] = backend
+	}
 	payload["benchmarkMode"] = mode
 	for key, value := range metrics {
 		payload[key] = value
@@ -2002,13 +2620,14 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 			}
 		}
 	}
+	applyCommandTokenHints(payload)
 	if notes := opt(args, "notes"); notes != "" {
 		payload["notes"] = notes
 	}
 	applyComparableBenchmarkMetrics(payload, mode, engineName)
 	payload["provenance"] = benchmarkProvenance(payload, mode)
 	if hasFlag(args, "dry-run") && numberField(payload, "tokSOut") == 0 {
-		printStatus(args, "benchmark_plan_ready", map[string]any{"mode": mode, "engine": engineName, "next": "Run without --dry-run to measure, or pass explicit --tok-s-out metrics."})
+		printStatus(args, "benchmark_plan_ready", map[string]any{"mode": mode, "engine": engineName, "dryRunType": "measurement_plan", "next": "Run without --dry-run to measure, or pass explicit --tok-s-out metrics. API validation is lmx benchmark dry-run <payload.json>."})
 		return payload, nil
 	}
 	if tokSOut, ok := payload["tokSOut"].(float64); !ok || tokSOut <= 0 {
@@ -2022,8 +2641,177 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	return payload, nil
 }
 
-func benchmarkAgentFeedback(payload map[string]any, out string, dryRun, submit bool) map[string]any {
+// toBenchmarkSubmit strips internal-only fields and remaps hardware/engineFlags
+// to match the localmaxxing.com POST /api/benchmarks schema.
+func toBenchmarkSubmit(payload map[string]any) map[string]any {
+	out := map[string]any{}
+	if payload == nil {
+		return out
+	}
+
+	for _, key := range []string{
+		"hfId", "modelRevision", "engineName", "engineVersion",
+		"quantization", "backend", "promptTokens", "outputTokens",
+		"contextLength", "batchSize", "temperature", "topP",
+		"ttftMs", "tokSOut", "tokSPrefill", "tokSTotal",
+		"peakVramGb", "prefillTokens", "notes",
+	} {
+		if v, ok := payload[key]; ok && submitValuePresent(v) {
+			out[key] = v
+		}
+	}
+
+	if hw := asObject(payload["hardware"]); hw != nil {
+		out["hardware"] = remapHardware(hw)
+	}
+	if ef := asObject(payload["engineFlags"]); ef != nil {
+		out["engineFlags"] = remapEngineFlags(ef, payload)
+	}
+
+	return out
+}
+
+func remapHardware(hw map[string]any) map[string]any {
+	hwClass := "CPU_ONLY"
+	if firstNonEmpty(stringValue(hw["gpuName"]), stringValue(hw["gpus"])) != "" || len(anySlice(hw["gpus"])) > 0 {
+		hwClass = "DISCRETE_GPU"
+	} else if firstNonEmpty(stringValue(hw["chipVendor"]), stringValue(hw["chipFamily"])) != "" || stringValue(hw["hwClass"]) == "UNIFIED" || stringValue(hw["hwClass"]) == "APPLE_SILICON" {
+		hwClass = "UNIFIED"
+	}
+
+	remapped := map[string]any{"hwClass": hwClass}
+	if hwClass == "DISCRETE_GPU" {
+		remapped["gpuName"] = firstNonEmpty(stringValue(hw["gpuName"]), "Unknown GPU")
+		remapped["vramGb"] = numberField(hw, "vramGb")
+		if remapped["vramGb"] == 0 {
+			remapped["vramGb"] = numberField(hw, "gpuVramGb")
+		}
+		if c := numberField(hw, "gpuCount"); c > 0 {
+			remapped["gpuCount"] = c
+		}
+		if gpus := anySlice(hw["gpus"]); len(gpus) > 0 {
+			remapped["gpus"] = gpus
+			delete(remapped, "gpuName")
+			delete(remapped, "vramGb")
+		}
+	}
+	if hwClass == "UNIFIED" {
+		remapped["chipVendor"] = stringValue(hw["chipVendor"])
+		remapped["chipFamily"] = stringValue(hw["chipFamily"])
+		remapped["chipVariant"] = stringValue(hw["chipVariant"])
+		remapped["unifiedMemoryGb"] = numberField(hw, "unifiedMemoryGb")
+	}
+	if cpu := firstNonEmpty(stringValue(hw["cpu"]), stringValue(hw["cpuName"])); cpu != "" {
+		remapped["cpu"] = cpu
+	}
+	if ram := numberField(hw, "ramGb"); ram > 0 {
+		remapped["ramGb"] = ram
+	} else if ram = numberField(hw, "systemMemoryGb"); ram > 0 {
+		remapped["ramGb"] = ram
+	}
+	if osName := firstNonEmpty(stringValue(hw["os"]), stringValue(hw["systemOs"])); osName != "" {
+		remapped["os"] = osName
+	}
+	if power := numberField(hw, "powerWatts"); power > 0 {
+		remapped["powerWatts"] = power
+	}
+
+	return remapped
+}
+
+func remapEngineFlags(ef map[string]any, payload map[string]any) map[string]any {
+	remapped := map[string]any{}
+	cmd := stringValue(ef["commandSnippet"])
+	if cmd == "" {
+		mode := stringValue(ef["mode"])
+		engine := stringValue(payload["engineName"])
+		if mode == "remote" {
+			baseURL := stringValue(ef["baseUrl"])
+			servedModel := stringValue(ef["servedModel"])
+			cmd = fmt.Sprintf("# Remote endpoint: %s  servedModel: %s", baseURL, servedModel)
+			if engine == "llama.cpp" {
+				if mp := stringValue(payload["modelPath"]); mp != "" {
+					cmd = fmt.Sprintf("llama-server -m %s --host %s", shellQuote(mp), shellQuote(baseURL))
+				}
+			}
+		} else {
+			cmd = localBenchmarkCommand(engine, cliArgs{})
+		}
+	}
+	if cmd == "" {
+		cmd = "# No command snippet available"
+	}
+	remapped["commandSnippet"] = cmd
+
+	for _, key := range []string{
+		"gpuLayers", "cpuLayers", "flashAttn", "kvCacheDtype", "prefixCaching",
+		"contBatching", "chunkedPrefill", "tensorParallel", "pipelineParallel",
+		"concurrency", "numParallel", "maxRunningSeqs", "gpuMemUtil",
+		"specDecoding", "specModel", "specDraftModel", "specNgramSize",
+		"specNumTokens", "specDraftTp", "specMethod", "mtpEnabled", "mtpDraftLayers",
+		"temperature", "topP", "topK", "minP", "repeatPenalty", "mirostat",
+		"ropeScale", "ropeScaling", "yarnExtFactor", "schedulerDelayFactor",
+		"attentionBackend", "sglangQuant", "engineQuant", "splitMode",
+		"prefillChunkSize", "kvCacheSizeMb", "cpuOffloadGb", "extraFlags",
+	} {
+		if v, ok := ef[key]; ok && submitValuePresent(v) {
+			remapped[key] = v
+		}
+	}
+
+	return remapped
+}
+
+func engineBackendDefault(engine string) string {
+	switch engine {
+	case "llama.cpp", "vllm", "sglang", "tensorrt-llm", "exllamav2", "lmdeploy", "tgi":
+		return "cuda"
+	case "mlx":
+		return "metal"
+	default:
+		return ""
+	}
+}
+
+func submitValuePresent(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case string:
+		return v != ""
+	case bool:
+		return v
+	case int:
+		return v != 0
+	case int64:
+		return v != 0
+	case float64:
+		return v != 0
+	case float32:
+		return v != 0
+	default:
+		return true
+	}
+}
+
+func anySlice(value any) []any {
+	switch v := value.(type) {
+	case []any:
+		return v
+	case []map[string]any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = item
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dryRun, submit bool) map[string]any {
 	ready := numberField(payload, "tokSOut") > 0
+	missingAuth := ready && !submit && apiKey(args) == ""
 	status := "ready_for_api_validation"
 	message := "Benchmark payload is ready for API validation."
 	nextCommand := "lmx benchmark dry-run " + out
@@ -2033,11 +2821,15 @@ func benchmarkAgentFeedback(payload map[string]any, out string, dryRun, submit b
 		nextCommand = ""
 	} else if dryRun && !ready {
 		status = "plan_needs_metrics"
-		message = "Dry-run plan written. Run without --dry-run to measure, or add explicit metrics before API validation."
+		message = "Measurement plan written. benchmark run --dry-run does not contact the model endpoint or API; run without --dry-run to measure, or add explicit metrics before API validation."
 		nextCommand = "lmx benchmark run <engine> <same options without --dry-run>"
 	} else if dryRun {
 		status = "plan_ready_for_api_validation"
-		message = "Dry-run payload written with metrics. Validate it with lmx benchmark dry-run before submitting."
+		message = "Dry-run payload written with metrics. Validate it with lmx benchmark dry-run before submitting; benchmark run --dry-run is only a measurement-plan mode."
+	}
+	if missingAuth {
+		message += " API validation cannot run yet because no API key is configured."
+		nextCommand = "lmx auth --key bhk_..."
 	}
 	feedback := map[string]any{
 		"status":          status,
@@ -2053,23 +2845,80 @@ func benchmarkAgentFeedback(payload map[string]any, out string, dryRun, submit b
 	if ready && !submit {
 		feedback["submitCommand"] = "lmx benchmark submit " + out
 	}
+	if missingAuth {
+		feedback["authRequired"] = true
+		feedback["authCommand"] = "lmx auth --key bhk_..."
+		feedback["validationCommand"] = "lmx benchmark dry-run " + out
+	}
 	if engine := stringValue(payload["engineName"]); engine != "" {
 		feedback["engine"] = engine
 	}
 	if mode := stringValue(payload["benchmarkMode"]); mode != "" {
 		feedback["mode"] = mode
 	}
+	if cmd := detectedMetadataRerunCommand(payload, out); cmd != "" {
+		feedback["rerunWithDetectedMetadataCommand"] = cmd
+	}
 	return feedback
+}
+
+func detectedMetadataRerunCommand(payload map[string]any, out string) string {
+	if stringValue(payload["benchmarkMode"]) != "remote" {
+		return ""
+	}
+	hfID := stringValue(payload["hfId"])
+	quantization := stringValue(payload["quantization"])
+	changed := false
+	if modelResolution := asObject(payload["modelResolution"]); modelResolution != nil {
+		if detected := stringValue(modelResolution["sourceRepo"]); detected != "" && detected != hfID {
+			hfID = detected
+			changed = true
+		}
+	}
+	if quantizationResolution := asObject(payload["quantizationResolution"]); quantizationResolution != nil {
+		if trusted := stringValue(quantizationResolution["trusted"]); trusted != "" && !quantizationEqual(trusted, quantization) {
+			quantization = trusted
+			changed = true
+		}
+	}
+	if !changed {
+		return ""
+	}
+	engine := firstNonEmpty(stringValue(payload["engineName"]), "llama.cpp")
+	engineFlags := asObject(payload["engineFlags"])
+	cmd := []string{"lmx", "benchmark", "run", engine, "--mode", "remote"}
+	appendShellArg(&cmd, "--base-url", stringValue(engineFlags["baseUrl"]))
+	appendShellArg(&cmd, "--served-model", stringValue(engineFlags["servedModel"]))
+	appendShellArg(&cmd, "--hf-id", hfID)
+	appendShellArg(&cmd, "--quantization", quantization)
+	appendShellArg(&cmd, "--hardware", "hardware.json")
+	appendShellArg(&cmd, "--out", out)
+	return strings.Join(cmd, " ")
 }
 
 func applyBenchmarkPlanMetrics(metrics map[string]any, mode, engineName string, args cliArgs, model string) {
 	metrics["dryRun"] = true
 	if mode == "remote" {
-		metrics["engineFlags"] = map[string]string{"mode": "remote", "baseUrl": opt(args, "base-url"), "servedModel": firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), model)}
+		baseURL := opt(args, "base-url")
+		servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), model)
+		cmdSnippet := fmt.Sprintf("# Remote endpoint: %s  servedModel: %s", baseURL, servedModel)
+		if engineName == "llama.cpp" && opt(args, "model-path") != "" {
+			cmdSnippet = fmt.Sprintf("llama-server -m %s", shellQuote(opt(args, "model-path")))
+			if host := opt(args, "host"); host != "" {
+				cmdSnippet += fmt.Sprintf(" --host %s", shellQuote(host))
+			}
+			if port := opt(args, "port"); port != "" {
+				cmdSnippet += fmt.Sprintf(" --port %s", shellQuote(port))
+			}
+		}
+		if sb := opt(args, "server-bin"); sb != "" {
+			cmdSnippet = sb + " " + strings.TrimPrefix(cmdSnippet, "llama-server ")
+		}
+		metrics["engineFlags"] = map[string]any{"commandSnippet": cmdSnippet, "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel}
 		return
 	}
 	if commandSnippet := localBenchmarkCommand(engineName, args); commandSnippet != "" {
-		metrics["engineFlags"] = map[string]string{"mode": "local", "commandSnippet": commandSnippet}
+		metrics["engineFlags"] = map[string]any{"mode": "local", "commandSnippet": commandSnippet}
 	}
 }
 
@@ -2161,10 +3010,86 @@ func localBenchmarkCommand(engineName string, args cliArgs) string {
 	if value := opt(args, "gpu-layers"); value != "" {
 		cmd = append(cmd, "-ngl", shellQuote(value))
 	}
+	appendLlamaBenchArgs(&cmd, args, true)
 	if value := opt(args, "extra-bench-args"); value != "" {
 		cmd = append(cmd, value)
 	}
 	return strings.Join(cmd, " ")
+}
+
+func appendLlamaBenchArgs(cmd *[]string, args cliArgs, includeDepth bool) {
+	if includeDepth {
+		appendShellArg(cmd, "-d", firstNonEmpty(opt(args, "depth"), opt(args, "context-depth")))
+	}
+	appendShellArg(cmd, "-b", opt(args, "batch-size"))
+	appendShellArg(cmd, "-ub", firstNonEmpty(opt(args, "micro-batch-size"), opt(args, "ubatch-size")))
+	appendShellArg(cmd, "-r", firstNonEmpty(opt(args, "repetitions"), opt(args, "runs")))
+	appendShellArg(cmd, "-ctk", opt(args, "cache-type-k"))
+	appendShellArg(cmd, "-ctv", opt(args, "cache-type-v"))
+	if includeDepth {
+		appendShellArg(cmd, "-o", firstNonEmpty(opt(args, "benchmark-format"), opt(args, "bench-format"), opt(args, "output-format")))
+	}
+	if hasFlag(args, "flash-attn") {
+		*cmd = append(*cmd, "-fa", "1")
+	} else if hasFlag(args, "no-flash-attn") {
+		*cmd = append(*cmd, "-fa", "0")
+	} else if value := opt(args, "flash-attn"); value != "" {
+		*cmd = append(*cmd, "-fa", shellQuote(value))
+	}
+}
+
+func applyCommandTokenHints(payload map[string]any) {
+	engineFlags := asObject(payload["engineFlags"])
+	if engineFlags == nil {
+		return
+	}
+	command := stringValue(engineFlags["commandSnippet"])
+	if command == "" {
+		return
+	}
+	if numberField(payload, "promptTokens") == 0 {
+		if value := commandFlagNumber(command, "-p", "--prompt-tokens", "--prefill-tokens", "--input-len", "--random-input-len"); value > 0 {
+			payload["promptTokens"] = value
+		}
+	}
+	if numberField(payload, "outputTokens") == 0 {
+		if value := commandFlagNumber(command, "-n", "--output-tokens", "--output-len", "--random-output-len", "--max-tokens"); value > 0 {
+			payload["outputTokens"] = value
+		}
+	}
+	if numberField(payload, "contextLength") == 0 {
+		if value := commandFlagNumber(command, "-c", "-d", "--context-length", "--context-depth", "--max-model-len"); value > 0 {
+			payload["contextLength"] = value
+		}
+	}
+	if numberField(payload, "batchSize") == 0 {
+		if value := commandFlagNumber(command, "-b", "--batch-size"); value > 0 {
+			payload["batchSize"] = value
+		}
+	}
+}
+
+func commandFlagNumber(command string, flags ...string) float64 {
+	for _, flag := range flags {
+		patterns := []string{
+			regexp.QuoteMeta(flag) + `(?:=|\s+)([0-9]+(?:\.[0-9]+)?)`,
+		}
+		if len(flag) == 2 && strings.HasPrefix(flag, "-") && !strings.HasPrefix(flag, "--") {
+			patterns = append(patterns, regexp.QuoteMeta(flag)+`([0-9]+(?:\.[0-9]+)?)`)
+		}
+		for _, pattern := range patterns {
+			re := regexp.MustCompile(`(?:^|\s)` + pattern + `(?:\s|$)`)
+			match := re.FindStringSubmatch(command)
+			if len(match) < 2 {
+				continue
+			}
+			value, err := strconv.ParseFloat(match[1], 64)
+			if err == nil && value > 0 {
+				return value
+			}
+		}
+	}
+	return 0
 }
 
 func benchmarkKind(args cliArgs, fallback string) string {
@@ -2316,7 +3241,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	baseURL = strings.TrimRight(baseURL, "/")
+	baseURL = openAIBaseURL(baseURL)
 	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"))
 	servedModelSource := "explicit"
 	var servedModelInfo map[string]any
@@ -2448,7 +3373,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		"outputTokens": float64(outputTokens),
 		"tokSOut":      round1(float64(outputTokens) / (generationMs / 1000)),
 		"tokSTotal":    round1(float64(promptTokens+outputTokens) / (totalMs / 1000)),
-		"engineFlags":  map[string]string{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": strconv.FormatBool(stream), "maxTokens": strconv.Itoa(maxTokens), "timeoutSeconds": strconv.Itoa(int(timeout.Seconds()))},
+		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds())},
 		"tokenSources": map[string]any{"prompt": promptTokenResult.Source, "output": outputTokenResult.Source},
 		"timingSource": "client_observed_http",
 		"metricSource": "remote_endpoint",
@@ -2744,7 +3669,7 @@ func fetchEndpointJSON(rawURL, apiKey string) (any, error) {
 }
 
 func detectServedModel(baseURL, apiKey, preferred string) (string, map[string]any, error) {
-	req, err := http.NewRequest("GET", strings.TrimRight(baseURL, "/")+"/v1/models", nil)
+	req, err := http.NewRequest("GET", openAIBaseURL(baseURL)+"/v1/models", nil)
 	if err != nil {
 		return "", nil, err
 	}
@@ -3371,6 +4296,7 @@ func handleExecute(suiteSlug string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
+	baseURL = openAIBaseURL(baseURL)
 	key := apiKey(args)
 	if key == "" {
 		return missingAPIKey("--api-key or LMX_API_KEY is required for eval execute")
@@ -3502,6 +4428,26 @@ func printNextSteps(kind, out string) {
 	}
 	fmt.Println("  lmx " + kind + " dry-run " + out)
 	fmt.Println("  lmx " + kind + " submit " + out)
+}
+
+func printBenchmarkNextSteps(feedback map[string]any, out string) {
+	fmt.Println("Next:")
+	printedValidation := false
+	if next := stringValue(feedback["nextCommand"]); next != "" {
+		fmt.Println("  " + next)
+		printedValidation = next == "lmx benchmark dry-run "+out
+	}
+	if validation := stringValue(feedback["validationCommand"]); validation != "" {
+		fmt.Println("  " + validation)
+		printedValidation = true
+	} else if !printedValidation {
+		fmt.Println("  lmx benchmark dry-run " + out)
+	}
+	if submit := stringValue(feedback["submitCommand"]); submit != "" {
+		fmt.Println("  " + submit)
+	} else {
+		fmt.Println("  lmx benchmark submit " + out)
+	}
 }
 
 func receiptURL(value any) string {
@@ -3673,6 +4619,7 @@ Usage:
   lmx hardware --out hardware.json
   lmx hardware init --out hardware.json
   lmx engines
+  lmx endpoint discover --hf-id Qwen/Qwen3-8B --quantization fp16
   lmx server dry-run vllm --hf-id Qwen/Qwen3-8B --quantization fp16
   lmx server dry-run llama.cpp --model-path model.gguf
   lmx benchmark run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --dry-run
@@ -3680,9 +4627,15 @@ Usage:
   lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run
   lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --model-path model.gguf --dry-run
   lmx benchmark runs list
+  lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json
   lmx benchmark runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'
   lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run
   lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json --api-key bhk_...
+  lmx benchmark runs delete runs/Qwen-Qwen3-8B/run.json --yes
+  lmx benchmark runs stats --group-by quantization --metric tokSOut
+  lmx benchmark runs compare --by hardware --model Qwen/Qwen3-8B
+  lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs
+  lmx benchmark runs export --format csv --out runs.csv
   lmx kvcache run llama.cpp --hf-id Qwen/Qwen3-8B --model-path model.gguf --levels 10000,20000,30000,40000
   lmx kvcache run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --levels 10000,20000,30000,40000
   lmx benchmark submit benchmark.json --api-key bhk_...
@@ -3708,7 +4661,7 @@ Options:
   --model-args <args>      lm-eval --model_args value
   --num-fewshot <n>        lm-eval --num_fewshot override
   --lm-eval-bin <path>     lm-eval executable (default: lm_eval)
-  --base-url <url>         OpenAI-compatible model endpoint for eval execute
+  --base-url <url>         OpenAI-compatible model endpoint; accepts host or host/v1
   --mode <mode>            Benchmark mode: remote endpoint or local host command
   --served-model <name>    Model name served by the OpenAI-compatible endpoint
   --model-api-key <key>    Optional bearer token for remote endpoint benchmarking
@@ -3720,6 +4673,14 @@ Options:
   --host <addr>            Local model server host for generated server commands
   --port <n>               Local model server port for generated server/benchmark commands
   --model-path <path>      llama.cpp model path; generates llama-bench command
+  --depth <n>              llama-bench -d depth for benchmark run; KV sweeps use --levels
+  --batch-size <n>         llama-bench -b batch size
+  --micro-batch-size <n>   llama-bench -ub micro-batch size
+  --repetitions <n>        llama-bench -r repetitions
+  --benchmark-format <fmt> llama-bench -o output format, e.g. json or md
+  --flash-attn             llama-bench -fa 1; use --no-flash-attn for -fa 0
+  --cache-type-k <type>    llama-bench -ctk KV cache K type
+  --cache-type-v <type>    llama-bench -ctv KV cache V type
   --server-bin <path>      Server executable override, e.g. llama-server
   --bench-kind <kind>      Built-in vLLM benchmark: serve, throughput, or latency
   --benchmark-output <p>   Engine benchmark JSON output path
@@ -3735,10 +4696,17 @@ Options:
   --enable-prefix-caching  Enable vLLM prefix caching for local latency sweeps
   --num-prompts <n>        Number of prompts for vLLM serve/throughput benchmarks
   --runs-dir <dir>         Saved benchmark runs directory (default: runs)
+  --group-by <field>       Group saved-run stats by field, e.g. quantization or hardware
+  --by <field>             Group saved-run comparisons by field
+  --metric <field>         Saved-run metric for stats/compare (default: tokSOut)
+  --metrics <fields>       Comma-separated metrics for comparing two run files
+  --fields <fields>        Comma-separated saved-run export fields
+  --hardware-name <text>   Filter saved runs by hardware label substring
   --set field=value        Edit one field in a saved benchmark run
   --set-json <json>        Merge JSON object into a saved benchmark run
   --patch <path>           Merge JSON object file into a saved benchmark run
   --unset <fields>         Comma-separated saved-run fields to remove
+  --yes                    Confirm saved-run deletion
   --json-status            Emit progress events as JSON lines on stderr
   --quiet                  Suppress progress events
   --hardware <path>        JSON hardware object required when submitting

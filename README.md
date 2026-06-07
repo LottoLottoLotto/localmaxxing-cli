@@ -187,14 +187,28 @@ lmx profile save my-4090 \
 lmx benchmark run llama.cpp --profile my-4090 --model-path model.gguf --dry-run
 ```
 
-Saved benchmark run files can be listed, edited, rerun, or submitted:
+Saved benchmark run files can be listed, viewed, edited, rerun, submitted, or deleted:
 
 ```bash
 lmx benchmark runs list
+lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json
 lmx benchmark runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'
 lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run
 lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json
+lmx benchmark runs delete runs/Qwen-Qwen3-8B/run.json --yes
 ```
+
+Saved runs can also be analyzed or extracted without submitting anything:
+
+```bash
+lmx benchmark runs stats --group-by quantization --metric tokSOut
+lmx benchmark runs stats --group-by hardware --model Qwen/Qwen3-8B
+lmx benchmark runs compare --by quantization --metric tokSOut
+lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs
+lmx benchmark runs export --format csv --out runs.csv
+```
+
+`stats`, `compare`, and `export` accept `--runs-dir`, plus filters such as `--model`, `--engine`, `--mode`, `--quantization`, `--kind`, and `--hardware-name`. `export` defaults to JSON and supports `--fields path,hfId,hardware,tokSOut` for custom extraction.
 
 ## KV-Cache Context Sweeps
 

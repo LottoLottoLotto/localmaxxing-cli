@@ -265,7 +265,30 @@ Saved `lmx-bench` result files are also accepted. If the JSON has a top-level `p
 
 If engine token counts are missing or marked as estimated and the JSON includes generated text (`outputText`, `generatedText`, `completion`, `response`, or `text`), the CLI uses the model's Hugging Face tokenizer to fill `outputTokens`. If the submitted model has no tokenizer, it tries `tokenizer_name` or `base_model_name_or_path` from `config.json`.
 
-`benchmark run` writes `localmaxxing-benchmark.json` by default. Use `--out <path>` to save elsewhere, `--submit` after the dry-run passes, or explicit metric overrides such as `--tok-s-out`, `--tok-s-prefill`, `--tok-s-total`, `--ttft-ms`, and `--peak-vram-gb` when a benchmark tool prints an unsupported label.
+`benchmark run` writes a saved run under `runs/<model>/<timestamp>.json` by default. Use `--out <path>` to save elsewhere, `--submit` after the dry-run passes, or explicit metric overrides such as `--tok-s-out`, `--tok-s-prefill`, `--tok-s-total`, `--ttft-ms`, and `--peak-vram-gb` when a benchmark tool prints an unsupported label.
+
+Saved benchmark run files can be listed, viewed, edited, rerun, submitted, dry-run validated, or deleted:
+
+```bash
+lmx benchmark runs list
+lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json
+lmx benchmark runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'
+lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run
+lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json
+lmx benchmark runs delete runs/Qwen-Qwen3-8B/run.json --yes
+```
+
+Saved runs can also be analyzed or extracted locally:
+
+```bash
+lmx benchmark runs stats --group-by quantization --metric tokSOut
+lmx benchmark runs stats --group-by hardware --model Qwen/Qwen3-8B
+lmx benchmark runs compare --by quantization --metric tokSOut
+lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs
+lmx benchmark runs export --format csv --out runs.csv
+```
+
+`stats`, `compare`, and `export` accept `--runs-dir`, plus filters such as `--model`, `--engine`, `--mode`, `--quantization`, `--kind`, and `--hardware-name`. `export` defaults to JSON and supports `--fields path,hfId,hardware,tokSOut` for custom extraction.
 
 Agents can skip `benchmark run` entirely: create any JSON object matching `POST /api/benchmarks`, then call `lmx benchmark dry-run benchmark.json` and `lmx benchmark submit benchmark.json`. Fetch `lmx context --out localmaxxing-agent-context.json` first for the current schema, accepted engines, and methodology tips.
 

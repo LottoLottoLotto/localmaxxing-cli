@@ -2,8 +2,8 @@
 import { execFileSync, execSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { homedir, platform, release, totalmem, cpus } from 'node:os'
-import { basename, join } from 'node:path'
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 
 type Runner = 'LM_EVAL_HARNESS' | 'CUSTOM'
 type ScoringMethod = 'exact_match' | 'f1' | 'pass_at_k' | 'perplexity' | 'llm_judge'
@@ -183,6 +183,10 @@ Usage:
   lmx benchmark run llama.cpp --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run
   lmx benchmark run vllm --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind throughput --input-len 512 --output-len 128 --dry-run
   lmx benchmark run sglang --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind serving --base-url http://127.0.0.1:30000 --dry-run
+  lmx benchmark runs list
+  lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json
+  lmx benchmark runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'
+  lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run
   lmx benchmark submit benchmark.json --api-key bhk_...
   lmx benchmark dry-run benchmark.json --api-key bhk_...
   lmx eval suite list --out suites.json
@@ -230,12 +234,15 @@ Options:
   --content-type <type>    Storage upload content type override
   --item-count <n>         Optional record/sample count for storage metadata
   --limit <n>              Optional search/list result limit
+  --runs-dir <dir>         Saved benchmark runs directory (default: runs)
   --submit                 Upload run to LocalMaxxing
   --dry-run                Validate upload without creating a run
   --out <path>             Write computed payload/result JSON (default: localmaxxing-eval-run.json)
 
 Benchmark submissions:
   benchmark run builds a payload from explicit metric fields, built-in vLLM/SGLang presets, --command, --results, or --base-url measurement.
+  benchmark run writes saved runs to runs/<model>/<timestamp>.json by default; use --out to write elsewhere.
+  benchmark runs list/show/edit/rerun/submit/dry-run/delete manages saved run JSON files.
   Pass a JSON object matching POST /api/benchmarks, or a lmx-bench result with a payload field.
   Use dry-run first to validate without writing.
 
@@ -713,6 +720,108 @@ function appendRawArgs(args: string[], raw: string | undefined) {
 
 function commandFromArgs(command: string, args: string[]) {
   return [shellArg(command), ...args.map(arg => arg.startsWith('__RAW__') ? arg.slice('__RAW__'.length) : arg.startsWith('--') ? arg : shellArg(arg))].join(' ')
+}
+
+function shellQuote(value: string) {
+  if (/^[\w@%+=:,./-]+$/.test(value)) return value
+  return `'${value.replace(/'/g, `'"'"'`)}'`
+}
+
+function safePathPart(value: string) {
+  return value.replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '') || 'unknown-model'
+}
+
+function timestampForPath(date = new Date()) {
+  return date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')
+}
+
+function benchmarkRunPath(payload: Record<string, unknown>, opts: Record<string, string | boolean>) {
+  const runsDir = optString(opts, 'runs-dir') ?? 'runs'
+  const model = typeof payload.hfId === 'string' ? payload.hfId : 'unknown-model'
+  const prefix = typeof payload.contextLength === 'number' ? `kvcache-${payload.contextLength}-` : ''
+  return join(runsDir, safePathPart(model), `${prefix}${timestampForPath()}.json`)
+}
+
+function benchmarkPayloadObject(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const obj = value as Record<string, unknown>
+  const payload = obj.payload
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) return payload as Record<string, unknown>
+  return obj
+}
+
+function runNumberField(payload: Record<string, unknown>, key: string) {
+  const value = payload[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+async function walkJsonFiles(root: string) {
+  const files: string[] = []
+  async function walk(dir: string) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) await walk(path)
+      else if (entry.isFile() && entry.name.toLowerCase().endsWith('.json')) files.push(path)
+    }
+  }
+  try {
+    const info = await stat(root)
+    if (!info.isDirectory()) throw new CliError('invalid_runs_dir', `${root} is not a directory`, ['Pass --runs-dir <dir> if saved runs are elsewhere.'])
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+  await walk(root)
+  return files
+}
+
+async function benchmarkRunSummaries(opts: Record<string, string | boolean>) {
+  const root = optString(opts, 'runs-dir') ?? 'runs'
+  const paths = await walkJsonFiles(root)
+  const withStats = await Promise.all(paths.map(async path => ({ path, info: await stat(path) })))
+  withStats.sort((a, b) => b.info.mtimeMs - a.info.mtimeMs)
+  const runs: Record<string, unknown>[] = []
+  for (const { path, info } of withStats) {
+    let payload: Record<string, unknown> | undefined
+    try {
+      payload = benchmarkPayloadObject(await readJson<unknown>(path))
+    } catch {
+      continue
+    }
+    if (!payload?.hfId && !payload?.engineName) continue
+    runs.push({
+      path,
+      model: payload.hfId,
+      engine: payload.engineName,
+      mode: payload.benchmarkMode,
+      quantization: payload.quantization,
+      tokSOut: payload.tokSOut,
+      canSubmit: (runNumberField(payload, 'tokSOut') ?? 0) > 0,
+      updatedAt: info.mtime.toISOString(),
+      showCommand: `lmx benchmark runs show ${shellQuote(path)}`,
+      editCommand: `lmx benchmark runs edit ${shellQuote(path)} --set-json '{"notes":"..."}'`,
+      rerunCommand: `lmx benchmark runs rerun ${shellQuote(path)}`,
+      submitCommand: `lmx benchmark runs submit ${shellQuote(path)}`,
+    })
+  }
+  return { runsDir: root, runs }
+}
+
+function resolveBenchmarkRunPath(target: string | undefined, opts: Record<string, string | boolean>) {
+  const path = target ?? optString(opts, 'path') ?? optString(opts, 'run')
+  if (!path) throw new CliError('missing_run_path', 'Saved benchmark run path is required.', ['Use lmx benchmark runs list, then pass a path to show/edit/rerun/submit.'])
+  return path
+}
+
+function mergeObject(target: Record<string, unknown>, patch: Record<string, unknown>) {
+  for (const [key, value] of Object.entries(patch)) {
+    const current = target[key]
+    if (value && typeof value === 'object' && !Array.isArray(value) && current && typeof current === 'object' && !Array.isArray(current)) {
+      mergeObject(current as Record<string, unknown>, value as Record<string, unknown>)
+    } else {
+      target[key] = value
+    }
+  }
 }
 
 function benchmarkKind(opts: Record<string, string | boolean>, fallback: string) {
@@ -1837,13 +1946,124 @@ async function handleSuiteCommand(action: string | undefined, target: string | u
   throw new Error('Unknown suite command. Use init, validate, or submit.')
 }
 
-async function handleBenchmarkCommand(action: string | undefined, target: string | undefined, opts: Record<string, string | boolean>) {
+async function editBenchmarkRun(path: string, opts: Record<string, string | boolean>) {
+  const raw = await readJson<unknown>(path)
+  const payload = benchmarkPayloadObject(raw)
+  if (!payload) throw new CliError('invalid_benchmark_run', 'Saved benchmark run must be a JSON object or { payload: object }.', [], raw)
+
+  let changed = false
+  const patchPath = optString(opts, 'patch')
+  if (patchPath) {
+    const patch = await readJson<unknown>(patchPath)
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new CliError('invalid_patch', '--patch must point to a JSON object.', [], patch)
+    mergeObject(payload, patch as Record<string, unknown>)
+    changed = true
+  }
+
+  const patchText = optString(opts, 'set-json')
+  if (patchText) {
+    let patch: unknown
+    try {
+      patch = JSON.parse(patchText) as unknown
+    } catch (error) {
+      throw new CliError('json_parse_error', '--set-json must be a JSON object.', [], asMessage(error))
+    }
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new CliError('invalid_patch', '--set-json must be a JSON object.', [], patch)
+    mergeObject(payload, patch as Record<string, unknown>)
+    changed = true
+  }
+
+  for (const [flag, key] of [
+    ['notes', 'notes'],
+    ['tok-s-out', 'tokSOut'],
+    ['tok-s-prefill', 'tokSPrefill'],
+    ['tok-s-total', 'tokSTotal'],
+    ['ttft-ms', 'ttftMs'],
+    ['peak-vram-gb', 'peakVramGb'],
+  ] as const) {
+    if (optString(opts, flag) === undefined) continue
+    payload[key] = flag === 'notes' ? optString(opts, flag) : optNumber(opts, flag)
+    changed = true
+  }
+
+  if (!changed) throw new CliError('no_edit_requested', 'No edit was requested.', ['Pass --set-json, --patch, --notes, or a metric override such as --tok-s-out.'])
+  const normalized = await normalizeBenchmarkPayload(raw, payload)
+  if (raw && typeof raw === 'object' && !Array.isArray(raw) && 'payload' in raw) {
+    ;(raw as Record<string, unknown>).payload = normalized
+    await writeFile(path, JSON.stringify(raw, null, 2) + '\n')
+  } else {
+    await writeFile(path, JSON.stringify(normalized, null, 2) + '\n')
+  }
+  printInfo('benchmark_run_updated', { path, canSubmit: (runNumberField(normalized, 'tokSOut') ?? 0) > 0 })
+}
+
+async function rerunBenchmarkRun(path: string, opts: Record<string, string | boolean>) {
+  const raw = await readJson<unknown>(path)
+  const saved = benchmarkPayloadObject(raw)
+  if (!saved) throw new CliError('invalid_benchmark_run', 'Saved benchmark run must be a JSON object or { payload: object }.', [], raw)
+  const payload = { ...saved }
+  if (opts['dry-run']) payload.dryRun = true
+  if (optString(opts, 'notes')) payload.notes = optString(opts, 'notes')
+  const outPath = optString(opts, 'out') ?? benchmarkRunPath(payload, opts)
+  await mkdir(dirname(outPath), { recursive: true })
+  await writeFile(outPath, JSON.stringify(payload, null, 2) + '\n')
+  printInfo('benchmark_run_rerun_written', { source: path, path: outPath, dryRun: Boolean(opts['dry-run']) })
+}
+
+async function handleBenchmarkRunsCommand(action: string | undefined, target: string | undefined, opts: Record<string, string | boolean>) {
+  const normalizedAction = action === 'validate' ? 'dry-run' : action ?? 'list'
+  if (normalizedAction === 'list' || normalizedAction === 'ls') {
+    const limit = optInt(opts, 'limit') ?? 50
+    const { runsDir, runs } = await benchmarkRunSummaries(opts)
+    await writeOrPrintJson('benchmark_runs', opts, { runsDir, count: Math.min(runs.length, limit), runs: runs.slice(0, limit) })
+    return
+  }
+
+  const path = resolveBenchmarkRunPath(target, opts)
+  if (normalizedAction === 'show' || normalizedAction === 'cat') {
+    await writeOrPrintJson('benchmark_run', opts, await readJson<unknown>(path))
+    return
+  }
+  if (normalizedAction === 'edit' || normalizedAction === 'patch') {
+    await editBenchmarkRun(path, opts)
+    return
+  }
+  if (normalizedAction === 'rerun' || normalizedAction === 'replay') {
+    await rerunBenchmarkRun(path, opts)
+    return
+  }
+  if (normalizedAction === 'submit' || normalizedAction === 'dry-run') {
+    await handleBenchmarkCommand(normalizedAction, path, opts)
+    return
+  }
+  if (normalizedAction === 'delete' || normalizedAction === 'rm' || normalizedAction === 'remove') {
+    if (!opts.yes && !opts.force) throw new CliError('confirmation_required', 'Deleting a saved run requires --yes.', [`Rerun: lmx benchmark runs delete ${shellQuote(path)} --yes`])
+    await rm(path)
+    printInfo('benchmark_run_deleted', { path })
+    return
+  }
+
+  throw new Error('Unknown benchmark runs command. Use list, show, edit, rerun, submit, dry-run, or delete.')
+}
+
+async function handleBenchmarkCommand(action: string | undefined, target: string | undefined, opts: Record<string, string | boolean>, extraTarget?: string) {
   const apiUrl = (optString(opts, 'api-url') ?? 'https://www.localmaxxing.com').replace(/\/$/, '')
   const normalizedAction = action === 'validate' ? 'dry-run' : action
 
+  if (normalizedAction === 'runs' || normalizedAction === 'run-file' || normalizedAction === 'run-files') {
+    await handleBenchmarkRunsCommand(target, extraTarget ?? optString(opts, 'path') ?? optString(opts, 'run'), opts)
+    return
+  }
+
+  if (['list', 'ls', 'show', 'cat', 'edit', 'patch', 'rerun', 'replay'].includes(normalizedAction ?? '')) {
+    await handleBenchmarkRunsCommand(normalizedAction, target, opts)
+    return
+  }
+
   if (normalizedAction === 'run' || normalizedAction === 'measure') {
     const payload = await benchmarkPayloadFromRun(target, opts)
-    const outPath = optString(opts, 'out') ?? 'localmaxxing-benchmark.json'
+    const outPath = optString(opts, 'out') ?? benchmarkRunPath(payload, opts)
+    await mkdir(dirname(outPath), { recursive: true })
     await writeFile(outPath, JSON.stringify(payload, null, 2) + '\n')
     printInfo('benchmark_payload_written', {
       path: outPath,
@@ -1872,7 +2092,7 @@ async function handleBenchmarkCommand(action: string | undefined, target: string
   }
 
   if (normalizedAction !== 'submit' && normalizedAction !== 'dry-run') {
-    throw new Error('Unknown benchmark command. Use run, submit, or dry-run.')
+    throw new Error('Unknown benchmark command. Use run, runs, list, show, edit, rerun, submit, or dry-run.')
   }
   if (!target) throw new Error(`benchmark ${normalizedAction} requires a benchmark JSON path`)
 
@@ -2206,7 +2426,7 @@ async function main() {
   }
 
   if (positional[0] === 'benchmark' || positional[0] === 'bench') {
-    await handleBenchmarkCommand(positional[1], positional[2], opts)
+    await handleBenchmarkCommand(positional[1], positional[2], opts, positional[3])
     return
   }
 
