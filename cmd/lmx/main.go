@@ -772,15 +772,66 @@ func runLongCommand(commandSnippet string) error {
 }
 
 func detectHardware() map[string]any {
-	base := map[string]any{"hwClass": "CPU_ONLY", "cpu": runtime.GOARCH, "os": runtime.GOOS, "cpuThreads": runtime.NumCPU()}
+	base := map[string]any{"hwClass": "CPU_ONLY", "cpu": detectCPU(), "os": runtime.GOOS, "cpuThreads": runtime.NumCPU()}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		base["hwClass"] = "UNIFIED"
 		base["chipVendor"] = "Apple"
+		applyAppleHardware(base)
 	}
 	if out, err := exec.Command("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits").Output(); err == nil {
 		applyNvidiaSMIHardware(base, string(out))
+	} else if out, err := exec.Command("rocm-smi", "--showproductname", "--showmeminfo", "vram", "--csv").Output(); err == nil {
+		applyRocmSMIHardware(base, string(out))
 	}
 	return base
+}
+
+func detectCPU() string {
+	if runtime.GOOS == "linux" {
+		if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(line, "model name") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) == 2 {
+						return strings.TrimSpace(parts[1])
+					}
+				}
+			}
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		if out, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output(); err == nil {
+			return strings.TrimSpace(string(out))
+		}
+	}
+	return runtime.GOARCH
+}
+
+func applyAppleHardware(base map[string]any) {
+	out, err := exec.Command("system_profiler", "SPHardwareDataType").Output()
+	if err != nil {
+		return
+	}
+	text := string(out)
+	if match := regexp.MustCompile(`(?m)Chip:\s*(.+)$`).FindStringSubmatch(text); len(match) > 1 {
+		chip := strings.TrimSpace(match[1])
+		base["cpu"] = chip
+		parts := strings.Fields(strings.TrimPrefix(chip, "Apple "))
+		if len(parts) > 0 {
+			base["chipFamily"] = parts[0]
+			if len(parts) > 1 {
+				base["chipVariant"] = strings.Join(parts[1:], " ")
+			} else {
+				base["chipVariant"] = "base"
+			}
+		}
+	}
+	if match := regexp.MustCompile(`(?m)Memory:\s*(\d+)\s*GB`).FindStringSubmatch(text); len(match) > 1 {
+		if gb, err := strconv.Atoi(match[1]); err == nil {
+			base["unifiedMemoryGb"] = gb
+		}
+	}
+	base["os"] = "darwin"
 }
 
 func applyNvidiaSMIHardware(base map[string]any, output string) {
@@ -815,6 +866,42 @@ func applyNvidiaSMIHardware(base map[string]any, output string) {
 	if totalVramMb > 0 {
 		base["totalVramGb"] = round1(totalVramMb / 1024)
 	}
+}
+
+func applyRocmSMIHardware(base map[string]any, output string) {
+	name := ""
+	if match := regexp.MustCompile(`(?i)Card series:\s*(.+)`).FindStringSubmatch(output); len(match) > 1 {
+		name = strings.TrimSpace(match[1])
+	}
+	if name == "" {
+		for _, line := range strings.Split(output, "\n") {
+			if strings.Contains(strings.ToLower(line), "card") && strings.Contains(line, ",") {
+				parts := strings.Split(line, ",")
+				name = strings.Trim(strings.TrimSpace(parts[len(parts)-1]), `"`)
+				break
+			}
+		}
+	}
+	vramGb := 0.0
+	for _, match := range regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*MB.*VRAM`).FindAllStringSubmatch(output, -1) {
+		if len(match) > 1 {
+			mb, _ := strconv.ParseFloat(match[1], 64)
+			if mb > vramGb*1024 {
+				vramGb = mb / 1024
+			}
+		}
+	}
+	if name == "" && vramGb == 0 {
+		return
+	}
+	base["hwClass"] = "DISCRETE_GPU"
+	if name != "" {
+		base["gpuName"] = name
+	}
+	if vramGb > 0 {
+		base["vramGb"] = round1(vramGb)
+	}
+	base["gpuCount"] = 1
 }
 
 func round1(n float64) float64 { return float64(int(n*10+0.5)) / 10 }
@@ -962,16 +1049,13 @@ func handleSuiteInit(args cliArgs) error {
 		return err
 	}
 	name := firstNonEmpty(opt(args, "name"), slug)
+	category := firstNonEmpty(opt(args, "category"), "general")
 	runner := strings.ToUpper(firstNonEmpty(opt(args, "runner"), "CUSTOM"))
 	if strings.EqualFold(runner, "lm-eval-harness") {
 		runner = "LM_EVAL_HARNESS"
 	}
-	taskKey := firstNonEmpty(opt(args, "tasks"), opt(args, "task"), slug)
 	scoring := firstNonEmpty(opt(args, "scoring-method"), "exact_match")
-	payload := map[string]any{
-		"slug": slug, "name": name, "description": opt(args, "description"), "category": firstNonEmpty(opt(args, "category"), "general"), "runner": runner,
-		"suiteDoc": map[string]any{"version": "1", "runner": mapRunnerDoc(runner), "scoringMethod": scoring, "higherIsBetter": true, "aggregation": "mean", "tasks": []any{map[string]any{"key": taskKey, "displayName": name, "weight": 1}}},
-	}
+	payload := buildSuiteTemplate(slug, name, category, runner, scoring, args)
 	if err := validateSuite(payload); err != nil {
 		return err
 	}
@@ -984,6 +1068,31 @@ func handleSuiteInit(args cliArgs) error {
 	fmt.Println("  lmx eval suite validate " + out)
 	fmt.Println("  lmx eval suite submit " + out + " --api-key bhk_...")
 	return nil
+}
+
+func buildSuiteTemplate(slug, name, category, runner, scoring string, args cliArgs) map[string]any {
+	base := map[string]any{"slug": slug, "name": name, "description": opt(args, "description"), "category": category, "runner": runner, "version": "1.0"}
+	if runner == "LM_EVAL_HARNESS" {
+		tasks := parseCSVList(firstNonEmpty(opt(args, "tasks"), opt(args, "task"), slug))
+		items := []any{}
+		for _, task := range tasks {
+			items = append(items, map[string]any{"key": task, "displayName": strings.ReplaceAll(task, "_", " "), "taskType": "multiple_choice", "weight": 1, "higherIsBetter": true})
+		}
+		base["description"] = firstNonEmpty(opt(args, "description"), "LM-Eval Harness suite. Run with lm-eval-harness, then upload the output JSON with the LocalMaxxing CLI.")
+		base["suiteDoc"] = map[string]any{"version": "1.0", "runner": "lm-eval-harness", "scoringMethod": scoring, "higherIsBetter": true, "aggregation": "weighted_mean", "tasks": items}
+		return base
+	}
+	kind := firstNonEmpty(opt(args, "kind"), "multiple_choice")
+	base["description"] = firstNonEmpty(opt(args, "description"), "Custom "+strings.ReplaceAll(kind, "_", " ")+" eval suite. Replace the sample items before submitting.")
+	switch kind {
+	case "qa":
+		base["suiteDoc"] = map[string]any{"version": "1.0", "runner": "custom", "scoringMethod": "exact_match", "higherIsBetter": true, "aggregation": "weighted_mean", "runConfig": map[string]any{"temperature": 0}, "tasks": []any{map[string]any{"key": "qa", "displayName": "Short-answer QA", "taskType": "qa", "weight": 1, "promptTemplate": "Answer the question with only the final answer.\n\nQuestion: {{input}}", "maxNewTokens": 64, "dataset": map[string]any{"source": "inline", "items": []any{map[string]any{"input": "What is 2 + 2?", "gold": "4"}}}}}}
+	case "judge":
+		base["suiteDoc"] = map[string]any{"version": "1.0", "runner": "custom", "scoringMethod": "llm_judge", "higherIsBetter": true, "aggregation": "weighted_mean", "runConfig": map[string]any{"temperature": 0.7}, "tasks": []any{map[string]any{"key": "judge_quality", "displayName": "Judge-scored response quality", "taskType": "judge", "weight": 1, "promptTemplate": "Write a concise answer to the following prompt.\n\n{{input}}", "maxNewTokens": 512, "dataset": map[string]any{"source": "inline", "items": []any{map[string]any{"input": "Explain why local inference benchmarks should include both speed and quality metrics.", "referenceAnswer": "A strong answer mentions that speed alone can hide regressions in reasoning, instruction following, or output quality.", "rubric": "Score 0 to 1. Reward clear explanation, mention of speed/quality tradeoffs, and relevance to local inference benchmarking."}}}}}}
+	default:
+		base["suiteDoc"] = map[string]any{"version": "1.0", "runner": "custom", "scoringMethod": "exact_match", "higherIsBetter": true, "aggregation": "weighted_mean", "runConfig": map[string]any{"temperature": 0}, "tasks": []any{map[string]any{"key": "multiple_choice", "displayName": "Multiple choice questions", "taskType": "multiple_choice", "weight": 1, "promptTemplate": "Choose the correct answer. Reply with only A, B, C, or D.\n\n{{input}}\n\n{{choices}}", "maxNewTokens": 8, "dataset": map[string]any{"source": "inline", "items": []any{map[string]any{"input": "Which number is even?", "choices": []any{"3", "5", "8", "9"}, "gold": "C"}}}}}}
+	}
+	return base
 }
 
 func mapRunnerDoc(runner string) string {
@@ -1004,14 +1113,90 @@ func validateSuite(value any) error {
 			errs = append(errs, key+" is required")
 		}
 	}
+	slug := stringValue(obj["slug"])
+	if !regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`).MatchString(slug) || len(slug) < 3 || len(slug) > 64 {
+		errs = append(errs, "slug must be 3-64 lowercase alphanumeric characters with hyphens")
+	}
+	if name := stringValue(obj["name"]); name == "" || len(name) > 256 {
+		errs = append(errs, "name is required and must be <= 256 chars")
+	}
+	if category := stringValue(obj["category"]); category == "" || len(category) > 64 {
+		errs = append(errs, "category is required and must be <= 64 chars")
+	}
+	runner := stringValue(obj["runner"])
+	if runner != "CUSTOM" && runner != "LM_EVAL_HARNESS" {
+		errs = append(errs, "runner must be CUSTOM or LM_EVAL_HARNESS")
+	}
 	doc := asObject(obj["suiteDoc"])
 	if doc == nil {
 		errs = append(errs, "suiteDoc must be an object")
-	} else if tasks, ok := doc["tasks"].([]any); !ok || len(tasks) == 0 {
-		errs = append(errs, "suiteDoc.tasks must contain at least one task")
+	} else {
+		expectedRunner := map[bool]string{true: "lm-eval-harness", false: "custom"}[runner == "LM_EVAL_HARNESS"]
+		if stringValue(doc["runner"]) != expectedRunner {
+			errs = append(errs, "suiteDoc.runner must be "+expectedRunner)
+		}
+		scoring := stringValue(doc["scoringMethod"])
+		if !containsString([]string{"exact_match", "f1", "pass_at_k", "perplexity", "llm_judge"}, scoring) {
+			errs = append(errs, "suiteDoc.scoringMethod is invalid")
+		}
+		if scoring == "perplexity" {
+			errs = append(errs, "perplexity scoring is not supported yet")
+		}
+		tasks := evalTasks(doc)
+		if len(tasks) == 0 {
+			errs = append(errs, "suiteDoc.tasks must contain at least one task")
+		}
+		if len(tasks) > 100 {
+			errs = append(errs, "suiteDoc.tasks cannot exceed 100 tasks")
+		}
+		keys := map[string]bool{}
+		for i, task := range tasks {
+			prefix := fmt.Sprintf("suiteDoc.tasks[%d]", i)
+			key := stringValue(task["key"])
+			if key == "" {
+				errs = append(errs, prefix+".key is required")
+			}
+			if keys[key] {
+				errs = append(errs, prefix+".key duplicates \""+key+"\"")
+			}
+			keys[key] = true
+			if stringValue(task["displayName"]) == "" {
+				errs = append(errs, prefix+".displayName is required")
+			}
+			if runner == "CUSTOM" {
+				if stringValue(task["promptTemplate"]) == "" {
+					errs = append(errs, prefix+".promptTemplate is required for CUSTOM suites")
+				}
+				dataset := asObject(task["dataset"])
+				if dataset == nil {
+					errs = append(errs, prefix+".dataset is required for CUSTOM suites")
+				} else if stringValue(dataset["source"]) == "inline" {
+					items := anySlice(dataset["items"])
+					if len(items) == 0 {
+						errs = append(errs, prefix+".dataset.items is required for inline datasets")
+					}
+					for itemIndex, rawItem := range items {
+						item := asObject(rawItem)
+						if item == nil {
+							continue
+						}
+						itemPrefix := fmt.Sprintf("%s.dataset.items[%d]", prefix, itemIndex)
+						if fmt.Sprint(item["input"]) == "" {
+							errs = append(errs, itemPrefix+".input is required")
+						}
+						if item["gold"] == nil && item["rubric"] == nil {
+							errs = append(errs, itemPrefix+" needs gold or rubric")
+						}
+						if stringValue(task["taskType"]) == "multiple_choice" && len(anySlice(item["choices"])) == 0 {
+							errs = append(errs, itemPrefix+".choices is required for multiple_choice tasks")
+						}
+					}
+				}
+			}
+		}
 	}
 	if len(errs) > 0 {
-		return cliError{"invalid_suite", "Suite payload is invalid.", errs, nil}
+		return cliError{"suite_validation_failed", "Suite validation failed.", []string{"Edit the suite JSON file and rerun eval suite validate.", "For custom suites, every task needs promptTemplate and dataset.", "For inline multiple-choice datasets, every item needs choices and gold."}, errs}
 	}
 	return nil
 }
@@ -1053,7 +1238,16 @@ func handleStorage(action, target string, args cliArgs, forcedKind string) error
 			return cliError{"storage_upload_url_missing", "Storage upload-url response did not include uploadUrl", []string{"Check that the LocalMaxxing API supports /api/evals/storage/upload-url."}, upload}
 		}
 		putReq, _ := http.NewRequest("PUT", uploadURL, bytes.NewReader(data))
-		putReq.Header.Set("Content-Type", fmt.Sprint(metadata["contentType"]))
+		hasContentType := false
+		for key, value := range stringMap(uploadObj["headers"]) {
+			putReq.Header.Set(key, value)
+			if strings.EqualFold(key, "Content-Type") {
+				hasContentType = true
+			}
+		}
+		if !hasContentType {
+			putReq.Header.Set("Content-Type", fmt.Sprint(metadata["contentType"]))
+		}
 		putRes, err := http.DefaultClient.Do(putReq)
 		if err != nil {
 			return err
@@ -4502,10 +4696,17 @@ func handleLmEval(suiteSlug string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
+	suite, err := loadSuiteForEvalRun(suiteSlug, args)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(stringValue(suite["runner"]), "LM_EVAL_HARNESS") {
+		return cliError{"suite_runner_mismatch", fmt.Sprintf("Suite %q is %s, not LM_EVAL_HARNESS", suiteSlug, stringValue(suite["runner"])), []string{"Use lmx eval run for CUSTOM suites.", "Use lmx eval suite list or show to find LM_EVAL_HARNESS suites."}, nil}
+	}
 	backend := firstNonEmpty(opt(args, "backend"), "hf")
 	command := firstNonEmpty(opt(args, "lm-eval-bin"), "lm_eval")
 	resultsPath := firstNonEmpty(opt(args, "results"), "localmaxxing-lm-eval-results.json")
-	tasks := firstNonEmpty(opt(args, "tasks"), suiteSlug)
+	tasks := firstNonEmpty(opt(args, "tasks"), strings.Join(evalTaskKeys(suiteDoc(suite)), ","), suiteSlug)
 	modelArgs := opt(args, "model-args")
 	if modelArgs == "" && backend == "hf" {
 		modelArgs = "pretrained=" + model
@@ -4515,7 +4716,7 @@ func handleLmEval(suiteSlug string, args cliArgs) error {
 		cmdArgs = append(cmdArgs, "--model_args", modelArgs)
 	}
 	cmdArgs = append(cmdArgs, "--tasks", tasks)
-	if fewshot := firstNonEmpty(opt(args, "num-fewshot"), opt(args, "fewshot")); fewshot != "" {
+	if fewshot := firstNonEmpty(opt(args, "num-fewshot"), opt(args, "fewshot"), inferredEvalFewShot(suiteDoc(suite))); fewshot != "" {
 		cmdArgs = append(cmdArgs, "--num_fewshot", fewshot)
 	}
 	cmdArgs = append(cmdArgs, "--output_path", resultsPath)
@@ -4534,15 +4735,38 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 	if suiteSlug == "" {
 		return errors.New("eval run requires a suite slug")
 	}
-	resultsPath := opt(args, "results")
-	if resultsPath == "" {
-		return cliError{"go_eval_run_partial", "The Go rewrite currently supports eval run uploads from --results only.", []string{"For CUSTOM local eval execution, keep using the TypeScript CLI until the runner is ported.", "Pass --results <lm-eval-output.json> for LM-Eval upload payload generation."}, nil}
-	}
-	results, err := readJSON(resultsPath)
+	suite, err := loadSuiteForEvalRun(suiteSlug, args)
 	if err != nil {
 		return err
 	}
-	payload := map[string]any{"suiteSlug": suiteSlug, "hfId": firstNonEmpty(opt(args, "model"), "<required-before-submit>"), "quantization": opt(args, "quantization"), "executionMode": "LM_EVAL_LOCAL", "judgeMode": "NONE", "runnerVersion": "localmaxxing-go lm-eval-upload", "results": results, "artifacts": []any{}}
+	doc := suiteDoc(suite)
+	runner := stringValue(suite["runner"])
+	var result map[string]any
+	if strings.EqualFold(runner, "LM_EVAL_HARNESS") {
+		resultsPath := opt(args, "results")
+		if resultsPath == "" {
+			return cliError{"missing_results", "LM-Eval suites require --results <lm-eval-output.json>.", []string{"Run lmx eval lm-eval <suiteSlug> to produce results, or pass an existing lm-eval output JSON with --results."}, nil}
+		}
+		result, err = loadLmEvalRunResult(resultsPath, suite)
+	} else if strings.EqualFold(runner, "CUSTOM") {
+		result, err = runCustomLocalEval(suite, args)
+	} else {
+		err = cliError{"suite_runner_mismatch", "Suite runner must be CUSTOM or LM_EVAL_HARNESS.", nil, runner}
+	}
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"suiteSlug":     suiteSlug,
+		"hfId":          firstNonEmpty(opt(args, "model"), "<required-before-submit>"),
+		"quantization":  opt(args, "quantization"),
+		"executionMode": map[bool]string{true: "CUSTOM_LOCAL", false: "LM_EVAL_LOCAL"}[strings.EqualFold(runner, "CUSTOM")],
+		"judgeMode":     map[bool]string{true: "LOCAL_REPORTED", false: "NONE"}[strings.EqualFold(stringValue(doc["scoringMethod"]), "llm_judge")],
+		"runnerVersion": map[bool]string{true: "localmaxxing-go custom-local", false: "localmaxxing-go lm-eval-upload"}[strings.EqualFold(runner, "CUSTOM")],
+		"results":       result["scores"],
+		"artifacts":     redactGold(result["artifacts"]),
+		"runConfig":     map[string]any{"aggregatePreview": result["aggregate"]},
+	}
 	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
 		hardware, err := readJSON(hardwarePath)
 		if err != nil {
@@ -4554,8 +4778,14 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 	if err := writeJSON(out, payload); err != nil {
 		return err
 	}
-	printInfo("run_payload_written", map[string]any{"path": out, "suite": suiteSlug})
+	printInfo("run_payload_written", map[string]any{"path": out, "suite": suiteSlug, "tasks": len(asObject(payload["results"])), "aggregatePreview": result["aggregate"]})
 	if hasFlag(args, "submit") || hasFlag(args, "dry-run") {
+		if opt(args, "hardware") == "" {
+			return cliError{"missing_hardware", "--hardware is required for submit/dry-run", []string{"Create a hardware JSON file matching /api/agent-context hardwareSchemas.", "Pass --hardware hardware.json."}, nil}
+		}
+		if opt(args, "model") == "" {
+			return cliError{"missing_model", "--model is required for submit/dry-run", []string{"Pass --model <HuggingFace model id>."}, nil}
+		}
 		endpoint := "/api/evals/runs"
 		if hasFlag(args, "dry-run") {
 			endpoint = "/api/evals/runs/dry-run"
@@ -4563,6 +4793,804 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 		return submitPayload(endpoint, hasFlag(args, "dry-run"), "run", args, payload)
 	}
 	return nil
+}
+
+func loadSuiteForEvalRun(suiteSlug string, args cliArgs) (map[string]any, error) {
+	if path := opt(args, "suite-file"); path != "" {
+		value, err := readJSON(path)
+		if err != nil {
+			return nil, err
+		}
+		obj := asObject(value)
+		if obj == nil {
+			return nil, cliError{"invalid_suite", "Suite file must contain a JSON object.", nil, value}
+		}
+		return obj, nil
+	}
+	key := apiKey(args)
+	if key != "" {
+		bundle, err := fetchJSON("GET", apiURL(args)+"/api/evals/suites/"+url.PathEscape(suiteSlug)+"/run-bundle", key, nil)
+		if err == nil {
+			return suiteFromRunBundle(bundle, suiteSlug)
+		}
+		printStatus(args, "run_bundle_unavailable", map[string]any{"suite": suiteSlug, "reason": err.Error()})
+	}
+	value, err := fetchJSON("GET", apiURL(args)+"/api/evals/suites/"+url.PathEscape(suiteSlug), key, nil)
+	if err != nil {
+		return nil, err
+	}
+	obj := asObject(value)
+	if obj == nil {
+		return nil, cliError{"invalid_suite", "Suite response must be a JSON object.", nil, value}
+	}
+	return obj, nil
+}
+
+func suiteFromRunBundle(bundle any, suiteSlug string) (map[string]any, error) {
+	obj := asObject(bundle)
+	if obj == nil {
+		return nil, cliError{"run_bundle_invalid", "Run bundle response did not include a runnable suite document.", nil, bundle}
+	}
+	suite := asObject(obj["suite"])
+	if suite == nil {
+		suite = obj
+	}
+	if suite["suiteDoc"] == nil {
+		suite["suiteDoc"] = obj["suiteDoc"]
+	}
+	if suite["slug"] == nil {
+		suite["slug"] = suiteSlug
+	}
+	if suite["name"] == nil {
+		suite["name"] = suiteSlug
+	}
+	if suite["runner"] == nil {
+		suite["runner"] = obj["runner"]
+	}
+	if suiteDoc(suite) == nil || stringValue(suite["runner"]) == "" {
+		return nil, cliError{"run_bundle_invalid", "Run bundle response did not include a runnable suite document.", []string{"Check that the LocalMaxxing API supports /run-bundle for this suite.", "Retry with a valid API key or inspect the suite with eval suite show."}, bundle}
+	}
+	applyRunBundleDownloadURLs(suite, obj)
+	return suite, nil
+}
+
+func suiteDoc(suite map[string]any) map[string]any {
+	return asObject(suite["suiteDoc"])
+}
+
+func evalTasks(doc map[string]any) []map[string]any {
+	tasks := []map[string]any{}
+	for _, item := range anySlice(doc["tasks"]) {
+		if task := asObject(item); task != nil {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks
+}
+
+func evalTaskKeys(doc map[string]any) []string {
+	keys := []string{}
+	for _, task := range evalTasks(doc) {
+		if key := stringValue(task["key"]); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func inferredEvalFewShot(doc map[string]any) string {
+	if runConfig := asObject(doc["runConfig"]); runConfig != nil {
+		if n := numberField(runConfig, "fewShot"); n > 0 {
+			return strconv.Itoa(int(n))
+		}
+	}
+	seen := map[int]bool{}
+	for _, task := range evalTasks(doc) {
+		if n := numberField(task, "nShots"); n > 0 {
+			seen[int(n)] = true
+		}
+	}
+	if len(seen) != 1 {
+		return ""
+	}
+	for n := range seen {
+		return strconv.Itoa(n)
+	}
+	return ""
+}
+
+func applyRunBundleDownloadURLs(suite map[string]any, bundle map[string]any) {
+	doc := suiteDoc(suite)
+	if doc == nil {
+		return
+	}
+	candidates := []any{bundle["downloadUrls"], bundle["datasetDownloadUrls"], bundle["datasets"]}
+	tasks := anySlice(doc["tasks"])
+	for i, item := range tasks {
+		task := asObject(item)
+		if task == nil {
+			continue
+		}
+		dataset := asObject(task["dataset"])
+		if dataset != nil && firstDatasetDownloadURL(dataset) != "" {
+			continue
+		}
+		urlText := ""
+		for _, candidate := range candidates {
+			urlText = downloadURLForTask(candidate, task, i, len(tasks))
+			if urlText != "" {
+				break
+			}
+		}
+		if urlText == "" {
+			continue
+		}
+		if dataset == nil {
+			dataset = map[string]any{}
+		}
+		dataset["source"] = "url"
+		dataset["url"] = urlText
+		dataset["downloadUrl"] = urlText
+		task["dataset"] = dataset
+	}
+}
+
+func firstDatasetDownloadURL(dataset map[string]any) string {
+	return firstNonEmpty(stringValue(dataset["downloadUrl"]), downloadURLFromValue(dataset["downloadUrls"]))
+}
+
+func downloadURLForTask(value any, task map[string]any, taskIndex, totalTasks int) string {
+	if arr := anySlice(value); len(arr) > 0 {
+		if taskIndex < len(arr) {
+			if urlText := downloadURLFromValue(arr[taskIndex]); urlText != "" {
+				return urlText
+			}
+		}
+		for _, child := range arr {
+			obj := asObject(child)
+			if obj == nil {
+				continue
+			}
+			key := firstNonEmpty(stringValue(obj["taskKey"]), stringValue(obj["task"]), stringValue(obj["key"]))
+			if key == stringValue(task["key"]) {
+				return downloadURLFromValue(obj)
+			}
+		}
+		return ""
+	}
+	obj := asObject(value)
+	if obj == nil {
+		return downloadURLFromValue(value)
+	}
+	dataset := asObject(task["dataset"])
+	keys := []string{stringValue(task["key"]), strconv.Itoa(taskIndex)}
+	if dataset != nil {
+		for _, key := range []string{"storageKey", "storageRef", "datasetKey", "id"} {
+			keys = append(keys, stringValue(dataset[key]))
+		}
+	}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if urlText := downloadURLFromValue(obj[key]); urlText != "" {
+			return urlText
+		}
+	}
+	if totalTasks == 1 {
+		return downloadURLFromValue(value)
+	}
+	return ""
+}
+
+func downloadURLFromValue(value any) string {
+	if text := stringValue(value); text != "" {
+		return text
+	}
+	if arr := anySlice(value); len(arr) > 0 {
+		for _, child := range arr {
+			if urlText := downloadURLFromValue(child); urlText != "" {
+				return urlText
+			}
+		}
+		return ""
+	}
+	obj := asObject(value)
+	if obj == nil {
+		return ""
+	}
+	return firstNonEmpty(stringValue(obj["downloadUrl"]), stringValue(obj["url"]), stringValue(obj["signedUrl"]), downloadURLFromValue(obj["downloadUrls"]))
+}
+
+func loadLmEvalRunResult(path string, suite map[string]any) (map[string]any, error) {
+	raw, err := readJSON(path)
+	if err != nil {
+		return nil, err
+	}
+	doc := suiteDoc(suite)
+	scoring := firstNonEmpty(stringValue(doc["scoringMethod"]), "exact_match")
+	scores := map[string]any{}
+	flatScores := map[string]float64{}
+	printInfo("lm_eval_parse_start", map[string]any{"suite": suite["slug"], "tasks": len(evalTasks(doc)), "scoringMethod": scoring, "results": path})
+	for _, task := range evalTasks(doc) {
+		key := stringValue(task["key"])
+		result := lmEvalResultForTask(raw, key)
+		score, ok := scoreFromLmEvalTask(result, scoring)
+		if !ok {
+			return nil, cliError{"lm_eval_metric_not_found", fmt.Sprintf("Could not find lm-eval score for task %q", key), []string{fmt.Sprintf("Ensure the lm-eval output contains results.%s or groups.%s.", key, key), "If the task uses a different metric, edit the suite scoringMethod or extend the CLI metric mapping."}, map[string]any{"taskKey": key, "availableMetrics": availableMetricNames(result)}}
+		}
+		scores[key] = map[string]any{"score": score, "nShots": firstNonZero(int(numberField(task, "nShots")), atoiDefault(inferredEvalFewShot(doc), 0))}
+		flatScores[key] = score
+		printInfo("lm_eval_task_score", map[string]any{"task": key, "score": score})
+	}
+	return map[string]any{"scores": scores, "artifacts": []any{}, "aggregate": computeEvalAggregate(doc, flatScores)}, nil
+}
+
+func lmEvalResultForTask(raw any, taskKey string) any {
+	obj := asObject(raw)
+	if obj == nil {
+		return nil
+	}
+	results := asObject(obj["results"])
+	if results == nil {
+		results = obj
+	}
+	groups := asObject(obj["groups"])
+	underscore := strings.ReplaceAll(taskKey, "-", "_")
+	if results != nil {
+		if results[taskKey] != nil {
+			return results[taskKey]
+		}
+		if results[underscore] != nil {
+			return results[underscore]
+		}
+	}
+	if groups != nil {
+		if groups[taskKey] != nil {
+			return groups[taskKey]
+		}
+		if groups[underscore] != nil {
+			return groups[underscore]
+		}
+	}
+	return nil
+}
+
+func scoreFromLmEvalTask(value any, scoring string) (float64, bool) {
+	obj := asObject(value)
+	if obj == nil {
+		return 0, false
+	}
+	for _, key := range lmEvalMetricCandidates(scoring) {
+		if normalized, ok := normalizeMetricScore(key, numberField(obj, key)); ok {
+			return normalized, true
+		}
+	}
+	for key, raw := range obj {
+		if strings.Contains(strings.ToLower(key), "stderr") {
+			continue
+		}
+		if normalized, ok := normalizeMetricScore(key, numericValue(raw)); ok {
+			return normalized, true
+		}
+	}
+	return 0, false
+}
+
+func lmEvalMetricCandidates(scoring string) []string {
+	switch scoring {
+	case "f1":
+		return []string{"f1,none", "f1", "macro_f1,none", "macro_f1", "rouge1,none", "rouge1", "rougeL,none", "rougeL"}
+	case "pass_at_k":
+		return []string{"pass_at_1,none", "pass@1,none", "pass_at_1", "pass@1", "pass_at_k,none", "pass@k,none", "pass_at_k", "pass@k"}
+	case "llm_judge":
+		return []string{"score,none", "score", "acc,none", "acc"}
+	case "perplexity":
+		return []string{"word_perplexity,none", "perplexity,none", "ppl,none", "word_perplexity", "perplexity", "ppl"}
+	default:
+		return []string{"acc_norm,none", "acc,none", "exact_match,none", "exact,none", "em,none", "pass_at_1,none", "pass@1,none", "inst_level_strict_acc,none", "prompt_level_strict_acc,none", "acc_norm", "acc", "exact_match", "exact", "em", "pass_at_1", "pass@1", "inst_level_strict_acc", "prompt_level_strict_acc"}
+	}
+}
+
+func normalizeMetricScore(metric string, value float64) (float64, bool) {
+	if value <= 0 && value != 0 {
+		return 0, false
+	}
+	if value >= 0 && value <= 1 {
+		return value, true
+	}
+	metric = strings.ToLower(metric)
+	if (strings.HasPrefix(metric, "rouge") || strings.Contains(metric, "bleu") || strings.Contains(metric, "chrf")) && value >= 0 && value <= 100 {
+		return value / 100, true
+	}
+	return 0, false
+}
+
+func availableMetricNames(value any) []string {
+	obj := asObject(value)
+	if obj == nil {
+		return []string{}
+	}
+	names := []string{}
+	for key, raw := range obj {
+		if numericValue(raw) != 0 || raw == float64(0) || raw == 0 {
+			names = append(names, key)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func runCustomLocalEval(suite map[string]any, args cliArgs) (map[string]any, error) {
+	model, err := requireOpt(args, "model")
+	if err != nil {
+		return nil, err
+	}
+	baseURL := openAIBaseURL(firstNonEmpty(opt(args, "base-url"), "http://localhost:8000"))
+	doc := suiteDoc(suite)
+	scoring := stringValue(doc["scoringMethod"])
+	judgeBaseURL := firstNonEmpty(opt(args, "judge-base-url"), stringValue(asObject(doc["judge"])["baseUrl"]))
+	judgeModel := firstNonEmpty(opt(args, "judge-model"), stringValue(asObject(doc["judge"])["model"]))
+	judgeAPIKey := firstNonEmpty(opt(args, "judge-api-key"), os.Getenv("EVAL_JUDGE_API_KEY"))
+	if scoring == "llm_judge" && (judgeBaseURL == "" || judgeModel == "") {
+		return nil, cliError{"judge_config_missing", "llm_judge suites require --judge-base-url and --judge-model, or suiteDoc.judge defaults", []string{"Pass --judge-base-url and --judge-model.", "If the judge requires auth, pass --judge-api-key or set EVAL_JUDGE_API_KEY."}, nil}
+	}
+	printInfo("custom_eval_start", map[string]any{"suite": suite["slug"], "tasks": len(evalTasks(doc)), "model": model, "baseUrl": baseURL, "scoringMethod": scoring})
+	scores := map[string]any{}
+	flatScores := map[string]float64{}
+	artifacts := []any{}
+	for _, task := range evalTasks(doc) {
+		if stringValue(task["promptTemplate"]) == "" || asObject(task["dataset"]) == nil {
+			return nil, cliError{"task_not_runnable", fmt.Sprintf("Task %q requires promptTemplate and dataset", stringValue(task["key"])), []string{"Fix the suite JSON or use an LM_EVAL_HARNESS suite for external lm-eval tasks."}, nil}
+		}
+		items, err := loadEvalDataset(asObject(task["dataset"]))
+		if err != nil {
+			return nil, cliError{"dataset_load_failed", fmt.Sprintf("Failed to load dataset for task %q: %v", stringValue(task["key"]), err), []string{"Check dataset source fields and network access."}, nil}
+		}
+		totalScore := 0.0
+		counted := 0
+		failures := 0
+		for i, item := range items {
+			prompt := renderEvalPrompt(stringValue(task["promptTemplate"]), item)
+			started := time.Now()
+			artifact := map[string]any{"taskKey": stringValue(task["key"]), "itemIndex": i, "promptHash": sha256Hex(prompt), "question": renderEvalQuestion(item), "prompt": prompt}
+			response, err := callOpenAIChat(baseURL, model, prompt, opt(args, "model-api-key"), int(firstNonZero(int(numberField(task, "maxNewTokens")), 256)), evalTemperature(doc), evalTopP(doc), stringSlice(task["stopSequences"]))
+			if err == nil {
+				artifact["response"] = response
+				var score float64
+				score, artifact, err = scoreCustomEvalItem(scoring, task, item, response, prompt, artifact, judgeBaseURL, judgeModel, judgeAPIKey)
+				if err == nil {
+					totalScore += score
+					artifact["score"] = score
+				}
+			}
+			if err != nil {
+				failures++
+				artifact["error"] = err.Error()
+			}
+			counted++
+			artifact["latencyMs"] = time.Since(started).Milliseconds()
+			artifacts = append(artifacts, artifact)
+		}
+		if counted > 0 {
+			score := totalScore / float64(counted)
+			scores[stringValue(task["key"])] = map[string]any{"score": score, "nSamples": counted, "nShots": numberField(task, "nShots")}
+			flatScores[stringValue(task["key"])] = score
+		}
+		printInfo("task_complete", map[string]any{"task": task["key"], "samples": counted, "failures": failures, "score": flatScores[stringValue(task["key"])]})
+	}
+	return map[string]any{"scores": scores, "artifacts": artifacts, "aggregate": computeEvalAggregate(doc, flatScores)}, nil
+}
+
+func loadEvalDataset(dataset map[string]any) ([]map[string]any, error) {
+	if dataset == nil {
+		return nil, errors.New("dataset missing")
+	}
+	if stringValue(dataset["source"]) == "inline" {
+		items := []map[string]any{}
+		for _, item := range anySlice(dataset["items"]) {
+			if obj := asObject(item); obj != nil {
+				items = append(items, obj)
+			}
+		}
+		return items, nil
+	}
+	if urlText := firstNonEmpty(firstDatasetDownloadURL(dataset), stringValue(dataset["url"])); urlText != "" {
+		return fetchDatasetItems(urlText, stringValue(dataset["format"]))
+	}
+	if stringValue(dataset["source"]) == "huggingface" {
+		hfPath := stringValue(dataset["hfPath"])
+		if hfPath == "" {
+			return nil, errors.New("huggingface dataset missing hfPath")
+		}
+		name := firstNonEmpty(stringValue(dataset["hfName"]), "default")
+		split := firstNonEmpty(stringValue(dataset["split"]), "test")
+		urlText := "https://datasets-server.huggingface.co/rows?dataset=" + url.QueryEscape(hfPath) + "&config=" + url.QueryEscape(name) + "&split=" + url.QueryEscape(split) + "&offset=0&limit=500"
+		rows, err := fetchEndpointJSON(urlText, "")
+		if err != nil {
+			return nil, err
+		}
+		items := []map[string]any{}
+		for _, item := range anySlice(asObject(rows)["rows"]) {
+			row := asObject(asObject(item)["row"])
+			if row == nil {
+				continue
+			}
+			items = append(items, map[string]any{"input": firstNonEmpty(stringValue(row["question"]), stringValue(row["input"]), stringValue(row["prompt"])), "gold": firstNonEmpty(stringValue(row["answer"]), stringValue(row["gold"]), stringValue(row["label"])), "choices": row["choices"]})
+		}
+		return items, nil
+	}
+	return nil, fmt.Errorf("unknown dataset source %q", stringValue(dataset["source"]))
+}
+
+func fetchDatasetItems(urlText, format string) ([]map[string]any, error) {
+	res, err := http.Get(urlText)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	text, _ := io.ReadAll(res.Body)
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, fmt.Errorf("dataset download failed: %s", res.Status)
+	}
+	return parseDatasetItems(string(text), urlText, format)
+}
+
+func parseDatasetItems(text, urlText, format string) ([]map[string]any, error) {
+	if format == "jsonl" || strings.HasSuffix(strings.ToLower(urlText), ".jsonl") {
+		return parseJSONLDataset(text)
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal([]byte(text), &arr); err == nil {
+		return arr, nil
+	}
+	return parseJSONLDataset(text)
+}
+
+func parseJSONLDataset(text string) ([]map[string]any, error) {
+	items := []map[string]any{}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			return nil, err
+		}
+		items = append(items, obj)
+	}
+	return items, nil
+}
+
+func renderEvalPrompt(template string, item map[string]any) string {
+	prompt := strings.ReplaceAll(template, "{{input}}", fmt.Sprint(item["input"]))
+	prompt = strings.ReplaceAll(prompt, "{{gold}}", "")
+	if choices := stringChoices(item["choices"]); len(choices) > 0 {
+		parts := []string{}
+		for i, choice := range choices {
+			parts = append(parts, choiceLabel(i)+". "+choice)
+		}
+		prompt = strings.ReplaceAll(prompt, "{{choices}}", strings.Join(parts, "\n"))
+	}
+	return strings.TrimSpace(prompt)
+}
+
+func renderEvalQuestion(item map[string]any) string {
+	input := strings.TrimSpace(fmt.Sprint(item["input"]))
+	choices := stringChoices(item["choices"])
+	if len(choices) == 0 {
+		return input
+	}
+	parts := []string{}
+	for i, choice := range choices {
+		parts = append(parts, choiceLabel(i)+". "+choice)
+	}
+	return strings.TrimSpace(input + "\n\n" + strings.Join(parts, "\n"))
+}
+
+func callOpenAIChat(baseURL, model, prompt, apiKey string, maxTokens int, temperature, topP float64, stop []string) (string, error) {
+	body := map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": prompt}}, "max_tokens": maxTokens, "temperature": temperature, "top_p": topP}
+	if len(stop) > 0 {
+		body["stop"] = stop
+	}
+	data, _ := json.Marshal(body)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultEndpointTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", openAIBaseURL(baseURL)+"/v1/chat/completions", bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		text, _ := io.ReadAll(res.Body)
+		return "", fmt.Errorf("OpenAI-compatible server returned %s: %s", res.Status, strings.TrimSpace(string(text)))
+	}
+	var response map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(nonStreamingContent(response)), nil
+}
+
+func scoreCustomEvalItem(scoring string, task, item map[string]any, response, prompt string, artifact map[string]any, judgeBaseURL, judgeModel, judgeAPIKey string) (float64, map[string]any, error) {
+	switch scoring {
+	case "exact_match":
+		gold, ok := item["gold"]
+		if !ok {
+			return 0, artifact, errors.New("item is missing gold answer for exact_match scoring")
+		}
+		if stringValue(task["taskType"]) == "multiple_choice" || len(stringChoices(item["choices"])) > 0 {
+			if normalizeChoice(response, stringChoices(item["choices"])) == normalizeChoice(fmt.Sprint(gold), stringChoices(item["choices"])) {
+				return 1, artifact, nil
+			}
+			return 0, artifact, nil
+		}
+		if normalizeEvalText(response) == normalizeEvalText(fmt.Sprint(gold)) {
+			return 1, artifact, nil
+		}
+		return 0, artifact, nil
+	case "f1":
+		if item["gold"] == nil {
+			return 0, artifact, errors.New("item is missing gold answer for f1 scoring")
+		}
+		return tokenF1(response, fmt.Sprint(item["gold"])), artifact, nil
+	case "llm_judge":
+		score, rationale, err := judgeEvalResponse(judgeBaseURL, judgeModel, judgeAPIKey, task, item, prompt, response)
+		artifact["judgeModel"] = judgeModel
+		artifact["judgeScore"] = score
+		artifact["judgeRationale"] = rationale
+		return score, artifact, err
+	default:
+		return 0, artifact, fmt.Errorf("CLI custom evals do not support scoringMethod %q yet", scoring)
+	}
+}
+
+func judgeEvalResponse(baseURL, model, apiKey string, task, item map[string]any, prompt, response string) (float64, string, error) {
+	rubric := firstNonEmpty(stringValue(item["rubric"]), "Score the response from 0 to 1 for correctness and quality.")
+	judgePrompt := "You are grading a model response. Return strict JSON: {\"score\": number, \"rationale\": string}.\n\nRubric:\n" + rubric + "\n\nQuestion:\n" + renderEvalQuestion(item) + "\n\nPrompt sent to model:\n" + prompt + "\n\nModel response:\n" + response + "\n\nReference answer, if any:\n" + stringValue(item["referenceAnswer"])
+	raw, err := callOpenAIChat(baseURL, model, judgePrompt, apiKey, 512, 0, 1, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	return parseJudgeResponse(raw)
+}
+
+func parseJudgeResponse(raw string) (float64, string, error) {
+	match := regexp.MustCompile(`(?s)\{.*\}`).FindString(raw)
+	if match != "" {
+		var obj map[string]any
+		if json.Unmarshal([]byte(match), &obj) == nil {
+			score := numericValue(obj["score"])
+			if score >= 0 && score <= 1 {
+				return score, firstNonEmpty(stringValue(obj["rationale"]), raw), nil
+			}
+		}
+	}
+	parts := regexp.MustCompile(`(?i)(?:score\D+)?([01](?:\.\d+)?)`).FindStringSubmatch(raw)
+	if len(parts) > 1 {
+		score, _ := strconv.ParseFloat(parts[1], 64)
+		if score >= 0 && score <= 1 {
+			return score, raw, nil
+		}
+	}
+	return 0, raw, fmt.Errorf("judge did not return a parseable score: %s", raw)
+}
+
+func computeEvalAggregate(doc map[string]any, scores map[string]float64) float64 {
+	tasks := evalTasks(doc)
+	values := []float64{}
+	weights := []float64{}
+	for _, task := range tasks {
+		key := stringValue(task["key"])
+		value, ok := scores[key]
+		if !ok {
+			continue
+		}
+		values = append(values, value)
+		weight := numberField(task, "weight")
+		if weight <= 0 {
+			weight = 1
+		}
+		weights = append(weights, weight)
+	}
+	if len(values) == 0 {
+		return 0
+	}
+	switch stringValue(doc["aggregation"]) {
+	case "min":
+		min := values[0]
+		for _, value := range values[1:] {
+			if value < min {
+				min = value
+			}
+		}
+		return min
+	case "max":
+		max := values[0]
+		for _, value := range values[1:] {
+			if value > max {
+				max = value
+			}
+		}
+		return max
+	case "mean":
+		sum := 0.0
+		for _, value := range values {
+			sum += value
+		}
+		return sum / float64(len(values))
+	default:
+		sum := 0.0
+		weightSum := 0.0
+		for i, value := range values {
+			sum += value * weights[i]
+			weightSum += weights[i]
+		}
+		return sum / weightSum
+	}
+}
+
+func numericValue(value any) float64 {
+	switch v := value.(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case json.Number:
+		n, _ := v.Float64()
+		return n
+	default:
+		return 0
+	}
+}
+
+func atoiDefault(value string, fallback int) int {
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func sha256Hex(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func stringSlice(value any) []string {
+	out := []string{}
+	for _, item := range anySlice(value) {
+		out = append(out, fmt.Sprint(item))
+	}
+	return out
+}
+
+func stringChoices(value any) []string {
+	choices := []string{}
+	for _, item := range anySlice(value) {
+		choices = append(choices, fmt.Sprint(item))
+	}
+	return choices
+}
+
+func choiceLabel(index int) string {
+	return string(rune('A' + index))
+}
+
+func normalizeEvalText(value string) string {
+	lower := strings.ToLower(value)
+	re := regexp.MustCompile(`[^\w\s]+`)
+	return strings.TrimSpace(re.ReplaceAllString(lower, ""))
+}
+
+func tokenF1(pred, gold string) float64 {
+	predTokens := strings.Fields(normalizeEvalText(pred))
+	goldTokens := strings.Fields(normalizeEvalText(gold))
+	if len(predTokens) == 0 || len(goldTokens) == 0 {
+		return 0
+	}
+	predCounts := map[string]int{}
+	goldCounts := map[string]int{}
+	for _, token := range predTokens {
+		predCounts[token]++
+	}
+	for _, token := range goldTokens {
+		goldCounts[token]++
+	}
+	common := 0
+	for token, count := range predCounts {
+		if goldCounts[token] < count {
+			common += goldCounts[token]
+		} else {
+			common += count
+		}
+	}
+	if common == 0 {
+		return 0
+	}
+	precision := float64(common) / float64(len(predTokens))
+	recall := float64(common) / float64(len(goldTokens))
+	return (2 * precision * recall) / (precision + recall)
+}
+
+func normalizeChoice(value string, choices []string) string {
+	normalized := normalizeEvalText(value)
+	if regexp.MustCompile(`^[a-z]$`).MatchString(normalized) {
+		return strings.ToUpper(normalized)
+	}
+	if regexp.MustCompile(`^\d+$`).MatchString(normalized) {
+		n, _ := strconv.Atoi(normalized)
+		if n < 1 {
+			n = 1
+		}
+		return choiceLabel(n - 1)
+	}
+	for i, choice := range choices {
+		if normalizeEvalText(choice) == normalized {
+			return choiceLabel(i)
+		}
+	}
+	for _, token := range strings.Fields(normalized) {
+		if regexp.MustCompile(`^[a-z]$`).MatchString(token) {
+			return strings.ToUpper(token)
+		}
+	}
+	return normalized
+}
+
+func evalTemperature(doc map[string]any) float64 {
+	if runConfig := asObject(doc["runConfig"]); runConfig != nil {
+		if value := numberField(runConfig, "temperature"); value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func evalTopP(doc map[string]any) float64 {
+	if runConfig := asObject(doc["runConfig"]); runConfig != nil {
+		if value := numberField(runConfig, "topP"); value != 0 {
+			return value
+		}
+	}
+	return 1
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func stringMap(value any) map[string]string {
+	out := map[string]string{}
+	obj := asObject(value)
+	if obj == nil {
+		return out
+	}
+	for key, raw := range obj {
+		if raw == nil {
+			continue
+		}
+		out[key] = fmt.Sprint(raw)
+	}
+	return out
 }
 
 func submitPayload(endpoint string, dryRun bool, label string, args cliArgs, payload any) error {

@@ -6,7 +6,7 @@ This package is standalone. It does not include the private LocalMaxxing web app
 
 ## Implementation Status
 
-The CLI is being rewritten with Go as the primary executable and optional Python helpers for ML-specific behavior such as Hugging Face token counting. The previous TypeScript CLI remains in `src/index.ts` as the reference implementation during the migration.
+The Go CLI is the primary executable. Optional Python helpers are used for ML-specific behavior such as Hugging Face token counting. The previous TypeScript CLI remains in `src/index.ts` temporarily as a legacy migration reference and should not be treated as the source of truth.
 
 Build the Go CLI from this repository:
 

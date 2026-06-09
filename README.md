@@ -362,7 +362,7 @@ Build the CLI:
 npm run build:cli
 ```
 
-Build the TypeScript workspace package reference implementation:
+Build the legacy TypeScript workspace package, if needed for migration comparison:
 
 ```bash
 npm run build:ts-cli

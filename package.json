@@ -4,7 +4,7 @@
   "type": "module",
   "workspaces": ["packages/*"],
   "scripts": {
-    "lmx": "tsx packages/localmaxxing-cli/src/index.ts",
+    "lmx": "go run ./cmd/lmx",
     "build:cli": "npm run build:go",
     "build:go": "go build -o dist/lmx ./cmd/lmx",
     "build:ts-cli": "npm run build -w localmaxxing"
