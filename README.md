@@ -1,80 +1,42 @@
 # LocalMaxxing CLI
 
-Command-line tools for LocalMaxxing benchmark and eval workflows. The CLI helps you discover LocalMaxxing schemas and suites, collect hardware metadata, run inference benchmarks, measure KV-cache/context slowdown, validate payloads, and submit benchmark or eval results to LocalMaxxing.
+The official CLI for [localmaxxing.com](https://localmaxxing.com) — benchmark and evaluate local LLM inference and submit results from your terminal.
 
-This repository is the public CLI workspace. The current primary executable is the Go CLI in `cmd/lmx`; the npm workspace package is `packages/localmaxxing-cli` and publishes as `localmaxxing` with `localmaxxing` and `lmx` binaries.
+## Install
 
-## Features
+### Download Binary (Recommended)
 
-- Authenticate with LocalMaxxing using a saved API key or `LMX_API_KEY`.
-- Generate a best-effort hardware metadata file for submissions.
-- Discover models, eval suites, schemas, methodology tips, and agent context from the LocalMaxxing API.
-- Run or package local and remote inference benchmarks for vLLM, llama.cpp, SGLang, Ollama, and custom commands.
-- Measure KV-cache and long-context slowdown across configurable context lengths.
-- Run LM-Eval Harness suites and upload existing lm-eval result JSON.
-- Run custom LocalMaxxing eval suites against local or public OpenAI-compatible endpoints.
-- Upload large eval traces as bucket-backed artifacts.
-- Save benchmark profiles and edit, rerun, or submit saved benchmark runs.
+Download a pre-built binary for your platform from the [latest release](https://github.com/LottoLottoLotto/localmaxxing-cli/releases/latest):
 
-## Requirements
+| Platform | Binary |
+|----------|--------|
+| Linux (amd64) | `lmx-linux-amd64` |
+| Linux (arm64) | `lmx-linux-arm64` |
+| macOS (Intel) | `lmx-darwin-amd64` |
+| macOS (Apple Silicon) | `lmx-darwin-arm64` |
+| Windows (amd64) | `lmx-windows-amd64.exe` |
 
-- Go 1.22 or newer for the current CLI build.
-- Node.js 20.9 or newer and npm for workspace scripts and package publishing checks.
-- Optional: Python plus `transformers` for Hugging Face tokenizer fallbacks.
-- Optional: `lm-eval` for LM-Eval Harness suites.
+```bash
+# Linux / macOS example
+chmod +x lmx-linux-amd64
+sudo mv lmx-linux-amd64 /usr/local/bin/lmx
+lmx --help
+```
 
-## Install And Build
+### Build From Source
 
-From a checkout:
+Requires Go 1.22 or newer.
 
 ```bash
 git clone https://github.com/LottoLottoLotto/localmaxxing-cli.git
 cd localmaxxing-cli
-npm install
-npm run build:cli
-./dist/lmx --help
-```
-
-You can also build the Go executable directly:
-
-```bash
-go build -o dist/lmx ./cmd/lmx
-```
-
-After the npm package is published, install or run it with:
-
-```bash
-npm install -g localmaxxing
-lmx --help
-```
-
-or:
-
-```bash
-npx localmaxxing --help
-```
-
-Optional tokenizer fallback:
-
-```bash
-python -m pip install transformers
-```
-
-Optional lm-eval support:
-
-```bash
-python -m pip install lm-eval
+go build -o lmx ./cmd/lmx
+./lmx --help
 ```
 
 ## Authentication
 
-Create a LocalMaxxing API key from your dashboard, then either pass it per command:
-
-```bash
-lmx benchmark dry-run benchmark.json --api-key bhk_...
-```
-
-set it in the environment:
+Create an API key from your [LocalMaxxing dashboard](https://localmaxxing.com), then either set it in the environment:
 
 ```bash
 export LMX_API_KEY=bhk_...
@@ -88,17 +50,17 @@ lmx auth
 lmx auth --logout
 ```
 
-Saved CLI config lives under `~/.config/localmaxxing`.
+Saved config lives under `~/.config/localmaxxing`. You can also pass `--api-key bhk_...` to any command directly.
 
 ## Hardware Metadata
 
-Submissions require a hardware JSON object. Generate one on the machine that actually ran the benchmark and review it before submitting results:
+Submissions require a hardware JSON object. Generate one on the machine running the benchmark:
 
 ```bash
 lmx hardware --out hardware.json
 ```
 
-Example:
+Example output:
 
 ```json
 {
@@ -108,23 +70,11 @@ Example:
 }
 ```
 
-## Discover Context, Suites, And Models
-
-Fetch current API context, approved suite metadata, and canonical model IDs:
-
-```bash
-lmx context --out localmaxxing-agent-context.json
-lmx eval suite list --out localmaxxing-suites.json
-lmx eval suite search reasoning --out reasoning-suites.json
-lmx eval suite show hellaswag --out hellaswag-suite.json
-lmx model search qwen3-8b --out models.json
-```
-
-Discovery output is redacted defensively so fields such as `gold`, `answer`, and `referenceAnswer` are not written to agent-facing files.
+> For remote endpoint benchmarks, run `lmx hardware` on the **server** hosting the model, not your local machine.
 
 ## Benchmarks
 
-Remote endpoint mode measures throughput and latency from an OpenAI-compatible server:
+### Remote Endpoint (vLLM, SGLang, Ollama, custom OpenAI-compatible)
 
 ```bash
 lmx benchmark run vllm \
@@ -138,11 +88,15 @@ lmx benchmark run vllm \
   --dry-run
 ```
 
+<<<<<<< HEAD
 For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server, before `benchmark dry-run` or `benchmark submit`.
 
 Remote endpoint runs issue one untimed warmup request and three timed iterations by default, reporting the median of each metric plus per-iteration `samples` and `sampleStats` (min/p50/mean/max/stddev). Tune with `--warmup <n>` and `--iterations <n>`; `--warmup 0 --iterations 1` restores single-shot measurement. Decode throughput is measured over the inter-token window (first to last streamed token) when more than one token arrives.
 
 For Ollama, use remote mode against the native Ollama endpoint. The CLI calls `/api/generate` and maps Ollama's `prompt_eval_*`, `eval_*`, and `total_duration` fields into benchmark metrics:
+=======
+Ollama uses the native `/api/generate` endpoint:
+>>>>>>> 61878f85bfd22dfab260cae8eb6ab51454cd9c9c
 
 ```bash
 lmx benchmark run ollama \
@@ -155,19 +109,7 @@ lmx benchmark run ollama \
   --max-tokens 256
 ```
 
-Local host mode runs a benchmark command on the machine where the runtime is installed:
-
-```bash
-lmx benchmark run llama.cpp \
-  --mode local \
-  --hf-id Qwen/Qwen3-8B \
-  --quantization Q4_K_M \
-  --hardware hardware.json \
-  --command "llama-bench -m model.gguf -p 512 -n 128" \
-  --dry-run
-```
-
-For llama.cpp, the CLI can generate the benchmark command from a model path:
+### Local llama.cpp
 
 ```bash
 lmx benchmark run llama.cpp \
@@ -181,21 +123,25 @@ lmx benchmark run llama.cpp \
   --dry-run
 ```
 
-Validate and submit a saved benchmark payload. `validate-local` checks the payload shape without an API key; `dry-run` sends an authenticated validation request to the LocalMaxxing API without creating a run:
+### Validate and Submit
 
 ```bash
 lmx benchmark validate-local benchmark.json
-lmx benchmark dry-run benchmark.json --api-key bhk_...
-lmx benchmark submit benchmark.json --api-key bhk_...
+lmx benchmark dry-run benchmark.json
+lmx benchmark submit benchmark.json
 ```
 
-`bench` is accepted as a shorter alias for `benchmark`. Use `--out <path>` to choose the output file, `--json-status` for machine-readable progress events, and `--quiet` to suppress progress events.
+`bench` is a shorter alias for `benchmark`. Use `--out <path>` to set the output file, `--json-status` for machine-readable progress, and `--quiet` to suppress output.
 
+<<<<<<< HEAD
 Local benchmark commands run without a time limit by default; pass `--command-timeout-seconds <n>` to abort hung runs.
 
 ## Saved Profiles And Runs
+=======
+## Saved Profiles and Runs
+>>>>>>> 61878f85bfd22dfab260cae8eb6ab51454cd9c9c
 
-Save repeated benchmark or server options in a profile:
+Save repeated options as a profile:
 
 ```bash
 lmx profile save my-4090 \
@@ -207,7 +153,7 @@ lmx profile save my-4090 \
 lmx benchmark run llama.cpp --profile my-4090 --model-path model.gguf --dry-run
 ```
 
-Saved benchmark run files can be listed, viewed, edited, rerun, submitted, or deleted:
+Manage saved run files:
 
 ```bash
 lmx benchmark runs list
@@ -218,23 +164,22 @@ lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json
 lmx benchmark runs delete runs/Qwen-Qwen3-8B/run.json --yes
 ```
 
-Saved runs can also be analyzed or extracted without submitting anything:
+Analyze and export runs:
 
 ```bash
 lmx benchmark runs stats --group-by quantization --metric tokSOut
-lmx benchmark runs stats --group-by hardware --model Qwen/Qwen3-8B
 lmx benchmark runs compare --by quantization --metric tokSOut
-lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs
 lmx benchmark runs export --format csv --out runs.csv
 ```
 
+<<<<<<< HEAD
 `stats`, `compare`, and `export` accept `--runs-dir`, plus filters such as `--model`, `--engine`, `--mode`, `--quantization`, `--kind`, and `--hardware-name`. Group stats report min/p50/mean/max/p95/stddev and the best single run; group comparisons rank by the median (`p50`) so a single outlier run cannot win. `export` defaults to JSON and supports `--fields path,hfId,hardware,tokSOut` for custom extraction.
 
+=======
+>>>>>>> 61878f85bfd22dfab260cae8eb6ab51454cd9c9c
 ## KV-Cache Context Sweeps
 
-Use `kvcache run` to record how prefill, TTFT, decode TPS, and total TPS change as context length grows. It writes `localmaxxing-kvcache.json` by default.
-
-Local llama.cpp example:
+Measure how prefill, TTFT, and decode TPS change as context length grows:
 
 ```bash
 lmx kvcache run llama.cpp \
@@ -247,7 +192,7 @@ lmx kvcache run llama.cpp \
   --output-tokens 128
 ```
 
-Remote OpenAI-compatible endpoint example:
+Remote endpoint:
 
 ```bash
 lmx kvcache run vllm \
@@ -259,11 +204,23 @@ lmx kvcache run vllm \
   --output-tokens 128
 ```
 
+<<<<<<< HEAD
 Remote sweeps pre-warm the target context prefix, inspect llama.cpp `/slots` for `n_prompt_tokens_cache`, then time a streaming probe with the same prefix. The default filler is a deterministic varied-word sequence (a single repeated word is unrealistically friendly to prefix caching); pass `--filler-token <word>` to override. Reported `promptTokens` come from the endpoint's `usage.prompt_tokens` when available, and cached points estimate prefill speed from the non-cached suffix only. If `/slots` reports no retained prompt cache, the CLI records a warning and labels the point as a cold inline prefill measurement instead of cached-context speed.
+=======
+## Evals
+>>>>>>> 61878f85bfd22dfab260cae8eb6ab51454cd9c9c
 
-## Eval Workflows
+### Run a custom suite against a local endpoint
 
-Run an LM-Eval Harness suite through the CLI wrapper:
+```bash
+lmx eval run my-custom-suite \
+  --model Qwen/Qwen3-8B \
+  --base-url http://localhost:8000 \
+  --hardware hardware.json \
+  --submit
+```
+
+### LM-Eval Harness
 
 ```bash
 lmx eval lm-eval hellaswag \
@@ -283,27 +240,7 @@ lmx eval run local-open-llm-core \
   --submit
 ```
 
-Run a custom suite against a local OpenAI-compatible endpoint:
-
-```bash
-lmx eval run my-custom-suite \
-  --model Qwen/Qwen3-8B \
-  --base-url http://localhost:8000 \
-  --hardware hardware.json \
-  --submit
-```
-
-For public endpoints that LocalMaxxing can reach directly, use server-side execution:
-
-```bash
-lmx eval execute my-custom-suite \
-  --model Qwen/Qwen3-8B \
-  --base-url https://my-public-endpoint.example \
-  --hardware hardware.json \
-  --submit
-```
-
-Run an LM-Judge suite:
+### LM-Judge
 
 ```bash
 lmx eval run my-judge-suite \
@@ -316,9 +253,16 @@ lmx eval run my-judge-suite \
   --submit
 ```
 
-## Eval Suite Authoring
+## Discover Models and Suites
 
-Create a starter suite:
+```bash
+lmx context --out localmaxxing-agent-context.json
+lmx eval suite list --out localmaxxing-suites.json
+lmx eval suite search reasoning
+lmx model search qwen3-8b
+```
+
+## Eval Suite Authoring
 
 ```bash
 lmx eval suite init \
@@ -327,77 +271,27 @@ lmx eval suite init \
   --category reasoning \
   --kind multiple_choice \
   --out my-reasoning-eval.json
-```
 
-Edit the generated JSON, then validate and submit:
-
-```bash
 lmx eval suite validate my-reasoning-eval.json
 lmx eval suite submit my-reasoning-eval.json
 ```
 
 Submitted suites start as `PENDING` and appear publicly after admin approval.
 
-## Artifact Storage
-
-Large eval traces should be uploaded as artifact bundles instead of inline run artifacts:
-
-```bash
-lmx eval artifacts upload traces.jsonl \
-  --format jsonl \
-  --item-count 1000 \
-  --out artifact-bundle.json
-```
-
-Lower-level storage commands support artifact bundles and bucket-backed datasets:
-
-```bash
-lmx eval storage upload dataset.jsonl \
-  --kind dataset \
-  --format jsonl \
-  --out dataset-storage.json
-
-lmx eval storage download <storageKey> --out traces.jsonl
-```
-
 ## Development
 
-Install dependencies:
-
 ```bash
-npm install
-```
-
-Run the Go test suite:
-
-```bash
+# Run tests
 go test ./...
+
+# Build
+go build -o lmx ./cmd/lmx
 ```
 
-Build the CLI:
+## Optional Dependencies
 
-```bash
-npm run build:cli
-```
-
-Build the legacy TypeScript workspace package, if needed for migration comparison:
-
-```bash
-npm run build:ts-cli
-```
-
-Check npm package contents:
-
-```bash
-npm pack -w localmaxxing --dry-run
-```
-
-## Documentation
-
-- `docs/running-evals.md`
-- `docs/eval-suite-authoring.md`
-- `docs/lm-eval-compatibility.md`
-- `packages/localmaxxing-cli/README.md`
+- `lm-eval` — required for LM-Eval Harness suites: `pip install lm-eval`
+- `transformers` — Hugging Face tokenizer fallback: `pip install transformers`
 
 ## License
 
