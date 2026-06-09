@@ -1982,6 +1982,55 @@ func metricBetter(value, baseline float64, metric string) bool {
 	return value > baseline
 }
 
+type benchmarkPayload struct {
+	EngineName      string
+	HFID            string
+	ModelRevision   string
+	Quantization    string
+	Backend         string
+	BenchmarkMode   string
+	DetectedEngines []detectedEngine
+	Hardware        any
+	HardwareSource  string
+	Extra           map[string]any
+}
+
+func (payload benchmarkPayload) ToMap() map[string]any {
+	out := map[string]any{
+		"engineName":      payload.EngineName,
+		"hfId":            payload.HFID,
+		"modelRevision":   payload.ModelRevision,
+		"quantization":    payload.Quantization,
+		"benchmarkMode":   payload.BenchmarkMode,
+		"detectedEngines": payload.DetectedEngines,
+	}
+	if payload.Backend != "" {
+		out["backend"] = payload.Backend
+	}
+	if payload.Hardware != nil {
+		out["hardware"] = payload.Hardware
+	}
+	if payload.HardwareSource != "" {
+		out["hardwareSource"] = payload.HardwareSource
+	}
+	for key, value := range payload.Extra {
+		out[key] = value
+	}
+	return out
+}
+
+func setNumericFlagFields(payload map[string]any, args cliArgs, mapping map[string]string) {
+	for flag, field := range mapping {
+		if value := opt(args, flag); value != "" {
+			if n, err := strconv.ParseFloat(value, 64); err == nil {
+				payload[field] = n
+			} else {
+				payload[field] = value
+			}
+		}
+	}
+}
+
 func medianOf(values []float64) float64 {
 	if len(values) == 0 {
 		return 0
@@ -2402,7 +2451,7 @@ func handleKVCache(action, target string, args cliArgs) error {
 			"hfId":          model,
 			"modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"),
 			"quantization":  quantization,
-			"contextTokens": float64(level),
+			"contextTokens": firstNonNil(point["contextTokens"], float64(level)),
 			"outputTokens":  point["outputTokens"],
 			"promptTokens":  point["promptTokens"],
 			"tokSOut":       point["tokSOut"],
@@ -2765,7 +2814,10 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 		}
 		return point, nil
 	}
-	prompt := kvCachePrompt(args, level)
+	prompt, contextTokens, contextTokenSource, err := kvCachePromptForRemote(args, hfID, firstNonEmpty(opt(args, "model-revision"), "main"), level)
+	if err != nil {
+		return nil, err
+	}
 	prefixMessages := []any{
 		map[string]any{"role": "system", "content": "You are measuring decode speed after a long retained context. Answer the final question concisely."},
 		map[string]any{"role": "user", "content": prompt},
@@ -2830,19 +2882,20 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 		promptTokens = usagePromptTokens
 	}
 	point := map[string]any{
-		"contextTokens":     float64(level),
-		"promptTokens":      float64(promptTokens),
-		"outputTokens":      float64(outputTokens),
-		"outputText":        probe.outputText,
-		"mode":              "remote",
-		"baseUrl":           baseURL,
-		"servedModel":       servedModel,
-		"servedModelSource": servedModelSource,
-		"methodology":       methodology,
-		"cacheReuse":        cacheStatus,
-		"usagePromptTokens": float64(usagePromptTokens),
-		"metricSource":      "remote_endpoint",
-		"timingSource":      "client_observed_http",
+		"contextTokens":      float64(contextTokens),
+		"promptTokens":       float64(promptTokens),
+		"outputTokens":       float64(outputTokens),
+		"outputText":         probe.outputText,
+		"mode":               "remote",
+		"baseUrl":            baseURL,
+		"servedModel":        servedModel,
+		"servedModelSource":  servedModelSource,
+		"methodology":        methodology,
+		"cacheReuse":         cacheStatus,
+		"usagePromptTokens":  float64(usagePromptTokens),
+		"contextTokenSource": contextTokenSource,
+		"metricSource":       "remote_endpoint",
+		"timingSource":       "client_observed_http",
 	}
 	if tokSOut, source, ok := decodeThroughput(probe, outputTokens); ok {
 		point["tokSOut"] = tokSOut
@@ -2975,13 +3028,20 @@ func kvCachePrompt(args cliArgs, targetTokens int) string {
 	if targetTokens < 1 {
 		targetTokens = 1
 	}
+	return kvCachePromptWords(args, targetTokens)
+}
+
+func kvCachePromptWords(args cliArgs, words int) string {
+	if words < 1 {
+		words = 1
+	}
 	if word := opt(args, "filler-token"); word != "" {
-		return strings.TrimSpace(strings.Repeat(word+" ", targetTokens))
+		return strings.TrimSpace(strings.Repeat(word+" ", words))
 	}
 	var builder strings.Builder
-	builder.Grow(targetTokens * 8)
+	builder.Grow(words * 8)
 	seed := uint64(0x9E3779B97F4A7C15)
-	for i := 0; i < targetTokens; i++ {
+	for i := 0; i < words; i++ {
 		seed ^= seed << 13
 		seed ^= seed >> 7
 		seed ^= seed << 17
@@ -2991,6 +3051,28 @@ func kvCachePrompt(args cliArgs, targetTokens int) string {
 		builder.WriteString(kvCacheFillerVocab[seed%uint64(len(kvCacheFillerVocab))])
 	}
 	return builder.String()
+}
+
+func kvCachePromptForRemote(args cliArgs, hfID, revision string, targetTokens int) (string, int, string, error) {
+	if value := firstNonEmpty(opt(args, "prompt-tokens"), opt(args, "prefill-tokens")); value != "" {
+		count, err := strconv.Atoi(value)
+		if err != nil || count <= 0 {
+			return "", 0, "", cliError{"invalid_option", "--prompt-tokens must be a positive integer", []string{"Pass --prompt-tokens <number>."}, nil}
+		}
+		return kvCachePrompt(args, targetTokens), count, "explicit_flag", nil
+	}
+	if prompt := opt(args, "prompt"); prompt != "" {
+		count, err := pythonTokenCount(hfID, revision, prompt)
+		if err != nil {
+			return "", 0, "", cliError{"token_count_missing", "Could not tokenize --prompt for remote KV-cache measurement.", []string{"Install Python transformers, or pass a model tokenizer available to AutoTokenizer.", "Remote KV-cache sweeps require token-accurate context lengths."}, errString(err)}
+		}
+		return prompt, count, "python_transformers_explicit_prompt", nil
+	}
+	prompt, count, err := pythonExactTokenText(hfID, revision, targetTokens, kvCachePromptWords(args, targetTokens*2))
+	if err != nil {
+		return "", 0, "", cliError{"token_count_missing", "Could not build a token-accurate remote KV-cache filler prompt.", []string{"Install Python transformers so the CLI can synthesize exactly --levels tokens.", "Pass --prompt with text that the tokenizer helper can count if you need custom context content."}, errString(err)}
+	}
+	return prompt, count, "python_transformers_exact_filler", nil
 }
 
 func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, error) {
@@ -3075,29 +3157,20 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		return nil, err
 	}
 
-	payload := map[string]any{"engineName": engineName, "hfId": model, "modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"), "quantization": quantization, "detectedEngines": detectInferenceEngines(args)}
-	if hardware != nil {
-		payload["hardware"] = hardware
+	builder := benchmarkPayload{
+		EngineName:      engineName,
+		HFID:            model,
+		ModelRevision:   firstNonEmpty(opt(args, "model-revision"), "main"),
+		Quantization:    quantization,
+		Backend:         backend,
+		BenchmarkMode:   mode,
+		DetectedEngines: detectInferenceEngines(args),
+		Hardware:        hardware,
+		HardwareSource:  hardwareSource,
+		Extra:           metrics,
 	}
-	if hardwareSource != "" {
-		payload["hardwareSource"] = hardwareSource
-	}
-	if backend != "" {
-		payload["backend"] = backend
-	}
-	payload["benchmarkMode"] = mode
-	for key, value := range metrics {
-		payload[key] = value
-	}
-	for flag, field := range map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "prompt-tokens": "promptTokens", "prefill-tokens": "promptTokens", "output-tokens": "outputTokens", "num-prompts": "numPrompts"} {
-		if value := opt(args, flag); value != "" {
-			if n, err := strconv.ParseFloat(value, 64); err == nil {
-				payload[field] = n
-			} else {
-				payload[field] = value
-			}
-		}
-	}
+	payload := builder.ToMap()
+	setNumericFlagFields(payload, args, map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "prompt-tokens": "promptTokens", "prefill-tokens": "promptTokens", "output-tokens": "outputTokens", "num-prompts": "numPrompts"})
 	applyCommandTokenHints(payload)
 	if notes := opt(args, "notes"); notes != "" {
 		payload["notes"] = notes
@@ -4707,11 +4780,34 @@ func tokenCount(args cliArgs, hfID, revision, text string, known int, kind strin
 var tokenCountScript string
 
 func pythonTokenCount(model, revision, text string) (int, error) {
-	script, err := tokenCountScriptPath()
+	response, err := runPythonTokenHelper(map[string]any{"model": model, "revision": revision, "text": text})
 	if err != nil {
 		return 0, err
 	}
-	request := map[string]any{"model": model, "revision": revision, "text": text}
+	if tokens, ok := response["tokens"].(float64); ok {
+		return int(tokens), nil
+	}
+	return 0, errors.New("token helper did not return tokens")
+}
+
+func pythonExactTokenText(model, revision string, targetTokens int, seedText string) (string, int, error) {
+	response, err := runPythonTokenHelper(map[string]any{"model": model, "revision": revision, "target_tokens": targetTokens, "seed_text": seedText})
+	if err != nil {
+		return "", 0, err
+	}
+	text := stringValue(response["text"])
+	tokensFloat, ok := response["tokens"].(float64)
+	if !ok || text == "" {
+		return "", 0, errors.New("token helper did not return exact text")
+	}
+	return text, int(tokensFloat), nil
+}
+
+func runPythonTokenHelper(request map[string]any) (map[string]any, error) {
+	script, err := tokenCountScriptPath()
+	if err != nil {
+		return nil, err
+	}
 	data, _ := json.Marshal(request)
 	var lastErr error
 	for _, python := range []string{"python3", "python"} {
@@ -4731,17 +4827,14 @@ func pythonTokenCount(model, revision, text string) (int, error) {
 		}
 		var response map[string]any
 		if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
-			return 0, err
+			return nil, err
 		}
-		if tokens, ok := response["tokens"].(float64); ok {
-			return int(tokens), nil
-		}
-		return 0, errors.New("token helper did not return tokens")
+		return response, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no python interpreter found on PATH")
 	}
-	return 0, lastErr
+	return nil, lastErr
 }
 
 // tokenCountScriptPath materializes the embedded tokenizer helper to a stable
@@ -4784,6 +4877,15 @@ func firstNonZero(values ...int) int {
 // integer truncation (and 1ms floor) that previously biased sub-ms timings.
 func durationMS(duration time.Duration) float64 {
 	return float64(duration.Nanoseconds()) / 1e6
+}
+
+func firstNonNil(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 func stringValue(value any) string {
@@ -4829,18 +4931,31 @@ func runBenchmarkCommand(args cliArgs, commandSnippet string) (string, string, e
 	defer cancel()
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/C", commandSnippet)
+		cmd = exec.Command("cmd", "/C", commandSnippet)
 	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", commandSnippet)
+		cmd = exec.Command("sh", "-c", commandSnippet)
 	}
+	configureCommandProcessGroup(cmd)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", "", cliError{"benchmark_command_timeout", "Benchmark command timed out.", []string{"Raise --command-timeout-seconds or drop it to wait indefinitely."}, commandSnippet}
-		}
+	if err := cmd.Start(); err != nil {
+		return "", "", cliError{"benchmark_command_failed", "Benchmark command failed to start.", []string{"Check that the benchmark executable is installed and available on PATH."}, err.Error()}
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		killCommandProcessGroup(cmd)
+		err = <-done
+		return "", "", cliError{"benchmark_command_timeout", "Benchmark command timed out.", []string{"Raise --command-timeout-seconds or drop it to wait indefinitely."}, commandSnippet}
+	}
+	if err != nil {
 		output := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
 		return "", "", cliError{"benchmark_command_failed", "Benchmark command failed.", []string{"Check that the benchmark executable is installed and available on PATH.", "For llama.cpp, pass a complete llama-bench command with --command.", "For vLLM/SGLang, prefer their JSON output if available, then pass --results <path>."}, firstNonEmpty(output, err.Error())}
 	}

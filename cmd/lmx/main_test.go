@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1147,7 +1148,7 @@ func TestRemoteKVCachePointReportsUsagePromptTokens(t *testing.T) {
 	}))
 	defer server.Close()
 
-	point, err := measureRemoteKVCachePoint(cliArgs{opts: map[string]string{"base-url": server.URL, "served-model": "served-model", "max-tokens": "16"}, flags: map[string]bool{"quiet": true}}, "org/model", 10000)
+	point, err := measureRemoteKVCachePoint(cliArgs{opts: map[string]string{"base-url": server.URL, "served-model": "served-model", "max-tokens": "16", "prompt-tokens": "10000"}, flags: map[string]bool{"quiet": true}}, "org/model", 10000)
 	if err != nil {
 		t.Fatalf("measureRemoteKVCachePoint returned error: %v", err)
 	}
@@ -1208,7 +1209,7 @@ func TestRemoteKVCachePointWarnsWhenSlotsShowNoCache(t *testing.T) {
 	}))
 	defer server.Close()
 
-	point, err := measureRemoteKVCachePoint(cliArgs{opts: map[string]string{"base-url": server.URL, "served-model": "served-model", "max-tokens": "16"}, flags: map[string]bool{"quiet": true}}, "org/model", 10000)
+	point, err := measureRemoteKVCachePoint(cliArgs{opts: map[string]string{"base-url": server.URL, "served-model": "served-model", "max-tokens": "16", "prompt-tokens": "10000"}, flags: map[string]bool{"quiet": true}}, "org/model", 10000)
 	if err != nil {
 		t.Fatalf("measureRemoteKVCachePoint returned error: %v", err)
 	}
@@ -1409,6 +1410,58 @@ func TestCompareBenchmarkRunGroupsComparesByMedian(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("Q4_K_M group missing from comparisons")
+	}
+}
+
+func TestKVCachePromptForRemoteUsesExplicitTokenCount(t *testing.T) {
+	prompt, count, source, err := kvCachePromptForRemote(cliArgs{opts: map[string]string{"prompt-tokens": "123"}, flags: map[string]bool{}}, "org/model", "main", 123)
+	if err != nil {
+		t.Fatalf("kvCachePromptForRemote returned error: %v", err)
+	}
+	if count != 123 || source != "explicit_flag" {
+		t.Fatalf("count/source = %d/%q, want 123/explicit_flag", count, source)
+	}
+	if len(strings.Fields(prompt)) != 123 {
+		t.Fatalf("prompt word count = %d, want explicit fallback target words", len(strings.Fields(prompt)))
+	}
+}
+
+func TestBenchmarkPayloadToMapPreservesTypedFields(t *testing.T) {
+	payload := benchmarkPayload{
+		EngineName:      "llama.cpp",
+		HFID:            "org/model",
+		ModelRevision:   "main",
+		Quantization:    "Q4_K_M",
+		Backend:         "gguf",
+		BenchmarkMode:   "local",
+		DetectedEngines: []detectedEngine{{Name: "llama.cpp", Installed: true}},
+		Hardware:        map[string]any{"gpuName": "RTX 3090"},
+		HardwareSource:  "file",
+		Extra:           map[string]any{"tokSOut": 123.4},
+	}.ToMap()
+	if payload["engineName"] != "llama.cpp" || payload["hfId"] != "org/model" || payload["tokSOut"] != 123.4 {
+		t.Fatalf("payload map missing typed fields: %#v", payload)
+	}
+	if payload["backend"] != "gguf" || payload["hardwareSource"] != "file" {
+		t.Fatalf("payload map missing optional fields: %#v", payload)
+	}
+}
+
+func TestRunBenchmarkCommandTimeoutKillsChildProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell syntax is Unix-specific")
+	}
+	marker := filepath.Join(t.TempDir(), "child-survived")
+	_, _, err := runBenchmarkCommand(cliArgs{opts: map[string]string{"command-timeout-seconds": "1"}, flags: map[string]bool{}}, fmt.Sprintf("(sleep 2; touch %s) & wait", shellQuote(marker)))
+	if err == nil {
+		t.Fatal("runBenchmarkCommand succeeded, want timeout")
+	}
+	if ce, ok := err.(cliError); !ok || ce.Code != "benchmark_command_timeout" {
+		t.Fatalf("error = %#v, want benchmark_command_timeout", err)
+	}
+	time.Sleep(2200 * time.Millisecond)
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("child process survived timeout and wrote marker: %v", statErr)
 	}
 }
 
