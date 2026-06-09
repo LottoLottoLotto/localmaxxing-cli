@@ -92,7 +92,7 @@ Saved CLI config lives under `~/.config/localmaxxing`.
 
 ## Hardware Metadata
 
-Submissions require a hardware JSON object. Generate one and review it before submitting results:
+Submissions require a hardware JSON object. Generate one on the machine that actually ran the benchmark and review it before submitting results:
 
 ```bash
 lmx hardware --out hardware.json
@@ -137,6 +137,8 @@ lmx benchmark run vllm \
   --max-tokens 256 \
   --dry-run
 ```
+
+For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server, before `benchmark dry-run` or `benchmark submit`.
 
 Local host mode runs a benchmark command on the machine where the runtime is installed:
 
@@ -238,6 +240,8 @@ lmx kvcache run vllm \
   --levels 10000,20000,30000,40000 \
   --output-tokens 128
 ```
+
+Remote sweeps pre-warm the target context prefix, inspect llama.cpp `/slots` for `n_prompt_tokens_cache`, then time a streaming probe with the same prefix. If `/slots` reports no retained prompt cache, the CLI records a warning and labels the point as a cold inline prefill measurement instead of cached-context speed.
 
 ## Eval Workflows
 

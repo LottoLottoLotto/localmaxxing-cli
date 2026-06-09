@@ -69,7 +69,7 @@ lmx auth --logout
 
 ## Hardware File
 
-Submissions require a hardware JSON object. Example `hardware.json`:
+Submissions require a hardware JSON object for the machine that actually ran the benchmark. Example `hardware.json`:
 
 ```json
 {
@@ -85,6 +85,8 @@ You can generate a best-effort hardware file from the current machine:
 lmx hardware --out hardware.json
 ```
 
+For remote endpoint benchmarks, generate or review this file on the server running the endpoint. The CLI will not use client auto-detected hardware for remote submissions.
+
 ## Submit An Inference Benchmark
 
 The Go CLI supports two benchmark modes:
@@ -98,9 +100,12 @@ lmx benchmark run vllm \
   --hf-id Qwen/Qwen3-8B \
   --served-model Qwen/Qwen3-8B \
   --quantization fp16 \
+  --hardware hardware.json \
   --max-tokens 256 \
   --dry-run
 ```
+
+If the endpoint is on another machine, `hardware.json` must describe that server. Create it on the server with `lmx hardware --out hardware.json`, or provide an equivalent reviewed file, before API dry-run or submit.
 
 If `--served-model` is omitted, the CLI tries `GET /v1/models` and uses the matching or first returned model ID before falling back to `--hf-id`.
 
@@ -330,7 +335,7 @@ lmx kvcache run vllm \
   --batch-size 1
 ```
 
-Remote mode sends a streaming OpenAI-compatible chat completion with retained chat history/filler sized to the target context, then measures client-observed TTFT and decode speed after that loaded context:
+Remote mode pre-warms the target context prefix, inspects llama.cpp `/slots` for `n_prompt_tokens_cache`, then times a streaming OpenAI-compatible chat completion with the same prefix plus a probe:
 
 ```bash
 lmx kvcache run vllm \
@@ -342,7 +347,7 @@ lmx kvcache run vllm \
   --output-tokens 128
 ```
 
-Remote context sizing is approximate unless the endpoint returns `usage.prompt_tokens`. The output includes `methodology`, `timingSource`, `ttftMs`, `tokSPrefill`, `tokSOut`, and `tokSTotal` per point so results can be compared across context depths.
+If `/slots` reports no retained prompt cache, the CLI records a warning and labels the point as a cold inline prefill measurement instead of cached-context speed. Remote context sizing combines the requested context level with endpoint `usage.prompt_tokens` when present, because llama.cpp may report only new non-cached prompt tokens. The output includes `methodology`, `cacheReuse`, `timingSource`, `ttftMs`, `tokSPrefill`, `tokSOut`, and `tokSTotal` per point so results can be compared across context depths.
 
 ## Discover Eval Requirements
 

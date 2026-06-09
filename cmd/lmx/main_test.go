@@ -262,6 +262,43 @@ func TestBenchmarkDryRunInfersTokensFromExplicitCommand(t *testing.T) {
 	}
 }
 
+func TestBenchmarkRemoteDryRunDoesNotUseClientHardware(t *testing.T) {
+	payload, err := benchmarkPayloadFromFlags("llama.cpp", cliArgs{
+		opts: map[string]string{
+			"mode":         "remote",
+			"base-url":     "http://127.0.0.1:8080",
+			"hf-id":        "Qwen/Qwen3-8B",
+			"served-model": "Qwen/Qwen3-8B",
+			"quantization": "Q4_K_M",
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	if payload["hardware"] != nil {
+		t.Fatalf("remote payload hardware = %#v, want no implicit client hardware", payload["hardware"])
+	}
+	if payload["hardwareSource"] != "missing_remote" {
+		t.Fatalf("hardwareSource = %v, want missing_remote", payload["hardwareSource"])
+	}
+}
+
+func TestBenchmarkRemoteSubmitRequiresHardware(t *testing.T) {
+	err := validateBenchmarkSubmitPayload(map[string]any{"benchmarkMode": "remote", "tokSOut": 120.0})
+	if err == nil {
+		t.Fatal("validateBenchmarkSubmitPayload accepted remote payload without hardware")
+	}
+	if cliErr, ok := err.(cliError); !ok || cliErr.Code != "missing_remote_hardware" {
+		t.Fatalf("error = %#v, want missing_remote_hardware", err)
+	}
+
+	err = validateBenchmarkSubmitPayload(map[string]any{"benchmarkMode": "remote", "tokSOut": 120.0, "hardware": map[string]any{"gpuName": "RTX 4090"}})
+	if err != nil {
+		t.Fatalf("validateBenchmarkSubmitPayload rejected hardware: %v", err)
+	}
+}
+
 func TestBenchmarkManualMetricsDeriveTotalsFromCommandTokens(t *testing.T) {
 	payload, err := benchmarkPayloadFromFlags("llama.cpp", cliArgs{
 		opts: map[string]string{
@@ -881,20 +918,31 @@ func TestParseVLLMLatencyJSONMetrics(t *testing.T) {
 	}
 }
 
-func TestRemoteKVCachePointMeasuresStreamingChatHistory(t *testing.T) {
-	var requestBody string
+func TestRemoteKVCachePointUsesLevelPlusUsagePromptTokens(t *testing.T) {
+	var timedRequestBody string
+	chatRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/chat/completions" {
+		switch r.URL.Path {
+		case "/slots":
+			fmt.Fprint(w, `[{"id":0,"n_prompt_tokens_cache":10000}]`)
+			return
+		case "/v1/chat/completions":
+			chatRequests++
+			data, _ := io.ReadAll(r.Body)
+			if chatRequests == 1 {
+				fmt.Fprint(w, `{"choices":[{"message":{"content":"warm"}}],"usage":{"prompt_tokens":10000,"completion_tokens":1}}`)
+				return
+			}
+			timedRequestBody = string(data)
+			w.Header().Set("Content-Type", "text/event-stream")
+			time.Sleep(2 * time.Millisecond)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":67,"completion_tokens":2}}`)
+			fmt.Fprintln(w, `data: [DONE]`)
+		default:
 			http.NotFound(w, r)
 			return
 		}
-		data, _ := io.ReadAll(r.Body)
-		requestBody = string(data)
-		w.Header().Set("Content-Type", "text/event-stream")
-		time.Sleep(2 * time.Millisecond)
-		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
-		fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":2}}`)
-		fmt.Fprintln(w, `data: [DONE]`)
 	}))
 	defer server.Close()
 
@@ -902,14 +950,63 @@ func TestRemoteKVCachePointMeasuresStreamingChatHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("measureRemoteKVCachePoint returned error: %v", err)
 	}
-	if point["contextTokens"] != 10000.0 || point["promptTokens"] != 10000.0 || point["outputTokens"] != 2.0 {
+	if chatRequests != 2 {
+		t.Fatalf("chatRequests = %d, want prewarm + timed requests", chatRequests)
+	}
+	if point["contextTokens"] != 10000.0 || point["promptTokens"] != 10067.0 || point["usagePromptTokens"] != 67.0 || point["outputTokens"] != 2.0 {
 		t.Fatalf("point token fields = %#v", point)
 	}
 	if point["tokSOut"] == nil || point["ttftMs"] == nil || point["tokSPrefill"] == nil {
 		t.Fatalf("expected throughput fields, got %#v", point)
 	}
-	if !strings.Contains(requestBody, "Context received.") || !strings.Contains(requestBody, "stream_options") {
-		t.Fatalf("requestBody missing retained chat history or usage options: %s", requestBody)
+	if point["methodology"] != remoteKVCacheReuseMethodology {
+		t.Fatalf("methodology = %v", point["methodology"])
+	}
+	cacheReuse := point["cacheReuse"].(map[string]any)
+	if cacheReuse["status"] != "retained" || cacheReuse["nPromptTokensCacheMax"] != 10000 {
+		t.Fatalf("cacheReuse = %#v", cacheReuse)
+	}
+	if !strings.Contains(timedRequestBody, "Context received.") || !strings.Contains(timedRequestBody, "stream_options") {
+		t.Fatalf("timedRequestBody missing retained chat history or usage options: %s", timedRequestBody)
+	}
+}
+
+func TestRemoteKVCachePointWarnsWhenSlotsShowNoCache(t *testing.T) {
+	chatRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/slots":
+			fmt.Fprint(w, `[{"id":0,"n_prompt_tokens_cache":0}]`)
+		case "/v1/chat/completions":
+			chatRequests++
+			if chatRequests == 1 {
+				fmt.Fprint(w, `{"choices":[{"message":{"content":"warm"}}],"usage":{"prompt_tokens":10000,"completion_tokens":1}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":67,"completion_tokens":2}}`)
+			fmt.Fprintln(w, `data: [DONE]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	point, err := measureRemoteKVCachePoint(cliArgs{opts: map[string]string{"base-url": server.URL, "served-model": "served-model", "max-tokens": "16"}, flags: map[string]bool{"quiet": true}}, "org/model", 10000)
+	if err != nil {
+		t.Fatalf("measureRemoteKVCachePoint returned error: %v", err)
+	}
+	cacheReuse := point["cacheReuse"].(map[string]any)
+	if cacheReuse["status"] != "not_retained" || cacheReuse["nPromptTokensCacheMax"] != 0 {
+		t.Fatalf("cacheReuse = %#v", cacheReuse)
+	}
+	if point["methodology"] != remoteKVCacheColdMethodology {
+		t.Fatalf("methodology = %v", point["methodology"])
+	}
+	warnings := point["warnings"].([]string)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "cold prefill") {
+		t.Fatalf("warnings = %#v", warnings)
 	}
 }
 
@@ -941,5 +1038,13 @@ func TestBenchmarkAgentFeedbackDistinguishesPlanFromReadyPayload(t *testing.T) {
 	}
 	if unauthenticated["validationCommand"] != "lmx benchmark dry-run ready.json" {
 		t.Fatalf("validationCommand = %v", unauthenticated["validationCommand"])
+	}
+
+	remoteNoHardware := benchmarkAgentFeedback(map[string]any{"engineName": "llama.cpp", "benchmarkMode": "remote", "tokSOut": 120.0}, "remote.json", cliArgs{opts: map[string]string{"api-key": "bhk_test"}, flags: map[string]bool{}}, false, false)
+	if remoteNoHardware["status"] != "needs_remote_hardware" || remoteNoHardware["canSubmit"] != false || remoteNoHardware["requiresHardware"] != true {
+		t.Fatalf("remoteNoHardware feedback = %#v", remoteNoHardware)
+	}
+	if remoteNoHardware["submitCommand"] != nil {
+		t.Fatalf("remoteNoHardware submitCommand = %v, want nil", remoteNoHardware["submitCommand"])
 	}
 }

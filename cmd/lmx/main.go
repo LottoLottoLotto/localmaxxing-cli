@@ -26,6 +26,8 @@ import (
 const defaultAPIURL = "https://www.localmaxxing.com"
 const defaultHFAPIURL = "https://huggingface.co"
 const defaultEndpointTimeout = 10 * time.Minute
+const remoteKVCacheColdMethodology = "Single streaming request with inline filler padded to target context size; measures cold prefill + decode at that context depth."
+const remoteKVCacheReuseMethodology = "Two-step remote cache-reuse probe: pre-warm target context, then time a streaming request with the same prefix plus probe; measures cached-prefix decode at that context depth."
 
 var goldFieldNames = map[string]bool{
 	"gold": true, "answer": true, "referenceAnswer": true, "expectedAnswer": true,
@@ -1158,6 +1160,9 @@ func handleBenchmark(action, target string, args cliArgs) error {
 			if hasFlag(args, "dry-run") {
 				endpoint = "/api/benchmarks/dry-run"
 			}
+			if err := validateBenchmarkSubmitPayload(payload); err != nil {
+				return err
+			}
 			apiPayload := toBenchmarkSubmit(payload)
 			return submitPayload(endpoint, hasFlag(args, "dry-run"), "benchmark", args, apiPayload)
 		}
@@ -1179,11 +1184,15 @@ func handleBenchmark(action, target string, args cliArgs) error {
 			value = payload
 		}
 	}
+	payload := asObject(value)
+	if err := validateBenchmarkSubmitPayload(payload); err != nil {
+		return err
+	}
 	endpoint := "/api/benchmarks"
 	if action == "dry-run" {
 		endpoint = "/api/benchmarks/dry-run"
 	}
-	apiPayload := toBenchmarkSubmit(asObject(value))
+	apiPayload := toBenchmarkSubmit(payload)
 	return submitPayload(endpoint, action == "dry-run", "benchmark", args, apiPayload)
 }
 
@@ -2038,17 +2047,16 @@ func handleKVCache(action, target string, args cliArgs) error {
 		engineName = resolved
 	}
 	quantization := opt(args, "quantization")
-	hardwarePath := opt(args, "hardware")
 
-	var hardware map[string]any
-	if hardwarePath != "" {
-		hw, err := readJSON(hardwarePath)
+	var hardware any
+	hardwareSource := ""
+	if !hasFlag(args, "dry-run") || opt(args, "hardware") != "" {
+		loaded, source, err := benchmarkHardware(mode, args)
 		if err != nil {
 			return err
 		}
-		hardware = hw.(map[string]any)
-	} else if !hasFlag(args, "dry-run") {
-		hardware = detectHardware()
+		hardware = loaded
+		hardwareSource = source
 	}
 
 	runsDir := firstNonEmpty(opt(args, "runs-dir"), "runs")
@@ -2098,8 +2106,16 @@ func handleKVCache(action, target string, args cliArgs) error {
 		if hardware != nil {
 			runPayload["hardware"] = hardware
 		}
+		if hardwareSource != "" {
+			runPayload["hardwareSource"] = hardwareSource
+		}
 		if commandSnippet := stringValue(point["commandSnippet"]); commandSnippet != "" {
 			runPayload["engineFlags"] = map[string]any{"mode": mode, "commandSnippet": commandSnippet}
+		}
+		for _, key := range []string{"methodology", "warnings", "cacheReuse", "usagePromptTokens"} {
+			if value, ok := point[key]; ok {
+				runPayload[key] = value
+			}
 		}
 
 		if hasFlag(args, "dry-run") {
@@ -2134,6 +2150,9 @@ func handleKVCache(action, target string, args cliArgs) error {
 	}
 	if hardware != nil {
 		aggregate["hardware"] = hardware
+	}
+	if hardwareSource != "" {
+		aggregate["hardwareSource"] = hardwareSource
 	}
 	if hasFlag(args, "dry-run") {
 		aggregate["dryRun"] = true
@@ -2201,14 +2220,17 @@ func kvCachePayloadFromFlags(target string, args cliArgs) (map[string]any, error
 	if q := opt(args, "quantization"); q != "" {
 		payload["quantization"] = q
 	}
-	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
-		hardware, err := readJSON(hardwarePath)
+	if !hasFlag(args, "dry-run") || opt(args, "hardware") != "" {
+		hardware, source, err := benchmarkHardware(mode, args)
 		if err != nil {
 			return nil, err
 		}
-		payload["hardware"] = hardware
-	} else if !hasFlag(args, "dry-run") {
-		payload["hardware"] = detectHardware()
+		if hardware != nil {
+			payload["hardware"] = hardware
+		}
+		if source != "" {
+			payload["hardwareSource"] = source
+		}
 	}
 
 	points := []any{}
@@ -2421,19 +2443,50 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), hfID)
 	maxTokens := kvOutputTokens(args)
 	if hasFlag(args, "dry-run") {
-		return map[string]any{"contextTokens": float64(level), "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "maxTokens": float64(maxTokens), "dryRun": true, "methodology": "streaming request with retained chat history/filler sized to target context"}, nil
+		return map[string]any{"contextTokens": float64(level), "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "maxTokens": float64(maxTokens), "dryRun": true, "methodology": remoteKVCacheColdMethodology}, nil
 	}
 	prompt := kvCachePrompt(args, level)
-	messages := []any{
+	prefixMessages := []any{
 		map[string]any{"role": "system", "content": "You are measuring decode speed after a long retained context. Answer the final question concisely."},
 		map[string]any{"role": "user", "content": prompt},
 		map[string]any{"role": "assistant", "content": "Context received."},
-		map[string]any{"role": "user", "content": firstNonEmpty(opt(args, "probe-prompt"), "Continue with a concise benchmark response.")},
 	}
+	messages := append(append([]any{}, prefixMessages...),
+		map[string]any{"role": "user", "content": firstNonEmpty(opt(args, "probe-prompt"), "Continue with a concise benchmark response.")},
+	)
 	body := map[string]any{"model": servedModel, "messages": messages, "max_tokens": maxTokens, "temperature": 0, "stream": true, "stream_options": map[string]any{"include_usage": true}}
 	timeout, err := endpointTimeout(args)
 	if err != nil {
 		return nil, err
+	}
+	cacheStatus := map[string]any{"status": "unknown"}
+	methodology := remoteKVCacheColdMethodology
+	warnings := []string{}
+	if err := warmRemoteKVCachePrefix(args, baseURL, servedModel, prefixMessages, timeout); err != nil {
+		return nil, err
+	}
+	cacheTokens, slots, err := remoteKVCacheSlotPromptTokens(args, baseURL, timeout)
+	if err != nil {
+		warning := "Could not verify llama.cpp /slots cache retention; results may reflect cold prefill rather than cached-context speed."
+		warnings = append(warnings, warning)
+		cacheStatus["status"] = "unverified"
+		cacheStatus["warning"] = warning
+		cacheStatus["error"] = err.Error()
+		printStatus(args, "kvcache_cache_reuse_unverified", map[string]any{"level": level, "warning": warning, "error": err.Error()})
+	} else {
+		cacheStatus["nPromptTokensCacheMax"] = cacheTokens
+		cacheStatus["slots"] = slots
+		if cacheTokens > 0 {
+			cacheStatus["status"] = "retained"
+			methodology = remoteKVCacheReuseMethodology
+			printStatus(args, "kvcache_cache_reuse_detected", map[string]any{"level": level, "nPromptTokensCacheMax": cacheTokens})
+		} else {
+			warning := "Server does not appear to retain KV cache between requests; results reflect cold prefill, not cached-context speed."
+			warnings = append(warnings, warning)
+			cacheStatus["status"] = "not_retained"
+			cacheStatus["warning"] = warning
+			printStatus(args, "kvcache_cache_reuse_missing", map[string]any{"level": level, "warning": warning})
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -2481,9 +2534,9 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 		}
 		outputTokens = count.Count
 	}
-	promptTokens := usagePromptTokens
-	if promptTokens == 0 {
-		promptTokens = level
+	promptTokens := level
+	if usagePromptTokens > 0 {
+		promptTokens = level + usagePromptTokens
 	}
 	totalMs := maxDurationMS(completedAt.Sub(started))
 	generationMs := maxDurationMS(completedAt.Sub(generationStart))
@@ -2497,9 +2550,14 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 		"mode":              "remote",
 		"baseUrl":           baseURL,
 		"servedModel":       servedModel,
-		"methodology":       "streaming request with retained chat history/filler sized to target context",
+		"methodology":       methodology,
+		"cacheReuse":        cacheStatus,
+		"usagePromptTokens": float64(usagePromptTokens),
 		"timingSource":      "client_observed_http",
 		"tokSPrefillSource": "estimated_from_ttft",
+	}
+	if len(warnings) > 0 {
+		point["warnings"] = warnings
 	}
 	if !streamResult.firstTokenAt.IsZero() {
 		ttftMs := float64(streamResult.firstTokenAt.Sub(started).Milliseconds())
@@ -2509,6 +2567,82 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 		}
 	}
 	return point, nil
+}
+
+func warmRemoteKVCachePrefix(args cliArgs, baseURL, servedModel string, messages []any, timeout time.Duration) error {
+	body := map[string]any{"model": servedModel, "messages": messages, "max_tokens": 1, "temperature": 0, "stream": false}
+	bodyData, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat/completions", bytes.NewReader(bodyData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := opt(args, "model-api-key"); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return cliError{"kvcache_remote_failed", fmt.Sprintf("Could not pre-warm remote KV-cache prefix: %v", err), []string{"Check --base-url and confirm the endpoint is reachable from this machine."}, nil}
+	}
+	defer res.Body.Close()
+	data, _ := io.ReadAll(res.Body)
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return cliError{"kvcache_remote_failed", fmt.Sprintf("Remote KV-cache pre-warm returned %s", res.Status), []string{"Check --base-url, --served-model, and the target context level."}, string(data)}
+	}
+	return nil
+}
+
+func remoteKVCacheSlotPromptTokens(args cliArgs, baseURL string, timeout time.Duration) (int, any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/slots", nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	if key := opt(args, "model-api-key"); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer res.Body.Close()
+	data, _ := io.ReadAll(res.Body)
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return 0, nil, fmt.Errorf("GET /slots returned %s", res.Status)
+	}
+	var slots any
+	if err := json.Unmarshal(data, &slots); err != nil {
+		return 0, nil, err
+	}
+	return maxSlotPromptCacheTokens(slots), slots, nil
+}
+
+func maxSlotPromptCacheTokens(value any) int {
+	maxValue := 0
+	var visit func(any)
+	visit = func(current any) {
+		switch typed := current.(type) {
+		case []any:
+			for _, item := range typed {
+				visit(item)
+			}
+		case map[string]any:
+			if n := int(numberField(typed, "n_prompt_tokens_cache")); n > maxValue {
+				maxValue = n
+			}
+			for _, item := range typed {
+				visit(item)
+			}
+		}
+	}
+	visit(value)
+	return maxValue
 }
 
 func kvCachePrompt(args cliArgs, targetTokens int) string {
@@ -2594,16 +2728,18 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		printStatus(args, "benchmark_metrics_detected", metricStatusFields(parsed))
 	}
 
-	hardware := any(detectHardware())
-	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
-		loaded, err := readJSON(hardwarePath)
-		if err != nil {
-			return nil, err
-		}
-		hardware = loaded
+	hardware, hardwareSource, err := benchmarkHardware(mode, args)
+	if err != nil {
+		return nil, err
 	}
 
-	payload := map[string]any{"engineName": engineName, "hfId": model, "modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"), "hardware": hardware, "quantization": quantization, "detectedEngines": detectInferenceEngines(args)}
+	payload := map[string]any{"engineName": engineName, "hfId": model, "modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"), "quantization": quantization, "detectedEngines": detectInferenceEngines(args)}
+	if hardware != nil {
+		payload["hardware"] = hardware
+	}
+	if hardwareSource != "" {
+		payload["hardwareSource"] = hardwareSource
+	}
 	if backend != "" {
 		payload["backend"] = backend
 	}
@@ -2639,6 +2775,33 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	}
 	printStatus(args, "benchmark_payload_ready", map[string]any{"mode": mode, "tokSOut": payload["tokSOut"], "tokSPrefill": payload["tokSPrefill"], "tokSTotal": payload["tokSTotal"], "ttftMs": payload["ttftMs"]})
 	return payload, nil
+}
+
+func benchmarkHardware(mode string, args cliArgs) (any, string, error) {
+	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
+		loaded, err := readJSON(hardwarePath)
+		if err != nil {
+			return nil, "", err
+		}
+		if asObject(loaded) == nil {
+			return nil, "", cliError{"invalid_hardware", "--hardware must point to a JSON object.", []string{"Generate one with lmx hardware --out hardware.json on the benchmark host."}, loaded}
+		}
+		return loaded, "file", nil
+	}
+	if mode == "remote" {
+		return nil, "missing_remote", nil
+	}
+	return detectHardware(), "detected_local", nil
+}
+
+func validateBenchmarkSubmitPayload(payload map[string]any) error {
+	if payload == nil {
+		return cliError{"invalid_benchmark_payload", "Benchmark payload must be a JSON object.", nil, nil}
+	}
+	if stringValue(payload["benchmarkMode"]) == "remote" && asObject(payload["hardware"]) == nil {
+		return cliError{"missing_remote_hardware", "Remote benchmark submission requires explicit server hardware metadata.", []string{"Run lmx hardware --out hardware.json on the machine running the endpoint, or create an equivalent hardware JSON for that server.", "Rerun the remote benchmark with --hardware hardware.json before dry-run or submit.", "Do not rely on client auto-detected hardware for endpoint benchmarks."}, nil}
+	}
+	return nil
 }
 
 // toBenchmarkSubmit strips internal-only fields and remaps hardware/engineFlags
@@ -2811,7 +2974,8 @@ func anySlice(value any) []any {
 
 func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dryRun, submit bool) map[string]any {
 	ready := numberField(payload, "tokSOut") > 0
-	missingAuth := ready && !submit && apiKey(args) == ""
+	requiresRemoteHardware := stringValue(payload["benchmarkMode"]) == "remote" && asObject(payload["hardware"]) == nil
+	missingAuth := ready && !requiresRemoteHardware && !submit && apiKey(args) == ""
 	status := "ready_for_api_validation"
 	message := "Benchmark payload is ready for API validation."
 	nextCommand := "lmx benchmark dry-run " + out
@@ -2819,10 +2983,18 @@ func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dr
 		status = "api_submission_requested"
 		message = "Benchmark payload is being sent to the API."
 		nextCommand = ""
+	} else if ready && requiresRemoteHardware {
+		status = "needs_remote_hardware"
+		message = "Remote benchmark has metrics but no server hardware file. Generate hardware metadata on the endpoint host and rerun with --hardware before validating or submitting."
+		nextCommand = "lmx hardware --out hardware.json"
 	} else if dryRun && !ready {
 		status = "plan_needs_metrics"
 		message = "Measurement plan written. benchmark run --dry-run does not contact the model endpoint or API; run without --dry-run to measure, or add explicit metrics before API validation."
 		nextCommand = "lmx benchmark run <engine> <same options without --dry-run>"
+		if requiresRemoteHardware {
+			message += " Remote endpoint submissions also require --hardware with metadata from the endpoint host."
+			nextCommand += " --hardware hardware.json"
+		}
 	} else if dryRun {
 		status = "plan_ready_for_api_validation"
 		message = "Dry-run payload written with metrics. Validate it with lmx benchmark dry-run before submitting; benchmark run --dry-run is only a measurement-plan mode."
@@ -2835,14 +3007,18 @@ func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dr
 		"status":          status,
 		"message":         message,
 		"outputPath":      out,
-		"canApiValidate":  ready,
-		"canSubmit":       ready,
+		"canApiValidate":  ready && !requiresRemoteHardware,
+		"canSubmit":       ready && !requiresRemoteHardware,
 		"requiresMetrics": !ready,
+	}
+	if requiresRemoteHardware {
+		feedback["requiresHardware"] = true
+		feedback["hardwareCommand"] = "lmx hardware --out hardware.json"
 	}
 	if nextCommand != "" {
 		feedback["nextCommand"] = nextCommand
 	}
-	if ready && !submit {
+	if ready && !requiresRemoteHardware && !submit {
 		feedback["submitCommand"] = "lmx benchmark submit " + out
 	}
 	if missingAuth {
@@ -4445,7 +4621,7 @@ func printBenchmarkNextSteps(feedback map[string]any, out string) {
 	}
 	if submit := stringValue(feedback["submitCommand"]); submit != "" {
 		fmt.Println("  " + submit)
-	} else {
+	} else if feedback["canSubmit"] != false {
 		fmt.Println("  lmx benchmark submit " + out)
 	}
 }
