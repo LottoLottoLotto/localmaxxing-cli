@@ -917,7 +917,9 @@ func TestBenchmarkRunRerunHonorsRunsDir(t *testing.T) {
 }
 
 func TestKVCacheDryRunBuildsLlamaCommandsPerLevel(t *testing.T) {
-	payload, err := kvCachePayloadFromFlags("llama.cpp", cliArgs{
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "sweep.json")
+	args := cliArgs{
 		opts: map[string]string{
 			"mode":          "local",
 			"hf-id":         "Qwen/Qwen3-8B",
@@ -931,13 +933,19 @@ func TestKVCacheDryRunBuildsLlamaCommandsPerLevel(t *testing.T) {
 			"repetitions":   "3",
 			"cache-type-k":  "q8_0",
 			"cache-type-v":  "f16",
+			"out":           out,
+			"runs-dir":      filepath.Join(tmp, "runs"),
 		},
 		flags: map[string]bool{"dry-run": true, "quiet": true, "flash-attn": true},
-	})
-	if err != nil {
-		t.Fatalf("kvCachePayloadFromFlags returned error: %v", err)
 	}
-	points := payload["points"].([]any)
+	if err := handleKVCache("run", "llama.cpp", args); err != nil {
+		t.Fatalf("handleKVCache returned error: %v", err)
+	}
+	aggregate, err := readJSON(out)
+	if err != nil {
+		t.Fatalf("read aggregate: %v", err)
+	}
+	points := aggregate.(map[string]any)["points"].([]any)
 	if len(points) != 2 {
 		t.Fatalf("points len = %d, want 2", len(points))
 	}
@@ -1069,20 +1077,28 @@ func TestParseLlamaBenchJSONDepthMetrics(t *testing.T) {
 }
 
 func TestKVCacheDryRunBuildsVLLMLatencyCommandsPerLevel(t *testing.T) {
-	payload, err := kvCachePayloadFromFlags("vllm", cliArgs{
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "sweep.json")
+	args := cliArgs{
 		opts: map[string]string{
 			"mode":          "local",
 			"hf-id":         "Qwen/Qwen3-8B",
 			"levels":        "10000",
 			"output-tokens": "64",
 			"batch-size":    "1",
+			"out":           out,
+			"runs-dir":      filepath.Join(tmp, "runs"),
 		},
 		flags: map[string]bool{"dry-run": true, "quiet": true},
-	})
-	if err != nil {
-		t.Fatalf("kvCachePayloadFromFlags returned error: %v", err)
 	}
-	points := payload["points"].([]any)
+	if err := handleKVCache("run", "vllm", args); err != nil {
+		t.Fatalf("handleKVCache returned error: %v", err)
+	}
+	aggregate, err := readJSON(out)
+	if err != nil {
+		t.Fatalf("read aggregate: %v", err)
+	}
+	points := aggregate.(map[string]any)["points"].([]any)
 	command := points[0].(map[string]any)["commandSnippet"].(string)
 	for _, want := range []string{"vllm bench latency", "--input-len 10000", "--output-len 64", "--batch-size 1", "--max-model-len 10064", "--output-json"} {
 		if !strings.Contains(command, want) {
@@ -1101,7 +1117,7 @@ func TestParseVLLMLatencyJSONMetrics(t *testing.T) {
 	}
 }
 
-func TestRemoteKVCachePointUsesLevelPlusUsagePromptTokens(t *testing.T) {
+func TestRemoteKVCachePointReportsUsagePromptTokens(t *testing.T) {
 	var warmRequestBody string
 	var timedRequestBody string
 	chatRequests := 0
@@ -1122,7 +1138,7 @@ func TestRemoteKVCachePointUsesLevelPlusUsagePromptTokens(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			time.Sleep(2 * time.Millisecond)
 			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
-			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":67,"completion_tokens":2}}`)
+			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":10067,"completion_tokens":2}}`)
 			fmt.Fprintln(w, `data: [DONE]`)
 		default:
 			http.NotFound(w, r)
@@ -1138,11 +1154,14 @@ func TestRemoteKVCachePointUsesLevelPlusUsagePromptTokens(t *testing.T) {
 	if chatRequests != 2 {
 		t.Fatalf("chatRequests = %d, want prewarm + timed requests", chatRequests)
 	}
-	if point["contextTokens"] != 10000.0 || point["promptTokens"] != 10067.0 || point["usagePromptTokens"] != 67.0 || point["outputTokens"] != 2.0 {
+	if point["contextTokens"] != 10000.0 || point["promptTokens"] != 10067.0 || point["usagePromptTokens"] != 10067.0 || point["outputTokens"] != 2.0 {
 		t.Fatalf("point token fields = %#v", point)
 	}
 	if point["tokSOut"] == nil || point["ttftMs"] == nil || point["tokSPrefill"] == nil {
 		t.Fatalf("expected throughput fields, got %#v", point)
+	}
+	if point["tokSPrefillSource"] != "estimated_from_ttft_uncached" {
+		t.Fatalf("tokSPrefillSource = %v, want estimated_from_ttft_uncached", point["tokSPrefillSource"])
 	}
 	if point["methodology"] != remoteKVCacheReuseMethodology {
 		t.Fatalf("methodology = %v", point["methodology"])
@@ -1245,5 +1264,160 @@ func TestBenchmarkAgentFeedbackDistinguishesPlanFromReadyPayload(t *testing.T) {
 	}
 	if remoteNoHardware["submitCommand"] != nil {
 		t.Fatalf("remoteNoHardware submitCommand = %v, want nil", remoteNoHardware["submitCommand"])
+	}
+}
+
+func TestRoundingHandlesNegativeValues(t *testing.T) {
+	if got := round1(-1.26); got != -1.3 {
+		t.Fatalf("round1(-1.26) = %v, want -1.3", got)
+	}
+	if got := roundMetric(-1.239); got != -1.24 {
+		t.Fatalf("roundMetric(-1.239) = %v, want -1.24", got)
+	}
+}
+
+func TestParseBenchmarkLayersPrefersEarlierLayers(t *testing.T) {
+	metrics := parseBenchmarkLayers(`{"output_token_throughput":50}`, "Output token throughput: 999 tok/s")
+	if metrics["tokSOut"] != 50 {
+		t.Fatalf("tokSOut = %v, want structured layer value 50", metrics["tokSOut"])
+	}
+	stderrOnly := parseBenchmarkLayers("", "Output token throughput: 75")
+	if stderrOnly["tokSOut"] != 75 {
+		t.Fatalf("tokSOut = %v, want stderr fallback 75", stderrOnly["tokSOut"])
+	}
+}
+
+func TestJSONNumberByAliasesPrefersShallowestMatch(t *testing.T) {
+	value := map[string]any{
+		"aaa":     map[string]any{"ttft_ms": 5.0},
+		"ttft_ms": 2.0,
+		"zzz":     map[string]any{"deeper": map[string]any{"ttftMs": 9.0}},
+	}
+	for i := 0; i < 50; i++ {
+		number, ok := jsonNumberByAliases(value, []string{"ttftMs"})
+		if !ok || number != 2.0 {
+			t.Fatalf("jsonNumberByAliases = %v, %v; want 2.0 shallow match", number, ok)
+		}
+	}
+}
+
+func TestDecodeThroughputPrefersInterTokenWindow(t *testing.T) {
+	started := time.Now()
+	probe := chatProbe{
+		started:      started,
+		firstTokenAt: started.Add(100 * time.Millisecond),
+		lastTokenAt:  started.Add(1100 * time.Millisecond),
+		completedAt:  started.Add(1300 * time.Millisecond),
+	}
+	value, source, ok := decodeThroughput(probe, 11)
+	if !ok || source != "inter_token" || value != 10 {
+		t.Fatalf("decodeThroughput = %v %q %v, want 10 inter_token true", value, source, ok)
+	}
+	value, source, ok = decodeThroughput(probe, 1)
+	if !ok || source != "request_window" || value != 0.8 {
+		t.Fatalf("single-token fallback = %v %q %v, want 0.8 request_window true", value, source, ok)
+	}
+}
+
+func TestMeasureOpenAIEndpointAggregatesIterations(t *testing.T) {
+	chatCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		chatCalls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		time.Sleep(2 * time.Millisecond)
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
+		fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2}}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer server.Close()
+
+	metrics, err := measureOpenAIEndpoint(cliArgs{opts: map[string]string{"base-url": server.URL, "served-model": "served-model", "max-tokens": "16", "warmup": "2", "iterations": "3"}, flags: map[string]bool{"quiet": true}}, "org/model")
+	if err != nil {
+		t.Fatalf("measureOpenAIEndpoint returned error: %v", err)
+	}
+	if chatCalls != 5 {
+		t.Fatalf("chatCalls = %d, want 2 warmup + 3 timed", chatCalls)
+	}
+	samples, ok := metrics["samples"].([]map[string]any)
+	if !ok || len(samples) != 3 {
+		t.Fatalf("samples = %#v, want 3 entries", metrics["samples"])
+	}
+	engineFlags := metrics["engineFlags"].(map[string]any)
+	if engineFlags["warmup"] != 2 || engineFlags["iterations"] != 3 {
+		t.Fatalf("engineFlags = %#v", engineFlags)
+	}
+	stats, ok := metrics["sampleStats"].(map[string]any)
+	if !ok {
+		t.Fatalf("sampleStats missing: %#v", metrics)
+	}
+	tokSOutStats := stats["tokSOut"].(map[string]any)
+	if tokSOutStats["count"] != 3 || tokSOutStats["p50"] == nil {
+		t.Fatalf("tokSOut stats = %#v", tokSOutStats)
+	}
+	if metrics["tokSOut"] == nil || metrics["ttftMs"] == nil {
+		t.Fatalf("expected median headline metrics, got %#v", metrics)
+	}
+}
+
+func TestKVCachePromptFillerIsDeterministicAndVaried(t *testing.T) {
+	args := cliArgs{opts: map[string]string{}, flags: map[string]bool{}}
+	first := kvCachePrompt(args, 500)
+	second := kvCachePrompt(args, 500)
+	if first != second {
+		t.Fatal("filler prompt must be deterministic for KV-cache prefix reuse")
+	}
+	words := strings.Fields(first)
+	if len(words) != 500 {
+		t.Fatalf("filler words = %d, want 500", len(words))
+	}
+	distinct := map[string]bool{}
+	for _, word := range words {
+		distinct[word] = true
+	}
+	if len(distinct) < 8 {
+		t.Fatalf("filler vocabulary too repetitive: %d distinct words", len(distinct))
+	}
+	legacy := kvCachePrompt(cliArgs{opts: map[string]string{"filler-token": "context"}, flags: map[string]bool{}}, 3)
+	if legacy != "context context context" {
+		t.Fatalf("explicit filler token = %q", legacy)
+	}
+}
+
+func TestCompareBenchmarkRunGroupsComparesByMedian(t *testing.T) {
+	records := []benchmarkRunRecord{
+		{Path: "a.json", Payload: map[string]any{"quantization": "fp16", "tokSOut": 100.0}},
+		{Path: "b.json", Payload: map[string]any{"quantization": "Q4_K_M", "tokSOut": 200.0}},
+		{Path: "c.json", Payload: map[string]any{"quantization": "Q4_K_M", "tokSOut": 50.0}},
+	}
+	result := compareBenchmarkRunGroups(records, cliArgs{opts: map[string]string{"by": "quantization", "baseline": "fp16"}, flags: map[string]bool{}})
+	if result["comparisonStat"] != "p50" {
+		t.Fatalf("comparisonStat = %v, want p50", result["comparisonStat"])
+	}
+	found := false
+	for _, item := range result["comparisons"].([]any) {
+		comparison := item.(map[string]any)
+		if comparison["name"] == "Q4_K_M" {
+			found = true
+			if comparison["value"] != 125.0 || comparison["ratio"] != 1.25 {
+				t.Fatalf("Q4_K_M comparison = %#v, want median 125 vs baseline 100", comparison)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Q4_K_M group missing from comparisons")
+	}
+}
+
+func TestEmbeddedTokenCountScriptMatchesHelperSource(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "python", "localmaxxing_helpers", "token_count.py"))
+	if err != nil {
+		t.Skipf("python helper source unavailable: %v", err)
+	}
+	if string(data) != tokenCountScript {
+		t.Fatal("embedded token_count.py is out of sync with python/localmaxxing_helpers/token_count.py")
 	}
 }

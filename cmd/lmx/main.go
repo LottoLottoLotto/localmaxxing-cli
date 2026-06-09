@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -909,7 +912,7 @@ func applyRocmSMIHardware(base map[string]any, output string) {
 	base["gpuCount"] = 1
 }
 
-func round1(n float64) float64 { return float64(int(n*10+0.5)) / 10 }
+func round1(n float64) float64 { return math.Round(n*10) / 10 }
 
 func handleContext(args cliArgs) error {
 	value, err := fetchJSON("GET", apiURL(args)+"/api/agent-context", "", nil)
@@ -1707,6 +1710,15 @@ func benchmarkRunGroupStats(key string, records []benchmarkRunRecord, metric str
 	result["p50"] = roundMetric(median)
 	result["mean"] = roundMetric(sum / float64(len(values)))
 	result["max"] = roundMetric(values[len(values)-1])
+	result["p95"] = roundMetric(percentileOf(values, 95))
+	if len(values) > 1 {
+		mean := sum / float64(len(values))
+		variance := 0.0
+		for _, value := range values {
+			variance += (value - mean) * (value - mean)
+		}
+		result["stddev"] = roundMetric(math.Sqrt(variance / float64(len(values)-1)))
+	}
 	if bestSet {
 		bestValue := numberField(best.Payload, metric)
 		result["best"] = roundMetric(bestValue)
@@ -1741,14 +1753,20 @@ func compareBenchmarkRunGroups(records []benchmarkRunRecord, args cliArgs) map[s
 		}
 	}
 	metric := stringValue(stats["metric"])
-	baseValue := numberField(baseline, "best")
+	groupStat := func(group map[string]any) float64 {
+		if value := numberField(group, "p50"); value > 0 {
+			return value
+		}
+		return numberField(group, "best")
+	}
+	baseValue := groupStat(baseline)
 	comparisons := []any{}
 	for _, item := range groups {
 		group := asObject(item)
-		value := numberField(group, "best")
-		comparisons = append(comparisons, metricComparison(stringValue(group["key"]), value, stringValue(baseline["key"]), baseValue, metric))
+		comparisons = append(comparisons, metricComparison(stringValue(group["key"]), groupStat(group), stringValue(baseline["key"]), baseValue, metric))
 	}
 	stats["baseline"] = baseline["key"]
+	stats["comparisonStat"] = "p50"
 	stats["comparisons"] = comparisons
 	return stats
 }
@@ -1946,7 +1964,7 @@ func csvValue(value any) string {
 }
 
 func roundMetric(value float64) float64 {
-	return float64(int(value*100+0.5)) / 100
+	return math.Round(value*100) / 100
 }
 
 func lowerIsBetterMetric(metric string) bool {
@@ -1962,6 +1980,79 @@ func metricBetter(value, baseline float64, metric string) bool {
 		return value > 0 && value < baseline
 	}
 	return value > baseline
+}
+
+func medianOf(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 0 {
+		return (sorted[mid-1] + sorted[mid]) / 2
+	}
+	return sorted[mid]
+}
+
+// percentileOf interpolates the pct percentile of an ascending-sorted slice.
+func percentileOf(sorted []float64, pct float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	rank := pct / 100 * float64(len(sorted)-1)
+	lower := int(math.Floor(rank))
+	upper := int(math.Ceil(rank))
+	if lower == upper {
+		return sorted[lower]
+	}
+	weight := rank - float64(lower)
+	return sorted[lower]*(1-weight) + sorted[upper]*weight
+}
+
+func metricSummary(values []float64) map[string]any {
+	if len(values) == 0 {
+		return map[string]any{"count": 0}
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	sum := 0.0
+	for _, value := range sorted {
+		sum += value
+	}
+	mean := sum / float64(len(sorted))
+	summary := map[string]any{
+		"count": len(sorted),
+		"min":   roundMetric(sorted[0]),
+		"p50":   roundMetric(medianOf(sorted)),
+		"mean":  roundMetric(mean),
+		"max":   roundMetric(sorted[len(sorted)-1]),
+	}
+	if len(sorted) > 1 {
+		variance := 0.0
+		for _, value := range sorted {
+			variance += (value - mean) * (value - mean)
+		}
+		summary["stddev"] = roundMetric(math.Sqrt(variance / float64(len(sorted)-1)))
+	}
+	return summary
+}
+
+func intOption(args cliArgs, fallback, minimum int, keys ...string) (int, error) {
+	value := ""
+	for _, key := range keys {
+		if value = opt(args, key); value != "" {
+			break
+		}
+	}
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < minimum {
+		return 0, cliError{"invalid_option", fmt.Sprintf("--%s must be an integer >= %d", keys[0], minimum), []string{fmt.Sprintf("Pass --%s <number>.", keys[0])}, nil}
+	}
+	return parsed, nil
 }
 
 func benchmarkRunSummaries(root string) ([]any, error) {
@@ -2418,77 +2509,6 @@ func handleKVCache(action, target string, args cliArgs) error {
 	return nil
 }
 
-func kvCachePayloadFromFlags(target string, args cliArgs) (map[string]any, error) {
-	model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
-	if model == "" {
-		return nil, cliError{"missing_model", "kvcache run requires --hf-id or --model", []string{"Pass --hf-id <HuggingFace model id>."}, nil}
-	}
-	levels, err := parseIntList(firstNonEmpty(opt(args, "levels"), opt(args, "context-levels"), opt(args, "contexts")))
-	if err != nil {
-		return nil, err
-	}
-	if len(levels) == 0 {
-		levels = []int{10000, 20000, 30000, 40000}
-	}
-	mode := benchmarkMode(args)
-	engineName := normalizeEngineName(firstNonEmpty(opt(args, "engine"), target))
-	if engineName == "" {
-		resolved, err := resolveEngineName(target, args, mode == "local")
-		if err != nil {
-			return nil, err
-		}
-		engineName = resolved
-	}
-	payload := map[string]any{
-		"kind":          "kvcache_context_sweep",
-		"mode":          mode,
-		"engineName":    engineName,
-		"hfId":          model,
-		"modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"),
-		"levels":        levels,
-		"outputTokens":  kvOutputTokens(args),
-		"createdAt":     time.Now().UTC().Format(time.RFC3339),
-		"points":        []any{},
-	}
-	if mode == "remote" {
-		payload["warnings"] = []string{remoteKVCacheFallbackWarning}
-		printStatus(args, "kvcache_remote_depth_fallback", map[string]any{"warning": remoteKVCacheFallbackWarning, "fallback": "remote_depth_tps"})
-	}
-	if q := opt(args, "quantization"); q != "" {
-		payload["quantization"] = q
-	}
-	if !hasFlag(args, "dry-run") || opt(args, "hardware") != "" {
-		hardware, source, err := benchmarkHardware(mode, args)
-		if err != nil {
-			return nil, err
-		}
-		if hardware != nil {
-			payload["hardware"] = hardware
-		}
-		if source != "" {
-			payload["hardwareSource"] = source
-		}
-	}
-
-	points := []any{}
-	for _, level := range levels {
-		printStatus(args, "kvcache_point_start", map[string]any{"level": level, "mode": mode})
-		var point map[string]any
-		if mode == "remote" {
-			point, err = measureRemoteKVCachePoint(args, model, level)
-		} else {
-			point, err = measureLocalKVCachePoint(args, engineName, level)
-		}
-		if err != nil {
-			return nil, err
-		}
-		points = append(points, point)
-		printStatus(args, "kvcache_point_complete", map[string]any{"level": level, "tokSOut": point["tokSOut"], "ttftMs": point["ttftMs"]})
-	}
-	payload["points"] = points
-	return payload, nil
-}
-
 func parseIntList(value string) ([]int, error) {
 	if strings.TrimSpace(value) == "" {
 		return nil, nil
@@ -2566,18 +2586,18 @@ func measureLocalKVCachePoint(args cliArgs, engineName string, level int) (map[s
 		point["dryRun"] = true
 		return point, nil
 	}
-	output, err := runBenchmarkCommand(commandSnippet)
+	stdout, stderr, err := runBenchmarkCommand(args, commandSnippet)
 	if err != nil {
 		return nil, err
 	}
+	fileOutput := ""
 	if outputPath := localKVCacheOutputPath(engineName, args, level); outputPath != "" {
-		if data, err := os.ReadFile(outputPath); err == nil {
-			output = strings.TrimSpace(output + "\n" + string(data))
+		if data, readErr := os.ReadFile(outputPath); readErr == nil {
+			fileOutput = string(data)
 			point["benchmarkOutput"] = outputPath
 		}
 	}
-	parsed := parseBenchmarkOutput(output)
-	for key, value := range parsed {
+	for key, value := range parseBenchmarkLayers(fileOutput, stdout, stderr) {
 		point[key] = value
 	}
 	if point["promptTokens"] == nil {
@@ -2636,10 +2656,16 @@ func vllmKVCacheCommand(args cliArgs, input, output string, inputTokens int) str
 		appendShellArg(&cmd, "--backend", firstNonEmpty(opt(args, "benchmark-backend"), "openai"))
 		appendShellArg(&cmd, "--model", firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), model))
 		appendShellArg(&cmd, "--base-url", opt(args, "base-url"))
+		appendShellArg(&cmd, "--host", opt(args, "host"))
+		appendShellArg(&cmd, "--port", opt(args, "port"))
+		appendShellArg(&cmd, "--endpoint", opt(args, "endpoint"))
 		appendShellArg(&cmd, "--dataset-name", firstNonEmpty(opt(args, "dataset-name"), "random"))
+		appendShellArg(&cmd, "--dataset-path", opt(args, "dataset-path"))
 		appendShellArg(&cmd, "--input-len", input)
 		appendShellArg(&cmd, "--output-len", output)
 		appendShellArg(&cmd, "--num-prompts", firstNonEmpty(opt(args, "num-prompts"), "1"))
+		appendShellArg(&cmd, "--request-rate", opt(args, "request-rate"))
+		appendShellArg(&cmd, "--max-concurrency", opt(args, "max-concurrency"))
 	} else {
 		appendShellArg(&cmd, "--model", model)
 		appendShellArg(&cmd, "--input-len", input)
@@ -2782,69 +2808,32 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 			printStatus(args, "kvcache_cache_reuse_missing", map[string]any{"level": level, "warning": warning})
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	bodyData, err := json.Marshal(body)
+	probe, err := timedChatCompletion(args, baseURL, body, timeout, "kvcache_remote_failed")
 	if err != nil {
 		return nil, err
 	}
-	started := time.Now()
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat/completions", bytes.NewReader(bodyData))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if key := opt(args, "model-api-key"); key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, cliError{"kvcache_remote_failed", fmt.Sprintf("Could not reach OpenAI-compatible endpoint: %v", err), []string{"Check --base-url and confirm the endpoint is reachable from this machine."}, nil}
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		text, _ := io.ReadAll(res.Body)
-		return nil, cliError{"kvcache_remote_failed", fmt.Sprintf("OpenAI-compatible endpoint returned %s", res.Status), []string{"Check --base-url, --served-model, --model-api-key, and the target context level."}, string(text)}
-	}
-	streamResult, err := readOpenAIStream(args, res.Body, started)
-	if err != nil {
-		return nil, err
-	}
-	completedAt := streamResult.completedAt
-	if completedAt.IsZero() {
-		completedAt = time.Now()
-	}
-	generationStart := streamResult.firstTokenAt
-	if generationStart.IsZero() {
-		generationStart = started
-	}
-	usagePromptTokens := usageToken(streamResult.usage, "prompt_tokens")
-	usageOutputTokens := firstNonZero(usageToken(streamResult.usage, "completion_tokens"), usageToken(streamResult.usage, "output_tokens"))
+	usagePromptTokens := usageToken(probe.usage, "prompt_tokens")
+	usageOutputTokens := firstNonZero(usageToken(probe.usage, "completion_tokens"), usageToken(probe.usage, "output_tokens"))
 	outputTokens := usageOutputTokens
 	if outputTokens == 0 {
-		count, err := tokenCount(args, hfID, firstNonEmpty(opt(args, "model-revision"), "main"), streamResult.outputText, 0, "output")
+		count, err := tokenCount(args, hfID, firstNonEmpty(opt(args, "model-revision"), "main"), probe.outputText, 0, "output")
 		if err != nil {
 			return nil, err
 		}
 		outputTokens = count.Count
 	}
+	// usage.prompt_tokens reports the full prompt of the timed request,
+	// including tokens served from the retained KV cache; it is the measured
+	// counterpart of the nominal context level.
 	promptTokens := level
 	if usagePromptTokens > 0 {
-		if stringValue(cacheStatus["status"]) == "retained" {
-			promptTokens = level + usagePromptTokens
-		} else {
-			promptTokens = usagePromptTokens
-		}
+		promptTokens = usagePromptTokens
 	}
-	totalMs := maxDurationMS(completedAt.Sub(started))
-	generationMs := maxDurationMS(completedAt.Sub(generationStart))
 	point := map[string]any{
 		"contextTokens":     float64(level),
 		"promptTokens":      float64(promptTokens),
 		"outputTokens":      float64(outputTokens),
-		"tokSOut":           round1(float64(outputTokens) / (generationMs / 1000)),
-		"tokSTotal":         round1(float64(promptTokens+outputTokens) / (totalMs / 1000)),
-		"outputText":        streamResult.outputText,
+		"outputText":        probe.outputText,
 		"mode":              "remote",
 		"baseUrl":           baseURL,
 		"servedModel":       servedModel,
@@ -2854,7 +2843,13 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 		"usagePromptTokens": float64(usagePromptTokens),
 		"metricSource":      "remote_endpoint",
 		"timingSource":      "client_observed_http",
-		"tokSPrefillSource": "estimated_from_ttft",
+	}
+	if tokSOut, source, ok := decodeThroughput(probe, outputTokens); ok {
+		point["tokSOut"] = tokSOut
+		point["tokSOutSource"] = source
+	}
+	if totalMs := durationMS(probe.completedAt.Sub(probe.started)); totalMs > 0 {
+		point["tokSTotal"] = round1(float64(promptTokens+outputTokens) / (totalMs / 1000))
 	}
 	if modelResolution != nil {
 		point["modelResolution"] = modelResolution
@@ -2865,11 +2860,19 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 	if len(warnings) > 0 {
 		point["warnings"] = warnings
 	}
-	if !streamResult.firstTokenAt.IsZero() {
-		ttftMs := float64(streamResult.firstTokenAt.Sub(started).Milliseconds())
-		point["ttftMs"] = ttftMs
-		if ttftMs > 0 {
-			point["tokSPrefill"] = round1(float64(promptTokens) / (ttftMs / 1000))
+	if !probe.firstTokenAt.IsZero() {
+		ttftMs := durationMS(probe.firstTokenAt.Sub(probe.started))
+		point["ttftMs"] = roundMetric(ttftMs)
+		prefillTokens := promptTokens
+		prefillSource := "estimated_from_ttft"
+		if stringValue(cacheStatus["status"]) == "retained" {
+			// Only the non-cached suffix is actually prefetched during TTFT.
+			prefillTokens = promptTokens - cacheTokens
+			prefillSource = "estimated_from_ttft_uncached"
+		}
+		if ttftMs > 0 && prefillTokens > 0 {
+			point["tokSPrefill"] = round1(float64(prefillTokens) / (ttftMs / 1000))
+			point["tokSPrefillSource"] = prefillSource
 		}
 	}
 	return point, nil
@@ -2951,15 +2954,43 @@ func maxSlotPromptCacheTokens(value any) int {
 	return maxValue
 }
 
+// kvCacheFillerVocab lists common single-token words used to synthesize a
+// non-repetitive long-context filler prompt. A single repeated word is
+// maximally friendly to prefix caching and compression shortcuts, which
+// overstates long-context speed; varied filler is more representative.
+var kvCacheFillerVocab = []string{
+	"context", "window", "memory", "tokens", "stream", "model", "cache", "depth",
+	"prompt", "decode", "layer", "tensor", "batch", "query", "value", "state",
+	"sample", "weight", "logit", "vector", "buffer", "index", "block", "frame",
+	"graph", "kernel", "thread", "shard", "slice", "table", "queue", "stack",
+}
+
+// kvCachePrompt builds a deterministic filler prompt of approximately
+// targetTokens tokens. Determinism is required so the warm request and the
+// timed probe share an identical prefix for KV-cache reuse.
 func kvCachePrompt(args cliArgs, targetTokens int) string {
 	if prompt := opt(args, "prompt"); prompt != "" {
 		return prompt
 	}
-	word := firstNonEmpty(opt(args, "filler-token"), "context")
 	if targetTokens < 1 {
 		targetTokens = 1
 	}
-	return strings.TrimSpace(strings.Repeat(word+" ", targetTokens))
+	if word := opt(args, "filler-token"); word != "" {
+		return strings.TrimSpace(strings.Repeat(word+" ", targetTokens))
+	}
+	var builder strings.Builder
+	builder.Grow(targetTokens * 8)
+	seed := uint64(0x9E3779B97F4A7C15)
+	for i := 0; i < targetTokens; i++ {
+		seed ^= seed << 13
+		seed ^= seed >> 7
+		seed ^= seed << 17
+		if i > 0 {
+			builder.WriteByte(' ')
+		}
+		builder.WriteString(kvCacheFillerVocab[seed%uint64(len(kvCacheFillerVocab))])
+	}
+	return builder.String()
 }
 
 func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, error) {
@@ -2989,7 +3020,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	if mode == "local" && opt(args, "base-url") != "" && opt(args, "command") == "" && opt(args, "results") == "" && localBenchmarkCommand(engineName, args) == "" {
 		return nil, cliError{"invalid_benchmark_mode", "Local benchmark mode needs --command, --results, or explicit metric flags.", []string{"Use --mode remote with --base-url when benchmarking an endpoint from another machine.", "Use --mode local --command \"llama-bench ...\" when running on the host server."}, nil}
 	}
-	var commandOutput string
+	var outputLayers []string
 	if hasFlag(args, "dry-run") {
 		applyBenchmarkPlanMetrics(metrics, mode, engineName, args, model)
 	} else if mode == "remote" {
@@ -3012,27 +3043,27 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		if err != nil {
 			return nil, err
 		}
-		commandOutput = string(data)
+		outputLayers = append(outputLayers, string(data))
 		metrics["engineFlags"] = map[string]any{"mode": mode, "commandSnippet": "# Metrics imported from " + resultsPath, "resultsPath": resultsPath}
 		printStatus(args, "benchmark_results_read_complete", map[string]any{"path": resultsPath, "bytes": len(data)})
 	} else if commandSnippet := localBenchmarkCommand(engineName, args); commandSnippet != "" {
 		printStatus(args, "benchmark_local_command_start", map[string]any{"command": commandSnippet})
-		output, err := runBenchmarkCommand(commandSnippet)
+		stdout, stderr, err := runBenchmarkCommand(args, commandSnippet)
 		if err != nil {
 			return nil, err
 		}
-		commandOutput = output
 		if outputPath := benchmarkOutputPath(args); outputPath != "" {
-			if data, err := os.ReadFile(outputPath); err == nil {
-				commandOutput = strings.TrimSpace(commandOutput + "\n" + string(data))
+			if data, readErr := os.ReadFile(outputPath); readErr == nil {
+				outputLayers = append(outputLayers, string(data))
 				printStatus(args, "benchmark_results_read_complete", map[string]any{"path": outputPath, "bytes": len(data)})
 			}
 		}
+		outputLayers = append(outputLayers, stdout, stderr)
 		metrics["engineFlags"] = localBenchmarkEngineFlags(engineName, commandSnippet)
-		printStatus(args, "benchmark_local_command_complete", map[string]any{"outputBytes": len(output)})
+		printStatus(args, "benchmark_local_command_complete", map[string]any{"outputBytes": len(stdout) + len(stderr)})
 	}
-	if commandOutput != "" {
-		parsed := parseBenchmarkOutput(commandOutput)
+	if len(outputLayers) > 0 {
+		parsed := parseBenchmarkLayers(outputLayers...)
 		for key, value := range parsed {
 			metrics[key] = value
 		}
@@ -3078,7 +3109,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		return payload, nil
 	}
 	if tokSOut, ok := payload["tokSOut"].(float64); !ok || tokSOut <= 0 {
-		details := commandOutput
+		details := strings.TrimSpace(strings.Join(outputLayers, "\n"))
 		if len(details) > 4000 {
 			details = details[:4000]
 		}
@@ -3744,6 +3775,90 @@ func benchmarkMode(args cliArgs) string {
 	return "local"
 }
 
+type chatProbe struct {
+	started      time.Time
+	firstTokenAt time.Time
+	lastTokenAt  time.Time
+	completedAt  time.Time
+	outputText   string
+	usage        map[string]any
+}
+
+// timedChatCompletion posts one chat completion and returns client-observed
+// timing. Streaming requests record first/last token arrival times.
+func timedChatCompletion(args cliArgs, baseURL string, body map[string]any, timeout time.Duration, errorCode string) (chatProbe, error) {
+	stream, _ := body["stream"].(bool)
+	bodyData, err := json.Marshal(body)
+	if err != nil {
+		return chatProbe{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	started := time.Now()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat/completions", bytes.NewReader(bodyData))
+	if err != nil {
+		return chatProbe{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := opt(args, "model-api-key"); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return chatProbe{}, cliError{errorCode, fmt.Sprintf("Could not reach OpenAI-compatible endpoint: %v", err), []string{"Check --base-url and confirm the endpoint is reachable from this machine."}, nil}
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		text, _ := io.ReadAll(res.Body)
+		return chatProbe{}, cliError{errorCode, fmt.Sprintf("OpenAI-compatible endpoint returned %s", res.Status), []string{"Check --base-url, --served-model, and --model-api-key.", "Confirm the endpoint supports POST /v1/chat/completions."}, string(text)}
+	}
+	probe := chatProbe{started: started}
+	if stream {
+		streamResult, err := readOpenAIStream(args, res.Body, started)
+		if err != nil {
+			return chatProbe{}, err
+		}
+		probe.firstTokenAt = streamResult.firstTokenAt
+		probe.lastTokenAt = streamResult.lastTokenAt
+		probe.completedAt = streamResult.completedAt
+		probe.outputText = streamResult.outputText
+		probe.usage = streamResult.usage
+	} else {
+		var response map[string]any
+		if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+			return chatProbe{}, err
+		}
+		probe.outputText = nonStreamingContent(response)
+		probe.usage = asObject(response["usage"])
+		probe.completedAt = time.Now()
+	}
+	if probe.completedAt.IsZero() {
+		probe.completedAt = time.Now()
+	}
+	return probe, nil
+}
+
+// decodeThroughput computes decode tokens/s, preferring the inter-token
+// window (first to last token, excluding the first token from the count) and
+// falling back to the full generation window when only one token arrived.
+func decodeThroughput(probe chatProbe, outputTokens int) (float64, string, bool) {
+	if outputTokens > 1 && !probe.firstTokenAt.IsZero() && probe.lastTokenAt.After(probe.firstTokenAt) {
+		decodeMs := durationMS(probe.lastTokenAt.Sub(probe.firstTokenAt))
+		if decodeMs > 0 {
+			return round1(float64(outputTokens-1) / (decodeMs / 1000)), "inter_token", true
+		}
+	}
+	generationStart := probe.started
+	if !probe.firstTokenAt.IsZero() {
+		generationStart = probe.firstTokenAt
+	}
+	generationMs := durationMS(probe.completedAt.Sub(generationStart))
+	if generationMs <= 0 || outputTokens <= 0 {
+		return 0, "", false
+	}
+	return round1(float64(outputTokens) / (generationMs / 1000)), "request_window", true
+}
+
 func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	baseURL, err := requireOpt(args, "base-url")
 	if err != nil {
@@ -3785,6 +3900,14 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		}
 		temperature = parsed
 	}
+	warmup, err := intOption(args, 1, 0, "warmup")
+	if err != nil {
+		return nil, err
+	}
+	iterations, err := intOption(args, 3, 1, "iterations", "iters")
+	if err != nil {
+		return nil, err
+	}
 	stream := !hasFlag(args, "no-stream")
 	body := map[string]any{
 		"model":       servedModel,
@@ -3802,104 +3925,111 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	bodyData, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
+	revision := firstNonEmpty(opt(args, "model-revision"), "main")
+	for i := 0; i < warmup; i++ {
+		printStatus(args, "endpoint_warmup_request", map[string]any{"index": i + 1, "warmup": warmup})
+		if _, err := timedChatCompletion(args, baseURL, body, timeout, "endpoint_benchmark_failed"); err != nil {
+			return nil, err
+		}
 	}
-	started := time.Now()
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat/completions", bytes.NewReader(bodyData))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if key := opt(args, "model-api-key"); key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, cliError{"endpoint_benchmark_failed", fmt.Sprintf("Could not reach OpenAI-compatible endpoint: %v", err), []string{"Check --base-url and confirm the endpoint is reachable from this machine."}, nil}
-	}
-	defer res.Body.Close()
-	printStatus(args, "endpoint_response_received", map[string]any{"status": res.StatusCode, "stream": stream})
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		text, _ := io.ReadAll(res.Body)
-		return nil, cliError{"endpoint_benchmark_failed", fmt.Sprintf("OpenAI-compatible endpoint returned %s", res.Status), []string{"Check --base-url, --served-model, and --model-api-key.", "Confirm the endpoint supports POST /v1/chat/completions."}, string(text)}
-	}
-
-	var firstTokenAt time.Time
-	completedAt := started
+	promptTokens := 0
+	promptTokenSource := ""
+	outputTokenSource := ""
 	outputText := ""
-	var usage map[string]any
-	if stream {
-		printStatus(args, "endpoint_stream_started", map[string]any{"baseUrl": baseURL})
-		streamResult, err := readOpenAIStream(args, res.Body, started)
+	decodeSource := ""
+	samples := make([]map[string]any, 0, iterations)
+	ttftValues := []float64{}
+	tokSOutValues := []float64{}
+	tokSTotalValues := []float64{}
+	tokSPrefillValues := []float64{}
+	outputTokenValues := []float64{}
+	for i := 0; i < iterations; i++ {
+		probe, err := timedChatCompletion(args, baseURL, body, timeout, "endpoint_benchmark_failed")
 		if err != nil {
 			return nil, err
 		}
-		firstTokenAt = streamResult.firstTokenAt
-		completedAt = streamResult.completedAt
-		outputText = streamResult.outputText
-		usage = streamResult.usage
-		printStatus(args, "endpoint_stream_complete", map[string]any{"outputChars": len(outputText), "usageReturned": usage != nil})
-	} else {
-		var response map[string]any
-		if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		if promptTokens == 0 {
+			result, err := tokenCount(args, hfID, revision, prompt, usageToken(probe.usage, "prompt_tokens"), "prompt")
+			if err != nil {
+				return nil, err
+			}
+			promptTokens = result.Count
+			promptTokenSource = result.Source
+		}
+		outputResult, err := tokenCount(args, hfID, revision, probe.outputText, firstNonZero(usageToken(probe.usage, "completion_tokens"), usageToken(probe.usage, "output_tokens")), "output")
+		if err != nil {
 			return nil, err
 		}
-		outputText = nonStreamingContent(response)
-		if obj := asObject(response["usage"]); obj != nil {
-			usage = obj
+		outputTokens := outputResult.Count
+		outputTokenSource = outputResult.Source
+		outputText = probe.outputText
+		sample := map[string]any{"iteration": i + 1, "outputTokens": float64(outputTokens)}
+		outputTokenValues = append(outputTokenValues, float64(outputTokens))
+		if totalMs := durationMS(probe.completedAt.Sub(probe.started)); totalMs > 0 {
+			value := round1(float64(promptTokens+outputTokens) / (totalMs / 1000))
+			sample["tokSTotal"] = value
+			tokSTotalValues = append(tokSTotalValues, value)
 		}
-		completedAt = time.Now()
-		printStatus(args, "endpoint_completion_received", map[string]any{"outputChars": len(outputText), "usageReturned": usage != nil})
+		if value, source, ok := decodeThroughput(probe, outputTokens); ok {
+			sample["tokSOut"] = value
+			tokSOutValues = append(tokSOutValues, value)
+			decodeSource = source
+		}
+		if !probe.firstTokenAt.IsZero() {
+			ttftMs := durationMS(probe.firstTokenAt.Sub(probe.started))
+			sample["ttftMs"] = roundMetric(ttftMs)
+			ttftValues = append(ttftValues, ttftMs)
+			if ttftMs > 0 && promptTokens > 0 {
+				value := round1(float64(promptTokens) / (ttftMs / 1000))
+				sample["tokSPrefill"] = value
+				tokSPrefillValues = append(tokSPrefillValues, value)
+			}
+		}
+		samples = append(samples, sample)
+		printStatus(args, "endpoint_iteration_complete", map[string]any{"iteration": i + 1, "iterations": iterations, "tokSOut": sample["tokSOut"], "ttftMs": sample["ttftMs"]})
 	}
-
-	revision := firstNonEmpty(opt(args, "model-revision"), "main")
-	promptTokenResult, err := tokenCount(args, hfID, revision, prompt, usageToken(usage, "prompt_tokens"), "prompt")
-	if err != nil {
-		return nil, err
-	}
-	outputTokenResult, err := tokenCount(args, hfID, revision, outputText, firstNonZero(usageToken(usage, "completion_tokens"), usageToken(usage, "output_tokens")), "output")
-	if err != nil {
-		return nil, err
-	}
-	promptTokens := promptTokenResult.Count
-	outputTokens := outputTokenResult.Count
-	printStatus(args, "token_count_source", map[string]any{"prompt": promptTokenResult.Source, "output": outputTokenResult.Source, "promptTokens": promptTokens, "outputTokens": outputTokens})
-	totalMs := maxDurationMS(completedAt.Sub(started))
-	generationStart := started
-	if !firstTokenAt.IsZero() {
-		generationStart = firstTokenAt
-	}
-	generationMs := maxDurationMS(completedAt.Sub(generationStart))
+	printStatus(args, "token_count_source", map[string]any{"prompt": promptTokenSource, "output": outputTokenSource, "promptTokens": promptTokens})
 	metrics := map[string]any{
 		"prompt":       prompt,
 		"outputText":   outputText,
 		"promptTokens": float64(promptTokens),
-		"outputTokens": float64(outputTokens),
-		"tokSOut":      round1(float64(outputTokens) / (generationMs / 1000)),
-		"tokSTotal":    round1(float64(promptTokens+outputTokens) / (totalMs / 1000)),
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds())},
-		"tokenSources": map[string]any{"prompt": promptTokenResult.Source, "output": outputTokenResult.Source},
+		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations},
+		"tokenSources": map[string]any{"prompt": promptTokenSource, "output": outputTokenSource},
 		"timingSource": "client_observed_http",
 		"metricSource": "remote_endpoint",
-		"ttftSource":   map[bool]string{true: "stream_first_token", false: "unavailable_no_stream"}[!firstTokenAt.IsZero()],
+		"ttftSource":   "unavailable_no_stream",
+	}
+	if len(outputTokenValues) > 0 {
+		metrics["outputTokens"] = medianOf(outputTokenValues)
+	}
+	if len(tokSOutValues) > 0 {
+		metrics["tokSOut"] = roundMetric(medianOf(tokSOutValues))
+		metrics["tokSOutSource"] = decodeSource
+	}
+	if len(tokSTotalValues) > 0 {
+		metrics["tokSTotal"] = roundMetric(medianOf(tokSTotalValues))
+	}
+	if len(ttftValues) > 0 {
+		metrics["ttftMs"] = roundMetric(medianOf(ttftValues))
+		metrics["ttftSource"] = "stream_first_token"
+	}
+	if len(tokSPrefillValues) > 0 {
+		metrics["tokSPrefill"] = roundMetric(medianOf(tokSPrefillValues))
+		metrics["tokSPrefillSource"] = "estimated_from_ttft"
+	}
+	if iterations > 1 {
+		metrics["samples"] = samples
+		metrics["sampleStats"] = map[string]any{
+			"tokSOut":   metricSummary(tokSOutValues),
+			"tokSTotal": metricSummary(tokSTotalValues),
+			"ttftMs":    metricSummary(ttftValues),
+		}
 	}
 	if modelResolution != nil {
 		metrics["modelResolution"] = modelResolution
 	}
 	if quantizationResolution != nil {
 		metrics["quantizationResolution"] = quantizationResolution
-	}
-	if !firstTokenAt.IsZero() {
-		ttftMs := float64(firstTokenAt.Sub(started).Milliseconds())
-		metrics["ttftMs"] = ttftMs
-		if ttftMs > 0 {
-			metrics["tokSPrefill"] = round1(float64(promptTokens) / (ttftMs / 1000))
-			metrics["tokSPrefillSource"] = "estimated_from_ttft"
-		}
 	}
 	return metrics, nil
 }
@@ -3924,6 +4054,14 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		}
 		temperature = parsed
 	}
+	warmup, err := intOption(args, 1, 0, "warmup")
+	if err != nil {
+		return nil, err
+	}
+	iterations, err := intOption(args, 3, 1, "iterations", "iters")
+	if err != nil {
+		return nil, err
+	}
 	timeout, err := endpointTimeout(args)
 	if err != nil {
 		return nil, err
@@ -3937,16 +4075,115 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 			"temperature": temperature,
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	for i := 0; i < warmup; i++ {
+		printStatus(args, "ollama_warmup_request", map[string]any{"index": i + 1, "warmup": warmup})
+		if _, _, err := ollamaGenerate(args, baseURL, body, timeout); err != nil {
+			return nil, err
+		}
+	}
+	promptTokenValues := []float64{}
+	outputTokenValues := []float64{}
+	tokSPrefillValues := []float64{}
+	tokSOutValues := []float64{}
+	tokSTotalValues := []float64{}
+	ttftValues := []float64{}
+	samples := make([]map[string]any, 0, iterations)
+	outputText := ""
+	for i := 0; i < iterations; i++ {
+		response, elapsed, err := ollamaGenerate(args, baseURL, body, timeout)
+		if err != nil {
+			return nil, err
+		}
+		outputText = stringValue(response["response"])
+		promptTokens := firstPositiveNumber(response, "prompt_eval_count", "promptEvalCount")
+		outputTokens := firstPositiveNumber(response, "eval_count", "evalCount")
+		promptSeconds := ollamaDurationSeconds(firstPositiveNumber(response, "prompt_eval_duration", "promptEvalDuration"))
+		decodeSeconds := ollamaDurationSeconds(firstPositiveNumber(response, "eval_duration", "evalDuration"))
+		totalSeconds := ollamaDurationSeconds(firstPositiveNumber(response, "total_duration", "totalDuration"))
+		if totalSeconds == 0 {
+			totalSeconds = elapsed.Seconds()
+		}
+		sample := map[string]any{"iteration": i + 1}
+		if promptTokens > 0 {
+			sample["promptTokens"] = promptTokens
+			promptTokenValues = append(promptTokenValues, promptTokens)
+		}
+		if outputTokens > 0 {
+			sample["outputTokens"] = outputTokens
+			outputTokenValues = append(outputTokenValues, outputTokens)
+		}
+		if promptTokens > 0 && promptSeconds > 0 {
+			value := round1(promptTokens / promptSeconds)
+			sample["tokSPrefill"] = value
+			tokSPrefillValues = append(tokSPrefillValues, value)
+		}
+		if outputTokens > 0 && decodeSeconds > 0 {
+			value := round1(outputTokens / decodeSeconds)
+			sample["tokSOut"] = value
+			tokSOutValues = append(tokSOutValues, value)
+		}
+		if promptTokens+outputTokens > 0 && totalSeconds > 0 {
+			value := round1((promptTokens + outputTokens) / totalSeconds)
+			sample["tokSTotal"] = value
+			tokSTotalValues = append(tokSTotalValues, value)
+		}
+		if promptSeconds > 0 {
+			value := round1(promptSeconds * 1000)
+			sample["ttftMs"] = value
+			ttftValues = append(ttftValues, value)
+		}
+		samples = append(samples, sample)
+		printStatus(args, "ollama_iteration_complete", map[string]any{"iteration": i + 1, "iterations": iterations, "tokSOut": sample["tokSOut"], "ttftMs": sample["ttftMs"]})
+	}
+	metrics := map[string]any{
+		"prompt":       prompt,
+		"outputText":   outputText,
+		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations},
+		"tokenSources": map[string]any{"prompt": "ollama_prompt_eval_count", "output": "ollama_eval_count"},
+		"timingSource": "ollama_native_api",
+		"metricSource": "remote_endpoint",
+		"ttftSource":   "unavailable_ollama_nonstreaming",
+	}
+	if len(promptTokenValues) > 0 {
+		metrics["promptTokens"] = medianOf(promptTokenValues)
+	}
+	if len(outputTokenValues) > 0 {
+		metrics["outputTokens"] = medianOf(outputTokenValues)
+	}
+	if len(tokSPrefillValues) > 0 {
+		metrics["tokSPrefill"] = roundMetric(medianOf(tokSPrefillValues))
+	}
+	if len(tokSOutValues) > 0 {
+		metrics["tokSOut"] = roundMetric(medianOf(tokSOutValues))
+	}
+	if len(tokSTotalValues) > 0 {
+		metrics["tokSTotal"] = roundMetric(medianOf(tokSTotalValues))
+	}
+	if len(ttftValues) > 0 {
+		metrics["ttftMs"] = roundMetric(medianOf(ttftValues))
+		metrics["ttftSource"] = "ollama_prompt_eval_duration"
+	}
+	if iterations > 1 {
+		metrics["samples"] = samples
+		metrics["sampleStats"] = map[string]any{
+			"tokSOut": metricSummary(tokSOutValues),
+			"ttftMs":  metricSummary(ttftValues),
+		}
+	}
+	return metrics, nil
+}
+
+func ollamaGenerate(args cliArgs, baseURL string, body map[string]any, timeout time.Duration) (map[string]any, time.Duration, error) {
 	bodyData, err := json.Marshal(body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	started := time.Now()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/api/generate", bytes.NewReader(bodyData))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if key := opt(args, "model-api-key"); key != "" {
@@ -3954,56 +4191,18 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, cliError{"endpoint_benchmark_failed", fmt.Sprintf("Could not reach Ollama endpoint: %v", err), []string{"Check --base-url and confirm Ollama is serving from this machine."}, nil}
+		return nil, 0, cliError{"endpoint_benchmark_failed", fmt.Sprintf("Could not reach Ollama endpoint: %v", err), []string{"Check --base-url and confirm Ollama is serving from this machine."}, nil}
 	}
 	defer res.Body.Close()
-	printStatus(args, "ollama_response_received", map[string]any{"status": res.StatusCode})
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		text, _ := io.ReadAll(res.Body)
-		return nil, cliError{"endpoint_benchmark_failed", fmt.Sprintf("Ollama endpoint returned %s", res.Status), []string{"Check --base-url, --served-model, and --model-api-key.", "Confirm the endpoint supports POST /api/generate."}, string(text)}
+		return nil, 0, cliError{"endpoint_benchmark_failed", fmt.Sprintf("Ollama endpoint returned %s", res.Status), []string{"Check --base-url, --served-model, and --model-api-key.", "Confirm the endpoint supports POST /api/generate."}, string(text)}
 	}
 	var response map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	completedAt := time.Now()
-	promptTokens := firstPositiveNumber(response, "prompt_eval_count", "promptEvalCount")
-	outputTokens := firstPositiveNumber(response, "eval_count", "evalCount")
-	promptSeconds := ollamaDurationSeconds(firstPositiveNumber(response, "prompt_eval_duration", "promptEvalDuration"))
-	decodeSeconds := ollamaDurationSeconds(firstPositiveNumber(response, "eval_duration", "evalDuration"))
-	totalSeconds := ollamaDurationSeconds(firstPositiveNumber(response, "total_duration", "totalDuration"))
-	if totalSeconds == 0 {
-		totalSeconds = completedAt.Sub(started).Seconds()
-	}
-	metrics := map[string]any{
-		"prompt":       prompt,
-		"outputText":   stringValue(response["response"]),
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds())},
-		"tokenSources": map[string]any{"prompt": "ollama_prompt_eval_count", "output": "ollama_eval_count"},
-		"timingSource": "ollama_native_api",
-		"metricSource": "remote_endpoint",
-		"ttftSource":   "unavailable_ollama_nonstreaming",
-	}
-	if promptTokens > 0 {
-		metrics["promptTokens"] = promptTokens
-	}
-	if outputTokens > 0 {
-		metrics["outputTokens"] = outputTokens
-	}
-	if promptTokens > 0 && promptSeconds > 0 {
-		metrics["tokSPrefill"] = round1(promptTokens / promptSeconds)
-	}
-	if outputTokens > 0 && decodeSeconds > 0 {
-		metrics["tokSOut"] = round1(outputTokens / decodeSeconds)
-	}
-	if promptTokens+outputTokens > 0 && totalSeconds > 0 {
-		metrics["tokSTotal"] = round1((promptTokens + outputTokens) / totalSeconds)
-	}
-	if promptSeconds > 0 {
-		metrics["ttftMs"] = round1(promptSeconds * 1000)
-		metrics["ttftSource"] = "ollama_prompt_eval_duration"
-	}
-	return metrics, nil
+	return response, time.Since(started), nil
 }
 
 func ollamaBaseURL(args cliArgs) string {
@@ -4395,6 +4594,7 @@ func modelInfoItems(body map[string]any) []any {
 
 type openAIStreamResult struct {
 	firstTokenAt time.Time
+	lastTokenAt  time.Time
 	completedAt  time.Time
 	outputText   string
 	usage        map[string]any
@@ -4402,17 +4602,12 @@ type openAIStreamResult struct {
 
 func readOpenAIStream(args cliArgs, body io.Reader, started time.Time) (openAIStreamResult, error) {
 	result := openAIStreamResult{}
-	buffer := ""
-	chunk := make([]byte, 8192)
+	var output strings.Builder
+	reader := bufio.NewReaderSize(body, 64*1024)
 	for {
-		n, err := body.Read(chunk)
-		if n > 0 {
-			buffer += string(chunk[:n])
-			lines := strings.Split(buffer, "\n")
-			buffer = lines[len(lines)-1]
-			for _, line := range lines[:len(lines)-1] {
-				consumeOpenAIStreamLine(args, strings.TrimSpace(line), started, &result)
-			}
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			consumeOpenAIStreamLine(args, strings.TrimSpace(line), started, &result, &output)
 		}
 		if err == io.EOF {
 			break
@@ -4421,14 +4616,12 @@ func readOpenAIStream(args cliArgs, body io.Reader, started time.Time) (openAISt
 			return openAIStreamResult{}, err
 		}
 	}
-	if strings.TrimSpace(buffer) != "" {
-		consumeOpenAIStreamLine(args, strings.TrimSpace(buffer), started, &result)
-	}
+	result.outputText = output.String()
 	result.completedAt = time.Now()
 	return result, nil
 }
 
-func consumeOpenAIStreamLine(args cliArgs, line string, started time.Time, result *openAIStreamResult) {
+func consumeOpenAIStreamLine(args cliArgs, line string, started time.Time, result *openAIStreamResult, output *strings.Builder) {
 	if !strings.HasPrefix(line, "data:") {
 		return
 	}
@@ -4447,11 +4640,13 @@ func consumeOpenAIStreamLine(args cliArgs, line string, started time.Time, resul
 	if content == "" {
 		return
 	}
+	now := time.Now()
 	if result.firstTokenAt.IsZero() {
-		result.firstTokenAt = time.Now()
-		printStatus(args, "first_token_received", map[string]any{"ttftMs": result.firstTokenAt.Sub(started).Milliseconds()})
+		result.firstTokenAt = now
+		printStatus(args, "first_token_received", map[string]any{"ttftMs": roundMetric(durationMS(now.Sub(started)))})
 	}
-	result.outputText += content
+	result.lastTokenAt = now
+	output.WriteString(content)
 }
 
 func streamingContent(chunk map[string]any) string {
@@ -4508,27 +4703,58 @@ func tokenCount(args cliArgs, hfID, revision, text string, known int, kind strin
 	return tokenCountResult{}, cliError{"token_count_missing", fmt.Sprintf("Could not determine %s token count.", kind), []string{fmt.Sprintf("Pass --%s <n> from the endpoint usage or benchmark output.", flag), "Or install Python transformers so the optional tokenizer helper can count tokens."}, errString(err)}
 }
 
+//go:embed token_count.py
+var tokenCountScript string
+
 func pythonTokenCount(model, revision, text string) (int, error) {
-	script := filepath.Join("python", "localmaxxing_helpers", "token_count.py")
-	request := map[string]any{"model": model, "revision": revision, "text": text}
-	data, _ := json.Marshal(request)
-	cmd := exec.Command("python", script)
-	cmd.Stdin = bytes.NewReader(data)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return 0, fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr.String()))
-	}
-	var response map[string]any
-	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+	script, err := tokenCountScriptPath()
+	if err != nil {
 		return 0, err
 	}
-	if tokens, ok := response["tokens"].(float64); ok {
-		return int(tokens), nil
+	request := map[string]any{"model": model, "revision": revision, "text": text}
+	data, _ := json.Marshal(request)
+	var lastErr error
+	for _, python := range []string{"python3", "python"} {
+		if _, ok := lookupExecutable(python); !ok {
+			lastErr = fmt.Errorf("%s not found on PATH", python)
+			continue
+		}
+		cmd := exec.Command(python, script)
+		cmd.Stdin = bytes.NewReader(data)
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			lastErr = fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr.String()))
+			continue
+		}
+		var response map[string]any
+		if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+			return 0, err
+		}
+		if tokens, ok := response["tokens"].(float64); ok {
+			return int(tokens), nil
+		}
+		return 0, errors.New("token helper did not return tokens")
 	}
-	return 0, errors.New("token helper did not return tokens")
+	if lastErr == nil {
+		lastErr = errors.New("no python interpreter found on PATH")
+	}
+	return 0, lastErr
+}
+
+// tokenCountScriptPath materializes the embedded tokenizer helper to a stable
+// temp path so the installed binary works outside a repository checkout.
+func tokenCountScriptPath() (string, error) {
+	path := filepath.Join(os.TempDir(), "localmaxxing-token-count.py")
+	if data, err := os.ReadFile(path); err == nil && string(data) == tokenCountScript {
+		return path, nil
+	}
+	if err := os.WriteFile(path, []byte(tokenCountScript), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func usageToken(usage map[string]any, key string) int {
@@ -4554,12 +4780,10 @@ func firstNonZero(values ...int) int {
 	return 0
 }
 
-func maxDurationMS(duration time.Duration) float64 {
-	ms := float64(duration.Milliseconds())
-	if ms < 1 {
-		return 1
-	}
-	return ms
+// durationMS converts a duration to fractional milliseconds without the
+// integer truncation (and 1ms floor) that previously biased sub-ms timings.
+func durationMS(duration time.Duration) float64 {
+	return float64(duration.Nanoseconds()) / 1e6
 }
 
 func stringValue(value any) string {
@@ -4592,22 +4816,52 @@ func normalizeEngineName(value string) string {
 	}
 }
 
-func runBenchmarkCommand(commandSnippet string) (string, error) {
+func runBenchmarkCommand(args cliArgs, commandSnippet string) (string, string, error) {
+	ctx := context.Background()
+	cancel := func() {}
+	if value := opt(args, "command-timeout-seconds"); value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds <= 0 {
+			return "", "", cliError{"invalid_option", "--command-timeout-seconds must be a positive integer", []string{"Pass --command-timeout-seconds <seconds>."}, nil}
+		}
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(seconds)*time.Second)
+	}
+	defer cancel()
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/C", commandSnippet)
+		cmd = exec.CommandContext(ctx, "cmd", "/C", commandSnippet)
 	} else {
-		cmd = exec.Command("sh", "-c", commandSnippet)
+		cmd = exec.CommandContext(ctx, "sh", "-c", commandSnippet)
 	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", "", cliError{"benchmark_command_timeout", "Benchmark command timed out.", []string{"Raise --command-timeout-seconds or drop it to wait indefinitely."}, commandSnippet}
+		}
 		output := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
-		return "", cliError{"benchmark_command_failed", "Benchmark command failed.", []string{"Check that the benchmark executable is installed and available on PATH.", "For llama.cpp, pass a complete llama-bench command with --command.", "For vLLM/SGLang, prefer their JSON output if available, then pass --results <path>."}, firstNonEmpty(output, err.Error())}
+		return "", "", cliError{"benchmark_command_failed", "Benchmark command failed.", []string{"Check that the benchmark executable is installed and available on PATH.", "For llama.cpp, pass a complete llama-bench command with --command.", "For vLLM/SGLang, prefer their JSON output if available, then pass --results <path>."}, firstNonEmpty(output, err.Error())}
 	}
-	return strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n")), nil
+	return strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String()), nil
+}
+
+// parseBenchmarkLayers parses each output layer in priority order; earlier
+// layers win, so structured result files beat stdout scraping beats stderr.
+func parseBenchmarkLayers(layers ...string) map[string]float64 {
+	merged := map[string]float64{}
+	for _, layer := range layers {
+		if strings.TrimSpace(layer) == "" {
+			continue
+		}
+		for key, value := range parseBenchmarkOutput(layer) {
+			if _, ok := merged[key]; !ok {
+				merged[key] = value
+			}
+		}
+	}
+	return merged
 }
 
 func parseBenchmarkOutput(text string) map[string]float64 {
@@ -4811,37 +5065,40 @@ func secondsToMs(value float64) float64 {
 	return round1(value * 1000)
 }
 
+// jsonNumberByAliases finds the first numeric value whose key matches an
+// alias, searching breadth-first with sorted keys so shallow matches win and
+// results are deterministic regardless of Go map iteration order.
 func jsonNumberByAliases(value any, aliases []string) (float64, bool) {
 	aliasSet := map[string]bool{}
 	for _, alias := range aliases {
 		aliasSet[normalizeMetricKey(alias)] = true
 	}
-	var walk func(any) (float64, bool)
-	walk = func(current any) (float64, bool) {
+	queue := []any{value}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
 		switch typed := current.(type) {
 		case map[string]any:
-			for key, child := range typed {
+			keys := make([]string, 0, len(typed))
+			for key := range typed {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
 				if aliasSet[normalizeMetricKey(key)] {
-					if number, ok := anyNumber(child); ok {
+					if number, ok := anyNumber(typed[key]); ok {
 						return number, true
 					}
 				}
 			}
-			for _, child := range typed {
-				if number, ok := walk(child); ok {
-					return number, true
-				}
+			for _, key := range keys {
+				queue = append(queue, typed[key])
 			}
 		case []any:
-			for _, child := range typed {
-				if number, ok := walk(child); ok {
-					return number, true
-				}
-			}
+			queue = append(queue, typed...)
 		}
-		return 0, false
 	}
-	return walk(value)
+	return 0, false
 }
 
 func normalizeMetricKey(value string) string {
@@ -6189,6 +6446,9 @@ Options:
   --prompt <text>          Prompt for remote endpoint benchmark
   --max-tokens <n>         Max generated tokens for remote endpoint benchmark
   --endpoint-timeout-seconds <n> Timeout for remote endpoint benchmark (default: 600)
+  --warmup <n>             Untimed warmup requests before remote endpoint measurement (default: 1)
+  --iterations <n>         Timed remote endpoint measurement iterations; median is reported (default: 3)
+  --command-timeout-seconds <n> Timeout for local benchmark commands (default: unlimited)
   --no-stream              Disable streaming for remote endpoint benchmark
   --command <cmd>          Local benchmark command, e.g. llama-bench
   --host <addr>            Local model server host for generated server commands

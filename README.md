@@ -140,6 +140,8 @@ lmx benchmark run vllm \
 
 For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server, before `benchmark dry-run` or `benchmark submit`.
 
+Remote endpoint runs issue one untimed warmup request and three timed iterations by default, reporting the median of each metric plus per-iteration `samples` and `sampleStats` (min/p50/mean/max/stddev). Tune with `--warmup <n>` and `--iterations <n>`; `--warmup 0 --iterations 1` restores single-shot measurement. Decode throughput is measured over the inter-token window (first to last streamed token) when more than one token arrives.
+
 For Ollama, use remote mode against the native Ollama endpoint. The CLI calls `/api/generate` and maps Ollama's `prompt_eval_*`, `eval_*`, and `total_duration` fields into benchmark metrics:
 
 ```bash
@@ -189,6 +191,8 @@ lmx benchmark submit benchmark.json --api-key bhk_...
 
 `bench` is accepted as a shorter alias for `benchmark`. Use `--out <path>` to choose the output file, `--json-status` for machine-readable progress events, and `--quiet` to suppress progress events.
 
+Local benchmark commands run without a time limit by default; pass `--command-timeout-seconds <n>` to abort hung runs.
+
 ## Saved Profiles And Runs
 
 Save repeated benchmark or server options in a profile:
@@ -224,7 +228,7 @@ lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,
 lmx benchmark runs export --format csv --out runs.csv
 ```
 
-`stats`, `compare`, and `export` accept `--runs-dir`, plus filters such as `--model`, `--engine`, `--mode`, `--quantization`, `--kind`, and `--hardware-name`. `export` defaults to JSON and supports `--fields path,hfId,hardware,tokSOut` for custom extraction.
+`stats`, `compare`, and `export` accept `--runs-dir`, plus filters such as `--model`, `--engine`, `--mode`, `--quantization`, `--kind`, and `--hardware-name`. Group stats report min/p50/mean/max/p95/stddev and the best single run; group comparisons rank by the median (`p50`) so a single outlier run cannot win. `export` defaults to JSON and supports `--fields path,hfId,hardware,tokSOut` for custom extraction.
 
 ## KV-Cache Context Sweeps
 
@@ -255,7 +259,7 @@ lmx kvcache run vllm \
   --output-tokens 128
 ```
 
-Remote sweeps pre-warm the target context prefix, inspect llama.cpp `/slots` for `n_prompt_tokens_cache`, then time a streaming probe with the same prefix. If `/slots` reports no retained prompt cache, the CLI records a warning and labels the point as a cold inline prefill measurement instead of cached-context speed.
+Remote sweeps pre-warm the target context prefix, inspect llama.cpp `/slots` for `n_prompt_tokens_cache`, then time a streaming probe with the same prefix. The default filler is a deterministic varied-word sequence (a single repeated word is unrealistically friendly to prefix caching); pass `--filler-token <word>` to override. Reported `promptTokens` come from the endpoint's `usage.prompt_tokens` when available, and cached points estimate prefill speed from the non-cached suffix only. If `/slots` reports no retained prompt cache, the CLI records a warning and labels the point as a cold inline prefill measurement instead of cached-context speed.
 
 ## Eval Workflows
 
