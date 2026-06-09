@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -175,6 +176,8 @@ func TestRemoteModelResolutionTreatsServedModelAsAlias(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/models/search":
 			fmt.Fprint(w, `{"models":[{"hfId":"unsloth/gemma-4-31B-it-GGUF"},{"hfId":"google/gemma-4-31B-it"}]}`)
+		case "/api/models/unsloth/gemma-4-31B-it-qat-GGUF":
+			fmt.Fprint(w, `{"siblings":[{"rfilename":"gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"}]}`)
 		case "/api/models/unsloth/gemma-4-31B-it-GGUF":
 			fmt.Fprint(w, `{"siblings":[{"rfilename":"gemma-4-31B-it-UD-Q4_K_XL.gguf"}]}`)
 		case "/api/models/google/gemma-4-31B-it":
@@ -190,7 +193,7 @@ func TestRemoteModelResolutionTreatsServedModelAsAlias(t *testing.T) {
 		"gemma-4-31b-it",
 		"explicit",
 		"google/gemma-4-31B-it",
-		"/models/gemma-4-31B-it-UD-Q4_K_XL.gguf",
+		"/models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
 	)
 
 	if resolution["status"] != "source_repo_detected" {
@@ -199,10 +202,10 @@ func TestRemoteModelResolutionTreatsServedModelAsAlias(t *testing.T) {
 	if len(resolution["candidates"].([]any)) != 2 {
 		t.Fatalf("candidates = %#v, want two model candidates", resolution["candidates"])
 	}
-	if resolution["sourceRepo"] != "unsloth/gemma-4-31B-it-GGUF" || resolution["sourceRepoMatch"] != "exact_filename" {
+	if resolution["sourceRepo"] != "unsloth/gemma-4-31B-it-qat-GGUF" || resolution["sourceRepoMatch"] != "exact_filename" {
 		t.Fatalf("source repo resolution = %#v", resolution)
 	}
-	if resolution["declaredBaseModel"] != "google/gemma-4-31B-it" || resolution["loadedFilename"] != "gemma-4-31B-it-UD-Q4_K_XL.gguf" {
+	if resolution["declaredBaseModel"] != "google/gemma-4-31B-it" || resolution["loadedFilename"] != "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf" {
 		t.Fatalf("model metadata = %#v", resolution)
 	}
 }
@@ -919,6 +922,7 @@ func TestParseVLLMLatencyJSONMetrics(t *testing.T) {
 }
 
 func TestRemoteKVCachePointUsesLevelPlusUsagePromptTokens(t *testing.T) {
+	var warmRequestBody string
 	var timedRequestBody string
 	chatRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -930,6 +934,7 @@ func TestRemoteKVCachePointUsesLevelPlusUsagePromptTokens(t *testing.T) {
 			chatRequests++
 			data, _ := io.ReadAll(r.Body)
 			if chatRequests == 1 {
+				warmRequestBody = string(data)
 				fmt.Fprint(w, `{"choices":[{"message":{"content":"warm"}}],"usage":{"prompt_tokens":10000,"completion_tokens":1}}`)
 				return
 			}
@@ -969,6 +974,17 @@ func TestRemoteKVCachePointUsesLevelPlusUsagePromptTokens(t *testing.T) {
 	if !strings.Contains(timedRequestBody, "Context received.") || !strings.Contains(timedRequestBody, "stream_options") {
 		t.Fatalf("timedRequestBody missing retained chat history or usage options: %s", timedRequestBody)
 	}
+	for name, body := range map[string]string{"warm": warmRequestBody, "timed": timedRequestBody} {
+		var request map[string]any
+		if err := json.Unmarshal([]byte(body), &request); err != nil {
+			t.Fatalf("parse %s request body: %v", name, err)
+		}
+		messages := request["messages"].([]any)
+		prefix := messages[1].(map[string]any)["content"].(string)
+		if got := len(strings.Fields(prefix)); got != 10000 {
+			t.Fatalf("%s request prefill depth = %d words, want 10000", name, got)
+		}
+	}
 }
 
 func TestRemoteKVCachePointWarnsWhenSlotsShowNoCache(t *testing.T) {
@@ -1003,6 +1019,9 @@ func TestRemoteKVCachePointWarnsWhenSlotsShowNoCache(t *testing.T) {
 	}
 	if point["methodology"] != remoteKVCacheColdMethodology {
 		t.Fatalf("methodology = %v", point["methodology"])
+	}
+	if point["promptTokens"] != 67.0 || point["usagePromptTokens"] != 67.0 {
+		t.Fatalf("point token fields = %#v", point)
 	}
 	warnings := point["warnings"].([]string)
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "cold prefill") {

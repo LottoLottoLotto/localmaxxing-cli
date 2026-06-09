@@ -2306,7 +2306,7 @@ func handleKVCache(action, target string, args cliArgs) error {
 		if commandSnippet := stringValue(point["commandSnippet"]); commandSnippet != "" {
 			runPayload["engineFlags"] = map[string]any{"mode": mode, "commandSnippet": commandSnippet}
 		}
-		for _, key := range []string{"methodology", "warnings", "cacheReuse", "usagePromptTokens"} {
+		for _, key := range []string{"methodology", "warnings", "cacheReuse", "usagePromptTokens", "modelResolution", "quantizationResolution"} {
 			if value, ok := point[key]; ok {
 				runPayload[key] = value
 			}
@@ -2634,10 +2634,38 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 		return nil, err
 	}
 	baseURL = openAIBaseURL(baseURL)
-	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), hfID)
+	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"))
+	servedModelSource := "explicit"
+	var servedModelInfo map[string]any
+	if servedModel == "" {
+		if detected, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), hfID); err == nil && detected != "" {
+			servedModel = detected
+			servedModelInfo = info
+			servedModelSource = "v1_models"
+			printStatus(args, "served_model_detected", map[string]any{"servedModel": servedModel, "source": servedModelSource})
+		} else {
+			servedModel = hfID
+			servedModelSource = "hf_id_fallback"
+			printStatus(args, "served_model_fallback", map[string]any{"servedModel": servedModel, "source": servedModelSource, "reason": errString(err)})
+		}
+	} else if _, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), servedModel); err == nil {
+		servedModelInfo = info
+	}
+	quantizationResolution := remoteQuantizationResolution(args, baseURL, opt(args, "model-api-key"), opt(args, "quantization"), servedModelInfo)
+	var modelResolution map[string]any
+	if modelPath := stringValue(quantizationResolution["modelPath"]); modelPath != "" {
+		modelResolution = remoteModelResolution(args, servedModel, servedModelSource, hfID, modelPath)
+	}
 	maxTokens := kvOutputTokens(args)
 	if hasFlag(args, "dry-run") {
-		return map[string]any{"contextTokens": float64(level), "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "maxTokens": float64(maxTokens), "dryRun": true, "methodology": remoteKVCacheColdMethodology}, nil
+		point := map[string]any{"contextTokens": float64(level), "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "maxTokens": float64(maxTokens), "dryRun": true, "methodology": remoteKVCacheColdMethodology}
+		if modelResolution != nil {
+			point["modelResolution"] = modelResolution
+		}
+		if quantizationResolution != nil {
+			point["quantizationResolution"] = quantizationResolution
+		}
+		return point, nil
 	}
 	prompt := kvCachePrompt(args, level)
 	prefixMessages := []any{
@@ -2730,7 +2758,11 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 	}
 	promptTokens := level
 	if usagePromptTokens > 0 {
-		promptTokens = level + usagePromptTokens
+		if stringValue(cacheStatus["status"]) == "retained" {
+			promptTokens = level + usagePromptTokens
+		} else {
+			promptTokens = usagePromptTokens
+		}
 	}
 	totalMs := maxDurationMS(completedAt.Sub(started))
 	generationMs := maxDurationMS(completedAt.Sub(generationStart))
@@ -2744,11 +2776,19 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 		"mode":              "remote",
 		"baseUrl":           baseURL,
 		"servedModel":       servedModel,
+		"servedModelSource": servedModelSource,
 		"methodology":       methodology,
 		"cacheReuse":        cacheStatus,
 		"usagePromptTokens": float64(usagePromptTokens),
+		"metricSource":      "remote_endpoint",
 		"timingSource":      "client_observed_http",
 		"tokSPrefillSource": "estimated_from_ttft",
+	}
+	if modelResolution != nil {
+		point["modelResolution"] = modelResolution
+	}
+	if quantizationResolution != nil {
+		point["quantizationResolution"] = quantizationResolution
 	}
 	if len(warnings) > 0 {
 		point["warnings"] = warnings
@@ -3833,6 +3873,18 @@ func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, m
 
 func sourceRepoFromFilename(args cliArgs, candidates []any, filename string) (string, error) {
 	var firstErr error
+	for _, repo := range filenameDerivedSourceRepos(filename) {
+		matched, err := hfRepoContainsFilename(args, repo, filename)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if matched {
+			return repo, nil
+		}
+	}
 	for _, candidate := range candidates {
 		repo := candidateRepoID(candidate)
 		if repo == "" {
@@ -3852,6 +3904,18 @@ func sourceRepoFromFilename(args cliArgs, candidates []any, filename string) (st
 	return "", firstErr
 }
 
+func filenameDerivedSourceRepos(filename string) []string {
+	name := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	lower := strings.ToLower(name)
+	if !strings.Contains(lower, "-qat-") {
+		return nil
+	}
+	if idx := strings.Index(lower, "-ud-"); idx > 0 {
+		return []string{"unsloth/" + name[:idx] + "-GGUF"}
+	}
+	return nil
+}
+
 func candidateRepoID(candidate any) string {
 	if obj := asObject(candidate); obj != nil {
 		return firstNonEmpty(stringValue(obj["hfId"]), stringValue(obj["id"]), stringValue(obj["modelId"]))
@@ -3868,12 +3932,27 @@ func hfRepoContainsFilename(args cliArgs, repo, filename string) (bool, error) {
 	if obj == nil {
 		return false, nil
 	}
+	normalizedFilename := normalizedModelFilename(filename)
 	for _, sibling := range modelFileItems(obj) {
-		if file := firstNonEmpty(stringValue(sibling["rfilename"]), stringValue(sibling["filename"]), stringValue(sibling["path"])); file == filename || strings.EqualFold(file, filename) {
+		file := firstNonEmpty(stringValue(sibling["rfilename"]), stringValue(sibling["filename"]), stringValue(sibling["path"]))
+		if file == filename || strings.EqualFold(file, filename) || normalizedModelFilename(file) == normalizedFilename {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+func normalizedModelFilename(filename string) string {
+	name := strings.ToLower(filepath.Base(filename))
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	parts := strings.FieldsFunc(name, func(r rune) bool { return r == '-' || r == '_' || r == '.' })
+	kept := parts[:0]
+	for _, part := range parts {
+		if part != "qat" {
+			kept = append(kept, part)
+		}
+	}
+	return strings.Join(kept, "-")
 }
 
 func modelFileItems(obj map[string]any) []map[string]any {
