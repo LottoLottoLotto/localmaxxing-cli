@@ -140,6 +140,19 @@ lmx benchmark run vllm \
 
 For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server, before `benchmark dry-run` or `benchmark submit`.
 
+For Ollama, use remote mode against the native Ollama endpoint. The CLI calls `/api/generate` and maps Ollama's `prompt_eval_*`, `eval_*`, and `total_duration` fields into benchmark metrics:
+
+```bash
+lmx benchmark run ollama \
+  --mode remote \
+  --base-url http://localhost:11434 \
+  --hf-id Qwen/Qwen3-8B \
+  --served-model qwen3:8b \
+  --quantization Q4_K_M \
+  --hardware hardware.json \
+  --max-tokens 256
+```
+
 Local host mode runs a benchmark command on the machine where the runtime is installed:
 
 ```bash
@@ -166,11 +179,12 @@ lmx benchmark run llama.cpp \
   --dry-run
 ```
 
-Validate and submit a saved benchmark payload:
+Validate and submit a saved benchmark payload. `validate-local` checks the payload shape without an API key; `dry-run` sends an authenticated validation request to the LocalMaxxing API without creating a run:
 
 ```bash
-lmx benchmark dry-run benchmark.json
-lmx benchmark submit benchmark.json
+lmx benchmark validate-local benchmark.json
+lmx benchmark dry-run benchmark.json --api-key bhk_...
+lmx benchmark submit benchmark.json --api-key bhk_...
 ```
 
 `bench` is accepted as a shorter alias for `benchmark`. Use `--out <path>` to choose the output file, `--json-status` for machine-readable progress events, and `--quiet` to suppress progress events.

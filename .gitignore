@@ -4,6 +4,7 @@ dist/
 .env
 .env.*
 localmaxxing-eval-run.json
+hardware.json
 *.eval-suite.local.json
 runs/
 localmaxxing-kvcache.json

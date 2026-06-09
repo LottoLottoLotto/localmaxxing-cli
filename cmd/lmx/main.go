@@ -28,6 +28,7 @@ const defaultHFAPIURL = "https://huggingface.co"
 const defaultEndpointTimeout = 10 * time.Minute
 const remoteKVCacheColdMethodology = "Single streaming request with inline filler padded to target context size; measures cold prefill + decode at that context depth."
 const remoteKVCacheReuseMethodology = "Two-step remote cache-reuse probe: pre-warm target context, then time a streaming request with the same prefix plus probe; measures cached-prefix decode at that context depth."
+const remoteKVCacheFallbackWarning = "Remote OpenAI-compatible endpoints do not provide a portable persistent KV-cache session API; this sweep resends the full prefix at each depth and can only verify cache reuse when backend-specific cache metrics are exposed. Results may fall back to cold depth TPS instead of retained KV-cache TPS."
 
 var goldFieldNames = map[string]bool{
 	"gold": true, "answer": true, "referenceAnswer": true, "expectedAnswer": true,
@@ -64,14 +65,18 @@ type detectedEngine struct {
 func (e cliError) Error() string { return e.Message }
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		printError(err)
+	args := parseArgs(os.Args[1:])
+	if err := runWithArgs(args); err != nil {
+		printError(args, err)
 		os.Exit(1)
 	}
 }
 
 func run(argv []string) error {
-	args := parseArgs(argv)
+	return runWithArgs(parseArgs(argv))
+}
+
+func runWithArgs(args cliArgs) error {
 	if err := applyProfile(&args); err != nil {
 		return err
 	}
@@ -666,7 +671,7 @@ func detectOllama(args cliArgs) detectedEngine {
 	engine := detectedEngine{Name: "ollama", Installed: len(binaries) > 0, Binaries: binaries}
 	if engine.Installed {
 		engine.ServerCommand = localServerCommand("ollama", args)
-		engine.Notes = append(engine.Notes, "Ollama is detected for serving; benchmark with --mode remote --base-url http://localhost:11434/v1.")
+		engine.Notes = append(engine.Notes, "Ollama is detected for serving; benchmark with --mode remote --base-url http://localhost:11434.")
 	}
 	return engine
 }
@@ -725,7 +730,7 @@ func localServerCommand(engineName string, args cliArgs) string {
 		if opt(args, "model-path") == "" {
 			return ""
 		}
-		cmd := []string{shellQuote(firstNonEmpty(opt(args, "server-bin"), "llama-server")), "-m", shellQuote(opt(args, "model-path")), "--host", shellQuote(host), "--port", shellQuote(port)}
+		cmd := []string{shellQuote(resolvedExecutable(firstNonEmpty(opt(args, "server-bin"), "llama-server"))), "-m", shellQuote(opt(args, "model-path")), "--host", shellQuote(host), "--port", shellQuote(port)}
 		appendShellArg(&cmd, "-c", opt(args, "context-length"))
 		appendShellArg(&cmd, "-ngl", opt(args, "gpu-layers"))
 		appendExtraArgs(&cmd, opt(args, "extra-server-args"))
@@ -1317,6 +1322,9 @@ func defaultContentType(format string) string {
 }
 
 func handleBenchmark(action, target string, args cliArgs) error {
+	if action == "validate-local" || action == "local-validate" {
+		return validateBenchmarkFileLocally(target)
+	}
 	if action == "validate" {
 		action = "dry-run"
 	}
@@ -1364,7 +1372,7 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		return nil
 	}
 	if action != "submit" && action != "dry-run" {
-		return errors.New("Unknown benchmark command. Use run, runs, list, show, edit, rerun, submit, dry-run, delete, stats, export, or compare.")
+		return errors.New("Unknown benchmark command. Use run, runs, list, show, edit, rerun, submit, dry-run, validate-local, delete, stats, export, or compare.")
 	}
 	if target == "" {
 		return fmt.Errorf("benchmark %s requires a benchmark JSON path", action)
@@ -1388,6 +1396,26 @@ func handleBenchmark(action, target string, args cliArgs) error {
 	}
 	apiPayload := toBenchmarkSubmit(payload)
 	return submitPayload(endpoint, action == "dry-run", "benchmark", args, apiPayload)
+}
+
+func validateBenchmarkFileLocally(path string) error {
+	if path == "" {
+		return errors.New("benchmark validate-local requires a benchmark JSON path")
+	}
+	value, err := readJSON(path)
+	if err != nil {
+		return err
+	}
+	if obj := asObject(value); obj != nil {
+		if payload, ok := obj["payload"]; ok {
+			value = payload
+		}
+	}
+	if err := validateBenchmarkSubmitPayload(asObject(value)); err != nil {
+		return err
+	}
+	printInfo("benchmark_local_valid", map[string]any{"path": path, "status": "valid", "note": "Local validation only; API dry-run still requires --api-key or LMX_API_KEY."})
+	return nil
 }
 
 func handleBenchmarkRuns(action, target string, args cliArgs) error {
@@ -2241,6 +2269,11 @@ func handleKVCache(action, target string, args cliArgs) error {
 		engineName = resolved
 	}
 	quantization := opt(args, "quantization")
+	remoteWarnings := []string{}
+	if mode == "remote" {
+		remoteWarnings = append(remoteWarnings, remoteKVCacheFallbackWarning)
+		printStatus(args, "kvcache_remote_depth_fallback", map[string]any{"warning": remoteKVCacheFallbackWarning, "fallback": "remote_depth_tps"})
+	}
 
 	var hardware any
 	hardwareSource := ""
@@ -2311,6 +2344,9 @@ func handleKVCache(action, target string, args cliArgs) error {
 				runPayload[key] = value
 			}
 		}
+		if len(remoteWarnings) > 0 {
+			runPayload["warnings"] = mergeWarnings(remoteWarnings, runPayload["warnings"])
+		}
 
 		if hasFlag(args, "dry-run") {
 			runPayload["dryRun"] = true
@@ -2347,6 +2383,9 @@ func handleKVCache(action, target string, args cliArgs) error {
 	}
 	if hardwareSource != "" {
 		aggregate["hardwareSource"] = hardwareSource
+	}
+	if len(remoteWarnings) > 0 {
+		aggregate["warnings"] = remoteWarnings
 	}
 	if hasFlag(args, "dry-run") {
 		aggregate["dryRun"] = true
@@ -2411,6 +2450,10 @@ func kvCachePayloadFromFlags(target string, args cliArgs) (map[string]any, error
 		"createdAt":     time.Now().UTC().Format(time.RFC3339),
 		"points":        []any{},
 	}
+	if mode == "remote" {
+		payload["warnings"] = []string{remoteKVCacheFallbackWarning}
+		printStatus(args, "kvcache_remote_depth_fallback", map[string]any{"warning": remoteKVCacheFallbackWarning, "fallback": "remote_depth_tps"})
+	}
 	if q := opt(args, "quantization"); q != "" {
 		payload["quantization"] = q
 	}
@@ -2464,6 +2507,35 @@ func parseIntList(value string) ([]int, error) {
 		levels = append(levels, parsed)
 	}
 	return levels, nil
+}
+
+func mergeWarnings(prefix []string, existing any) []string {
+	warnings := []string{}
+	seen := map[string]bool{}
+	appendWarning := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		warnings = append(warnings, value)
+	}
+	for _, warning := range prefix {
+		appendWarning(warning)
+	}
+	switch typed := existing.(type) {
+	case []string:
+		for _, warning := range typed {
+			appendWarning(warning)
+		}
+	case []any:
+		for _, warning := range typed {
+			appendWarning(stringValue(warning))
+		}
+	case string:
+		appendWarning(typed)
+	}
+	return warnings
 }
 
 func kvOutputTokens(args cliArgs) int {
@@ -2922,7 +2994,12 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		applyBenchmarkPlanMetrics(metrics, mode, engineName, args, model)
 	} else if mode == "remote" {
 		printStatus(args, "benchmark_remote_start", map[string]any{"baseUrl": opt(args, "base-url"), "servedModel": firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), model)})
-		endpointMetrics, err := measureOpenAIEndpoint(args, model)
+		var endpointMetrics map[string]any
+		if engineName == "ollama" {
+			endpointMetrics, err = measureOllamaEndpoint(args, model)
+		} else {
+			endpointMetrics, err = measureOpenAIEndpoint(args, model)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -2951,7 +3028,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 				printStatus(args, "benchmark_results_read_complete", map[string]any{"path": outputPath, "bytes": len(data)})
 			}
 		}
-		metrics["engineFlags"] = map[string]any{"mode": "local", "commandSnippet": commandSnippet}
+		metrics["engineFlags"] = localBenchmarkEngineFlags(engineName, commandSnippet)
 		printStatus(args, "benchmark_local_command_complete", map[string]any{"outputBytes": len(output)})
 	}
 	if commandOutput != "" {
@@ -3148,7 +3225,7 @@ func remapEngineFlags(ef map[string]any, payload map[string]any) map[string]any 
 		"specNumTokens", "specDraftTp", "specMethod", "mtpEnabled", "mtpDraftLayers",
 		"temperature", "topP", "topK", "minP", "repeatPenalty", "mirostat",
 		"ropeScale", "ropeScaling", "yarnExtFactor", "schedulerDelayFactor",
-		"attentionBackend", "sglangQuant", "engineQuant", "splitMode",
+		"attentionBackend", "sglangQuant", "engineQuant", "splitMode", "warmup",
 		"prefillChunkSize", "kvCacheSizeMb", "cpuOffloadGb", "extraFlags",
 	} {
 		if v, ok := ef[key]; ok && submitValuePresent(v) {
@@ -3223,7 +3300,7 @@ func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dr
 		nextCommand = "lmx hardware --out hardware.json"
 	} else if dryRun && !ready {
 		status = "plan_needs_metrics"
-		message = "Measurement plan written. benchmark run --dry-run does not contact the model endpoint or API; run without --dry-run to measure, or add explicit metrics before API validation."
+		message = "Measurement plan written. No benchmark command or API request ran. Run without --dry-run to measure, or pass explicit --tok-s-out metrics before API validation."
 		nextCommand = "lmx benchmark run <engine> <same options without --dry-run>"
 		if requiresRemoteHardware {
 			message += " Remote endpoint submissions also require --hardware with metadata from the endpoint host."
@@ -3231,18 +3308,19 @@ func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dr
 		}
 	} else if dryRun {
 		status = "plan_ready_for_api_validation"
-		message = "Dry-run payload written with metrics. Validate it with lmx benchmark dry-run before submitting; benchmark run --dry-run is only a measurement-plan mode."
+		message = "Dry-run measurement plan written with metrics. No API request ran. Validate locally with lmx benchmark validate-local, or run authenticated API validation with lmx benchmark dry-run."
 	}
 	if missingAuth {
-		message += " API validation cannot run yet because no API key is configured."
+		message += " API validation and submission require an API key."
 		nextCommand = "lmx auth --key bhk_..."
 	}
+	canUseAPI := ready && !requiresRemoteHardware && !missingAuth
 	feedback := map[string]any{
 		"status":          status,
 		"message":         message,
 		"outputPath":      out,
-		"canApiValidate":  ready && !requiresRemoteHardware,
-		"canSubmit":       ready && !requiresRemoteHardware,
+		"canApiValidate":  canUseAPI,
+		"canSubmit":       canUseAPI,
 		"requiresMetrics": !ready,
 	}
 	if requiresRemoteHardware {
@@ -3252,13 +3330,14 @@ func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dr
 	if nextCommand != "" {
 		feedback["nextCommand"] = nextCommand
 	}
-	if ready && !requiresRemoteHardware && !submit {
+	if ready && !requiresRemoteHardware && !submit && !missingAuth {
 		feedback["submitCommand"] = "lmx benchmark submit " + out
 	}
 	if missingAuth {
 		feedback["authRequired"] = true
+		feedback["blockedByAuth"] = true
 		feedback["authCommand"] = "lmx auth --key bhk_..."
-		feedback["validationCommand"] = "lmx benchmark dry-run " + out
+		feedback["validationCommand"] = "lmx benchmark validate-local " + out
 	}
 	if engine := stringValue(payload["engineName"]); engine != "" {
 		feedback["engine"] = engine
@@ -3328,7 +3407,7 @@ func applyBenchmarkPlanMetrics(metrics map[string]any, mode, engineName string, 
 		return
 	}
 	if commandSnippet := localBenchmarkCommand(engineName, args); commandSnippet != "" {
-		metrics["engineFlags"] = map[string]any{"mode": "local", "commandSnippet": commandSnippet}
+		metrics["engineFlags"] = localBenchmarkEngineFlags(engineName, commandSnippet)
 	}
 }
 
@@ -3407,7 +3486,7 @@ func localBenchmarkCommand(engineName string, args cliArgs) string {
 	if engineName != "llama.cpp" || opt(args, "model-path") == "" {
 		return ""
 	}
-	cmd := []string{"llama-bench", "-m", shellQuote(opt(args, "model-path"))}
+	cmd := []string{shellQuote(resolvedExecutable(firstNonEmpty(opt(args, "benchmark-bin"), "llama-bench"))), "-m", shellQuote(opt(args, "model-path"))}
 	if value := firstNonEmpty(opt(args, "prompt-tokens"), opt(args, "prefill-tokens"), "512"); value != "" {
 		cmd = append(cmd, "-p", shellQuote(value))
 	}
@@ -3425,6 +3504,25 @@ func localBenchmarkCommand(engineName string, args cliArgs) string {
 		cmd = append(cmd, value)
 	}
 	return strings.Join(cmd, " ")
+}
+
+func resolvedExecutable(name string) string {
+	if path, ok := lookupExecutable(name); ok {
+		return path
+	}
+	return name
+}
+
+func localBenchmarkEngineFlags(engineName, commandSnippet string) map[string]any {
+	flags := map[string]any{"mode": "local", "commandSnippet": commandSnippet}
+	if engineName == "llama.cpp" {
+		if strings.Contains(commandSnippet, "--no-warmup") {
+			flags["warmup"] = "disabled"
+		} else {
+			flags["warmup"] = "llama-bench-default"
+		}
+	}
+	return flags
 }
 
 func appendLlamaBenchArgs(cmd *[]string, args cliArgs, includeDepth bool) {
@@ -3804,6 +3902,128 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		}
 	}
 	return metrics, nil
+}
+
+func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
+	baseURL := ollamaBaseURL(args)
+	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), hfID)
+	prompt := firstNonEmpty(opt(args, "prompt"), "Explain why local inference benchmarks should report prompt prefill throughput, decode throughput, and time to first token.")
+	maxTokens := 256
+	if value := opt(args, "max-tokens"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return nil, cliError{"invalid_option", "--max-tokens must be a positive integer", []string{"Pass --max-tokens <number>."}, nil}
+		}
+		maxTokens = parsed
+	}
+	temperature := 0.0
+	if value := opt(args, "temperature"); value != "" {
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return nil, cliError{"invalid_option", "--temperature must be a number", []string{"Pass --temperature <number>."}, nil}
+		}
+		temperature = parsed
+	}
+	timeout, err := endpointTimeout(args)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{
+		"model":  servedModel,
+		"prompt": prompt,
+		"stream": false,
+		"options": map[string]any{
+			"num_predict": maxTokens,
+			"temperature": temperature,
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	bodyData, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/api/generate", bytes.NewReader(bodyData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := opt(args, "model-api-key"); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, cliError{"endpoint_benchmark_failed", fmt.Sprintf("Could not reach Ollama endpoint: %v", err), []string{"Check --base-url and confirm Ollama is serving from this machine."}, nil}
+	}
+	defer res.Body.Close()
+	printStatus(args, "ollama_response_received", map[string]any{"status": res.StatusCode})
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		text, _ := io.ReadAll(res.Body)
+		return nil, cliError{"endpoint_benchmark_failed", fmt.Sprintf("Ollama endpoint returned %s", res.Status), []string{"Check --base-url, --served-model, and --model-api-key.", "Confirm the endpoint supports POST /api/generate."}, string(text)}
+	}
+	var response map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		return nil, err
+	}
+	completedAt := time.Now()
+	promptTokens := firstPositiveNumber(response, "prompt_eval_count", "promptEvalCount")
+	outputTokens := firstPositiveNumber(response, "eval_count", "evalCount")
+	promptSeconds := ollamaDurationSeconds(firstPositiveNumber(response, "prompt_eval_duration", "promptEvalDuration"))
+	decodeSeconds := ollamaDurationSeconds(firstPositiveNumber(response, "eval_duration", "evalDuration"))
+	totalSeconds := ollamaDurationSeconds(firstPositiveNumber(response, "total_duration", "totalDuration"))
+	if totalSeconds == 0 {
+		totalSeconds = completedAt.Sub(started).Seconds()
+	}
+	metrics := map[string]any{
+		"prompt":       prompt,
+		"outputText":   stringValue(response["response"]),
+		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds())},
+		"tokenSources": map[string]any{"prompt": "ollama_prompt_eval_count", "output": "ollama_eval_count"},
+		"timingSource": "ollama_native_api",
+		"metricSource": "remote_endpoint",
+		"ttftSource":   "unavailable_ollama_nonstreaming",
+	}
+	if promptTokens > 0 {
+		metrics["promptTokens"] = promptTokens
+	}
+	if outputTokens > 0 {
+		metrics["outputTokens"] = outputTokens
+	}
+	if promptTokens > 0 && promptSeconds > 0 {
+		metrics["tokSPrefill"] = round1(promptTokens / promptSeconds)
+	}
+	if outputTokens > 0 && decodeSeconds > 0 {
+		metrics["tokSOut"] = round1(outputTokens / decodeSeconds)
+	}
+	if promptTokens+outputTokens > 0 && totalSeconds > 0 {
+		metrics["tokSTotal"] = round1((promptTokens + outputTokens) / totalSeconds)
+	}
+	if promptSeconds > 0 {
+		metrics["ttftMs"] = round1(promptSeconds * 1000)
+		metrics["ttftSource"] = "ollama_prompt_eval_duration"
+	}
+	return metrics, nil
+}
+
+func ollamaBaseURL(args cliArgs) string {
+	return openAIBaseURL(firstNonEmpty(opt(args, "base-url"), "http://localhost:11434"))
+}
+
+func firstPositiveNumber(obj map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		if value := numberField(obj, key); value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func ollamaDurationSeconds(value float64) float64 {
+	if value <= 0 {
+		return 0
+	}
+	return value / 1e9
 }
 
 func endpointTimeout(args cliArgs) (time.Duration, error) {
@@ -5866,9 +6086,21 @@ func metricStatusFields(metrics map[string]float64) map[string]any {
 	return fields
 }
 
-func printError(err error) {
+func printError(args cliArgs, err error) {
 	var ce cliError
 	if errors.As(err, &ce) {
+		if hasFlag(args, "json-status") {
+			payload := map[string]any{"event": "error", "time": time.Now().UTC().Format(time.RFC3339), "code": ce.Code, "message": ce.Message}
+			if len(ce.Hints) > 0 {
+				payload["hints"] = ce.Hints
+			}
+			if ce.Details != nil {
+				payload["details"] = ce.Details
+			}
+			data, _ := json.Marshal(payload)
+			fmt.Fprintln(os.Stderr, string(data))
+			return
+		}
 		fmt.Fprintln(os.Stderr, "[localmaxxing:error] "+ce.Code)
 		fmt.Fprintln(os.Stderr, ce.Message)
 		if len(ce.Hints) > 0 {
@@ -5886,6 +6118,11 @@ func printError(err error) {
 				fmt.Fprintln(os.Stderr, string(data))
 			}
 		}
+		return
+	}
+	if hasFlag(args, "json-status") {
+		data, _ := json.Marshal(map[string]any{"event": "error", "time": time.Now().UTC().Format(time.RFC3339), "code": "unexpected_error", "message": err.Error()})
+		fmt.Fprintln(os.Stderr, string(data))
 		return
 	}
 	fmt.Fprintln(os.Stderr, "[localmaxxing:error] unexpected_error")
@@ -5923,6 +6160,7 @@ Usage:
   lmx kvcache run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --levels 10000,20000,30000,40000
   lmx benchmark submit benchmark.json --api-key bhk_...
   lmx benchmark dry-run benchmark.json --api-key bhk_...
+  lmx benchmark validate-local benchmark.json
   lmx eval suite list --out suites.json
   lmx eval suite search reasoning --out reasoning-suites.json
   lmx eval suite show hellaswag --out hellaswag-suite.json
@@ -6000,6 +6238,6 @@ Options:
   --item-count <n>         Optional record/sample count for storage metadata
   --limit <n>              Optional search/list result limit
   --submit                 Upload run to LocalMaxxing
-  --dry-run                Validate upload without creating a run
+  --dry-run                For benchmark run: write a measurement plan; for submit commands: authenticated API validation without creating a run
   --out <path>             Write computed payload/result JSON`)
 }

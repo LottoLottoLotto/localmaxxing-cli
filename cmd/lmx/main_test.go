@@ -403,6 +403,47 @@ func TestLlamaBenchmarkCommandSupportsNoFlashAttention(t *testing.T) {
 	}
 }
 
+func TestLlamaBenchmarkCommandUsesResolvedBinaryAndReportsWarmup(t *testing.T) {
+	binDir := t.TempDir()
+	benchPath := filepath.Join(binDir, "llama-bench")
+	writeExecutable(t, benchPath)
+	t.Setenv("PATH", binDir)
+
+	command := localBenchmarkCommand("llama.cpp", cliArgs{
+		opts:  map[string]string{"model-path": "/models/qwen.gguf"},
+		flags: map[string]bool{},
+	})
+	if !strings.HasPrefix(command, benchPath+" ") {
+		t.Fatalf("benchmark command = %q, want resolved executable %q", command, benchPath)
+	}
+	flags := localBenchmarkEngineFlags("llama.cpp", command)
+	if flags["warmup"] != "llama-bench-default" {
+		t.Fatalf("warmup = %v, want llama-bench-default", flags["warmup"])
+	}
+	flags = localBenchmarkEngineFlags("llama.cpp", command+" --no-warmup")
+	if flags["warmup"] != "disabled" {
+		t.Fatalf("warmup = %v, want disabled", flags["warmup"])
+	}
+}
+
+func TestBenchmarkFeedbackBlocksSubmitWithoutAuth(t *testing.T) {
+	t.Setenv("LMX_API_KEY", "")
+	feedback := benchmarkAgentFeedback(map[string]any{
+		"benchmarkMode": "local",
+		"engineName":    "llama.cpp",
+		"tokSOut":       120.0,
+	}, "run.json", cliArgs{opts: map[string]string{}, flags: map[string]bool{}}, false, false)
+	if feedback["canSubmit"] != false || feedback["canApiValidate"] != false || feedback["blockedByAuth"] != true {
+		t.Fatalf("feedback = %#v, want auth-blocked API actions", feedback)
+	}
+	if feedback["submitCommand"] != nil {
+		t.Fatalf("submitCommand = %v, want omitted while auth is missing", feedback["submitCommand"])
+	}
+	if feedback["validationCommand"] != "lmx benchmark validate-local run.json" {
+		t.Fatalf("validationCommand = %v, want local validation next", feedback["validationCommand"])
+	}
+}
+
 func TestLocalServerCommandBuildsSGLangCommandWithDefaultPort(t *testing.T) {
 	command := localServerCommand("sglang", cliArgs{
 		opts: map[string]string{
@@ -436,6 +477,64 @@ func TestSGLangBenchmarkCommandUsesBenchServingFlags(t *testing.T) {
 		if !strings.Contains(command, want) {
 			t.Fatalf("benchmark command = %q, missing %q", command, want)
 		}
+	}
+}
+
+func TestOllamaDoesNotGenerateLocalBenchmarkCommand(t *testing.T) {
+	command := localBenchmarkCommand("ollama", cliArgs{
+		opts:  map[string]string{"model": "qwen3:8b"},
+		flags: map[string]bool{},
+	})
+	if command != "" {
+		t.Fatalf("benchmark command = %q, want no local Ollama benchmark command", command)
+	}
+}
+
+func TestOllamaRemoteBenchmarkUsesNativeTimingMetrics(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/generate" {
+			http.NotFound(w, r)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		fmt.Fprint(w, `{"response":"hello world","done":true,"prompt_eval_count":100,"prompt_eval_duration":2000000000,"eval_count":40,"eval_duration":1000000000,"total_duration":4000000000}`)
+	}))
+	defer server.Close()
+
+	payload, err := benchmarkPayloadFromFlags("ollama", cliArgs{
+		opts: map[string]string{
+			"mode":         "remote",
+			"base-url":     server.URL + "/v1",
+			"hf-id":        "Qwen/Qwen3-8B",
+			"served-model": "qwen3:8b",
+			"quantization": "Q4_K_M",
+			"hardware":     writeBenchmarkHardwareForTest(t),
+			"max-tokens":   "40",
+		},
+		flags: map[string]bool{"quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	if request["model"] != "qwen3:8b" {
+		t.Fatalf("request model = %v, want qwen3:8b", request["model"])
+	}
+	options := request["options"].(map[string]any)
+	if options["num_predict"] != float64(40) {
+		t.Fatalf("num_predict = %v, want 40", options["num_predict"])
+	}
+	if payload["tokSPrefill"] != 50.0 || payload["tokSOut"] != 40.0 || payload["tokSTotal"] != 35.0 || payload["ttftMs"] != 2000.0 {
+		t.Fatalf("ollama metrics = %#v", payload)
+	}
+	if payload["timingSource"] != "ollama_native_api" || payload["ttftSource"] != "ollama_prompt_eval_duration" {
+		t.Fatalf("metric provenance = %#v", payload)
+	}
+	engineFlags := payload["engineFlags"].(map[string]any)
+	if engineFlags["baseUrl"] != server.URL || engineFlags["nativeApi"] != "ollama_generate" {
+		t.Fatalf("engineFlags = %#v", engineFlags)
 	}
 }
 
@@ -477,6 +576,24 @@ func TestBenchmarkExplicitTokenFlagsDeriveComparableMetrics(t *testing.T) {
 	}
 	if _, exists := provenance["ttftSource"]; !exists || provenance["ttftSource"] != "estimated_from_prefill" {
 		t.Fatalf("provenance ttftSource = %v", provenance["ttftSource"])
+	}
+}
+
+func TestBenchmarkValidateLocalDoesNotRequireAPIKey(t *testing.T) {
+	t.Setenv("LMX_API_KEY", "")
+	path := filepath.Join(t.TempDir(), "run.json")
+	if err := writeJSON(path, map[string]any{
+		"hfId":          "Qwen/Qwen3-8B",
+		"engineName":    "llama.cpp",
+		"benchmarkMode": "local",
+		"quantization":  "Q4_K_M",
+		"tokSOut":       120.0,
+		"hardware":      map[string]any{"gpuName": "NVIDIA RTX 4090", "vramGb": 24.0},
+	}); err != nil {
+		t.Fatalf("write run: %v", err)
+	}
+	if err := handleBenchmark("validate-local", path, cliArgs{opts: map[string]string{}, flags: map[string]bool{"quiet": true}}); err != nil {
+		t.Fatalf("validate-local returned error without API key: %v", err)
 	}
 }
 
@@ -566,7 +683,7 @@ func TestBenchmarkRunEditAppliesAgentPatch(t *testing.T) {
 	if err := writeJSON(path, value); err != nil {
 		t.Fatalf("write run: %v", err)
 	}
-	if err := editBenchmarkRun(path, cliArgs{opts: map[string]string{"set-json": `{"tokSOut":120,"notes":"agent fixed metrics"}`}, flags: map[string]bool{}}); err != nil {
+	if err := editBenchmarkRun(path, cliArgs{opts: map[string]string{"api-key": "bhk_test", "set-json": `{"tokSOut":120,"notes":"agent fixed metrics"}`}, flags: map[string]bool{}}); err != nil {
 		t.Fatalf("editBenchmarkRun returned error: %v", err)
 	}
 	updated, err := readJSON(path)
@@ -675,6 +792,15 @@ func writeBenchmarkRunForTest(t *testing.T, path string, payload map[string]any)
 	if err := writeJSON(path, payload); err != nil {
 		t.Fatalf("write benchmark run: %v", err)
 	}
+}
+
+func writeBenchmarkHardwareForTest(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hardware.json")
+	if err := writeJSON(path, map[string]any{"gpuName": "NVIDIA RTX 4090", "vramGb": 24.0}); err != nil {
+		t.Fatalf("write hardware: %v", err)
+	}
+	return path
 }
 
 func TestBenchmarkRunDeleteRequiresConfirmation(t *testing.T) {
@@ -875,6 +1001,60 @@ func TestHandleKVCacheHonorsOutAndRunsDir(t *testing.T) {
 	}
 }
 
+func TestHandleRemoteKVCacheWarnsAboutDepthFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"object":"list","data":[{"id":"served-model","object":"model"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "sweep.json")
+	runsDir := filepath.Join(tmp, "runs")
+	args := cliArgs{
+		opts: map[string]string{
+			"mode":         "remote",
+			"base-url":     server.URL,
+			"hf-id":        "org/model",
+			"served-model": "served-model",
+			"levels":       "128",
+			"out":          out,
+			"runs-dir":     runsDir,
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	}
+	if err := handleKVCache("run", "vllm", args); err != nil {
+		t.Fatalf("handleKVCache returned error: %v", err)
+	}
+
+	aggregate, err := readJSON(out)
+	if err != nil {
+		t.Fatalf("read aggregate: %v", err)
+	}
+	warnings := aggregate.(map[string]any)["warnings"].([]any)
+	if len(warnings) != 1 || !strings.Contains(stringValue(warnings[0]), "Remote OpenAI-compatible endpoints") {
+		t.Fatalf("aggregate warnings = %#v", warnings)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(runsDir, "org-model"))
+	if err != nil {
+		t.Fatalf("read remote kvcache run dir: %v", err)
+	}
+	value, err := readJSON(filepath.Join(runsDir, "org-model", entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read saved kvcache run: %v", err)
+	}
+	payload := value.(map[string]any)["payload"].(map[string]any)
+	runWarnings := payload["warnings"].([]any)
+	if len(runWarnings) != 1 || !strings.Contains(stringValue(runWarnings[0]), "cold depth TPS") {
+		t.Fatalf("run warnings = %#v", runWarnings)
+	}
+}
+
 func TestParseLlamaBenchJSONDepthMetrics(t *testing.T) {
 	metrics := parseBenchmarkOutput(`[
   {"n_prompt":512,"n_gen":0,"n_depth":10000,"avg_ts":6425.91},
@@ -1052,10 +1232,10 @@ func TestBenchmarkAgentFeedbackDistinguishesPlanFromReadyPayload(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("LMX_API_KEY", "")
 	unauthenticated := benchmarkAgentFeedback(map[string]any{"engineName": "llama.cpp", "benchmarkMode": "local", "tokSOut": 120.0}, "ready.json", cliArgs{opts: map[string]string{}, flags: map[string]bool{}}, false, false)
-	if unauthenticated["authRequired"] != true || unauthenticated["nextCommand"] != "lmx auth --key bhk_..." {
+	if unauthenticated["authRequired"] != true || unauthenticated["blockedByAuth"] != true || unauthenticated["nextCommand"] != "lmx auth --key bhk_..." {
 		t.Fatalf("unauthenticated feedback = %#v", unauthenticated)
 	}
-	if unauthenticated["validationCommand"] != "lmx benchmark dry-run ready.json" {
+	if unauthenticated["validationCommand"] != "lmx benchmark validate-local ready.json" {
 		t.Fatalf("validationCommand = %v", unauthenticated["validationCommand"])
 	}
 

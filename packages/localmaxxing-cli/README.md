@@ -109,6 +109,19 @@ If the endpoint is on another machine, `hardware.json` must describe that server
 
 If `--served-model` is omitted, the CLI tries `GET /v1/models` and uses the matching or first returned model ID before falling back to `--hf-id`.
 
+For Ollama, use remote mode against the native Ollama endpoint. The CLI calls `/api/generate` and maps Ollama's `prompt_eval_*`, `eval_*`, and `total_duration` fields into benchmark metrics:
+
+```bash
+lmx benchmark run ollama \
+  --mode remote \
+  --base-url http://localhost:11434 \
+  --hf-id Qwen/Qwen3-8B \
+  --served-model qwen3:8b \
+  --quantization Q4_K_M \
+  --hardware hardware.json \
+  --max-tokens 256
+```
+
 Local host mode runs a benchmark command on the machine where the model/runtime is installed. Use this when you are on the server and can run `llama-bench` or another benchmark executable:
 
 ```bash
