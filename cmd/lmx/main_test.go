@@ -678,6 +678,58 @@ func TestBenchmarkRunWritesDefaultRunFile(t *testing.T) {
 	}
 }
 
+func TestBenchmarkRunWithOutAlsoSavesManagedRun(t *testing.T) {
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "payload.json")
+	runsDir := filepath.Join(tmp, "managed-runs")
+
+	err := handleBenchmark("run", "llama.cpp", cliArgs{
+		opts: map[string]string{
+			"mode":         "local",
+			"hf-id":        "Qwen/Qwen3-8B",
+			"quantization": "Q4_K_M",
+			"tok-s-out":    "120",
+			"out":          out,
+			"runs-dir":     runsDir,
+		},
+		flags: map[string]bool{"quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("handleBenchmark returned error: %v", err)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatalf("expected explicit --out payload: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(runsDir, "Qwen-Qwen3-8B"))
+	if err != nil {
+		t.Fatalf("read managed run dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("managed run files = %d, want 1", len(entries))
+	}
+	value, err := readJSON(out)
+	if err != nil {
+		t.Fatalf("read out json: %v", err)
+	}
+	payload := value.(map[string]any)
+	feedback := payload["agentFeedback"].(map[string]any)
+	if stringValue(feedback["savedRunPath"]) == "" {
+		t.Fatalf("agentFeedback missing savedRunPath: %#v", feedback)
+	}
+
+	summaries, err := benchmarkRunSummaries(runsDir)
+	if err != nil {
+		t.Fatalf("benchmarkRunSummaries returned error: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("managed run summaries = %d, want 1", len(summaries))
+	}
+	summary := summaries[0].(map[string]any)
+	if summary["model"] != "Qwen/Qwen3-8B" {
+		t.Fatalf("managed run summary = %#v", summary)
+	}
+}
+
 func TestBenchmarkRunEditAppliesAgentPatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "run.json")
 	value := map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "llama.cpp", "benchmarkMode": "local", "quantization": "Q4_K_M"}

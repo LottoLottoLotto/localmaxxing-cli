@@ -1345,16 +1345,20 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		if err != nil {
 			return err
 		}
-		out := firstNonEmpty(opt(args, "out"), benchmarkRunPathInDir(payload, firstNonEmpty(opt(args, "runs-dir"), "runs")))
+		runPath := benchmarkRunPathInDir(payload, firstNonEmpty(opt(args, "runs-dir"), "runs"))
+		out := firstNonEmpty(opt(args, "out"), runPath)
 		feedback := benchmarkAgentFeedback(payload, out, args, hasFlag(args, "dry-run"), hasFlag(args, "submit"))
-		payload["agentFeedback"] = feedback
-		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-			return err
+		if out != runPath {
+			feedback["savedRunPath"] = runPath
 		}
-		if err := writeJSON(out, payload); err != nil {
+		payload["agentFeedback"] = feedback
+		if err := writeBenchmarkPayloadFiles(payload, out, runPath); err != nil {
 			return err
 		}
 		printInfo("benchmark_payload_file_written", map[string]any{"path": out, "engine": payload["engineName"]})
+		if out != runPath {
+			printInfo("benchmark_run_saved", map[string]any{"path": runPath, "engine": payload["engineName"]})
+		}
 		printStatus(args, "benchmark_payload_status", feedback)
 		if hasFlag(args, "dry-run") && !hasFlag(args, "submit") {
 			fmt.Println(stringValue(feedback["message"]))
@@ -1399,6 +1403,22 @@ func handleBenchmark(action, target string, args cliArgs) error {
 	}
 	apiPayload := toBenchmarkSubmit(payload)
 	return submitPayload(endpoint, action == "dry-run", "benchmark", args, apiPayload)
+}
+
+func writeBenchmarkPayloadFiles(payload map[string]any, out, runPath string) error {
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		return err
+	}
+	if err := writeJSON(out, payload); err != nil {
+		return err
+	}
+	if out == runPath {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(runPath), 0o755); err != nil {
+		return err
+	}
+	return writeJSON(runPath, payload)
 }
 
 func validateBenchmarkFileLocally(path string) error {
