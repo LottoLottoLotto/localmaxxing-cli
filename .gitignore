@@ -8,3 +8,4 @@ hardware.json
 *.eval-suite.local.json
 runs/
 localmaxxing-kvcache.json
+/lmx

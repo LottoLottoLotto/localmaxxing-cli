@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1527,6 +1528,71 @@ func TestEmbeddedTokenCountScriptMatchesHelperSource(t *testing.T) {
 	}
 }
 
+func requireCliErrorCode(t *testing.T, err error, code string) {
+	t.Helper()
+	var cli cliError
+	if !errors.As(err, &cli) {
+		t.Fatalf("error = %v, want cliError %s", err, code)
+	}
+	if cli.Code != code {
+		t.Fatalf("cliError code = %s, want %s", cli.Code, code)
+	}
+}
+
+func TestAuthManualKeyStatusAndLogoutUseConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LMX_API_KEY", "")
+
+	if err := runWithArgs(parseArgs([]string{"auth", "--key", "bhk_manual_secret"})); err != nil {
+		t.Fatalf("auth --key returned error: %v", err)
+	}
+	cfg := loadConfig()
+	if cfg["apiKey"] != "bhk_manual_secret" {
+		t.Fatalf("apiKey = %v, want manual key", cfg["apiKey"])
+	}
+	if cfg["authProvider"] != "manual" {
+		t.Fatalf("authProvider = %v, want manual", cfg["authProvider"])
+	}
+	savedAt, ok := cfg["authSavedAt"].(string)
+	if !ok || savedAt == "" {
+		t.Fatalf("authSavedAt = %#v, want non-empty string", cfg["authSavedAt"])
+	}
+	if _, err := time.Parse(time.RFC3339, savedAt); err != nil {
+		t.Fatalf("authSavedAt = %q, want RFC3339: %v", savedAt, err)
+	}
+
+	if err := runWithArgs(parseArgs([]string{"auth"})); err != nil {
+		t.Fatalf("auth status returned error: %v", err)
+	}
+	if err := runWithArgs(parseArgs([]string{"auth", "--logout"})); err != nil {
+		t.Fatalf("auth --logout returned error: %v", err)
+	}
+	cfg = loadConfig()
+	if len(cfg) != 0 {
+		t.Fatalf("config after logout = %#v, want empty map", cfg)
+	}
+}
+
+func TestAuthAPIKeyPrefersFlagThenEnvThenConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LMX_API_KEY", "")
+	if err := saveConfig(map[string]any{"apiKey": "bhk_saved"}); err != nil {
+		t.Fatalf("saveConfig returned error: %v", err)
+	}
+
+	if key := apiKey(cliArgs{opts: map[string]string{"api-key": "bhk_flag"}, flags: map[string]bool{}}); key != "bhk_flag" {
+		t.Fatalf("apiKey with flag = %q, want bhk_flag", key)
+	}
+	t.Setenv("LMX_API_KEY", "bhk_env")
+	if key := apiKey(cliArgs{opts: map[string]string{}, flags: map[string]bool{}}); key != "bhk_env" {
+		t.Fatalf("apiKey with env = %q, want bhk_env", key)
+	}
+	t.Setenv("LMX_API_KEY", "")
+	if key := apiKey(cliArgs{opts: map[string]string{}, flags: map[string]bool{}}); key != "bhk_saved" {
+		t.Fatalf("apiKey with config = %q, want bhk_saved", key)
+	}
+}
+
 func TestAuthLoginDeviceFlowSavesIssuedKey(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("LMX_API_KEY", "")
@@ -1538,8 +1604,8 @@ func TestAuthLoginDeviceFlowSavesIssuedKey(t *testing.T) {
 				t.Fatalf("code method = %s, want POST", r.Method)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"deviceCode":     "device-secret",
-				"userCode":       "LMXR-7K42",
+				"deviceCode":      "device-secret",
+				"userCode":        "LMXR-7K42",
 				"verificationUri": serverURL(r) + "/auth/device",
 			})
 		case "/api/auth/device/token":
@@ -1583,6 +1649,78 @@ func TestAuthLoginDeviceFlowSavesIssuedKey(t *testing.T) {
 	}
 	if tokenCalls != 2 {
 		t.Fatalf("token calls = %d, want pending then success", tokenCalls)
+	}
+}
+
+func TestAuthLoginDeviceFlowReportsServerErrors(t *testing.T) {
+	validDeviceCode := map[string]any{
+		"deviceCode":      "device-secret",
+		"userCode":        "LMXR-7K42",
+		"verificationUri": "http://example.test/auth/device",
+	}
+	tests := []struct {
+		name       string
+		deviceBody map[string]any
+		tokenBody  map[string]any
+		wantCode   string
+	}{
+		{
+			name:       "missing_device_fields",
+			deviceBody: map[string]any{"deviceCode": "device-secret"},
+			wantCode:   "auth_device_code_invalid",
+		},
+		{
+			name:       "expired_token",
+			deviceBody: validDeviceCode,
+			tokenBody:  map[string]any{"error": "expired_token"},
+			wantCode:   "auth_device_expired",
+		},
+		{
+			name:       "access_denied",
+			deviceBody: validDeviceCode,
+			tokenBody:  map[string]any{"error": "access_denied"},
+			wantCode:   "auth_device_error",
+		},
+		{
+			name:       "missing_key",
+			deviceBody: validDeviceCode,
+			tokenBody:  map[string]any{},
+			wantCode:   "auth_device_token_invalid",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("LMX_API_KEY", "")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/auth/device/code":
+					if r.Method != http.MethodPost {
+						t.Fatalf("code method = %s, want POST", r.Method)
+					}
+					_ = json.NewEncoder(w).Encode(tt.deviceBody)
+				case "/api/auth/device/token":
+					if r.Method != http.MethodPost {
+						t.Fatalf("token method = %s, want POST", r.Method)
+					}
+					_ = json.NewEncoder(w).Encode(tt.tokenBody)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			err := runWithArgs(cliArgs{
+				positional: []string{"auth", "login"},
+				opts: map[string]string{
+					"api-url":            server.URL,
+					"auth-poll-interval": "1ms",
+					"auth-timeout":       "100ms",
+				},
+				flags: map[string]bool{"no-browser": true, "quiet": true},
+			})
+			requireCliErrorCode(t, err, tt.wantCode)
+		})
 	}
 }
 
@@ -1636,6 +1774,38 @@ func TestAuthKeyManagementCommandsUseExistingAPIKey(t *testing.T) {
 		if !seen[name] {
 			t.Fatalf("did not observe %s request", name)
 		}
+	}
+}
+
+func TestAuthKeyManagementValidatesInputsAndMissingAuth(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LMX_API_KEY", "")
+
+	for _, tc := range []struct {
+		name string
+		args cliArgs
+	}{
+		{name: "keys_list", args: parseArgs([]string{"auth", "keys", "list"})},
+		{name: "whoami", args: parseArgs([]string{"auth", "whoami"})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requireCliErrorCode(t, runWithArgs(tc.args), "missing_api_key")
+		})
+	}
+
+	t.Setenv("LMX_API_KEY", "bhk_test")
+	for _, tc := range []struct {
+		name     string
+		args     cliArgs
+		wantCode string
+	}{
+		{name: "keys_create_missing_name", args: parseArgs([]string{"auth", "keys", "create"}), wantCode: "missing_name"},
+		{name: "keys_revoke_missing_id", args: parseArgs([]string{"auth", "keys", "revoke"}), wantCode: "missing_key_id"},
+		{name: "keys_rotate_unknown", args: parseArgs([]string{"auth", "keys", "rotate"}), wantCode: "unknown_auth_keys_command"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requireCliErrorCode(t, runWithArgs(tc.args), tc.wantCode)
+		})
 	}
 }
 

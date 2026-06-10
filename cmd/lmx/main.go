@@ -546,7 +546,7 @@ func authDurationOption(args cliArgs, key string, fallback time.Duration) (time.
 func authResponseError(err error) string {
 	var cli cliError
 	if errors.As(err, &cli) {
-		return stringValue(asObject(cli.Data)["error"])
+		return stringValue(asObject(cli.Details)["error"])
 	}
 	return ""
 }
