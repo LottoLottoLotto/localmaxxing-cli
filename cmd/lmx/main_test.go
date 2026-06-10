@@ -1526,3 +1526,119 @@ func TestEmbeddedTokenCountScriptMatchesHelperSource(t *testing.T) {
 		t.Fatal("embedded token_count.py is out of sync with python/localmaxxing_helpers/token_count.py")
 	}
 }
+
+func TestAuthLoginDeviceFlowSavesIssuedKey(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LMX_API_KEY", "")
+	tokenCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/device/code":
+			if r.Method != http.MethodPost {
+				t.Fatalf("code method = %s, want POST", r.Method)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":     "device-secret",
+				"userCode":       "LMXR-7K42",
+				"verificationUri": serverURL(r) + "/auth/device",
+			})
+		case "/api/auth/device/token":
+			if r.Method != http.MethodPost {
+				t.Fatalf("token method = %s, want POST", r.Method)
+			}
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode token request: %v", err)
+			}
+			if body["deviceCode"] != "device-secret" {
+				t.Fatalf("deviceCode = %q, want device-secret", body["deviceCode"])
+			}
+			tokenCalls++
+			if tokenCalls == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "authorization_pending"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"key": "bhk_device_key"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := runWithArgs(cliArgs{
+		positional: []string{"auth", "login"},
+		opts: map[string]string{
+			"api-url":            server.URL,
+			"auth-poll-interval": "1ms",
+			"auth-timeout":       "1s",
+		},
+		flags: map[string]bool{"no-browser": true, "quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("auth login returned error: %v", err)
+	}
+	cfg := loadConfig()
+	if cfg["apiKey"] != "bhk_device_key" || cfg["authProvider"] != "device" {
+		t.Fatalf("config = %#v, want saved device key", cfg)
+	}
+	if tokenCalls != 2 {
+		t.Fatalf("token calls = %d, want pending then success", tokenCalls)
+	}
+}
+
+func TestAuthKeyManagementCommandsUseExistingAPIKey(t *testing.T) {
+	t.Setenv("LMX_API_KEY", "bhk_test")
+	seen := map[string]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer bhk_test" {
+			t.Fatalf("Authorization = %q, want bearer key", r.Header.Get("Authorization"))
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/keys":
+			seen["list"] = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"id": "key_1"}}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/keys":
+			seen["create"] = true
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode create request: %v", err)
+			}
+			if body["name"] != "my key" {
+				t.Fatalf("created key name = %q, want my key", body["name"])
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "key_2", "key": "bhk_created"})
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/keys/key_2":
+			seen["revoke"] = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"revoked": true})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/user":
+			seen["whoami"] = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "user_1"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	for _, argv := range [][]string{
+		{"auth", "keys", "list"},
+		{"auth", "keys", "create", "--name", "my key"},
+		{"auth", "keys", "revoke", "key_2"},
+		{"auth", "whoami"},
+	} {
+		args := parseArgs(argv)
+		args.opts["api-url"] = server.URL
+		args.flags["quiet"] = true
+		if err := runWithArgs(args); err != nil {
+			t.Fatalf("run %v returned error: %v", argv, err)
+		}
+	}
+	for _, name := range []string{"list", "create", "revoke", "whoami"} {
+		if !seen[name] {
+			t.Fatalf("did not observe %s request", name)
+		}
+	}
+}
+
+func serverURL(r *http.Request) string {
+	return "http://" + r.Host
+}

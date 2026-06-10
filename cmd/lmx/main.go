@@ -394,6 +394,21 @@ func handleAuth(args cliArgs) error {
 	if key == "" {
 		key = opt(args, "api-key")
 	}
+	sub := positional(args, 1)
+	switch sub {
+	case "login":
+		return handleAuthLogin(args)
+	case "logout":
+		if err := saveConfig(map[string]any{}); err != nil {
+			return err
+		}
+		printInfo("auth_cleared", map[string]any{"path": configFile()})
+		return nil
+	case "keys":
+		return handleAuthKeys(positional(args, 2), positional(args, 3), args)
+	case "whoami":
+		return handleAuthWhoami(args)
+	}
 	if hasFlag(args, "logout") {
 		if err := saveConfig(map[string]any{}); err != nil {
 			return err
@@ -417,11 +432,173 @@ func handleAuth(args cliArgs) error {
 		key = stored
 	}
 	if key == "" {
-		printInfo("auth_missing", map[string]any{"next": "Run lmx auth --key bhk_... or set LMX_API_KEY."})
+		printInfo("auth_missing", map[string]any{"next": "Run lmx auth login, lmx auth --key bhk_..., or set LMX_API_KEY."})
 		return nil
 	}
 	printInfo("auth_status", map[string]any{"source": source, "key": redactKey(key), "provider": cfg["authProvider"]})
 	return nil
+}
+
+func handleAuthLogin(args cliArgs) error {
+	base := strings.TrimRight(apiURL(args), "/")
+	parsed, err := fetchJSON("POST", base+"/api/auth/device/code", "", map[string]any{})
+	if err != nil {
+		return err
+	}
+	obj := asObject(parsed)
+	deviceCode := stringValue(obj["deviceCode"])
+	userCode := stringValue(obj["userCode"])
+	verificationURI := stringValue(obj["verificationUri"])
+	if verificationURI == "" {
+		verificationURI = base + "/auth/device"
+	}
+	if deviceCode == "" || userCode == "" {
+		return cliError{"auth_device_code_invalid", "Device authorization response did not include deviceCode and userCode.", nil, parsed}
+	}
+
+	fmt.Printf("Open: %s\n", verificationURI)
+	fmt.Printf("Enter code: %s\n", userCode)
+	if !hasFlag(args, "no-browser") {
+		openBrowser(verificationURI)
+	}
+
+	pollInterval, err := authDurationOption(args, "auth-poll-interval", 5*time.Second)
+	if err != nil {
+		return err
+	}
+	timeout, err := authDurationOption(args, "auth-timeout", 15*time.Minute)
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		token, err := fetchJSON("POST", base+"/api/auth/device/token", "", map[string]any{"deviceCode": deviceCode})
+		if err != nil {
+			if code := authResponseError(err); code == "authorization_pending" {
+				fmt.Print(".")
+			} else if code == "expired_token" {
+				return cliError{"auth_device_expired", "Device authorization expired before approval.", []string{"Run lmx auth login to request a new code."}, nil}
+			} else {
+				return err
+			}
+		} else {
+			tokenObj := asObject(token)
+			switch code := stringValue(tokenObj["error"]); code {
+			case "":
+				key := stringValue(tokenObj["key"])
+				if key == "" {
+					return cliError{"auth_device_token_invalid", "Device token response did not include an API key.", nil, token}
+				}
+				cfg := map[string]any{"apiKey": key, "authProvider": "device", "authSavedAt": time.Now().UTC().Format(time.RFC3339)}
+				if err := saveConfig(cfg); err != nil {
+					return err
+				}
+				fmt.Println()
+				printInfo("auth_saved", map[string]any{"path": configFile(), "key": redactKey(key)})
+				return nil
+			case "authorization_pending":
+				fmt.Print(".")
+			case "expired_token":
+				return cliError{"auth_device_expired", "Device authorization expired before approval.", []string{"Run lmx auth login to request a new code."}, nil}
+			default:
+				return cliError{"auth_device_error", "Device authorization failed: " + code, nil, token}
+			}
+		}
+		if time.Now().After(deadline) {
+			return cliError{"auth_device_timeout", "Timed out waiting for browser approval.", []string{"Run lmx auth login to request a new code."}, nil}
+		}
+		sleep := pollInterval
+		if remaining := time.Until(deadline); remaining < sleep {
+			sleep = remaining
+		}
+		if sleep > 0 {
+			time.Sleep(sleep)
+		}
+	}
+}
+
+func openBrowser(rawURL string) {
+	switch runtime.GOOS {
+	case "darwin":
+		_ = exec.Command("open", rawURL).Start()
+	case "windows":
+		_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL).Start()
+	default:
+		_ = exec.Command("xdg-open", rawURL).Start()
+	}
+}
+
+func authDurationOption(args cliArgs, key string, fallback time.Duration) (time.Duration, error) {
+	value := opt(args, key)
+	if value == "" {
+		return fallback, nil
+	}
+	if duration, err := time.ParseDuration(value); err == nil {
+		return duration, nil
+	}
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil || seconds <= 0 {
+		return 0, cliError{"invalid_option", "--" + key + " must be a positive duration like 5s or 300ms.", nil, value}
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
+}
+
+func authResponseError(err error) string {
+	var cli cliError
+	if errors.As(err, &cli) {
+		return stringValue(asObject(cli.Data)["error"])
+	}
+	return ""
+}
+
+func handleAuthKeys(action, target string, args cliArgs) error {
+	key := apiKey(args)
+	if key == "" {
+		return missingAPIKey("API key management requires authentication.")
+	}
+	base := strings.TrimRight(apiURL(args), "/")
+	switch action {
+	case "list", "":
+		parsed, err := fetchJSON("GET", base+"/api/keys", key, nil)
+		if err != nil {
+			return err
+		}
+		return writeOrPrintJSON("auth_keys", args, parsed)
+	case "create":
+		name := firstNonEmpty(opt(args, "name"), target)
+		if name == "" {
+			return cliError{"missing_name", "Key creation requires --name or a positional name.", []string{"Run lmx auth keys create --name \"my key\"."}, nil}
+		}
+		parsed, err := fetchJSON("POST", base+"/api/keys", key, map[string]any{"name": name})
+		if err != nil {
+			return err
+		}
+		return writeOrPrintJSON("auth_key_created", args, parsed)
+	case "revoke", "delete":
+		id := target
+		if id == "" {
+			return cliError{"missing_key_id", "Key revocation requires an API key id.", []string{"Run lmx auth keys revoke <id>."}, nil}
+		}
+		parsed, err := fetchJSON("DELETE", base+"/api/keys/"+url.PathEscape(id), key, nil)
+		if err != nil {
+			return err
+		}
+		return writeOrPrintJSON("auth_key_revoked", args, parsed)
+	default:
+		return cliError{"unknown_auth_keys_command", "Unknown auth keys command: " + action, []string{"Use list, create, or revoke."}, nil}
+	}
+}
+
+func handleAuthWhoami(args cliArgs) error {
+	key := apiKey(args)
+	if key == "" {
+		return missingAPIKey("whoami requires authentication.")
+	}
+	parsed, err := fetchJSON("GET", strings.TrimRight(apiURL(args), "/")+"/api/user", key, nil)
+	if err != nil {
+		return err
+	}
+	return writeOrPrintJSON("auth_user", args, parsed)
 }
 
 func handleProfile(action, name string, args cliArgs) error {
@@ -6527,6 +6704,12 @@ func usage() {
 Usage:
   lmx context --out localmaxxing-agent-context.json
   lmx auth --key bhk_...
+  lmx auth login
+  lmx auth logout
+  lmx auth keys list
+  lmx auth keys create --name "my key"
+  lmx auth keys revoke <id>
+  lmx auth whoami
   lmx profile save my-4090 --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --hardware hardware.json
   lmx hardware --out hardware.json
   lmx hardware init --out hardware.json
@@ -6568,6 +6751,7 @@ Usage:
 Options:
   --api-url <url>          LocalMaxxing origin (default: https://www.localmaxxing.com)
   --api-key <key>          API key, defaults to LMX_API_KEY, then saved config
+  --no-browser            Do not open the device-login browser automatically
   --profile <name>         Load saved defaults from lmx profile save
   --model <hfId>           HuggingFace model ID
   --backend <name>         lm-eval backend name for eval lm-eval (default: hf)
