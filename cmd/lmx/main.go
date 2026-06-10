@@ -33,6 +33,8 @@ const remoteKVCacheColdMethodology = "Single streaming request with inline fille
 const remoteKVCacheReuseMethodology = "Two-step remote cache-reuse probe: pre-warm target context, then time a streaming request with the same prefix plus probe; measures cached-prefix decode at that context depth."
 const remoteKVCacheFallbackWarning = "Remote OpenAI-compatible endpoints do not provide a portable persistent KV-cache session API; this sweep resends the full prefix at each depth and can only verify cache reuse when backend-specific cache metrics are exposed. Results may fall back to cold depth TPS instead of retained KV-cache TPS."
 
+var apiHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 var goldFieldNames = map[string]bool{
 	"gold": true, "answer": true, "referenceAnswer": true, "expectedAnswer": true,
 	"correctAnswer": true, "label": true, "target": true,
@@ -276,10 +278,15 @@ func applyProfile(args *cliArgs) error {
 
 func saveConfig(cfg map[string]any) error {
 	path := configFile()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return writeJSON(path, cfg)
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o600)
 }
 
 func apiKey(args cliArgs) string {
@@ -314,7 +321,7 @@ func fetchJSON(method, rawURL, key string, body any) (any, error) {
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := apiHTTPClient.Do(req)
 	if err != nil {
 		return nil, cliError{"network_error", fmt.Sprintf("Could not reach %s: %v", rawURL, err), []string{"Check --api-url or endpoint URL.", "If this is a local model server, make sure it is running and reachable."}, nil}
 	}
@@ -466,6 +473,9 @@ func handleAuthLogin(args cliArgs) error {
 	if err != nil {
 		return err
 	}
+	if pollInterval < time.Second {
+		pollInterval = time.Second
+	}
 	timeout, err := authDurationOption(args, "auth-timeout", 15*time.Minute)
 	if err != nil {
 		return err
@@ -478,6 +488,8 @@ func handleAuthLogin(args cliArgs) error {
 				fmt.Print(".")
 			} else if code == "expired_token" {
 				return cliError{"auth_device_expired", "Device authorization expired before approval.", []string{"Run lmx auth login to request a new code."}, nil}
+			} else if code == "key_limit_exceeded" {
+				return authKeyLimitError()
 			} else {
 				return err
 			}
@@ -500,6 +512,8 @@ func handleAuthLogin(args cliArgs) error {
 				fmt.Print(".")
 			case "expired_token":
 				return cliError{"auth_device_expired", "Device authorization expired before approval.", []string{"Run lmx auth login to request a new code."}, nil}
+			case "key_limit_exceeded":
+				return authKeyLimitError()
 			default:
 				return cliError{"auth_device_error", "Device authorization failed: " + code, nil, token}
 			}
@@ -515,6 +529,10 @@ func handleAuthLogin(args cliArgs) error {
 			time.Sleep(sleep)
 		}
 	}
+}
+
+func authKeyLimitError() error {
+	return cliError{"auth_key_limit", "Account already has the maximum of 10 API keys.", []string{"Run lmx auth keys list, revoke an old key with lmx auth keys revoke <id>, then retry lmx auth login."}, nil}
 }
 
 func openBrowser(rawURL string) {

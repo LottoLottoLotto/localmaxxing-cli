@@ -1593,6 +1593,21 @@ func TestAuthAPIKeyPrefersFlagThenEnvThenConfig(t *testing.T) {
 	}
 }
 
+func TestSaveConfigRestrictsFilePermissions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	if err := saveConfig(map[string]any{"apiKey": "bhk_dummy"}); err != nil {
+		t.Fatalf("saveConfig returned error: %v", err)
+	}
+	info, err := os.Stat(configFile())
+	if err != nil {
+		t.Fatalf("stat config: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("config mode = %o, want 600", got)
+	}
+}
+
 func TestAuthLoginDeviceFlowSavesIssuedKey(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("LMX_API_KEY", "")
@@ -1634,9 +1649,8 @@ func TestAuthLoginDeviceFlowSavesIssuedKey(t *testing.T) {
 	err := runWithArgs(cliArgs{
 		positional: []string{"auth", "login"},
 		opts: map[string]string{
-			"api-url":            server.URL,
-			"auth-poll-interval": "1ms",
-			"auth-timeout":       "1s",
+			"api-url":      server.URL,
+			"auth-timeout": "2s",
 		},
 		flags: map[string]bool{"no-browser": true, "quiet": true},
 	})
@@ -1687,6 +1701,12 @@ func TestAuthLoginDeviceFlowReportsServerErrors(t *testing.T) {
 			tokenBody:  map[string]any{},
 			wantCode:   "auth_device_token_invalid",
 		},
+		{
+			name:       "key_limit_exceeded",
+			deviceBody: validDeviceCode,
+			tokenBody:  map[string]any{"error": "key_limit_exceeded"},
+			wantCode:   "auth_key_limit",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1713,15 +1733,42 @@ func TestAuthLoginDeviceFlowReportsServerErrors(t *testing.T) {
 			err := runWithArgs(cliArgs{
 				positional: []string{"auth", "login"},
 				opts: map[string]string{
-					"api-url":            server.URL,
-					"auth-poll-interval": "1ms",
-					"auth-timeout":       "100ms",
+					"api-url":      server.URL,
+					"auth-timeout": "2s",
 				},
 				flags: map[string]bool{"no-browser": true, "quiet": true},
 			})
 			requireCliErrorCode(t, err, tt.wantCode)
 		})
 	}
+}
+
+func TestAuthLoginMapsKeyLimitHTTPError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LMX_API_KEY", "")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/device/code":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"deviceCode":      "device-secret",
+				"userCode":        "LMXR-7K42",
+				"verificationUri": "http://example.test/auth/device",
+			})
+		case "/api/auth/device/token":
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "key_limit_exceeded"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := runWithArgs(cliArgs{
+		positional: []string{"auth", "login"},
+		opts:       map[string]string{"api-url": server.URL, "auth-timeout": "2s"},
+		flags:      map[string]bool{"no-browser": true, "quiet": true},
+	})
+	requireCliErrorCode(t, err, "auth_key_limit")
 }
 
 func TestAuthKeyManagementCommandsUseExistingAPIKey(t *testing.T) {
