@@ -372,6 +372,7 @@ lmx eval suite list --out localmaxxing-suites.json
 lmx eval suite search reasoning --out reasoning-suites.json
 lmx eval suite show hellaswag --out hellaswag-suite.json
 lmx model search qwen3-8b --out models.json
+lmx model search Qwen3-8B-Q4_K_M.gguf --out models.json   # GGUF filenames/paths are normalized to the model name
 ```
 
 `eval suite show` returns the suite document, task keys, scoring method, aggregation mode, and `agentInstructions` such as lm-eval command templates or server-side custom eval payloads.

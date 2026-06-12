@@ -1128,6 +1128,10 @@ func handleModel(action, target string, args cliArgs) error {
 	if query == "" {
 		return cliError{"missing_query", "model search requires a query", []string{"Run lmx model search qwen3-8b."}, nil}
 	}
+	if normalized, changed := normalizedModelSearchQuery(query); changed {
+		printStatus(args, "model_search_query_normalized", map[string]any{"query": query, "normalized": normalized, "hint": "GGUF filename detected; searching by the derived model name."})
+		query = normalized
+	}
 	limit, err := strconv.Atoi(firstNonEmpty(opt(args, "limit"), "10"))
 	if err != nil || limit <= 0 {
 		return cliError{"invalid_option", "--limit must be a positive integer", []string{"Pass --limit <number>."}, nil}
@@ -4541,22 +4545,28 @@ func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, m
 	if status == "alias" {
 		printStatus(args, "remote_model_alias", map[string]any{"hfId": hfID, "servedModel": servedModel, "hint": "Endpoint model names are often server aliases; verify --hf-id only if the underlying model is different."})
 	}
-	queryCommand := "lmx model search " + shellQuote(servedModel)
-	value, err := searchModels(args, servedModel, 5)
+	query, querySource := remoteModelSearchQuery(servedModel, stringValue(resolution["loadedFilename"]))
+	resolution["searchQuery"] = query
+	resolution["searchQuerySource"] = querySource
+	if querySource == "loaded_filename" {
+		printStatus(args, "remote_model_query_from_filename", map[string]any{"servedModel": servedModel, "query": query, "hint": "Served model alias looks generic; searching by the loaded GGUF filename instead."})
+	}
+	queryCommand := "lmx model search " + shellQuote(query)
+	value, err := searchModels(args, query, 5)
 	if err != nil {
 		resolution["searchError"] = err.Error()
 		resolution["searchCommand"] = queryCommand
-		printStatus(args, "hf_id_search_unavailable", map[string]any{"query": servedModel, "next": queryCommand})
+		printStatus(args, "hf_id_search_unavailable", map[string]any{"query": query, "next": queryCommand})
 		return resolution
 	}
 	candidates := modelCandidates(value, 5)
 	resolution["candidates"] = candidates
 	resolution["searchCommand"] = queryCommand
 	if len(candidates) == 0 {
-		printStatus(args, "hf_id_candidates_empty", map[string]any{"query": servedModel, "next": queryCommand})
+		printStatus(args, "hf_id_candidates_empty", map[string]any{"query": query, "next": queryCommand})
 		return resolution
 	}
-	fields := map[string]any{"query": servedModel, "count": len(candidates), "next": "If the exact GGUF repo matters, rerun with that --hf-id."}
+	fields := map[string]any{"query": query, "count": len(candidates), "next": "If the exact GGUF repo matters, rerun with that --hf-id."}
 	for i, candidate := range candidates {
 		if obj := asObject(candidate); obj != nil {
 			fields[fmt.Sprintf("candidate%d", i+1)] = firstNonEmpty(stringValue(obj["hfId"]), stringValue(obj["id"]), stringValue(obj["modelId"]))
@@ -4576,6 +4586,90 @@ func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, m
 	}
 	printStatus(args, "hf_id_candidates_found", fields)
 	return resolution
+}
+
+// remoteModelSearchQuery picks the HF search query for resolving the served
+// model: the served alias when it looks like a real model name, otherwise a
+// name derived from the GGUF filename the endpoint reports as loaded.
+func remoteModelSearchQuery(servedModel, loadedFilename string) (string, string) {
+	if !canonicalModelAlias(servedModel) {
+		if derived := modelNameFromGGUFFilename(loadedFilename); derived != "" {
+			return derived, "loaded_filename"
+		}
+	}
+	return servedModel, "served_model"
+}
+
+var genericModelAliases = map[string]bool{"default": true, "model": true, "local": true, "local-model": true, "localmodel": true, "gguf": true, "unknown": true, "custom": true}
+
+// canonicalModelAlias reports whether a served model id looks like a real
+// model name rather than a generic alias or a filesystem path (llama.cpp
+// serves the loaded model path as the model id when no alias is set).
+func canonicalModelAlias(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || genericModelAliases[strings.ToLower(name)] {
+		return false
+	}
+	if strings.EqualFold(filepath.Ext(name), ".gguf") || strings.Contains(name, `\`) {
+		return false
+	}
+	// HF repo ids have exactly one slash; deeper or rooted means a path.
+	if strings.Count(name, "/") > 1 || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "./") || strings.HasPrefix(name, "../") {
+		return false
+	}
+	return true
+}
+
+var (
+	ggufShardSuffix = regexp.MustCompile(`(?i)-\d{5}-of-\d{5}$`)
+	ggufQuantToken  = regexp.MustCompile(`(?i)^(?:(?:IQ|Q)[0-9][A-Z0-9_]*|(?:BF|F|FP)[0-9]+)$`)
+)
+
+// modelNameFromGGUFFilename strips the extension, shard suffix, and trailing
+// quantization/packaging tokens from a GGUF filename, leaving a model name
+// usable as a search query.
+func modelNameFromGGUFFilename(path string) string {
+	if path == "" {
+		return ""
+	}
+	if idx := strings.LastIndexByte(path, '\\'); idx >= 0 {
+		path = path[idx+1:]
+	}
+	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	name = ggufShardSuffix.ReplaceAllString(name, "")
+	tokens := strings.Split(name, "-")
+	for len(tokens) > 1 && droppableGGUFNameToken(tokens[len(tokens)-1]) {
+		tokens = tokens[:len(tokens)-1]
+	}
+	return strings.Join(tokens, "-")
+}
+
+func droppableGGUFNameToken(token string) bool {
+	if ggufQuantToken.MatchString(token) {
+		return true
+	}
+	switch strings.ToLower(token) {
+	case "ud", "gguf", "imat", "imatrix":
+		return true
+	}
+	return false
+}
+
+// normalizedModelSearchQuery rewrites a GGUF filename or filesystem path
+// passed as a search query into the model name it embeds. Plain queries and
+// HF repo ids (org/name) pass through untouched.
+func normalizedModelSearchQuery(query string) (string, bool) {
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
+		return query, false
+	}
+	if !strings.EqualFold(filepath.Ext(trimmed), ".gguf") && canonicalModelAlias(trimmed) {
+		return query, false
+	}
+	if derived := modelNameFromGGUFFilename(trimmed); derived != "" && !strings.EqualFold(derived, trimmed) {
+		return derived, true
+	}
+	return query, false
 }
 
 func sourceRepoFromFilename(args cliArgs, candidates []any, filename string) (string, error) {

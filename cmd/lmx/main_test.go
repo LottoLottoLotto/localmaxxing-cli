@@ -212,6 +212,110 @@ func TestRemoteModelResolutionTreatsServedModelAsAlias(t *testing.T) {
 	}
 }
 
+func TestRemoteModelResolutionSearchesByLoadedFilenameWhenAliasNonCanonical(t *testing.T) {
+	var searchQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/models/search":
+			searchQuery = r.URL.Query().Get("q")
+			fmt.Fprint(w, `{"models":[{"hfId":"unsloth/gemma-4-31B-it-GGUF"}]}`)
+		case "/api/models/unsloth/gemma-4-31B-it-GGUF":
+			fmt.Fprint(w, `{"siblings":[{"rfilename":"gemma-4-31B-it-UD-Q4_K_XL.gguf"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	resolution := remoteModelResolution(
+		cliArgs{opts: map[string]string{"api-url": server.URL, "hf-api-url": server.URL}, flags: map[string]bool{"quiet": true}},
+		"/models/gemma-4-31B-it-UD-Q4_K_XL.gguf",
+		"v1_models",
+		"google/gemma-4-31B-it",
+		"/models/gemma-4-31B-it-UD-Q4_K_XL.gguf",
+	)
+
+	if searchQuery != "gemma-4-31B-it" {
+		t.Fatalf("search query = %q, want gemma-4-31B-it", searchQuery)
+	}
+	if resolution["searchQuery"] != "gemma-4-31B-it" || resolution["searchQuerySource"] != "loaded_filename" {
+		t.Fatalf("query metadata = %#v", resolution)
+	}
+	if resolution["sourceRepo"] != "unsloth/gemma-4-31B-it-GGUF" || resolution["status"] != "source_repo_detected" {
+		t.Fatalf("source repo resolution = %#v", resolution)
+	}
+}
+
+func TestRemoteModelSearchQuery(t *testing.T) {
+	cases := []struct {
+		servedModel, loadedFilename, query, source string
+	}{
+		{"gemma-4-31b-it", "/models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf", "gemma-4-31b-it", "served_model"},
+		{"org/model-name", "", "org/model-name", "served_model"},
+		{"default", "/models/Qwen3-8B-Q4_K_M.gguf", "Qwen3-8B", "loaded_filename"},
+		{"local-model", "llama-3.1-8b-instruct-imat-IQ4_XS-00001-of-00002.gguf", "llama-3.1-8b-instruct", "loaded_filename"},
+		{"/models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf", "/models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf", "gemma-4-31B-it-qat", "loaded_filename"},
+		{`C:\models\model.gguf`, `C:\models\Qwen3-8B-Q4_K_M.gguf`, "Qwen3-8B", "loaded_filename"},
+		{"default", "", "default", "served_model"},
+	}
+	for _, tc := range cases {
+		query, source := remoteModelSearchQuery(tc.servedModel, tc.loadedFilename)
+		if query != tc.query || source != tc.source {
+			t.Fatalf("remoteModelSearchQuery(%q, %q) = (%q, %q), want (%q, %q)", tc.servedModel, tc.loadedFilename, query, source, tc.query, tc.source)
+		}
+	}
+}
+
+func TestNormalizedModelSearchQuery(t *testing.T) {
+	cases := []struct {
+		query, want string
+		changed     bool
+	}{
+		{"qwen3-8b", "qwen3-8b", false},
+		{"unsloth/gemma-4-31B-it-GGUF", "unsloth/gemma-4-31B-it-GGUF", false},
+		{"Qwen3-8B-Q4_K_M.gguf", "Qwen3-8B", true},
+		{"/models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf", "gemma-4-31B-it-qat", true},
+		{`C:\models\Qwen3-8B-Q4_K_M.gguf`, "Qwen3-8B", true},
+		{"llama-3.1-8b-instruct-IQ4_XS-00001-of-00002.gguf", "llama-3.1-8b-instruct", true},
+		{"model.gguf", "model", true},
+	}
+	for _, tc := range cases {
+		got, changed := normalizedModelSearchQuery(tc.query)
+		if got != tc.want || changed != tc.changed {
+			t.Fatalf("normalizedModelSearchQuery(%q) = (%q, %v), want (%q, %v)", tc.query, got, changed, tc.want, tc.changed)
+		}
+	}
+}
+
+func TestModelSearchNormalizesGGUFFilenameQuery(t *testing.T) {
+	var searchQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/models/search" {
+			http.NotFound(w, r)
+			return
+		}
+		searchQuery = r.URL.Query().Get("q")
+		fmt.Fprint(w, `{"models":[{"hfId":"unsloth/gemma-4-31B-it-GGUF"}]}`)
+	}))
+	defer server.Close()
+
+	out := filepath.Join(t.TempDir(), "models.json")
+	err := handleModel("search", "/models/gemma-4-31B-it-UD-Q4_K_XL.gguf", cliArgs{
+		opts:  map[string]string{"api-url": server.URL, "out": out},
+		flags: map[string]bool{"quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("handleModel returned error: %v", err)
+	}
+	if searchQuery != "gemma-4-31B-it" {
+		t.Fatalf("search query = %q, want gemma-4-31B-it", searchQuery)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil || !strings.Contains(string(data), "unsloth/gemma-4-31B-it-GGUF") {
+		t.Fatalf("output file = %q, err = %v", data, err)
+	}
+}
+
 func TestBenchmarkDryRunDoesNotExecuteGeneratedLocalCommand(t *testing.T) {
 	payload, err := benchmarkPayloadFromFlags("llama.cpp", cliArgs{
 		opts: map[string]string{

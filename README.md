@@ -6,22 +6,39 @@ The official CLI for [localmaxxing.com](https://localmaxxing.com) — benchmark 
 
 ### Download Binary (Recommended)
 
-Download a pre-built binary for your platform from the [latest release](https://github.com/LottoLottoLotto/localmaxxing-cli/releases/latest):
+Download a pre-built archive for your platform from the [latest release](https://github.com/LottoLottoLotto/localmaxxing-cli/releases/latest):
 
-| Platform | Binary |
-|----------|--------|
-| Linux (amd64) | `lmx-linux-amd64` |
-| Linux (arm64) | `lmx-linux-arm64` |
-| macOS (Intel) | `lmx-darwin-amd64` |
-| macOS (Apple Silicon) | `lmx-darwin-arm64` |
+| Platform | Asset |
+|----------|-------|
+| Linux (amd64) | `lmx-linux-amd64.tar.gz` |
+| Linux (arm64) | `lmx-linux-arm64.tar.gz` |
+| macOS (Intel) | `lmx-darwin-amd64.tar.gz` |
+| macOS (Apple Silicon) | `lmx-darwin-arm64.tar.gz` |
 | Windows (amd64) | `lmx-windows-amd64.exe` |
 
+Linux and macOS binaries ship inside `.tar.gz` archives so the executable bit survives the download — no `chmod` needed.
+
 ```bash
-# Linux / macOS example
-chmod +x lmx-linux-amd64
-sudo mv lmx-linux-amd64 /usr/local/bin/lmx
+# Linux / macOS (adjust the asset name for your platform)
+base=https://github.com/LottoLottoLotto/localmaxxing-cli/releases/latest/download
+curl -fsSLO "$base/lmx-linux-amd64.tar.gz"
+curl -fsSLO "$base/checksums.txt"
+sha256sum --check --ignore-missing checksums.txt   # macOS: shasum -a 256 --check --ignore-missing checksums.txt
+tar -xzf lmx-linux-amd64.tar.gz
+sudo mv lmx /usr/local/bin/
 lmx --help
 ```
+
+Every release includes `checksums.txt` with SHA-256 hashes keyed by asset basename, so `--check --ignore-missing` succeeds even when you downloaded a single asset.
+
+On Windows, download the `.exe` and compare hashes in PowerShell:
+
+```powershell
+(Get-FileHash lmx-windows-amd64.exe -Algorithm SHA256).Hash
+Select-String -Path checksums.txt -Pattern lmx-windows-amd64.exe
+```
+
+> macOS: release binaries are not signed or notarized. If Gatekeeper blocks the first run, clear the quarantine attribute: `xattr -d com.apple.quarantine /usr/local/bin/lmx`.
 
 ### Build From Source
 
@@ -246,6 +263,7 @@ lmx context --out localmaxxing-agent-context.json
 lmx eval suite list --out localmaxxing-suites.json
 lmx eval suite search reasoning
 lmx model search qwen3-8b
+lmx model search Qwen3-8B-Q4_K_M.gguf   # GGUF filenames/paths are normalized to the model name
 ```
 
 ## Eval Suite Authoring
