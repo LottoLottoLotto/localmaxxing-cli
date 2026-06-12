@@ -4,14 +4,20 @@ This guide shows the practical flow for using the LocalMaxxing CLI to discover e
 
 ## 1. Install The CLI
 
-From this repository:
+Download a pre-built archive from the [latest release](https://github.com/LottoLottoLotto/localmaxxing-cli/releases/latest) (see the README for checksum verification):
+
+```bash
+curl -fsSLO https://github.com/LottoLottoLotto/localmaxxing-cli/releases/latest/download/lmx-linux-amd64.tar.gz
+tar -xzf lmx-linux-amd64.tar.gz
+sudo mv lmx /usr/local/bin/
+```
+
+Or build from source (requires Go 1.22+):
 
 ```bash
 git clone https://github.com/LottoLottoLotto/localmaxxing-cli.git
 cd localmaxxing-cli
-npm install
-npm run build
-npm link
+go build -o lmx ./cmd/lmx
 ```
 
 Verify it works:

@@ -533,6 +533,7 @@ func TestLlamaBenchmarkCommandUsesResolvedBinaryAndReportsWarmup(t *testing.T) {
 }
 
 func TestBenchmarkFeedbackBlocksSubmitWithoutAuth(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("LMX_API_KEY", "")
 	feedback := benchmarkAgentFeedback(map[string]any{
 		"benchmarkMode": "local",
