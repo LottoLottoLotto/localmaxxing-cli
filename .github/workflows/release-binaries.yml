@@ -49,7 +49,12 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "dist/lmx-${GOOS}-${GOARCH}${{ matrix.ext }}" ./cmd/lmx
+          go build -trimpath -ldflags="-s -w" -o "lmx${{ matrix.ext }}" ./cmd/lmx
+          if [ "$GOOS" = "windows" ]; then
+            mv "lmx${{ matrix.ext }}" "dist/lmx-${GOOS}-${GOARCH}${{ matrix.ext }}"
+          else
+            tar -czf "dist/lmx-${GOOS}-${GOARCH}.tar.gz" lmx
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -70,7 +75,7 @@ jobs:
           merge-multiple: true
 
       - name: Generate checksums
-        run: sha256sum dist/* > dist/checksums.txt
+        run: cd dist && sha256sum * > checksums.txt
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
