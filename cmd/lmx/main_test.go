@@ -1964,3 +1964,116 @@ func TestAuthKeyManagementValidatesInputsAndMissingAuth(t *testing.T) {
 func serverURL(r *http.Request) string {
 	return "http://" + r.Host
 }
+
+func TestCommandHelpFocusesSubcommand(t *testing.T) {
+	text, ok := commandHelp(parseArgs([]string{"endpoint", "discover", "--help"}))
+	if !ok {
+		t.Fatal("commandHelp did not find endpoint discover")
+	}
+	if !strings.Contains(text, "lmx endpoint discover") {
+		t.Fatalf("focused help missing endpoint discover: %s", text)
+	}
+	if strings.Contains(text, "lmx eval suite") {
+		t.Fatalf("focused help included eval suite: %s", text)
+	}
+	if !strings.Contains(text, "Run `lmx --help`") {
+		t.Fatalf("focused help missing see-also: %s", text)
+	}
+}
+
+func TestBenchmarkAgentFeedbackSplitsStatus(t *testing.T) {
+	payload := map[string]any{"benchmarkMode": "remote", "tokSOut": 12.0}
+	fb := benchmarkAgentFeedback(payload, "out.json", parseArgs(nil), false, false)
+	if fb["benchmarkStatus"] != "completed" {
+		t.Fatalf("benchmarkStatus = %v, want completed", fb["benchmarkStatus"])
+	}
+	if fb["submissionStatus"] != "needs_remote_hardware" {
+		t.Fatalf("submissionStatus = %v, want needs_remote_hardware", fb["submissionStatus"])
+	}
+	if fb["attachHardwareCommand"] != "lmx benchmark add-hardware out.json --hardware hardware.json" {
+		t.Fatalf("attachHardwareCommand = %v", fb["attachHardwareCommand"])
+	}
+	if fb["status"] != "needs_remote_hardware" {
+		t.Fatalf("legacy status = %v, want needs_remote_hardware", fb["status"])
+	}
+}
+
+func TestAddHardwareToRun(t *testing.T) {
+	dir := t.TempDir()
+	runPath := filepath.Join(dir, "run.json")
+	hwPath := filepath.Join(dir, "hardware.json")
+	if err := writeJSON(runPath, map[string]any{"benchmarkMode": "remote", "hfId": "x/y", "tokSOut": 12}); err != nil {
+		t.Fatalf("write run: %v", err)
+	}
+	if err := writeJSON(hwPath, map[string]any{"hwClass": "DISCRETE_GPU", "gpuName": "RTX 3090", "vramGb": 24}); err != nil {
+		t.Fatalf("write hardware: %v", err)
+	}
+	if err := addHardwareToRun(runPath, parseArgs([]string{"--hardware", hwPath})); err != nil {
+		t.Fatalf("addHardwareToRun returned error: %v", err)
+	}
+	value, err := readJSON(runPath)
+	if err != nil {
+		t.Fatalf("read updated run: %v", err)
+	}
+	payload := asObject(value)
+	if payload == nil || asObject(payload["hardware"]) == nil {
+		t.Fatalf("updated payload missing hardware: %#v", value)
+	}
+	feedback := asObject(payload["agentFeedback"])
+	if feedback == nil || feedback["benchmarkStatus"] != "completed" {
+		t.Fatalf("feedback = %#v, want completed", feedback)
+	}
+}
+
+func TestBenchmarkFixupReport(t *testing.T) {
+	payload := map[string]any{
+		"benchmarkMode": "remote",
+		"quantization":  "Q8_0",
+		"quantizationResolution": map[string]any{
+			"status":  "mismatch",
+			"trusted": "Q4_K_M",
+		},
+	}
+	report := benchmarkFixupReport(payload, "run.json", parseArgs(nil))
+	issues, ok := report["issues"].([]map[string]any)
+	if !ok {
+		t.Fatalf("issues = %#v", report["issues"])
+	}
+	codes := map[string]bool{}
+	for _, issue := range issues {
+		codes[stringValue(issue["code"])] = true
+	}
+	if !codes["missing_remote_hardware"] || !codes["quantization_mismatch"] {
+		t.Fatalf("issue codes = %#v", codes)
+	}
+}
+
+func TestHardwareTemplateFromArgs(t *testing.T) {
+	hw, err := hardwareTemplateFromArgs(parseArgs([]string{"--gpu-name", "RTX 3090", "--gpu-count", "2", "--vram-gb", "24", "--ram-gb", "96", "--os", "Linux"}))
+	if err != nil {
+		t.Fatalf("hardwareTemplateFromArgs returned error: %v", err)
+	}
+	if hw["gpuName"] != "RTX 3090" || hw["gpuCount"] != 2 || hw["vramGb"] != 24.0 || hw["ramGb"] != 96.0 || hw["hwClass"] != "DISCRETE_GPU" || hw["os"] != "Linux" {
+		t.Fatalf("hardware template = %#v", hw)
+	}
+}
+
+func TestDiscoverServerMetadata(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/props" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"model_path":"/m/gemma-Q4_K_M.gguf"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	meta := discoverServerMetadata(srv.URL, "", map[string]any{"quantization": "Q4_K_M"})
+	if meta["modelPath"] != "/m/gemma-Q4_K_M.gguf" {
+		t.Fatalf("modelPath = %v", meta["modelPath"])
+	}
+	if meta["quantization"] != "Q4_K_M" {
+		t.Fatalf("quantization = %v", meta["quantization"])
+	}
+}

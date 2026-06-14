@@ -53,6 +53,7 @@ jobs:
           if [ "$GOOS" = "windows" ]; then
             mv "lmx${{ matrix.ext }}" "dist/lmx-${GOOS}-${GOARCH}${{ matrix.ext }}"
           else
+            # Archive always contains the binary named `lmx` (asset name encodes platform).
             tar -czf "dist/lmx-${GOOS}-${GOARCH}.tar.gz" lmx
           fi
 

@@ -87,11 +87,22 @@ func runWithArgs(args cliArgs) error {
 	}
 	normalizeEndpointArgs(&args)
 	cmd := positional(args, 0)
-	if cmd == "" || hasFlag(args, "help") || !knownTopLevel(cmd) {
+	if cmd == "" {
 		usage()
-		if cmd == "" || hasFlag(args, "help") {
-			return nil
+		return nil
+	}
+	if wantsHelp(args) {
+		if knownTopLevel(cmd) {
+			if text, ok := commandHelp(args); ok {
+				fmt.Println(text)
+				return nil
+			}
 		}
+		usage()
+		return nil
+	}
+	if !knownTopLevel(cmd) {
+		usage()
 		return errors.New("unknown command")
 	}
 
@@ -179,6 +190,19 @@ func positional(args cliArgs, index int) string {
 
 func opt(args cliArgs, key string) string   { return args.opts[key] }
 func hasFlag(args cliArgs, key string) bool { return args.flags[key] }
+
+func wantsHelp(args cliArgs) bool {
+	return hasFlag(args, "help") || sliceContainsString(args.positional, "-h")
+}
+
+func sliceContainsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
 
 func requireOpt(args cliArgs, key string) (string, error) {
 	value := opt(args, key)
@@ -695,6 +719,9 @@ func redactKey(key string) string {
 }
 
 func handleHardware(action string, args cliArgs) error {
+	if action == "template" {
+		return handleHardwareTemplate(args)
+	}
 	hardware := detectHardware()
 	if action == "init" && opt(args, "out") == "" {
 		args.opts["out"] = "hardware.json"
@@ -718,6 +745,63 @@ func handleHardware(action string, args cliArgs) error {
 		return nil
 	}
 	data, _ := json.MarshalIndent(hardware, "", "  ")
+	fmt.Println(string(data))
+	return nil
+}
+
+func hardwareTemplateFromArgs(args cliArgs) (map[string]any, error) {
+	hw := map[string]any{}
+	for optName, field := range map[string]string{"gpu-name": "gpuName", "cpu": "cpu", "os": "os", "hw-class": "hwClass"} {
+		if v := opt(args, optName); v != "" {
+			hw[field] = v
+		}
+	}
+	if _, ok := hw["os"]; !ok {
+		hw["os"] = runtime.GOOS
+	}
+	for optName, field := range map[string]string{"vram-gb": "vramGb", "ram-gb": "ramGb", "power-watts": "powerWatts"} {
+		if v := opt(args, optName); v != "" {
+			parsed, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return nil, cliError{"invalid_option", "--" + optName + " must be a number", []string{"Pass a numeric value for --" + optName + "."}, nil}
+			}
+			hw[field] = parsed
+		}
+	}
+	if v := opt(args, "gpu-count"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, cliError{"invalid_option", "--gpu-count must be a number", []string{"Pass a whole number for --gpu-count."}, nil}
+		}
+		hw["gpuCount"] = parsed
+	}
+	if _, ok := hw["hwClass"]; !ok {
+		if stringValue(hw["gpuName"]) != "" {
+			hw["hwClass"] = "DISCRETE_GPU"
+		} else {
+			hw["hwClass"] = "CPU_ONLY"
+		}
+	}
+	return hw, nil
+}
+
+func handleHardwareTemplate(args cliArgs) error {
+	hw, err := hardwareTemplateFromArgs(args)
+	if err != nil {
+		return err
+	}
+	if opt(args, "out") != "" || hasFlag(args, "out") {
+		out := opt(args, "out")
+		if out == "" {
+			out = "hardware.json"
+		}
+		if err := writeJSON(out, hw); err != nil {
+			return err
+		}
+		printInfo("hardware_template_written", map[string]any{"path": out, "pathAbsolute": absPathOr(out)})
+		return nil
+	}
+	data, _ := json.MarshalIndent(hw, "", "  ")
 	fmt.Println(string(data))
 	return nil
 }
@@ -767,6 +851,13 @@ func handleEndpoint(action string, args cliArgs) error {
 			continue
 		}
 		result["servedModel"] = model
+		if hasFlag(args, "include-server-metadata") {
+			if meta := discoverServerMetadata(baseURL, opt(args, "model-api-key"), info); len(meta) > 0 {
+				result["serverMetadata"] = meta
+			} else {
+				result["serverMetadataNote"] = "endpoint exposed no opt-in server metadata"
+			}
+		}
 		if quant := quantizationFromModelInfo(info); quant != "" {
 			result["quantization"] = quant
 		}
@@ -1118,29 +1209,90 @@ func handleContext(args cliArgs) error {
 }
 
 func handleModel(action, target string, args cliArgs) error {
-	if action != "search" {
-		return errors.New("Unknown model command. Use search.")
+	switch action {
+	case "search":
+		query := target
+		if query == "" {
+			query = firstNonEmpty(opt(args, "q"), opt(args, "query"))
+		}
+		if query == "" {
+			return cliError{"missing_query", "model search requires a query", []string{"Run lmx model search qwen3-8b."}, nil}
+		}
+		if normalized, changed := normalizedModelSearchQuery(query); changed {
+			printStatus(args, "model_search_query_normalized", map[string]any{"query": query, "normalized": normalized, "hint": "GGUF filename detected; searching by the derived model name."})
+			query = normalized
+		}
+		limit, err := strconv.Atoi(firstNonEmpty(opt(args, "limit"), "10"))
+		if err != nil || limit <= 0 {
+			return cliError{"invalid_option", "--limit must be a positive integer", []string{"Pass --limit <number>."}, nil}
+		}
+		value, err := searchModels(args, query, limit)
+		if err != nil {
+			return err
+		}
+		return writeOrPrintJSON("models", args, value)
+	case "resolve-remote", "resolve":
+		return handleModelResolveRemote(args)
+	default:
+		return errors.New("Unknown model command. Use search or resolve-remote.")
 	}
-	query := target
-	if query == "" {
-		query = firstNonEmpty(opt(args, "q"), opt(args, "query"))
-	}
-	if query == "" {
-		return cliError{"missing_query", "model search requires a query", []string{"Run lmx model search qwen3-8b."}, nil}
-	}
-	if normalized, changed := normalizedModelSearchQuery(query); changed {
-		printStatus(args, "model_search_query_normalized", map[string]any{"query": query, "normalized": normalized, "hint": "GGUF filename detected; searching by the derived model name."})
-		query = normalized
-	}
-	limit, err := strconv.Atoi(firstNonEmpty(opt(args, "limit"), "10"))
-	if err != nil || limit <= 0 {
-		return cliError{"invalid_option", "--limit must be a positive integer", []string{"Pass --limit <number>."}, nil}
-	}
-	value, err := searchModels(args, query, limit)
+}
+
+func handleModelResolveRemote(args cliArgs) error {
+	baseURL, err := requireOpt(args, "base-url")
 	if err != nil {
 		return err
 	}
-	return writeOrPrintJSON("models", args, value)
+	baseURL = openAIBaseURL(baseURL)
+	apiKey := opt(args, "model-api-key")
+	model, info, err := detectServedModel(baseURL, apiKey, firstNonEmpty(opt(args, "served-model"), opt(args, "model-name")))
+	if err != nil {
+		return cliError{"endpoint_unreachable", "Could not read /v1/models from " + baseURL + ".", []string{"Verify --base-url and that the endpoint is running.", err.Error()}, nil}
+	}
+	quantRes := remoteQuantizationResolution(args, baseURL, apiKey, opt(args, "quantization"), info)
+	filename := ""
+	if quantRes != nil {
+		if mp := stringValue(quantRes["modelPath"]); mp != "" {
+			filename = filepath.Base(mp)
+		}
+	}
+	query, querySource := remoteModelSearchQuery(model, filename)
+	result := map[string]any{"baseUrl": baseURL, "servedModel": model, "searchQuery": query, "searchQuerySource": querySource}
+	if filename != "" {
+		result["loadedFilename"] = filename
+	}
+	if quantRes != nil && quantRes["trusted"] != nil {
+		result["quantization"] = quantRes["trusted"]
+	}
+	value, err := searchModels(args, query, 5)
+	if err != nil {
+		result["searchError"] = err.Error()
+		return writeOrPrintJSON("model_resolution", args, result)
+	}
+	candidates := modelCandidates(value, 5)
+	result["candidates"] = candidates
+	if filename != "" {
+		if match, err := sourceRepoFromFilename(args, candidates, filename); err == nil && match != "" {
+			result["sourceRepo"] = match
+			result["sourceRepoMatch"] = "exact_filename"
+		}
+	}
+	rerunHfID := firstNonEmpty(stringValue(result["sourceRepo"]), candidateID(candidates))
+	if rerunHfID != "" {
+		cmd := "lmx benchmark run llama.cpp --mode remote --base-url " + baseURL + " --served-model " + shellQuote(model) + " --hf-id " + rerunHfID
+		if quant := stringValue(result["quantization"]); quant != "" {
+			cmd += " --quantization " + quant
+		}
+		result["rerunCommand"] = cmd
+	}
+	return writeOrPrintJSON("model_resolution", args, result)
+}
+
+func candidateID(candidates []any) string {
+	if len(candidates) == 0 {
+		return ""
+	}
+	return candidateRepoID(candidates[0])
 }
 
 func handleSuite(action, target string, args cliArgs) error {
@@ -1547,6 +1699,13 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		runPath := benchmarkRunPathInDir(payload, firstNonEmpty(opt(args, "runs-dir"), "runs"))
 		out := firstNonEmpty(opt(args, "out"), runPath)
 		feedback := benchmarkAgentFeedback(payload, out, args, hasFlag(args, "dry-run"), hasFlag(args, "submit"))
+		if absOut, err := filepath.Abs(out); err == nil {
+			feedback["outputPathAbsolute"] = absOut
+		}
+		feedback["savedRunPathRelative"] = runPath
+		if absRun, err := filepath.Abs(runPath); err == nil {
+			feedback["savedRunPathAbsolute"] = absRun
+		}
 		if out != runPath {
 			feedback["savedRunPath"] = runPath
 		}
@@ -1554,9 +1713,9 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		if err := writeBenchmarkPayloadFiles(payload, out, runPath); err != nil {
 			return err
 		}
-		printInfo("benchmark_payload_file_written", map[string]any{"path": out, "engine": payload["engineName"]})
+		printInfo("benchmark_payload_file_written", map[string]any{"path": out, "pathAbsolute": absPathOr(out), "engine": payload["engineName"]})
 		if out != runPath {
-			printInfo("benchmark_run_saved", map[string]any{"path": runPath, "engine": payload["engineName"]})
+			printInfo("benchmark_run_saved", map[string]any{"path": runPath, "pathAbsolute": absPathOr(runPath), "engine": payload["engineName"]})
 		}
 		printStatus(args, "benchmark_payload_status", feedback)
 		if hasFlag(args, "dry-run") && !hasFlag(args, "submit") {
@@ -1574,11 +1733,18 @@ func handleBenchmark(action, target string, args cliArgs) error {
 			apiPayload := toBenchmarkSubmit(payload)
 			return submitPayload(endpoint, hasFlag(args, "dry-run"), "benchmark", args, apiPayload)
 		}
+		fmt.Println(stringValue(feedback["message"]))
 		printBenchmarkNextSteps(feedback, out)
 		return nil
 	}
+	if action == "add-hardware" || action == "attach-hardware" {
+		return addHardwareToRun(target, args)
+	}
+	if action == "fixup" {
+		return fixupBenchmarkRun(target, args)
+	}
 	if action != "submit" && action != "dry-run" {
-		return errors.New("Unknown benchmark command. Use run, runs, list, show, edit, rerun, submit, dry-run, validate-local, delete, stats, export, or compare.")
+		return errors.New("Unknown benchmark command. Use run, runs, list, show, edit, rerun, add-hardware, fixup, submit, dry-run, validate-local, delete, stats, export, or compare.")
 	}
 	if target == "" {
 		return fmt.Errorf("benchmark %s requires a benchmark JSON path", action)
@@ -1670,6 +1836,10 @@ func handleBenchmarkRuns(action, target string, args cliArgs) error {
 			return err
 		}
 		return rerunBenchmarkRun(path, args)
+	case "add-hardware", "attach-hardware":
+		return handleBenchmark("add-hardware", target, args)
+	case "fixup":
+		return handleBenchmark("fixup", target, args)
 	case "submit", "dry-run", "validate":
 		if action == "validate" {
 			action = "dry-run"
@@ -1692,7 +1862,7 @@ func handleBenchmarkRuns(action, target string, args cliArgs) error {
 	case "compare", "diff":
 		return compareBenchmarkRuns(target, positional(args, 4), args)
 	default:
-		return errors.New("Unknown benchmark runs command. Use list, show, edit, rerun, submit, dry-run, delete, stats, export, or compare.")
+		return errors.New("Unknown benchmark runs command. Use list, show, edit, rerun, add-hardware, fixup, submit, dry-run, delete, stats, export, or compare.")
 	}
 }
 
@@ -2458,6 +2628,78 @@ func editBenchmarkRun(path string, args cliArgs) error {
 	return nil
 }
 
+func addHardwareToRun(target string, args cliArgs) error {
+	path, err := resolveBenchmarkRunPath(target, args)
+	if err != nil {
+		return err
+	}
+	value, err := readJSON(path)
+	if err != nil {
+		return err
+	}
+	payload := benchmarkPayloadObject(value)
+	if payload == nil {
+		return cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+	}
+	hardwarePath := opt(args, "hardware")
+	if hardwarePath == "" {
+		return cliError{"missing_option", "--hardware is required", []string{"Generate it on the endpoint host: lmx hardware --out hardware.json", "Or build one from known specs: lmx hardware template --gpu-name ... --vram-gb ... > hardware.json", "Then: lmx benchmark add-hardware " + path + " --hardware hardware.json"}, nil}
+	}
+	loaded, err := readJSON(hardwarePath)
+	if err != nil {
+		return err
+	}
+	hardware := asObject(loaded)
+	if hardware == nil {
+		return cliError{"invalid_hardware", "--hardware must point to a JSON object.", []string{"Generate one with lmx hardware --out hardware.json on the benchmark host."}, loaded}
+	}
+	payload["hardware"] = loaded
+	payload["hardwareSource"] = "file"
+	feedback := benchmarkAgentFeedback(payload, path, args, false, false)
+	payload["agentFeedback"] = feedback
+	if err := writeJSON(path, value); err != nil {
+		return err
+	}
+	printInfo("benchmark_hardware_attached", map[string]any{"path": path, "pathAbsolute": absPathOr(path), "gpuName": hardware["gpuName"], "vramGb": hardware["vramGb"], "benchmarkStatus": feedback["benchmarkStatus"], "submissionStatus": feedback["submissionStatus"]})
+	printBenchmarkNextSteps(feedback, path)
+	return nil
+}
+
+func benchmarkFixupReport(payload map[string]any, path string, args cliArgs) map[string]any {
+	issues := []map[string]any{}
+	if stringValue(payload["benchmarkMode"]) == "remote" && asObject(payload["hardware"]) == nil {
+		issues = append(issues, map[string]any{"code": "missing_remote_hardware", "message": "Remote run has no server hardware metadata.", "commands": []string{"lmx hardware --out hardware.json   (run on the endpoint host)", "lmx hardware template --gpu-name \"...\" --vram-gb N --cpu \"...\" --ram-gb N --os Linux > hardware.json", "lmx benchmark add-hardware " + path + " --hardware hardware.json"}})
+	}
+	if mr := asObject(payload["modelResolution"]); mr != nil {
+		if sr := stringValue(mr["sourceRepo"]); sr != "" && sr != stringValue(payload["hfId"]) {
+			issues = append(issues, map[string]any{"code": "hf_id_mismatch", "message": "Detected source repo " + sr + " differs from hfId " + stringValue(payload["hfId"]) + ".", "commands": []string{"lmx benchmark runs edit " + path + " --set hfId=" + sr}})
+		}
+	}
+	if qr := asObject(payload["quantizationResolution"]); qr != nil && stringValue(qr["status"]) == "mismatch" {
+		if tr := stringValue(qr["trusted"]); tr != "" {
+			issues = append(issues, map[string]any{"code": "quantization_mismatch", "message": "Endpoint quantization " + tr + " differs from declared " + stringValue(payload["quantization"]) + ".", "commands": []string{"lmx benchmark runs edit " + path + " --set quantization=" + tr}})
+		}
+	}
+	feedback := benchmarkAgentFeedback(payload, path, args, false, false)
+	return map[string]any{"path": path, "pathAbsolute": absPathOr(path), "benchmarkStatus": feedback["benchmarkStatus"], "submissionStatus": feedback["submissionStatus"], "issues": issues, "ready": len(issues) == 0 && feedback["submissionStatus"] == "ready", "nextCommands": []string{"lmx benchmark dry-run " + path, "lmx benchmark submit " + path}}
+}
+
+func fixupBenchmarkRun(target string, args cliArgs) error {
+	path, err := resolveBenchmarkRunPath(target, args)
+	if err != nil {
+		return err
+	}
+	value, err := readJSON(path)
+	if err != nil {
+		return err
+	}
+	payload := benchmarkPayloadObject(value)
+	if payload == nil {
+		return cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+	}
+	return writeOrPrintJSON("benchmark_fixup", args, benchmarkFixupReport(payload, path, args))
+}
+
 func deleteBenchmarkRun(path string, args cliArgs) error {
 	if !hasFlag(args, "yes") && !hasFlag(args, "force") {
 		return cliError{"confirmation_required", "Deleting a saved benchmark run requires --yes.", []string{"Run lmx benchmark runs delete " + shellQuote(path) + " --yes to remove this file."}, nil}
@@ -2570,6 +2812,13 @@ func parseEditValue(value string) any {
 
 func benchmarkRunPath(payload map[string]any) string {
 	return benchmarkRunPathInDir(payload, "runs")
+}
+
+func absPathOr(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
 }
 
 func benchmarkRunPathInDir(payload map[string]any, runsDir string) string {
@@ -3610,6 +3859,22 @@ func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dr
 	ready := numberField(payload, "tokSOut") > 0
 	requiresRemoteHardware := stringValue(payload["benchmarkMode"]) == "remote" && asObject(payload["hardware"]) == nil
 	missingAuth := ready && !requiresRemoteHardware && !submit && apiKey(args) == ""
+	benchmarkStatus := "incomplete"
+	if ready {
+		benchmarkStatus = "completed"
+	} else if dryRun {
+		benchmarkStatus = "planned"
+	}
+	submissionStatus := "ready"
+	if submit {
+		submissionStatus = "submitting"
+	} else if requiresRemoteHardware {
+		submissionStatus = "needs_remote_hardware"
+	} else if missingAuth {
+		submissionStatus = "needs_auth"
+	} else if !ready {
+		submissionStatus = "needs_metrics"
+	}
 	status := "ready_for_api_validation"
 	message := "Benchmark payload is ready for API validation."
 	nextCommand := "lmx benchmark dry-run " + out
@@ -3619,7 +3884,7 @@ func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dr
 		nextCommand = ""
 	} else if ready && requiresRemoteHardware {
 		status = "needs_remote_hardware"
-		message = "Remote benchmark has metrics but no server hardware file. Generate hardware metadata on the endpoint host and rerun with --hardware before validating or submitting."
+		message = "Benchmark completed successfully. Submission is not yet ready: server hardware metadata is missing. Generate it on the endpoint host, then attach it without rerunning."
 		nextCommand = "lmx hardware --out hardware.json"
 	} else if dryRun && !ready {
 		status = "plan_needs_metrics"
@@ -3639,16 +3904,19 @@ func benchmarkAgentFeedback(payload map[string]any, out string, args cliArgs, dr
 	}
 	canUseAPI := ready && !requiresRemoteHardware && !missingAuth
 	feedback := map[string]any{
-		"status":          status,
-		"message":         message,
-		"outputPath":      out,
-		"canApiValidate":  canUseAPI,
-		"canSubmit":       canUseAPI,
-		"requiresMetrics": !ready,
+		"status":           status,
+		"message":          message,
+		"outputPath":       out,
+		"canApiValidate":   canUseAPI,
+		"canSubmit":        canUseAPI,
+		"requiresMetrics":  !ready,
+		"benchmarkStatus":  benchmarkStatus,
+		"submissionStatus": submissionStatus,
 	}
 	if requiresRemoteHardware {
 		feedback["requiresHardware"] = true
 		feedback["hardwareCommand"] = "lmx hardware --out hardware.json"
+		feedback["attachHardwareCommand"] = "lmx benchmark add-hardware " + out + " --hardware hardware.json"
 	}
 	if nextCommand != "" {
 		feedback["nextCommand"] = nextCommand
@@ -4893,6 +5161,46 @@ func quantizationFromFilename(path string) string {
 		return ""
 	}
 	return strings.ToUpper(matches[len(matches)-1][1])
+}
+
+func discoverServerMetadata(baseURL, apiKey string, info map[string]any) map[string]any {
+	meta := map[string]any{}
+	if q := quantizationFromModelInfo(info); q != "" {
+		meta["quantization"] = q
+	}
+	if props, err := fetchEndpointJSON(baseURL+"/props", apiKey); err == nil {
+		if obj := asObject(props); obj != nil {
+			if mp := stringValue(obj["model_path"]); mp != "" {
+				meta["modelPath"] = mp
+			}
+			copyKnownMetaFields(meta, obj)
+		}
+	}
+	if hw, err := fetchEndpointJSON(baseURL+"/hardware", apiKey); err == nil {
+		if obj := asObject(hw); obj != nil {
+			copyKnownMetaFields(meta, obj)
+		}
+	}
+	return meta
+}
+
+func copyKnownMetaFields(dst, src map[string]any) {
+	for _, name := range []string{"gpuName", "cpu", "os", "modelPath", "quantization", "engineName", "engineVersion"} {
+		if _, exists := dst[name]; exists {
+			continue
+		}
+		if value := stringValue(src[name]); value != "" {
+			dst[name] = value
+		}
+	}
+	for _, name := range []string{"gpuCount", "vramGb", "ramGb"} {
+		if _, exists := dst[name]; exists {
+			continue
+		}
+		if value := numberField(src, name); value > 0 {
+			dst[name] = value
+		}
+	}
 }
 
 func fetchEndpointJSON(rawURL, apiKey string) (any, error) {
@@ -6621,6 +6929,9 @@ func printBenchmarkNextSteps(feedback map[string]any, out string) {
 		fmt.Println("  " + next)
 		printedValidation = next == "lmx benchmark dry-run "+out
 	}
+	if attach := stringValue(feedback["attachHardwareCommand"]); attach != "" {
+		fmt.Println("  " + attach)
+	}
 	if validation := stringValue(feedback["validationCommand"]); validation != "" {
 		fmt.Println("  " + validation)
 		printedValidation = true
@@ -6810,58 +7121,60 @@ func printError(args cliArgs, err error) {
 	fmt.Fprintln(os.Stderr, err.Error())
 }
 
-func usage() {
-	fmt.Println(`LocalMaxxing CLI
+var usageExamples = []string{
+	`lmx context --out localmaxxing-agent-context.json`,
+	`lmx auth --key bhk_...`,
+	`lmx auth login`,
+	`lmx auth logout`,
+	`lmx auth keys list`,
+	`lmx auth keys create --name "my key"`,
+	`lmx auth keys revoke <id>`,
+	`lmx auth whoami`,
+	`lmx profile save my-4090 --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --hardware hardware.json`,
+	`lmx hardware --out hardware.json`,
+	`lmx hardware init --out hardware.json`,
+	`lmx engines`,
+	`lmx endpoint discover --hf-id Qwen/Qwen3-8B --quantization fp16`,
+	`lmx server dry-run vllm --hf-id Qwen/Qwen3-8B --quantization fp16`,
+	`lmx server dry-run llama.cpp --model-path model.gguf`,
+	`lmx benchmark run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --dry-run`,
+	`lmx benchmark run vllm --mode local --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind throughput --benchmark-output vllm.json --dry-run`,
+	`lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run`,
+	`lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --model-path model.gguf --dry-run`,
+	`lmx benchmark runs list`,
+	`lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json`,
+	`lmx benchmark runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'`,
+	`lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run`,
+	`lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json --api-key bhk_...`,
+	`lmx benchmark runs delete runs/Qwen-Qwen3-8B/run.json --yes`,
+	`lmx benchmark runs stats --group-by quantization --metric tokSOut`,
+	`lmx benchmark runs compare --by hardware --model Qwen/Qwen3-8B`,
+	`lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs`,
+	`lmx benchmark runs export --format csv --out runs.csv`,
+	`lmx kvcache run llama.cpp --hf-id Qwen/Qwen3-8B --model-path model.gguf --levels 10000,20000,30000,40000`,
+	`lmx kvcache run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --levels 10000,20000,30000,40000`,
+	`lmx benchmark submit benchmark.json --api-key bhk_...`,
+	`lmx benchmark dry-run benchmark.json --api-key bhk_...`,
+	`lmx benchmark validate-local benchmark.json`,
+	`lmx eval suite list --out suites.json`,
+	`lmx eval suite search reasoning --out reasoning-suites.json`,
+	`lmx eval suite show hellaswag --out hellaswag-suite.json`,
+	`lmx model search qwen3-8b --out models.json`,
+	`lmx eval storage upload traces.jsonl --kind artifact --format jsonl --out artifact-bundle.json`,
+	`lmx eval storage download <storageKey> --out traces.jsonl`,
+	`lmx eval lm-eval hellaswag --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run`,
+	`lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --out my-eval.json`,
+	`lmx eval suite validate my-eval.json`,
+	`lmx eval suite submit my-eval.json --api-key bhk_...`,
+	`lmx eval execute <suiteSlug> --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --submit`,
+	`lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`,
+	`lmx benchmark fixup runs/Model/run.json`,
+	`lmx hardware template --gpu-name "RTX 3090" --gpu-count 2 --vram-gb 24 --cpu "Ryzen 9 9950X" --ram-gb 96 --os Linux`,
+	`lmx model resolve-remote --base-url http://server:8080`,
+	`lmx endpoint discover --base-url http://server:8080 --include-server-metadata`,
+}
 
-Usage:
-  lmx context --out localmaxxing-agent-context.json
-  lmx auth --key bhk_...
-  lmx auth login
-  lmx auth logout
-  lmx auth keys list
-  lmx auth keys create --name "my key"
-  lmx auth keys revoke <id>
-  lmx auth whoami
-  lmx profile save my-4090 --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --hardware hardware.json
-  lmx hardware --out hardware.json
-  lmx hardware init --out hardware.json
-  lmx engines
-  lmx endpoint discover --hf-id Qwen/Qwen3-8B --quantization fp16
-  lmx server dry-run vllm --hf-id Qwen/Qwen3-8B --quantization fp16
-  lmx server dry-run llama.cpp --model-path model.gguf
-  lmx benchmark run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --dry-run
-  lmx benchmark run vllm --mode local --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind throughput --benchmark-output vllm.json --dry-run
-  lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run
-  lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --model-path model.gguf --dry-run
-  lmx benchmark runs list
-  lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json
-  lmx benchmark runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'
-  lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run
-  lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json --api-key bhk_...
-  lmx benchmark runs delete runs/Qwen-Qwen3-8B/run.json --yes
-  lmx benchmark runs stats --group-by quantization --metric tokSOut
-  lmx benchmark runs compare --by hardware --model Qwen/Qwen3-8B
-  lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs
-  lmx benchmark runs export --format csv --out runs.csv
-  lmx kvcache run llama.cpp --hf-id Qwen/Qwen3-8B --model-path model.gguf --levels 10000,20000,30000,40000
-  lmx kvcache run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --levels 10000,20000,30000,40000
-  lmx benchmark submit benchmark.json --api-key bhk_...
-  lmx benchmark dry-run benchmark.json --api-key bhk_...
-  lmx benchmark validate-local benchmark.json
-  lmx eval suite list --out suites.json
-  lmx eval suite search reasoning --out reasoning-suites.json
-  lmx eval suite show hellaswag --out hellaswag-suite.json
-  lmx model search qwen3-8b --out models.json
-  lmx eval storage upload traces.jsonl --kind artifact --format jsonl --out artifact-bundle.json
-  lmx eval storage download <storageKey> --out traces.jsonl
-  lmx eval lm-eval hellaswag --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run
-  lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --out my-eval.json
-  lmx eval suite validate my-eval.json
-  lmx eval suite submit my-eval.json --api-key bhk_...
-  lmx eval execute <suiteSlug> --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --submit
-
-Options:
-  --api-url <url>          LocalMaxxing origin (default: https://www.localmaxxing.com)
+const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: https://www.localmaxxing.com)
   --api-key <key>          API key, defaults to LMX_API_KEY, then saved config
   --no-browser            Do not open the device-login browser automatically
   --profile <name>         Load saved defaults from lmx profile save
@@ -6930,5 +7243,72 @@ Options:
   --limit <n>              Optional search/list result limit
   --submit                 Upload run to LocalMaxxing
   --dry-run                For benchmark run: write a measurement plan; for submit commands: authenticated API validation without creating a run
-  --out <path>             Write computed payload/result JSON`)
+  --include-server-metadata Probe optional endpoint /props and /hardware metadata during discover
+  --gpu-name <name>       Hardware template GPU name
+  --gpu-count <n>         Hardware template GPU count
+  --vram-gb <gb>          Hardware template VRAM in GB
+  --cpu <name>            Hardware template CPU name
+  --ram-gb <gb>           Hardware template system RAM in GB
+  --os <name>             Hardware template OS name (default: runtime OS)
+  --power-watts <n>       Hardware template power draw in watts
+  --hw-class <class>      Hardware template class, e.g. DISCRETE_GPU or CPU_ONLY
+  --out <path>             Write computed payload/result JSON`
+
+var commandDescriptions = map[string]string{
+	"endpoint discover":      "Discover an OpenAI-compatible endpoint and benchmark command hints.",
+	"endpoint":               "Discover OpenAI-compatible model endpoints.",
+	"benchmark":              "Create, manage, validate, and submit benchmark runs.",
+	"benchmark run":          "Measure a model or write a benchmark measurement plan.",
+	"benchmark runs":         "List and edit saved benchmark run files.",
+	"benchmark add-hardware": "Attach server hardware metadata to a saved run.",
+	"benchmark fixup":        "Inspect a saved run and print remediation commands.",
+	"hardware":               "Detect local hardware metadata.",
+	"hardware template":      "Generate hardware metadata from explicit flags.",
+	"model":                  "Search or resolve HuggingFace model IDs.",
+	"model search":           "Search LocalMaxxing model records.",
+	"model resolve-remote":   "Resolve a remote endpoint alias to likely HF candidates.",
+	"eval":                   "Discover, run, and submit evaluation suites.",
+	"eval suite":             "List, inspect, initialize, and submit eval suites.",
+	"kvcache":                "Run KV-cache and context-length sweeps.",
+	"profile":                "Save and manage reusable CLI defaults.",
+	"auth":                   "Manage LocalMaxxing API authentication.",
+	"server":                 "Build or run local model server commands.",
+}
+
+func commandHelp(args cliArgs) (string, bool) {
+	for n := len(args.positional); n >= 1; n-- {
+		prefix := strings.Join(args.positional[:n], " ")
+		matches := []string{}
+		for _, ex := range usageExamples {
+			if ex == "lmx "+prefix || strings.HasPrefix(ex, "lmx "+prefix+" ") {
+				matches = append(matches, ex)
+			}
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		var b strings.Builder
+		if desc := commandDescriptions[prefix]; desc != "" {
+			b.WriteString(desc)
+			b.WriteString("\n\n")
+		}
+		b.WriteString("Usage:\n")
+		for _, match := range matches {
+			b.WriteString("  ")
+			b.WriteString(match)
+			b.WriteByte('\n')
+		}
+		b.WriteString("\nRun `lmx --help` for all commands and the full option list.")
+		return b.String(), true
+	}
+	return "", false
+}
+
+func usage() {
+	fmt.Println("LocalMaxxing CLI\n\nUsage:")
+	for _, ex := range usageExamples {
+		fmt.Println("  " + ex)
+	}
+	fmt.Println("\nOptions:")
+	fmt.Println(usageOptions)
 }

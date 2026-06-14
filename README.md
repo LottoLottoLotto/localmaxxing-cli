@@ -16,7 +16,7 @@ Download a pre-built archive for your platform from the [latest release](https:/
 | macOS (Apple Silicon) | `lmx-darwin-arm64.tar.gz` |
 | Windows (amd64) | `lmx-windows-amd64.exe` |
 
-Linux and macOS binaries ship inside `.tar.gz` archives so the executable bit survives the download — no `chmod` needed.
+Linux and macOS binaries ship inside `.tar.gz` archives so the executable bit survives the download — no `chmod` needed. Each archive extracts to a single executable named `lmx` regardless of the asset name; rename it yourself if you keep multiple platforms side by side.
 
 ```bash
 # Linux / macOS (adjust the asset name for your platform)
@@ -77,6 +77,13 @@ Submissions require a hardware JSON object. Generate one on the machine running 
 lmx hardware --out hardware.json
 ```
 
+If you cannot run detection on the endpoint host yet, generate a reviewed template from known specs:
+
+```bash
+lmx hardware template --gpu-name "RTX 3090" --gpu-count 2 --vram-gb 24 --cpu "Ryzen 9 9950X" --ram-gb 96 --os Linux > hardware.json
+```
+
+
 Example output:
 
 ```json
@@ -105,7 +112,7 @@ lmx benchmark run vllm \
   --dry-run
 ```
 
-For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server, before `benchmark dry-run` or `benchmark submit`.
+For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server. If a remote run already has metrics but lacks hardware, attach it without rerunning: `lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`.
 
 Remote endpoint runs issue one untimed warmup request and three timed iterations by default, reporting the median of each metric plus per-iteration `samples` and `sampleStats` (min/p50/mean/max/stddev). Tune with `--warmup <n>` and `--iterations <n>`; `--warmup 0 --iterations 1` restores single-shot measurement. Decode throughput is measured over the inter-token window (first to last streamed token) when more than one token arrives.
 
@@ -172,6 +179,14 @@ lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run
 lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json
 lmx benchmark runs delete runs/Qwen-Qwen3-8B/run.json --yes
 ```
+
+Inspect a saved run for post-run fixes before submission:
+
+```bash
+lmx benchmark fixup runs/Qwen-Qwen3-8B/run.json
+lmx benchmark add-hardware runs/Qwen-Qwen3-8B/run.json --hardware hardware.json
+```
+
 
 Analyze and export runs:
 
@@ -264,6 +279,13 @@ lmx eval suite list --out localmaxxing-suites.json
 lmx eval suite search reasoning
 lmx model search qwen3-8b
 lmx model search Qwen3-8B-Q4_K_M.gguf   # GGUF filenames/paths are normalized to the model name
+```
+
+Resolve a remote endpoint's served-model alias to likely HuggingFace IDs:
+
+```bash
+lmx model resolve-remote --base-url http://server:8080
+lmx endpoint discover --base-url http://server:8080 --include-server-metadata
 ```
 
 ## Eval Suite Authoring
