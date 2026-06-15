@@ -6051,9 +6051,11 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 		"executionMode": map[bool]string{true: "CUSTOM_LOCAL", false: "LM_EVAL_LOCAL"}[strings.EqualFold(runner, "CUSTOM")],
 		"judgeMode":     map[bool]string{true: "LOCAL_REPORTED", false: "NONE"}[strings.EqualFold(stringValue(doc["scoringMethod"]), "llm_judge")],
 		"runnerVersion": map[bool]string{true: "localmaxxing-go custom-local", false: "localmaxxing-go lm-eval-upload"}[strings.EqualFold(runner, "CUSTOM")],
-		"results":       result["scores"],
 		"artifacts":     redactGold(result["artifacts"]),
 		"runConfig":     map[string]any{"aggregatePreview": result["aggregate"]},
+	}
+	if !strings.EqualFold(stringValue(doc["scoringMethod"]), "user_rating") {
+		payload["results"] = result["scores"]
 	}
 	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
 		hardware, err := readJSON(hardwarePath)
@@ -6428,12 +6430,21 @@ func runCustomLocalEval(suite map[string]any, args cliArgs) (map[string]any, err
 	flatScores := map[string]float64{}
 	artifacts := []any{}
 	for _, task := range evalTasks(doc) {
-		if stringValue(task["promptTemplate"]) == "" || asObject(task["dataset"]) == nil {
-			return nil, cliError{"task_not_runnable", fmt.Sprintf("Task %q requires promptTemplate and dataset", stringValue(task["key"])), []string{"Fix the suite JSON or use an LM_EVAL_HARNESS suite for external lm-eval tasks."}, nil}
+		if stringValue(task["promptTemplate"]) == "" {
+			return nil, cliError{"task_not_runnable", fmt.Sprintf("Task %q requires promptTemplate", stringValue(task["key"])), []string{"Fix the suite JSON or use an LM_EVAL_HARNESS suite for external lm-eval tasks."}, nil}
 		}
-		items, err := loadEvalDataset(asObject(task["dataset"]))
-		if err != nil {
-			return nil, cliError{"dataset_load_failed", fmt.Sprintf("Failed to load dataset for task %q: %v", stringValue(task["key"]), err), []string{"Check dataset source fields and network access."}, nil}
+		var items []map[string]any
+		if asObject(task["dataset"]) == nil {
+			if strings.EqualFold(scoring, "user_rating") {
+				items = []map[string]any{{}}
+			} else {
+				return nil, cliError{"task_not_runnable", fmt.Sprintf("Task %q requires dataset", stringValue(task["key"])), []string{"Fix the suite JSON or use an LM_EVAL_HARNESS suite for external lm-eval tasks."}, nil}
+			}
+		} else {
+			items, err = loadEvalDataset(asObject(task["dataset"]))
+			if err != nil {
+				return nil, cliError{"dataset_load_failed", fmt.Sprintf("Failed to load dataset for task %q: %v", stringValue(task["key"]), err), []string{"Check dataset source fields and network access."}, nil}
+			}
 		}
 		totalScore := 0.0
 		counted := 0
@@ -6445,11 +6456,15 @@ func runCustomLocalEval(suite map[string]any, args cliArgs) (map[string]any, err
 			response, err := callOpenAIChat(baseURL, model, prompt, opt(args, "model-api-key"), int(firstNonZero(int(numberField(task, "maxNewTokens")), 256)), evalTemperature(doc), evalTopP(doc), stringSlice(task["stopSequences"]))
 			if err == nil {
 				artifact["response"] = response
-				var score float64
-				score, artifact, err = scoreCustomEvalItem(scoring, task, item, response, prompt, artifact, judgeBaseURL, judgeModel, judgeAPIKey)
-				if err == nil {
-					totalScore += score
-					artifact["score"] = score
+				if strings.EqualFold(scoring, "user_rating") {
+					artifact["scorePending"] = true
+				} else {
+					var score float64
+					score, artifact, err = scoreCustomEvalItem(scoring, task, item, response, prompt, artifact, judgeBaseURL, judgeModel, judgeAPIKey)
+					if err == nil {
+						totalScore += score
+						artifact["score"] = score
+					}
 				}
 			}
 			if err != nil {
@@ -6460,7 +6475,7 @@ func runCustomLocalEval(suite map[string]any, args cliArgs) (map[string]any, err
 			artifact["latencyMs"] = time.Since(started).Milliseconds()
 			artifacts = append(artifacts, artifact)
 		}
-		if counted > 0 {
+		if counted > 0 && !strings.EqualFold(scoring, "user_rating") {
 			score := totalScore / float64(counted)
 			scores[stringValue(task["key"])] = map[string]any{"score": score, "nSamples": counted, "nShots": numberField(task, "nShots")}
 			flatScores[stringValue(task["key"])] = score
