@@ -6009,6 +6009,12 @@ func handleLmEval(suiteSlug string, args cliArgs) error {
 	}
 	cmdArgs = append(cmdArgs, "--output_path", resultsPath)
 	printInfo("lm_eval_start", map[string]any{"suite": suiteSlug, "command": command, "backend": backend, "modelArgs": modelArgs, "tasks": tasks, "output": resultsPath})
+	if hasFlag(args, "dry-run") {
+		printInfo("lm_eval_dry_run", map[string]any{"command": command, "args": cmdArgs, "suite": suiteSlug})
+		fmt.Printf("Dry-run: would execute:\n  %s %s\n", command, strings.Join(cmdArgs, " "))
+		fmt.Println("Remove --dry-run to execute.")
+		return nil
+	}
 	cmd := exec.Command(command, cmdArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
