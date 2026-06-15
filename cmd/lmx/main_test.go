@@ -2077,3 +2077,107 @@ func TestDiscoverServerMetadata(t *testing.T) {
 		t.Fatalf("quantization = %v", meta["quantization"])
 	}
 }
+
+func TestRunCustomLocalEvalSupportsPromptOnlyUserRating(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		messages := anySlice(body["messages"])
+		if len(messages) != 1 || !strings.Contains(stringValue(asObject(messages[0])["content"]), "greenpost") {
+			t.Fatalf("messages = %#v", messages)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":">line one\n>line two\n>line three\n>line four\n>line five"}}]}`)
+	}))
+	defer srv.Close()
+
+	suite := map[string]any{
+		"slug":   "tech-greenpost-usereval",
+		"runner": "CUSTOM",
+		"suiteDoc": map[string]any{
+			"scoringMethod": "user_rating",
+			"tasks": []any{
+				map[string]any{
+					"key":            "greenpost",
+					"promptTemplate": "Write a greenpost",
+					"maxNewTokens":   1000,
+				},
+			},
+		},
+	}
+	result, err := runCustomLocalEval(suite, parseArgs([]string{"--model", "test/model", "--base-url", srv.URL}))
+	if err != nil {
+		t.Fatalf("runCustomLocalEval returned error: %v", err)
+	}
+	if len(asObject(result["scores"])) != 0 {
+		t.Fatalf("user_rating scores should be empty, got %#v", result["scores"])
+	}
+	artifacts := anySlice(result["artifacts"])
+	if len(artifacts) != 1 {
+		t.Fatalf("artifacts len = %d", len(artifacts))
+	}
+	artifact := asObject(artifacts[0])
+	if artifact["taskKey"] != "greenpost" || artifact["scorePending"] != true {
+		t.Fatalf("artifact = %#v", artifact)
+	}
+	if !strings.Contains(stringValue(artifact["response"]), ">line one") {
+		t.Fatalf("response = %q", artifact["response"])
+	}
+}
+
+func TestHandleEvalRunOmitsResultsForUserRatingPromptOnlySuite(t *testing.T) {
+	modelSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected model path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":">line one\n>line two\n>line three\n>line four\n>line five"}}]}`)
+	}))
+	defer modelSrv.Close()
+
+	suitePath := filepath.Join(t.TempDir(), "suite.json")
+	if err := writeJSON(suitePath, map[string]any{
+		"slug":   "tech-greenpost-usereval",
+		"runner": "CUSTOM",
+		"suiteDoc": map[string]any{
+			"scoringMethod": "user_rating",
+			"tasks": []any{
+				map[string]any{
+					"key":            "greenpost",
+					"promptTemplate": "Write a greenpost",
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("write suite: %v", err)
+	}
+	outPath := filepath.Join(t.TempDir(), "run.json")
+	err := handleEvalRun("tech-greenpost-usereval", parseArgs([]string{"--suite-file", suitePath, "--model", "test/model", "--base-url", modelSrv.URL, "--out", outPath}))
+	if err != nil {
+		t.Fatalf("handleEvalRun returned error: %v", err)
+	}
+	payload := asObject(mustReadJSONForTest(t, outPath))
+	if _, ok := payload["results"]; ok {
+		t.Fatalf("user_rating payload should omit results, got %#v", payload["results"])
+	}
+	if payload["judgeMode"] != "NONE" || payload["executionMode"] != "CUSTOM_LOCAL" {
+		t.Fatalf("payload modes = %#v", payload)
+	}
+	if len(anySlice(payload["artifacts"])) != 1 {
+		t.Fatalf("artifacts = %#v", payload["artifacts"])
+	}
+}
+
+func mustReadJSONForTest(t *testing.T, path string) any {
+	t.Helper()
+	value, err := readJSON(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return value
+}
