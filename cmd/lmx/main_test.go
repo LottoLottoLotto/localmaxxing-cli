@@ -2077,3 +2077,29 @@ func TestDiscoverServerMetadata(t *testing.T) {
 		t.Fatalf("quantization = %v", meta["quantization"])
 	}
 }
+
+func TestHandleLmEvalDryRunPrintsCommandAndExits(t *testing.T) {
+	// `handleLmEval` calls `exec.Command(lm_eval, ...)` when not in dry-run.
+	// Placing a fake lm_eval on PATH avoids exec errors in test.
+	binDir := t.TempDir()
+	writeExecutable(t, filepath.Join(binDir, "lm_eval"))
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
+	defer os.Setenv("PATH", oldPath)
+
+	suitePath := filepath.Join(t.TempDir(), "suite.json")
+	if err := writeJSON(suitePath, map[string]any{
+		"slug":   "mmlu",
+		"runner": "LM_EVAL_HARNESS",
+		"suiteDoc": map[string]any{
+			"tasks": []any{map[string]any{"key": "mmlu", "nShots": 5}},
+		},
+	}); err != nil {
+		t.Fatalf("write suite: %v", err)
+	}
+
+	err := handleLmEval("mmlu", parseArgs([]string{"--suite-file", suitePath, "--model", "test/model", "--dry-run"}))
+	if err != nil {
+		t.Fatalf("handleLmEval dry-run returned error: %v", err)
+	}
+}
