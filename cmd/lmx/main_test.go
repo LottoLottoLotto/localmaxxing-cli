@@ -2077,3 +2077,131 @@ func TestDiscoverServerMetadata(t *testing.T) {
 		t.Fatalf("quantization = %v", meta["quantization"])
 	}
 }
+
+func TestSetupToHardwareMapsGpuFields(t *testing.T) {
+	single := setupToHardware(map[string]any{
+		"hwClass":  "DISCRETE_GPU",
+		"gpuName":  "RTX 3090",
+		"gpuCount": 1.0,
+		"vramGb":   24.0,
+	})
+	if single["hwClass"] != "DISCRETE_GPU" || single["gpuName"] != "RTX 3090" || single["gpuCount"] != 1.0 || single["vramGb"] != 24.0 {
+		t.Fatalf("single GPU hardware = %#v", single)
+	}
+	if _, ok := single["gpus"]; ok {
+		t.Fatalf("single GPU hardware should not include gpus array: %#v", single)
+	}
+
+	multi := setupToHardware(map[string]any{
+		"hwClass": "DISCRETE_GPU",
+		"gpus": []any{
+			map[string]any{"name": "RTX 3090", "count": 1.0, "vramGb": 24.0},
+			map[string]any{"name": "RTX 3080", "count": 2.0, "vramGb": 10.0},
+			map[string]any{"name": ""},
+		},
+	})
+	gpus, ok := multi["gpus"].([]any)
+	if !ok || len(gpus) != 2 {
+		t.Fatalf("expected 2 mapped gpus, got %#v", multi["gpus"])
+	}
+	first := gpus[0].(map[string]any)
+	if first["gpuName"] != "RTX 3090" || first["count"] != 1.0 || first["vramGb"] != 24.0 {
+		t.Fatalf("first gpu = %#v", first)
+	}
+	if _, ok := multi["gpuName"]; ok {
+		t.Fatalf("multi GPU hardware should not include gpuName: %#v", multi)
+	}
+}
+
+func TestSetupToHardwareUnifiedAndCPU(t *testing.T) {
+	unified := setupToHardware(map[string]any{
+		"hwClass":         "UNIFIED",
+		"chipVendor":      "Apple",
+		"chipFamily":      "M4",
+		"chipVariant":     "M4 Pro",
+		"unifiedMemoryGb": 48.0,
+		"gpuName":         "ignored",
+	})
+	if unified["chipVariant"] != "M4 Pro" || unified["unifiedMemoryGb"] != 48.0 {
+		t.Fatalf("unified hardware = %#v", unified)
+	}
+	if _, ok := unified["gpuName"]; ok {
+		t.Fatalf("unified hardware should not carry gpuName: %#v", unified)
+	}
+
+	cpu := setupToHardware(map[string]any{"hwClass": "CPU_ONLY", "cpu": "Ryzen 9", "ramGb": 128.0})
+	if cpu["cpu"] != "Ryzen 9" || cpu["ramGb"] != 128.0 {
+		t.Fatalf("cpu hardware = %#v", cpu)
+	}
+}
+
+func TestSelectSetupResolution(t *testing.T) {
+	setups := []map[string]any{
+		{"id": "a", "name": "default rig", "isDefault": true},
+		{"id": "b", "name": "2x RTX 3090", "isDefault": false},
+	}
+	if got, err := selectSetup(setups, parseArgs([]string{"--id", "b"})); err != nil || stringValue(got["id"]) != "b" {
+		t.Fatalf("by id = %#v, err %v", got, err)
+	}
+	if got, err := selectSetup(setups, parseArgs([]string{"--name", "2X rtx 3090"})); err != nil || stringValue(got["id"]) != "b" {
+		t.Fatalf("by name = %#v, err %v", got, err)
+	}
+	if got, err := selectSetup(setups, parseArgs(nil)); err != nil || stringValue(got["id"]) != "a" {
+		t.Fatalf("default = %#v, err %v", got, err)
+	}
+	if _, err := selectSetup(setups, parseArgs([]string{"--name", "missing"})); err == nil {
+		t.Fatalf("expected error for missing name")
+	}
+	twoNoDefault := []map[string]any{{"id": "a", "name": "x"}, {"id": "b", "name": "y"}}
+	if _, err := selectSetup(twoNoDefault, parseArgs(nil)); err == nil {
+		t.Fatalf("expected ambiguous error")
+	}
+	single := []map[string]any{{"id": "only", "name": "z"}}
+	if got, err := selectSetup(single, parseArgs(nil)); err != nil || stringValue(got["id"]) != "only" {
+		t.Fatalf("single fallback = %#v, err %v", got, err)
+	}
+}
+
+func TestHandleSetupsPullWritesHardware(t *testing.T) {
+	t.Setenv("LMX_API_KEY", "bhk_test")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer bhk_test" {
+			t.Fatalf("Authorization = %q, want bearer key", r.Header.Get("Authorization"))
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/api/setups" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]any{
+			map[string]any{"id": "a", "name": "test rig", "isDefault": true, "hwClass": "DISCRETE_GPU", "gpuName": "RTX 3090", "gpuCount": 1, "vramGb": 24, "engineName": "llama.cpp", "quantization": "Q4_K_M"},
+		})
+	}))
+	defer server.Close()
+
+	out := filepath.Join(t.TempDir(), "hardware.json")
+	args := parseArgs([]string{"setups", "pull", "--name", "test rig", "--out", out})
+	args.opts["api-url"] = server.URL
+	if err := runWithArgs(args); err != nil {
+		t.Fatalf("setups pull returned error: %v", err)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read out: %v", err)
+	}
+	var hw map[string]any
+	if err := json.Unmarshal(data, &hw); err != nil {
+		t.Fatalf("unmarshal hardware: %v", err)
+	}
+	if hw["hwClass"] != "DISCRETE_GPU" || hw["gpuName"] != "RTX 3090" || hw["gpuCount"] != 1.0 || hw["vramGb"] != 24.0 {
+		t.Fatalf("written hardware = %#v", hw)
+	}
+	if _, ok := hw["engineName"]; ok {
+		t.Fatalf("hardware.json should not include engine fields: %#v", hw)
+	}
+}
+
+func TestHandleSetupsRequiresAPIKey(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LMX_API_KEY", "")
+	requireCliErrorCode(t, runWithArgs(parseArgs([]string{"setups", "list"})), "missing_api_key")
+}

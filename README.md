@@ -96,6 +96,19 @@ Example output:
 
 > For remote endpoint benchmarks, run `lmx hardware` on the **server** hosting the model, not your local machine.
 
+### Pull a saved setup
+
+If you have saved hardware/engine setups in your LocalMaxxing account, pull one into a `hardware.json` instead of detecting locally — handy when the agent host is not the inference rig. Both commands require an API key (`--api-key`, `LMX_API_KEY`, or saved config) and return only your own setups.
+
+```bash
+lmx setups list
+lmx setups pull --default --out hardware.json
+lmx setups pull --name "2x RTX 3090" --out hardware.json
+lmx setups pull --id <setupId> --out hardware.json
+```
+
+`setups pull` selects by `--id`, case-insensitive `--name`, or `--default`; with no selector it uses your default setup, or the only setup when you have exactly one. Without `--out` it prints the hardware JSON to stdout.
+
 ## Benchmarks
 
 ### Remote Endpoint (vLLM, SGLang, Ollama, custom OpenAI-compatible)

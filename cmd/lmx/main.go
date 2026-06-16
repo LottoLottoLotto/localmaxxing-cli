@@ -111,6 +111,8 @@ func runWithArgs(args cliArgs) error {
 		return handleAuth(args)
 	case "hardware":
 		return handleHardware(positional(args, 1), args)
+	case "setups":
+		return handleSetups(positional(args, 1), args)
 	case "context", "agent-context":
 		return handleContext(args)
 	case "model":
@@ -151,7 +153,7 @@ func runWithArgs(args cliArgs) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "benchmark", "bench", "auth", "hardware", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep":
+	case "eval", "benchmark", "bench", "auth", "hardware", "setups", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep":
 		return true
 	default:
 		return false
@@ -804,6 +806,242 @@ func handleHardwareTemplate(args cliArgs) error {
 	data, _ := json.MarshalIndent(hw, "", "  ")
 	fmt.Println(string(data))
 	return nil
+}
+
+func handleSetups(action string, args cliArgs) error {
+	key := apiKey(args)
+	if key == "" {
+		return missingAPIKey("--api-key or LMX_API_KEY is required for setups")
+	}
+	parsed, err := fetchJSON("GET", apiURL(args)+"/api/setups", key, nil)
+	if err != nil {
+		return err
+	}
+	setups := setupRows(parsed)
+	if action == "" {
+		action = "list"
+	}
+	switch action {
+	case "list":
+		if len(setups) == 0 {
+			printInfo("no_setups", map[string]any{"next": "Save a setup from a benchmark submission or the dashboard."})
+			return nil
+		}
+		for _, setup := range setups {
+			fmt.Println(formatSetupLine(setup))
+		}
+		return nil
+	case "pull":
+		selected, err := selectSetup(setups, args)
+		if err != nil {
+			return err
+		}
+		return writeOrPrintJSON("hardware", args, setupToHardware(selected))
+	default:
+		return cliError{"unknown_action", "Unknown setups action: " + action, []string{"Use: setups list, setups pull"}, nil}
+	}
+}
+
+func setupRows(value any) []map[string]any {
+	var items []any
+	if arr, ok := value.([]any); ok {
+		items = arr
+	} else if obj := asObject(value); obj != nil {
+		if arr, ok := obj["setups"].([]any); ok {
+			items = arr
+		}
+	}
+	rows := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if obj := asObject(item); obj != nil {
+			rows = append(rows, obj)
+		}
+	}
+	return rows
+}
+
+func setupNames(setups []map[string]any) []string {
+	names := make([]string, 0, len(setups))
+	for _, setup := range setups {
+		label := stringValue(setup["name"])
+		if label == "" {
+			label = "(unnamed)"
+		}
+		if isDefault, _ := setup["isDefault"].(bool); isDefault {
+			label += " (default)"
+		}
+		names = append(names, label)
+	}
+	return names
+}
+
+func selectSetup(setups []map[string]any, args cliArgs) (map[string]any, error) {
+	if len(setups) == 0 {
+		return nil, cliError{"setup_not_found", "No saved setups found for this API key.", []string{"Save a setup from a benchmark submission or the dashboard."}, nil}
+	}
+	if id := opt(args, "id"); id != "" {
+		for _, setup := range setups {
+			if stringValue(setup["id"]) == id {
+				return setup, nil
+			}
+		}
+		return nil, cliError{"setup_not_found", "No setup found with id " + id, setupNames(setups), nil}
+	}
+	if name := opt(args, "name"); name != "" {
+		for _, setup := range setups {
+			if strings.EqualFold(stringValue(setup["name"]), name) {
+				return setup, nil
+			}
+		}
+		return nil, cliError{"setup_not_found", "No setup found named " + name, setupNames(setups), nil}
+	}
+	for _, setup := range setups {
+		if isDefault, _ := setup["isDefault"].(bool); isDefault {
+			return setup, nil
+		}
+	}
+	if hasFlag(args, "default") {
+		return nil, cliError{"setup_not_found", "No default setup is set; pass --name or --id.", setupNames(setups), nil}
+	}
+	if len(setups) == 1 {
+		return setups[0], nil
+	}
+	return nil, cliError{"ambiguous_setup", "Multiple setups; pass --default, --name, or --id", setupNames(setups), nil}
+}
+
+func setupGpus(setup map[string]any) []any {
+	raw, ok := setup["gpus"].([]any)
+	if !ok {
+		return nil
+	}
+	gpus := []any{}
+	for _, item := range raw {
+		obj := asObject(item)
+		if obj == nil {
+			continue
+		}
+		name := stringValue(obj["name"])
+		if name == "" {
+			continue
+		}
+		gpu := map[string]any{"gpuName": name}
+		if n := numberField(obj, "count"); n != 0 {
+			gpu["count"] = n
+		}
+		if n := numberField(obj, "vramGb"); n != 0 {
+			gpu["vramGb"] = n
+		}
+		gpus = append(gpus, gpu)
+	}
+	if len(gpus) == 0 {
+		return nil
+	}
+	return gpus
+}
+
+func setupToHardware(setup map[string]any) map[string]any {
+	hwClass := stringValue(setup["hwClass"])
+	if hwClass == "" {
+		hwClass = "DISCRETE_GPU"
+	}
+	hw := map[string]any{"hwClass": hwClass}
+	setStr := func(key string) {
+		if v := stringValue(setup[key]); v != "" {
+			hw[key] = v
+		}
+	}
+	setNum := func(key string) {
+		if n := numberField(setup, key); n != 0 {
+			hw[key] = n
+		}
+	}
+	switch hwClass {
+	case "UNIFIED":
+		setStr("chipVendor")
+		setStr("chipFamily")
+		setStr("chipVariant")
+		setNum("unifiedMemoryGb")
+		setNum("npuTops")
+		setStr("cpu")
+		setStr("os")
+	case "CPU_ONLY":
+		setStr("cpu")
+		setNum("ramGb")
+		setStr("os")
+	default:
+		if gpus := setupGpus(setup); len(gpus) > 0 {
+			hw["gpus"] = gpus
+		} else {
+			setStr("gpuName")
+			setNum("gpuCount")
+			setNum("vramGb")
+		}
+		setStr("cpu")
+		setNum("ramGb")
+		setStr("os")
+	}
+	return hw
+}
+
+func setupHardwareSummary(setup map[string]any) string {
+	switch stringValue(setup["hwClass"]) {
+	case "DISCRETE_GPU":
+		if gpus, ok := setup["gpus"].([]any); ok && len(gpus) > 0 {
+			parts := []string{}
+			for _, item := range gpus {
+				obj := asObject(item)
+				if obj == nil {
+					continue
+				}
+				parts = append(parts, gpuSummary(numberField(obj, "count"), stringValue(obj["name"]), numberField(obj, "vramGb")))
+			}
+			return strings.Join(parts, " + ")
+		}
+		return gpuSummary(numberField(setup, "gpuCount"), stringValue(setup["gpuName"]), numberField(setup, "vramGb"))
+	case "UNIFIED":
+		return firstNonEmpty(stringValue(setup["chipVariant"]), stringValue(setup["chipFamily"]), stringValue(setup["chipVendor"]), "Unified memory system")
+	default:
+		return firstNonEmpty(stringValue(setup["cpu"]), "CPU")
+	}
+}
+
+func gpuSummary(count float64, name string, vramGb float64) string {
+	if count == 0 {
+		count = 1
+	}
+	label := fmt.Sprintf("%gx %s", count, firstNonEmpty(name, "GPU"))
+	if vramGb != 0 {
+		label += fmt.Sprintf(" (%g GB)", vramGb)
+	}
+	return label
+}
+
+func formatSetupLine(setup map[string]any) string {
+	name := stringValue(setup["name"])
+	if name == "" {
+		name = "(unnamed)"
+	}
+	if isDefault, _ := setup["isDefault"].(bool); isDefault {
+		name += " ★"
+	}
+	segments := []string{name}
+	if hw := stringValue(setup["hwClass"]); hw != "" {
+		segments = append(segments, hw)
+	}
+	if summary := setupHardwareSummary(setup); summary != "" {
+		segments = append(segments, summary)
+	}
+	engineParts := []string{}
+	if e := stringValue(setup["engineName"]); e != "" {
+		engineParts = append(engineParts, e)
+	}
+	if q := stringValue(setup["quantization"]); q != "" {
+		engineParts = append(engineParts, q)
+	}
+	if len(engineParts) > 0 {
+		segments = append(segments, strings.Join(engineParts, " · "))
+	}
+	return strings.Join(segments, " — ")
 }
 
 func handleEngines(args cliArgs) error {
@@ -7133,6 +7371,9 @@ var usageExamples = []string{
 	`lmx profile save my-4090 --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --hardware hardware.json`,
 	`lmx hardware --out hardware.json`,
 	`lmx hardware init --out hardware.json`,
+	`lmx setups list`,
+	`lmx setups pull --default --out hardware.json`,
+	`lmx setups pull --name "2x RTX 3090" --out hardware.json`,
 	`lmx engines`,
 	`lmx endpoint discover --hf-id Qwen/Qwen3-8B --quantization fp16`,
 	`lmx server dry-run vllm --hf-id Qwen/Qwen3-8B --quantization fp16`,
@@ -7252,6 +7493,9 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --os <name>             Hardware template OS name (default: runtime OS)
   --power-watts <n>       Hardware template power draw in watts
   --hw-class <class>      Hardware template class, e.g. DISCRETE_GPU or CPU_ONLY
+  --name <name>            Saved setup name to pull (case-insensitive) for setups pull
+  --id <id>                Saved setup id to pull for setups pull
+  --default                Pull the default saved setup for setups pull
   --out <path>             Write computed payload/result JSON`
 
 var commandDescriptions = map[string]string{
@@ -7264,6 +7508,9 @@ var commandDescriptions = map[string]string{
 	"benchmark fixup":        "Inspect a saved run and print remediation commands.",
 	"hardware":               "Detect local hardware metadata.",
 	"hardware template":      "Generate hardware metadata from explicit flags.",
+	"setups":                "List and pull your saved hardware/engine setups.",
+	"setups list":           "List saved setups stored in your LocalMaxxing account.",
+	"setups pull":           "Write a hardware.json from a saved setup.",
 	"model":                  "Search or resolve HuggingFace model IDs.",
 	"model search":           "Search LocalMaxxing model records.",
 	"model resolve-remote":   "Resolve a remote endpoint alias to likely HF candidates.",
