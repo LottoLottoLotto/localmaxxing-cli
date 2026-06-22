@@ -40,6 +40,61 @@ func TestApplyNvidiaSMIHardwareParsesMultipleGPUs(t *testing.T) {
 	}
 }
 
+func TestRemapHardwareGpusUsesGpuNameForSubmit(t *testing.T) {
+	hw := map[string]any{
+		"hwClass":  "DISCRETE_GPU",
+		"gpuCount": 2.0,
+		"gpus": []any{
+			map[string]any{"name": "NVIDIA GeForce RTX 4090", "vramGb": 24.0},
+			map[string]any{"gpuName": "NVIDIA GeForce RTX 3090", "vramGb": 24.0, "count": 1.0},
+		},
+		"cpu": "Intel(R) Core(TM) i9-14900K",
+		"os":  "linux",
+	}
+	remapped := remapHardware(hw)
+	if remapped["hwClass"] != "DISCRETE_GPU" {
+		t.Fatalf("hwClass = %v, want DISCRETE_GPU", remapped["hwClass"])
+	}
+	if _, ok := remapped["gpuName"]; ok {
+		t.Fatalf("remapped gpus payload should drop parent gpuName, got %v", remapped["gpuName"])
+	}
+	gpus, ok := remapped["gpus"].([]any)
+	if !ok || len(gpus) != 2 {
+		t.Fatalf("gpus = %#v, want two entries", remapped["gpus"])
+	}
+	first, _ := gpus[0].(map[string]any)
+	if first["gpuName"] != "NVIDIA GeForce RTX 4090" {
+		t.Fatalf("gpus[0].gpuName = %v, want NVIDIA GeForce RTX 4090", first["gpuName"])
+	}
+	if first["count"] != 1 {
+		t.Fatalf("gpus[0].count = %v, want 1", first["count"])
+	}
+	if first["vramGb"] != 24.0 {
+		t.Fatalf("gpus[0].vramGb = %v, want 24.0", first["vramGb"])
+	}
+	if _, leaked := first["name"]; leaked {
+		t.Fatalf("gpus[0] still carries legacy 'name' key: %v", first["name"])
+	}
+}
+
+func TestApplyNvidiaSMIHardwareEmitsGpuName(t *testing.T) {
+	hw := map[string]any{"hwClass": "CPU_ONLY"}
+	applyNvidiaSMIHardware(hw, "NVIDIA GeForce RTX 4090, 24564\n")
+	gpus, ok := hw["gpus"].([]map[string]any)
+	if !ok || len(gpus) != 1 {
+		t.Fatalf("gpus = %#v, want one entry", hw["gpus"])
+	}
+	if gpus[0]["gpuName"] != "NVIDIA GeForce RTX 4090" {
+		t.Fatalf("gpus[0].gpuName = %v, want NVIDIA GeForce RTX 4090", gpus[0]["gpuName"])
+	}
+	if _, leaked := gpus[0]["name"]; leaked {
+		t.Fatalf("gpus[0] should not carry legacy 'name' key")
+	}
+	if hw["gpuName"] != "NVIDIA GeForce RTX 4090" {
+		t.Fatalf("parent gpuName = %v", hw["gpuName"])
+	}
+}
+
 func TestEndpointTimeout(t *testing.T) {
 	defaultTimeout, err := endpointTimeout(cliArgs{opts: map[string]string{}, flags: map[string]bool{}})
 	if err != nil {
