@@ -35,7 +35,11 @@ Use `--kind multiple_choice` for objective questions with choices and a gold ans
 
 Use `--kind qa` for short exact-answer questions.
 
+Use `--kind math` for numeric word-problems (GSM8K-style **one-off / custom** datasets). The model is prompted to reason step by step, and the runner extracts the final answer from the chain-of-thought before scoring — so you do **not** have to force answer-only output. This is the recommended way to build private math evals when public benchmarks like GSM8K have leaked into training data.
+
 Use `--kind judge` for open-ended LM-Judge/rubric-scored questions.
+
+Use `--kind loglikelihood` for multiple-choice questions scored by forced-continuation log-probability (the way lm-eval scores MMLU/HellaSwag/ARC) instead of by parsing generated text. Requires a `/v1/completions` endpoint exposing `echo`+`logprobs` (vLLM, SGLang, llama.cpp server); chat-only servers cannot run it. Tune `runConfig.loglikelihoodTarget` (`choice_text` ranks the full answer text, `letter` ranks " A"/" B"… after an `Answer:` prompt) and `runConfig.loglikelihoodNorm` (`byte` = acc_norm, `none` = acc). Scores are directionally comparable to lm-eval but not byte-identical (the context/continuation split is by character offset, not exact tokenization).
 
 ## Inline Multiple-Choice Item
 
@@ -53,6 +57,29 @@ Use `--kind judge` for open-ended LM-Judge/rubric-scored questions.
 {
   "input": "What is the time complexity of binary search on a sorted array?",
   "gold": "O(log n)"
+}
+```
+
+## Answer Extraction (chain-of-thought scoring)
+
+For `exact_match` tasks where the model reasons before answering (math word-problems, multi-step QA), set `answerExtraction` on the task so the final answer is pulled out of the response before comparison:
+
+- `"last_number"` — take the last number-like token (handles `$`, commas, decimals, `%`, sign). This is how `--kind math` is configured and mirrors lm-eval's GSM8K flexible-extract.
+- `"regex"` — take the last match of `answerRegex` (capture group 1 if present, else the whole match), e.g. `answerRegex: "answer:\\s*\\(([A-D])\\)"`.
+- omitted / `"none"` — compare the full response (current default).
+
+Matching is numeric-aware: `72`, `72.0`, `1,000` vs `1000`, and `50%` vs `50` all compare equal. The extracted value is recorded on each artifact as `extractedAnswer` for auditability.
+
+Example math task:
+
+```json
+{
+  "key": "math",
+  "taskType": "qa",
+  "promptTemplate": "Solve the problem. Show your reasoning, then state the final answer.\n\n{{input}}",
+  "answerExtraction": "last_number",
+  "maxNewTokens": 512,
+  "dataset": { "source": "inline", "items": [ { "input": "Natalia sold 48 clips in April and half as many in May. How many altogether?", "gold": "72" } ] }
 }
 ```
 
@@ -109,6 +136,28 @@ lmx eval run my-topic-judge-eval \
   --api-key bhk_... \
   --submit
 ```
+
+## Offline Pull, Run, and Deferred Submit
+
+To inspect a suite's dataset, run without a live site connection, or avoid losing a completed run if the site is temporarily unavailable, pull the suite once and run against the local copy.
+
+```bash
+# 1. Pull the suite + datasets (gold labels included) to a local directory.
+lmx eval pull my-topic-eval --api-key bhk_... --out localmaxxing-eval-my-topic-eval
+
+# 2. Run fully offline against the pulled copy — no site connection or API key needed.
+lmx eval run my-topic-eval \
+  --suite-file localmaxxing-eval-my-topic-eval/suite.json \
+  --model Qwen/Qwen3-8B --base-url http://localhost:8000 \
+  --hardware hardware.json --out run.json
+
+# 3. Submit the saved run later, once the site is reachable (no re-run needed).
+lmx eval submit run.json --model Qwen/Qwen3-8B --hardware hardware.json --api-key bhk_...
+```
+
+`eval pull` writes `suite.json` (datasets resolved to inline items so `eval run --suite-file` works offline), one `<taskKey>.jsonl` per task for inspection, and `manifest.json`. **The pulled files contain gold labels — do not publish them.**
+
+`eval submit` re-sends a run payload that `eval run --out` already wrote to disk, so a failed submit (e.g. site outage) never forces a GPU re-run. Pass `--model`/`--hardware` to fill fields an offline run omitted, and `--dry-run` to validate first.
 
 ## Agent Self-Correction
 

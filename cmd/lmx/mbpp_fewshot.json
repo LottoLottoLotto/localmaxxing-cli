@@ -1,0 +1,29 @@
+[
+  {
+    "text": "Write a function to find the minimum cost path to reach (m, n) from (0, 0) for the given cost matrix cost[][] and a position (m, n) in cost[][].",
+    "tests": [
+      "assert min_cost([[1, 2, 3], [4, 8, 2], [1, 5, 3]], 2, 2) == 8",
+      "assert min_cost([[2, 3, 4], [5, 9, 3], [2, 6, 4]], 2, 2) == 12",
+      "assert min_cost([[3, 4, 5], [6, 10, 4], [3, 7, 5]], 2, 2) == 16"
+    ],
+    "code": "R = 3\nC = 3\ndef min_cost(cost, m, n): \n\ttc = [[0 for x in range(C)] for x in range(R)] \n\ttc[0][0] = cost[0][0] \n\tfor i in range(1, m+1): \n\t\ttc[i][0] = tc[i-1][0] + cost[i][0] \n\tfor j in range(1, n+1): \n\t\ttc[0][j] = tc[0][j-1] + cost[0][j] \n\tfor i in range(1, m+1): \n\t\tfor j in range(1, n+1): \n\t\t\ttc[i][j] = min(tc[i-1][j-1], tc[i-1][j], tc[i][j-1]) + cost[i][j] \n\treturn tc[m][n]"
+  },
+  {
+    "text": "Write a function to find the similar elements from the given two tuple lists.",
+    "tests": [
+      "assert similar_elements((3, 4, 5, 6),(5, 7, 4, 10)) == (4, 5)",
+      "assert similar_elements((1, 2, 3, 4),(5, 4, 3, 7)) == (3, 4)",
+      "assert similar_elements((11, 12, 14, 13),(17, 15, 14, 13)) == (13, 14)"
+    ],
+    "code": "def similar_elements(test_tup1, test_tup2):\n  res = tuple(set(test_tup1) & set(test_tup2))\n  return (res) "
+  },
+  {
+    "text": "Write a python function to identify non-prime numbers.",
+    "tests": [
+      "assert is_not_prime(2) == False",
+      "assert is_not_prime(10) == True",
+      "assert is_not_prime(35) == True"
+    ],
+    "code": "import math\ndef is_not_prime(n):\n    result = False\n    for i in range(2,int(math.sqrt(n)) + 1):\n        if n % i == 0:\n            result = True\n    return result"
+  }
+]

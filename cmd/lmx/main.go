@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -144,6 +145,12 @@ func runWithArgs(args cliArgs) error {
 			return handleLmEval(positional(args, 2), args)
 		case "run":
 			return handleEvalRun(positional(args, 2), args)
+		case "pull":
+			return handleEvalPull(positional(args, 2), args)
+		case "submit":
+			return handleEvalSubmit(positional(args, 2), args)
+		case "shard":
+			return handleEvalShard(positional(args, 2), args)
 		}
 	}
 
@@ -1660,7 +1667,7 @@ func handleSuiteInit(args cliArgs) error {
 	if err := writeJSON(out, payload); err != nil {
 		return err
 	}
-	printInfo("suite_template_written", map[string]any{"path": out, "slug": slug, "runner": runner, "scoringMethod": scoring, "tasks": 1})
+	printInfo("suite_template_written", map[string]any{"path": out, "slug": slug, "runner": runner, "scoringMethod": stringValue(suiteDoc(payload)["scoringMethod"]), "tasks": len(evalTasks(suiteDoc(payload)))})
 	fmt.Println("Edit the suite, then run:")
 	fmt.Println("  lmx eval suite validate " + out)
 	fmt.Println("  lmx eval suite submit " + out + " --api-key bhk_...")
@@ -1686,6 +1693,10 @@ func buildSuiteTemplate(slug, name, category, runner, scoring string, args cliAr
 		base["suiteDoc"] = map[string]any{"version": "1.0", "runner": "custom", "scoringMethod": "exact_match", "higherIsBetter": true, "aggregation": "weighted_mean", "runConfig": map[string]any{"temperature": 0}, "tasks": []any{map[string]any{"key": "qa", "displayName": "Short-answer QA", "taskType": "qa", "weight": 1, "promptTemplate": "Answer the question with only the final answer.\n\nQuestion: {{input}}", "maxNewTokens": 64, "dataset": map[string]any{"source": "inline", "items": []any{map[string]any{"input": "What is 2 + 2?", "gold": "4"}}}}}}
 	case "judge":
 		base["suiteDoc"] = map[string]any{"version": "1.0", "runner": "custom", "scoringMethod": "llm_judge", "higherIsBetter": true, "aggregation": "weighted_mean", "runConfig": map[string]any{"temperature": 0.7}, "tasks": []any{map[string]any{"key": "judge_quality", "displayName": "Judge-scored response quality", "taskType": "judge", "weight": 1, "promptTemplate": "Write a concise answer to the following prompt.\n\n{{input}}", "maxNewTokens": 512, "dataset": map[string]any{"source": "inline", "items": []any{map[string]any{"input": "Explain why local inference benchmarks should include both speed and quality metrics.", "referenceAnswer": "A strong answer mentions that speed alone can hide regressions in reasoning, instruction following, or output quality.", "rubric": "Score 0 to 1. Reward clear explanation, mention of speed/quality tradeoffs, and relevance to local inference benchmarking."}}}}}}
+	case "loglikelihood":
+		base["suiteDoc"] = map[string]any{"version": "1.0", "runner": "custom", "scoringMethod": "loglikelihood", "higherIsBetter": true, "aggregation": "weighted_mean", "runConfig": map[string]any{"temperature": 0, "loglikelihoodTarget": "choice_text", "loglikelihoodNorm": "byte"}, "tasks": []any{map[string]any{"key": "loglikelihood", "displayName": "Multiple choice (loglikelihood)", "taskType": "multiple_choice", "weight": 1, "promptTemplate": "Question: {{input}}\nAnswer:", "dataset": map[string]any{"source": "inline", "items": []any{map[string]any{"input": "Which number is even?", "choices": []any{"3", "5", "8", "9"}, "gold": "C"}}}}}}
+	case "math":
+		base["suiteDoc"] = map[string]any{"version": "1.0", "runner": "custom", "scoringMethod": "exact_match", "higherIsBetter": true, "aggregation": "weighted_mean", "runConfig": map[string]any{"temperature": 0}, "tasks": []any{map[string]any{"key": "math", "displayName": "Numeric reasoning", "taskType": "qa", "weight": 1, "promptTemplate": "Solve the problem. Show your reasoning, then state the final answer.\n\n{{input}}", "answerExtraction": "last_number", "maxNewTokens": 512, "dataset": map[string]any{"source": "inline", "items": []any{map[string]any{"input": "Natalia sold 48 clips in April and half as many in May. How many clips did she sell altogether?", "gold": "72"}}}}}}
 	default:
 		base["suiteDoc"] = map[string]any{"version": "1.0", "runner": "custom", "scoringMethod": "exact_match", "higherIsBetter": true, "aggregation": "weighted_mean", "runConfig": map[string]any{"temperature": 0}, "tasks": []any{map[string]any{"key": "multiple_choice", "displayName": "Multiple choice questions", "taskType": "multiple_choice", "weight": 1, "promptTemplate": "Choose the correct answer. Reply with only A, B, C, or D.\n\n{{input}}\n\n{{choices}}", "maxNewTokens": 8, "dataset": map[string]any{"source": "inline", "items": []any{map[string]any{"input": "Which number is even?", "choices": []any{"3", "5", "8", "9"}, "gold": "C"}}}}}}
 	}
@@ -1733,7 +1744,7 @@ func validateSuite(value any) error {
 			errs = append(errs, "suiteDoc.runner must be "+expectedRunner)
 		}
 		scoring := stringValue(doc["scoringMethod"])
-		if !containsString([]string{"exact_match", "f1", "pass_at_k", "perplexity", "llm_judge"}, scoring) {
+		if !containsString([]string{"exact_match", "f1", "pass_at_k", "perplexity", "llm_judge", "loglikelihood"}, scoring) {
 			errs = append(errs, "suiteDoc.scoringMethod is invalid")
 		}
 		if scoring == "perplexity" {
@@ -1763,6 +1774,19 @@ func validateSuite(value any) error {
 			if runner == "CUSTOM" {
 				if stringValue(task["promptTemplate"]) == "" {
 					errs = append(errs, prefix+".promptTemplate is required for CUSTOM suites")
+				}
+				if ext := stringValue(task["answerExtraction"]); ext != "" {
+					if !containsString([]string{"none", "final_answer", "last_number", "regex"}, ext) {
+						errs = append(errs, prefix+".answerExtraction must be none, final_answer, last_number, or regex")
+					}
+					if ext == "regex" {
+						pattern := stringValue(task["answerRegex"])
+						if pattern == "" {
+							errs = append(errs, prefix+".answerRegex is required when answerExtraction is regex")
+						} else if _, err := regexp.Compile(pattern); err != nil {
+							errs = append(errs, prefix+".answerRegex is not a valid regular expression")
+						}
+					}
 				}
 				dataset := asObject(task["dataset"])
 				if dataset == nil {
@@ -5094,6 +5118,85 @@ func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, m
 	return resolution
 }
 
+func resolveEvalModelID(args cliArgs, declared string) (string, map[string]any) {
+	declared = strings.TrimSpace(declared)
+	if declared == "" || declared == "<required-before-submit>" {
+		return declared, nil
+	}
+	baseURL := opt(args, "base-url")
+	if baseURL != "" {
+		servedModel, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), declared))
+		if err == nil {
+			modelPath := ""
+			normalizedBaseURL := openAIBaseURL(baseURL)
+			if props, err := fetchEndpointJSON(normalizedBaseURL+"/props", opt(args, "model-api-key")); err == nil {
+				modelPath = stringValue(asObject(props)["model_path"])
+			}
+			if modelPath == "" {
+				modelPath = firstNonEmpty(stringValue(info["filename"]), stringValue(info["model_path"]), stringValue(info["path"]))
+			}
+			resolution := remoteModelResolution(args, servedModel, "v1_models", declared, modelPath)
+			if resolved := resolvedHFIDFromModelResolution(resolution); resolved != "" {
+				printStatus(args, "eval_hf_id_resolved", map[string]any{"declared": declared, "resolved": resolved, "servedModel": servedModel})
+				return resolved, resolution
+			}
+			if modelPath != "" {
+				if sourceRepo, err := sourceRepoFromFilename(args, nil, filepath.Base(modelPath)); err == nil && sourceRepo != "" {
+					resolution := map[string]any{
+						"hfId":              declared,
+						"servedModel":       servedModel,
+						"servedModelSource": "v1_models",
+						"loadedFilename":    filepath.Base(modelPath),
+						"sourceRepo":        sourceRepo,
+						"sourceRepoMatch":   "filename_derived",
+						"status":            "source_repo_detected",
+					}
+					printStatus(args, "eval_hf_id_resolved", map[string]any{"declared": declared, "resolved": sourceRepo, "servedModel": servedModel, "filename": filepath.Base(modelPath)})
+					return sourceRepo, resolution
+				}
+			}
+			if resolution != nil {
+				return declared, resolution
+			}
+		} else {
+			printStatus(args, "eval_model_detection_unavailable", map[string]any{"baseUrl": baseURL, "reason": err.Error()})
+		}
+	}
+	// If the user passed an endpoint alias (no org/name), search LocalMaxxing's
+	// model index and use the first candidate, matching benchmark UX.
+	if !strings.Contains(declared, "/") || genericModelAliases[strings.ToLower(declared)] {
+		query, _ := normalizedModelSearchQuery(declared)
+		value, err := searchModels(args, query, 5)
+		if err == nil {
+			candidates := modelCandidates(value, 5)
+			if len(candidates) > 0 {
+				resolved := candidateRepoID(candidates[0])
+				if resolved != "" {
+					resolution := map[string]any{"hfId": declared, "servedModel": declared, "searchQuery": query, "status": "search_candidate", "candidates": candidates}
+					printStatus(args, "eval_hf_id_resolved", map[string]any{"declared": declared, "resolved": resolved, "query": query})
+					return resolved, resolution
+				}
+			}
+		}
+	}
+	return declared, nil
+}
+
+func resolvedHFIDFromModelResolution(resolution map[string]any) string {
+	if resolution == nil {
+		return ""
+	}
+	if sourceRepo := stringValue(resolution["sourceRepo"]); sourceRepo != "" {
+		return sourceRepo
+	}
+	for _, candidate := range anySlice(resolution["candidates"]) {
+		if repo := candidateRepoID(candidate); repo != "" {
+			return repo
+		}
+	}
+	return ""
+}
+
 // remoteModelSearchQuery picks the HF search query for resolving the served
 // model: the served alias when it looks like a real model name, otherwise a
 // name derived from the GGUF filename the endpoint reports as loaded.
@@ -5214,10 +5317,10 @@ func sourceRepoFromFilename(args cliArgs, candidates []any, filename string) (st
 func filenameDerivedSourceRepos(filename string) []string {
 	name := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
 	lower := strings.ToLower(name)
-	if !strings.Contains(lower, "-qat-") {
-		return nil
-	}
 	if idx := strings.Index(lower, "-ud-"); idx > 0 {
+		return []string{"unsloth/" + name[:idx] + "-GGUF"}
+	}
+	if idx := strings.Index(lower, "-qat-"); idx > 0 {
 		return []string{"unsloth/" + name[:idx] + "-GGUF"}
 	}
 	return nil
@@ -6282,23 +6385,28 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
+	hfID, modelResolution := resolveEvalModelID(args, firstNonEmpty(opt(args, "model"), "<required-before-submit>"))
+	runConfig := map[string]any{"aggregatePreview": result["aggregate"]}
+	if modelResolution != nil {
+		runConfig["modelResolution"] = modelResolution
+	}
 	payload := map[string]any{
 		"suiteSlug":     suiteSlug,
-		"hfId":          firstNonEmpty(opt(args, "model"), "<required-before-submit>"),
+		"hfId":          hfID,
 		"quantization":  opt(args, "quantization"),
 		"executionMode": map[bool]string{true: "CUSTOM_LOCAL", false: "LM_EVAL_LOCAL"}[strings.EqualFold(runner, "CUSTOM")],
 		"judgeMode":     map[bool]string{true: "LOCAL_REPORTED", false: "NONE"}[strings.EqualFold(stringValue(doc["scoringMethod"]), "llm_judge")],
 		"runnerVersion": map[bool]string{true: "localmaxxing-go custom-local", false: "localmaxxing-go lm-eval-upload"}[strings.EqualFold(runner, "CUSTOM")],
 		"results":       result["scores"],
 		"artifacts":     redactGold(result["artifacts"]),
-		"runConfig":     map[string]any{"aggregatePreview": result["aggregate"]},
+		"runConfig":     runConfig,
 	}
 	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
 		hardware, err := readJSON(hardwarePath)
 		if err != nil {
 			return err
 		}
-		payload["hardware"] = hardware
+		payload["hardware"] = normalizeHardwarePayload(hardware)
 	}
 	out := firstNonEmpty(opt(args, "out"), "localmaxxing-eval-run.json")
 	if err := writeJSON(out, payload); err != nil {
@@ -6321,6 +6429,1255 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 	return nil
 }
 
+func handleEvalPull(suiteSlug string, args cliArgs) error {
+	if suiteSlug == "" {
+		return errors.New("eval pull requires a suite slug")
+	}
+	suite, err := loadSuiteForEvalRun(suiteSlug, args)
+	if err != nil {
+		return err
+	}
+	doc := suiteDoc(suite)
+	slug := firstNonEmpty(stringValue(suite["slug"]), suiteSlug)
+	outDir := firstNonEmpty(opt(args, "out"), "localmaxxing-eval-"+slug)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	resolvedTasks := []any{}
+	manifestTasks := []any{}
+	totalItems := 0
+	for _, task := range evalTasks(doc) {
+		dataset := asObject(task["dataset"])
+		if dataset == nil {
+			resolvedTasks = append(resolvedTasks, task)
+			manifestTasks = append(manifestTasks, map[string]any{"key": task["key"], "items": 0})
+			continue
+		}
+		items, err := loadEvalDataset(dataset)
+		if err != nil {
+			return cliError{"dataset_pull_failed", fmt.Sprintf("Failed to pull dataset for task %q: %v", stringValue(task["key"]), err), []string{
+				"Pass --api-key bhk_... so authenticated bucket datasets and gold labels are downloadable.",
+				"Bucket download URLs expire after 15 minutes; re-run eval pull if it times out.",
+			}, nil}
+		}
+		if len(items) > 0 {
+			var b strings.Builder
+			for _, it := range items {
+				line, _ := json.Marshal(it)
+				b.Write(line)
+				b.WriteByte('\n')
+			}
+			if err := os.WriteFile(filepath.Join(outDir, stringValue(task["key"])+".jsonl"), []byte(b.String()), 0o644); err != nil {
+				return err
+			}
+		}
+		itemsAny := make([]any, len(items))
+		for i := range items {
+			itemsAny[i] = items[i]
+		}
+		newTask := map[string]any{}
+		for k, v := range task {
+			newTask[k] = v
+		}
+		newTask["dataset"] = map[string]any{"source": "inline", "items": itemsAny}
+		resolvedTasks = append(resolvedTasks, newTask)
+		manifestTasks = append(manifestTasks, map[string]any{"key": task["key"], "items": len(items)})
+		totalItems += len(items)
+	}
+	offlineDoc := map[string]any{}
+	for k, v := range doc {
+		offlineDoc[k] = v
+	}
+	offlineDoc["tasks"] = resolvedTasks
+	offlineSuite := map[string]any{
+		"slug":        slug,
+		"name":        firstNonEmpty(stringValue(suite["name"]), slug),
+		"description": "Offline copy pulled from LocalMaxxing. Contains gold labels — do not publish.",
+		"category":    "offline",
+		"runner":      stringValue(suite["runner"]),
+		"version":     firstNonEmpty(stringValue(doc["version"]), "1.0"),
+		"suiteDoc":    offlineDoc,
+	}
+	if err := writeJSON(filepath.Join(outDir, "suite.json"), offlineSuite); err != nil {
+		return err
+	}
+	manifest := map[string]any{
+		"apiVersion":    "localmaxxing.evalPull.v1",
+		"slug":          slug,
+		"runner":        stringValue(suite["runner"]),
+		"scoringMethod": stringValue(doc["scoringMethod"]),
+		"pulledAt":      time.Now().UTC().Format(time.RFC3339),
+		"apiUrl":        apiURL(args),
+		"tasks":         manifestTasks,
+	}
+	if err := writeJSON(filepath.Join(outDir, "manifest.json"), manifest); err != nil {
+		return err
+	}
+	printInfo("eval_pulled", map[string]any{"suite": slug, "outDir": outDir, "tasks": len(resolvedTasks), "items": totalItems, "containsLabels": true})
+	fmt.Println("Gold labels are included in the .jsonl files and suite.json — do not publish them.")
+	fmt.Println("Run fully offline (no site connection or API key needed):")
+	fmt.Println("  lmx eval run " + slug + " --suite-file " + filepath.Join(outDir, "suite.json") + " --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --out run.json")
+	fmt.Println("Submit the saved run later, once the site is reachable:")
+	fmt.Println("  lmx eval submit run.json --model <hfId> --hardware hardware.json --api-key bhk_...")
+	return nil
+}
+
+func handleEvalSubmit(runFile string, args cliArgs) error {
+	if runFile == "" {
+		return errors.New("eval submit requires a saved run payload JSON path (written by eval run --out)")
+	}
+	value, err := readJSON(runFile)
+	if err != nil {
+		return err
+	}
+	payload := asObject(value)
+	if payload == nil {
+		return cliError{"invalid_run_payload", "Run payload must be a JSON object.", []string{"Pass a run payload written by eval run --out."}, value}
+	}
+	if stringValue(payload["suiteSlug"]) == "" {
+		return cliError{"invalid_run_payload", fmt.Sprintf("%q is missing suiteSlug", runFile), []string{"Pass a run payload written by eval run --out."}, nil}
+	}
+	if model := opt(args, "model"); model != "" {
+		payload["hfId"] = model
+	}
+	if hfID := stringValue(payload["hfId"]); hfID == "" || hfID == "<required-before-submit>" {
+		return cliError{"missing_model", "Run payload has no hfId; pass --model <HuggingFace model id>", []string{"Pass --model here, or re-run eval run with --model."}, nil}
+	}
+	resolvedHFID, modelResolution := resolveEvalModelID(args, stringValue(payload["hfId"]))
+	payload["hfId"] = resolvedHFID
+	if modelResolution != nil {
+		runConfig := asObject(payload["runConfig"])
+		if runConfig == nil {
+			runConfig = map[string]any{}
+		}
+		runConfig["modelResolution"] = modelResolution
+		payload["runConfig"] = runConfig
+	}
+	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
+		hardware, err := readJSON(hardwarePath)
+		if err != nil {
+			return err
+		}
+		payload["hardware"] = normalizeHardwarePayload(hardware)
+	}
+	if payload["hardware"] == nil {
+		return cliError{"missing_hardware", "Run payload has no hardware; pass --hardware hardware.json", []string{"Create a hardware JSON file matching /api/agent-context hardwareSchemas and pass --hardware."}, nil}
+	}
+	endpoint := "/api/evals/runs"
+	if hasFlag(args, "dry-run") {
+		endpoint = "/api/evals/runs/dry-run"
+	}
+	return submitPayload(endpoint, hasFlag(args, "dry-run"), "run", args, payload)
+}
+
+type runShardConfig struct {
+	maxTokens      int
+	temperature    float64
+	topP           float64
+	extraction     string
+	answerRegex    string
+	promptTemplate string
+	concurrency    int
+	apiKey         string
+	scoring        string
+	dataset        string
+	nSamples       int
+	passK          int
+	fewShot        int
+	tempExplicit   bool
+}
+
+type shardItemResult struct {
+	questionID         string
+	itemIndex          int
+	pass               bool
+	scored             bool
+	errText            string
+	question           string
+	prompt             string
+	promptHash         string
+	response           string
+	reasoning          string
+	predicted          string
+	gold               string
+	choices            []string
+	choiceScores       map[string]float64
+	scoreNormalization string
+	latencyMs          int64
+}
+
+type shardStats struct {
+	correct        int
+	scored         int
+	errors         int
+	totalLatencyMs int64
+}
+
+// defaultShardScoring selects the canonical local scorer for official shard
+// datasets. HellaSwag is conventionally scored by continuation likelihood, not
+// by asking chat models to emit A/B/C/D.
+func defaultShardScoring(dataset string) string {
+	d := strings.ToLower(dataset)
+	switch {
+	case d == "hellaswag":
+		return "loglikelihood"
+	case strings.HasPrefix(d, "humaneval") || strings.HasPrefix(d, "mbpp"):
+		return "code_execution"
+	default:
+		return "exact_match"
+	}
+}
+
+func normalizeShardScoring(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	switch value {
+	case "exact_match", "loglikelihood", "llama_cpp_loglikelihood", "code_execution":
+		return value, nil
+	default:
+		return "", cliError{"invalid_shard_scoring", fmt.Sprintf("Unsupported shard scoring mode %q.", value), []string{"Use exact_match for chat answer matching, loglikelihood for OpenAI echo-logprobs endpoints, llama_cpp_loglikelihood with --model-path for local GGUF scoring, or code_execution for HumanEval/MBPP."}, nil}
+	}
+}
+
+// handleEvalShard runs a blob-backed eval-shard dataset against a local
+// OpenAI-compatible endpoint, then prints a dry-run summary or submits
+// question_id/pass pairs to LocalMaxxing.
+func handleEvalShard(dataset string, args cliArgs) error {
+	if dataset == "" {
+		return errors.New("eval shard requires a dataset slug")
+	}
+	rawBaseURL, err := requireOpt(args, "base-url")
+	if err != nil {
+		return err
+	}
+	baseURL := openAIBaseURL(rawBaseURL)
+	submit := hasFlag(args, "submit")
+
+	requestedQuestions, err := intOption(args, 0, 1, "questions")
+	if err != nil {
+		return err
+	}
+	metaURL := apiURL(args) + "/api/evals/" + url.PathEscape(dataset) + "/shard"
+	query := url.Values{}
+	if shard := opt(args, "shard"); shard != "" {
+		query.Set("shard", shard)
+	}
+	if requestedQuestions > 0 {
+		query.Set("questions", strconv.Itoa(requestedQuestions))
+	}
+	if encoded := query.Encode(); encoded != "" {
+		metaURL += "?" + encoded
+	}
+	meta, err := fetchJSON("GET", metaURL, apiKey(args), nil)
+	if err != nil {
+		return err
+	}
+	metaObj := asObject(meta)
+	shardInfo := asObject(metaObj["shard"])
+	downloadURL := stringValue(metaObj["downloadUrl"])
+	if downloadURL == "" {
+		return cliError{"shard_unavailable", "Shard response did not include a download URL.", []string{"Confirm the dataset exists and is approved.", "Confirm eval storage is configured on the LocalMaxxing instance."}, meta}
+	}
+	shardIndex := int(numberField(shardInfo, "shardIndex"))
+	shardItemCount := int(numberField(shardInfo, "itemCount"))
+
+	count := requestedQuestions
+	if count == 0 {
+		sampling := asObject(metaObj["sampling"])
+		rec := asObject(sampling["recommendations"])
+		count = int(numberField(rec, "margin05"))
+		if count <= 0 {
+			count = shardItemCount
+		}
+	}
+	if shardItemCount > 0 && count > shardItemCount {
+		count = shardItemCount
+	}
+
+	items, err := fetchDatasetItems(downloadURL, "jsonl")
+	if err != nil {
+		return cliError{"shard_download_failed", fmt.Sprintf("Could not download shard JSONL: %v", err), []string{"Signed download URLs expire after 15 minutes; re-run the command.", "Check network access to the storage host."}, nil}
+	}
+	if count > len(items) {
+		count = len(items)
+	}
+	if count == 0 {
+		return cliError{"empty_shard", "The shard contained no questions to run.", nil, nil}
+	}
+	items = items[:count]
+
+	declaredModel := opt(args, "model")
+	servedModel := opt(args, "served-model")
+	var servedModelInfo map[string]any
+	if servedModel == "" {
+		if detected, info, derr := detectServedModel(baseURL, opt(args, "model-api-key"), declaredModel); derr == nil {
+			servedModel = detected
+			servedModelInfo = info
+		}
+	} else if _, info, derr := detectServedModel(baseURL, opt(args, "model-api-key"), servedModel); derr == nil {
+		servedModelInfo = info
+	}
+	callModel := firstNonEmpty(servedModel, declaredModel, "local")
+
+	// Pull the quantization from the endpoint exactly like `benchmark run`:
+	// filename-derived (llama.cpp /props model_path) > /v1/models metadata >
+	// --quantization, with the trusted value winning. This records the real quant
+	// without the user passing a flag; --quantization still acts as an override
+	// of last resort. Derive the GGUF container format from the model path too.
+	quantResolution := remoteQuantizationResolution(args, baseURL, opt(args, "model-api-key"), opt(args, "quantization"), servedModelInfo)
+	resolvedQuant := firstNonEmpty(stringValue(quantResolution["trusted"]), opt(args, "quantization"))
+	resolvedQuantFormat := opt(args, "quant-format")
+	if resolvedQuantFormat == "" && strings.EqualFold(filepath.Ext(stringValue(quantResolution["modelPath"])), ".gguf") {
+		resolvedQuantFormat = "gguf"
+	}
+
+	maxTokens, err := intOption(args, 0, 0, "max-tokens")
+	if err != nil {
+		return err
+	}
+	// Default 0 = submit every scored question so the server's whole-shard trace
+	// bundle is complete; the server samples its own Postgres preview rows.
+	artifactLimit, err := intOption(args, 0, 0, "artifact-limit")
+	if err != nil {
+		return err
+	}
+	concurrency, err := intOption(args, 1, 1, "concurrency")
+	if err != nil {
+		return err
+	}
+	defaultScoring := defaultShardScoring(dataset)
+	if strings.EqualFold(dataset, "hellaswag") && opt(args, "model-path") != "" {
+		defaultScoring = "llama_cpp_loglikelihood"
+	}
+	scoring, err := normalizeShardScoring(firstNonEmpty(opt(args, "scoring"), opt(args, "scoring-method"), defaultScoring))
+	if err != nil {
+		return err
+	}
+
+	nSamples, err := intOption(args, 1, 1, "n-samples")
+	if err != nil {
+		return err
+	}
+	passK, err := intOption(args, 1, 1, "k")
+	if err != nil {
+		return err
+	}
+	if passK > nSamples {
+		passK = nSamples
+	}
+	tempExplicit := opt(args, "temperature") != ""
+	// pass@k with sampling uses a non-zero temperature by convention; pass@1 stays
+	// greedy (temp 0) unless the user overrides --temperature.
+	temperature := floatOption(args, "temperature", 0)
+	if !tempExplicit && nSamples > 1 {
+		temperature = 0.8
+	}
+	fewShot, err := intOption(args, defaultFewShot(dataset), 0, "few-shot")
+	if err != nil {
+		return err
+	}
+	cfg := runShardConfig{
+		maxTokens:      maxTokens,
+		temperature:    temperature,
+		topP:           floatOption(args, "top-p", 1),
+		extraction:     opt(args, "answer-extraction"),
+		answerRegex:    opt(args, "answer-regex"),
+		promptTemplate: opt(args, "prompt-template"),
+		concurrency:    concurrency,
+		apiKey:         opt(args, "model-api-key"),
+		scoring:        scoring,
+		dataset:        dataset,
+		nSamples:       nSamples,
+		passK:          passK,
+		fewShot:        fewShot,
+		tempExplicit:   tempExplicit,
+	}
+
+	printInfo("eval_shard_start", map[string]any{"dataset": dataset, "shard": shardIndex, "questions": count, "model": callModel, "baseUrl": baseURL, "concurrency": concurrency, "scoring": scoring})
+
+	var results []shardItemResult
+	var stats shardStats
+	var codeMetrics map[string]any
+	if scoring == "llama_cpp_loglikelihood" {
+		results, stats, err = runEvalShardLlamaCpp(args, items)
+		if err != nil {
+			return err
+		}
+	} else if scoring == "code_execution" {
+		results, stats, codeMetrics, err = runEvalShardCodeExec(args, baseURL, callModel, items, cfg)
+		if err != nil {
+			return err
+		}
+		if len(codeMetrics) > 0 {
+			printInfo("eval_shard_passk", codeMetrics)
+		}
+	} else {
+		results, stats = runEvalShard(args, baseURL, callModel, items, cfg)
+	}
+	accuracy := 0.0
+	if stats.scored > 0 {
+		accuracy = float64(stats.correct) / float64(stats.scored)
+	}
+	avgLatency := int64(0)
+	if len(results) > 0 {
+		avgLatency = stats.totalLatencyMs / int64(len(results))
+	}
+	summary := map[string]any{"dataset": dataset, "shardIndex": shardIndex, "questions": count, "correct": stats.correct, "scored": stats.scored, "errors": stats.errors, "accuracyPct": roundMetric(accuracy * 100), "avgLatencyMs": avgLatency, "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "scoring": scoring}
+	for mk, mv := range codeMetrics {
+		summary[mk] = mv
+	}
+	submitResults := make([]any, 0, len(results))
+	for _, r := range results {
+		if !r.scored {
+			continue
+		}
+		submitResults = append(submitResults, map[string]any{"question_id": r.questionID, "pass": r.pass})
+	}
+
+	// Submit one artifact per scored question by default (artifactLimit 0) so the
+	// server can persist a complete whole-shard trace bundle; it caps the Postgres
+	// preview rows itself. A positive --artifact-limit keeps only a balanced
+	// sample (half passing, half failing). Send the full answer and reasoning.
+	toArtifact := func(r shardItemResult) map[string]any {
+		artifact := map[string]any{
+			"question_id":     r.questionID,
+			"itemIndex":       r.itemIndex,
+			"promptHash":      r.promptHash,
+			"question":        r.question,
+			"prompt":          r.prompt,
+			"response":        r.response,
+			"reasoning":       r.reasoning,
+			"extractedAnswer": r.predicted,
+			"gold":            r.gold,
+			"score":           boolScore(r.pass),
+			"testPassed":      r.pass,
+			"latencyMs":       r.latencyMs,
+		}
+		if len(r.choices) == 4 {
+			artifact["choices"] = r.choices
+		}
+		if len(r.choiceScores) > 0 {
+			artifact["choiceScores"] = r.choiceScores
+		}
+		if r.scoreNormalization != "" {
+			artifact["scoreNormalization"] = r.scoreNormalization
+		}
+		return artifact
+	}
+	passCap, failCap := -1, -1
+	if artifactLimit > 0 {
+		failCap = artifactLimit / 2
+		passCap = artifactLimit - failCap
+	}
+	submitArtifacts := make([]any, 0, len(results))
+	passCount, failCount := 0, 0
+	for _, r := range results {
+		if !r.scored {
+			continue
+		}
+		if r.pass {
+			if passCap >= 0 && passCount >= passCap {
+				continue
+			}
+			passCount++
+		} else {
+			if failCap >= 0 && failCount >= failCap {
+				continue
+			}
+			failCount++
+		}
+		submitArtifacts = append(submitArtifacts, toArtifact(r))
+	}
+
+	if out := opt(args, "out"); out != "" {
+		records := make([]any, len(results))
+		for i, r := range results {
+			records[i] = map[string]any{"question_id": r.questionID, "pass": r.pass, "scored": r.scored, "predicted": r.predicted, "gold": r.gold, "latencyMs": r.latencyMs, "error": r.errText, "question": r.question, "promptHash": r.promptHash, "prompt": r.prompt, "response": r.response, "reasoning": r.reasoning, "choices": r.choices, "choiceScores": r.choiceScores, "scoreNormalization": r.scoreNormalization}
+		}
+		if err := writeJSON(out, map[string]any{"summary": summary, "results": records}); err != nil {
+			return err
+		}
+		printStatus(args, "eval_shard_results_written", map[string]any{"path": out, "containsLabels": true})
+	}
+
+	if !submit {
+		printInfo("eval_shard_dry_run", summary)
+		fmt.Println("Dry run only — nothing submitted.")
+		fmt.Println("Publish with: lmx eval shard " + dataset + " --base-url " + rawBaseURL + " --model <hfId> --hardware hardware.json --submit")
+		return nil
+	}
+
+	key := apiKey(args)
+	if key == "" {
+		return missingAPIKey("--api-key or LMX_API_KEY is required for eval shard --submit")
+	}
+	if declaredModel == "" {
+		return cliError{"missing_model", "eval shard --submit requires --model <HuggingFace model id>", []string{"Pass --model org/name so the submission records a real model.", "Use lmx model search <name> to find the canonical id."}, nil}
+	}
+	hardwarePath := opt(args, "hardware")
+	if hardwarePath == "" {
+		return cliError{"missing_hardware", "eval shard --submit requires --hardware hardware.json", []string{"Run lmx hardware --out hardware.json and pass --hardware hardware.json."}, nil}
+	}
+	hardware, err := readJSON(hardwarePath)
+	if err != nil {
+		return err
+	}
+	if len(submitResults) == 0 {
+		return cliError{"no_scored_questions", "Every question failed to score, so there is nothing to submit.", []string{"Check that the endpoint is reachable and returns completions.", "Inspect failures with --out results.json."}, nil}
+	}
+	hfID, modelResolution := resolveEvalModelID(args, declaredModel)
+	runConfig := map[string]any{"accuracy": accuracy, "questionsRun": count, "errors": stats.errors, "avgLatencyMs": avgLatency, "answerExtraction": firstNonEmpty(cfg.extraction, "auto"), "artifactCount": len(submitArtifacts), "scoring": scoring}
+	if scoring == "loglikelihood" {
+		runConfig["answerExtraction"] = "none"
+		runConfig["loglikelihoodTarget"] = "choice_text"
+		runConfig["loglikelihoodNorm"] = "byte"
+	}
+	if modelResolution != nil {
+		runConfig["modelResolution"] = modelResolution
+	}
+	if quantResolution != nil {
+		runConfig["quantizationResolution"] = quantResolution
+	}
+	for mk, mv := range codeMetrics {
+		runConfig[mk] = mv
+	}
+	payload := map[string]any{
+		"hfId":          hfID,
+		"modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"),
+		"hardware":      normalizeHardwarePayload(hardware),
+		"shardIndex":    shardIndex,
+		"results":       submitResults,
+		"artifacts":     submitArtifacts,
+		"runnerVersion": firstNonEmpty(opt(args, "runner-version"), "localmaxxing-go eval-shard"),
+		"runConfig":     runConfig,
+	}
+	if resolvedQuant != "" {
+		payload["quantization"] = resolvedQuant
+	}
+	if resolvedQuantFormat != "" {
+		payload["quantFormat"] = resolvedQuantFormat
+	}
+	if notes := opt(args, "notes"); notes != "" {
+		payload["notes"] = notes
+	}
+	value, err := fetchJSON("POST", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/submit", key, payload)
+	if err != nil {
+		return err
+	}
+	if hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose") {
+		printJSON(value)
+	}
+	fields := map[string]any{"dataset": dataset, "shardIndex": shardIndex, "submitted": len(submitResults), "accuracyPct": summary["accuracyPct"]}
+	if obj := asObject(value); obj != nil {
+		if agg := asObject(obj["aggregate"]); agg != nil {
+			fields["pooledScore"] = agg["pooledScore"]
+			fields["ciLower"] = agg["ciLower"]
+			fields["ciUpper"] = agg["ciUpper"]
+			fields["coverage"] = agg["shardsCovered"]
+		}
+		if run := asObject(obj["run"]); run != nil {
+			fields["runId"] = run["id"]
+			fields["status"] = run["status"]
+		}
+	}
+	printInfo("eval_shard_submitted", fields)
+	return nil
+}
+
+func runEvalShard(args cliArgs, baseURL, model string, items []map[string]any, cfg runShardConfig) ([]shardItemResult, shardStats) {
+	results := make([]shardItemResult, len(items))
+	if cfg.concurrency < 1 {
+		cfg.concurrency = 1
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	completed := 0
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobs {
+			results[idx] = scoreShardItem(idx, items[idx], cfg, baseURL, model)
+			mu.Lock()
+			completed++
+			done := completed
+			mu.Unlock()
+			if done%25 == 0 || done == len(items) {
+				printStatus(args, "eval_shard_progress", map[string]any{"done": done, "total": len(items)})
+			}
+		}
+	}
+	for i := 0; i < cfg.concurrency; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	for i := range items {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	stats := shardStats{}
+	for _, r := range results {
+		stats.totalLatencyMs += r.latencyMs
+		if r.scored {
+			stats.scored++
+			if r.pass {
+				stats.correct++
+			}
+		} else {
+			stats.errors++
+		}
+	}
+	return results, stats
+}
+
+func runEvalShardLlamaCpp(args cliArgs, items []map[string]any) ([]shardItemResult, shardStats, error) {
+	modelPath := opt(args, "model-path")
+	if modelPath == "" {
+		return nil, shardStats{}, cliError{"missing_model_path", "llama_cpp_loglikelihood scoring requires --model-path <model.gguf>.", []string{"Pass the same GGUF used by your llama.cpp server.", "Or use --scoring loglikelihood with a /v1/completions endpoint that returns echoed prompt token logprobs."}, nil}
+	}
+	tmp, err := os.CreateTemp("", "lmx-hellaswag-*.jsonl")
+	if err != nil {
+		return nil, shardStats{}, err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	enc := json.NewEncoder(tmp)
+	for _, item := range items {
+		if err := enc.Encode(item); err != nil {
+			tmp.Close()
+			return nil, shardStats{}, err
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, shardStats{}, err
+	}
+
+	scorer := firstNonEmpty(opt(args, "llama-scorer"), opt(args, "scorer-bin"), bundledExecutable("lmx-llama-score-hellaswag"), "lmx-llama-score-hellaswag")
+	cmdArgs := []string{"--model", modelPath, "--input", tmpPath}
+	if v := opt(args, "context-length"); v != "" {
+		cmdArgs = append(cmdArgs, "--ctx-size", v)
+	}
+	if v := opt(args, "ctx-size"); v != "" {
+		cmdArgs = append(cmdArgs, "--ctx-size", v)
+	}
+	if v := opt(args, "batch-size"); v != "" {
+		cmdArgs = append(cmdArgs, "--batch-size", v)
+	}
+	if v := opt(args, "gpu-layers"); v != "" {
+		cmdArgs = append(cmdArgs, "--gpu-layers", v)
+	}
+	cmd := exec.Command(scorer, cmdArgs...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	started := time.Now()
+	if err := cmd.Run(); err != nil {
+		return nil, shardStats{}, cliError{"llama_scorer_failed", fmt.Sprintf("local llama.cpp scorer failed: %v", err), []string{strings.TrimSpace(stderr.String()), "Build dist/lmx-llama-score-hellaswag and pass --llama-scorer if it is not next to lmx."}, nil}
+	}
+	elapsed := time.Since(started).Milliseconds()
+	results := make([]shardItemResult, len(items))
+	scanner := bufio.NewScanner(bytes.NewReader(stdout.Bytes()))
+	idx := 0
+	for scanner.Scan() {
+		if idx >= len(items) {
+			break
+		}
+		var row struct {
+			QuestionID         string             `json:"question_id"`
+			ItemIndex          int                `json:"itemIndex"`
+			Predicted          string             `json:"predicted"`
+			Gold               string             `json:"gold"`
+			Pass               bool               `json:"pass"`
+			Choices            []string           `json:"choices"`
+			Scores             map[string]float64 `json:"scores"`
+			ScoreNormalization string             `json:"scoreNormalization"`
+			Error              string             `json:"error"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
+			return nil, shardStats{}, err
+		}
+		item := items[idx]
+		scoreText := ""
+		if len(row.Scores) > 0 {
+			scoreText = fmt.Sprintf("A %.6f | B %.6f | C %.6f | D %.6f", row.Scores["A"], row.Scores["B"], row.Scores["C"], row.Scores["D"])
+		}
+		results[idx] = shardItemResult{
+			questionID:         firstNonEmpty(row.QuestionID, firstNonEmpty(stringValue(item["question_id"]), stringValue(item["questionId"]), stringValue(item["id"]))),
+			itemIndex:          idx,
+			pass:               row.Pass,
+			scored:             row.Error == "",
+			predicted:          row.Predicted,
+			gold:               row.Gold,
+			response:           row.Predicted,
+			reasoning:          "llama.cpp continuation loglikelihood scores: " + scoreText,
+			prompt:             strings.TrimSpace(fmt.Sprint(item["input"])),
+			promptHash:         sha256Hex(strings.TrimSpace(fmt.Sprint(item["input"]))),
+			question:           renderEvalQuestion(item),
+			choices:            append([]string(nil), row.Choices...),
+			choiceScores:       row.Scores,
+			scoreNormalization: row.ScoreNormalization,
+			latencyMs:          0,
+			errText:            row.Error,
+		}
+		idx++
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, shardStats{}, err
+	}
+	if idx != len(items) {
+		return nil, shardStats{}, cliError{"llama_scorer_incomplete", fmt.Sprintf("local scorer returned %d rows for %d items", idx, len(items)), nil, nil}
+	}
+	stats := shardStats{}
+	if len(results) > 0 {
+		per := elapsed / int64(len(results))
+		for i := range results {
+			results[i].latencyMs = per
+		}
+	}
+	for _, r := range results {
+		if r.scored {
+			stats.scored++
+			if r.pass {
+				stats.correct++
+			}
+		} else {
+			stats.errors++
+		}
+		stats.totalLatencyMs += r.latencyMs
+	}
+	printStatus(args, "eval_shard_progress", map[string]any{"done": len(items), "total": len(items)})
+	return results, stats, nil
+}
+
+func bundledExecutable(name string) string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	candidates := []string{
+		filepath.Join(filepath.Dir(exe), name),
+		filepath.Join(filepath.Dir(exe), "dist", name),
+	}
+	for _, candidate := range candidates {
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+var codeBlockRe = regexp.MustCompile("(?s)```(?:python|py)?[ \\t]*\\r?\\n(.*?)```")
+
+type codeGeneration struct {
+	prompt    string
+	response  string
+	code      string
+	program   string
+	latencyMs int64
+	errText   string
+}
+
+// extractGeneratedCode pulls runnable Python out of a chat completion: prefer the
+// first fenced code block, fall back to the raw text, and if the entry point is
+// not defined treat the output as a body continuation of the prompt stub.
+func extractGeneratedCode(response, prompt, entryPoint string) string {
+	code := response
+	if m := codeBlockRe.FindStringSubmatch(response); m != nil {
+		code = m[1]
+	}
+	code = strings.TrimRight(code, " \t\r\n")
+	if entryPoint != "" {
+		defRe := regexp.MustCompile("(?m)^[ \\t]*def[ \\t]+" + regexp.QuoteMeta(entryPoint) + "[ \\t]*\\(")
+		if !defRe.MatchString(code) {
+			return strings.TrimRight(prompt, "\n") + "\n" + code
+		}
+	}
+	return code
+}
+
+// promptImportPreamble returns import lines present in the prompt stub but absent
+// from the model's code, so canonical HumanEval programs do not false-fail when a
+// model omits an import (e.g. `from typing import List`) that the stub provided.
+func promptImportPreamble(prompt, solution string) string {
+	var lines []string
+	for _, raw := range strings.Split(prompt, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "from ") {
+			if !strings.Contains(solution, line) {
+				lines = append(lines, line)
+			}
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// buildCodeProgram assembles a self-contained Python program: solution + hidden
+// tests + an invocation that raises on failure (HumanEval `check(entry)`, or the
+// raw test block otherwise).
+func buildCodeProgram(item map[string]any, solution string) string {
+	test := stringValue(item["test"])
+	entry := stringValue(item["entry_point"])
+	var b strings.Builder
+	if entry != "" {
+		// HumanEval-style: keep the stub's imports, matching the canonical
+		// `prompt + completion + test` program assembly.
+		b.WriteString(promptImportPreamble(stringValue(item["input"]), solution))
+	}
+	b.WriteString(solution)
+	b.WriteString("\n\n")
+	b.WriteString(test)
+	if entry != "" && strings.Contains(test, "def check(") {
+		b.WriteString("\n\ncheck(")
+		b.WriteString(entry)
+		b.WriteString(")\n")
+	}
+	return b.String()
+}
+
+// sandboxCommand builds the process that runs the code sandbox. By default it
+// launches the hardened Docker image over stdin/stdout; --sandbox-cmd overrides
+// it entirely (e.g. podman, or `python3 sandbox/run_sandbox.py` without Docker).
+func sandboxCommand(args cliArgs) (*exec.Cmd, string) {
+	if custom := opt(args, "sandbox-cmd"); custom != "" {
+		return exec.Command("sh", "-c", custom), custom
+	}
+	runtime := firstNonEmpty(opt(args, "sandbox-runtime"), "docker")
+	image := firstNonEmpty(opt(args, "sandbox-image"), "lmx-sandbox")
+	argv := []string{
+		runtime, "run", "--rm", "-i",
+		"--network", "none",
+		"--memory", firstNonEmpty(opt(args, "sandbox-memory"), "2g"),
+		"--cpus", firstNonEmpty(opt(args, "sandbox-cpus"), "2"),
+		"--pids-limit", "128",
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges",
+		"--read-only",
+		"--tmpfs", "/tmp:exec,size=128m",
+		image,
+	}
+	return exec.Command(argv[0], argv[1:]...), strings.Join(argv, " ")
+}
+
+//go:embed mbpp_fewshot.json
+var mbppFewShotJSON []byte
+
+func defaultFewShot(dataset string) int {
+	if isMbppFamily(dataset) {
+		return 3
+	}
+	return 0
+}
+
+// mbppFewShotPreamble renders the canonical MBPP n-shot prefix (task text + tests
+// + reference solution) used by standard MBPP harnesses.
+func mbppFewShotPreamble(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	var examples []struct {
+		Text  string   `json:"text"`
+		Tests []string `json:"tests"`
+		Code  string   `json:"code"`
+	}
+	if err := json.Unmarshal(mbppFewShotJSON, &examples); err != nil || len(examples) == 0 {
+		return ""
+	}
+	if n > len(examples) {
+		n = len(examples)
+	}
+	var b strings.Builder
+	b.WriteString("Here are examples of Python tasks and correct solutions.\n\n")
+	for i := 0; i < n; i++ {
+		ex := examples[i]
+		b.WriteString(ex.Text)
+		b.WriteString("\nYour code should pass these tests:\n")
+		b.WriteString(strings.Join(ex.Tests, "\n"))
+		b.WriteString("\n```python\n")
+		b.WriteString(strings.TrimRight(ex.Code, "\n"))
+		b.WriteString("\n```\n\n")
+	}
+	return b.String()
+}
+
+// passAtK is the unbiased pass@k estimator from the Codex paper: given n samples
+// of which c pass, the probability that k random samples contain a passing one.
+func passAtK(n, c, k int) float64 {
+	if k > n {
+		k = n
+	}
+	if n-c < k {
+		return 1.0
+	}
+	prod := 1.0
+	for i := n - c + 1; i <= n; i++ {
+		prod *= 1.0 - float64(k)/float64(i)
+	}
+	return 1.0 - prod
+}
+
+func isMbppFamily(dataset string) bool {
+	return strings.HasPrefix(strings.ToLower(dataset), "mbpp")
+}
+
+// codePrompt builds the generation prompt for a code item: MBPP-family uses the
+// canonical few-shot prefix; HumanEval-family uses an instruct completion prompt.
+func codePrompt(cfg runShardConfig, item map[string]any) string {
+	if cfg.promptTemplate != "" {
+		return renderEvalPrompt(cfg.promptTemplate, item)
+	}
+	input := stringValue(item["input"])
+	if isMbppFamily(cfg.dataset) && cfg.fewShot > 0 {
+		return mbppFewShotPreamble(cfg.fewShot) + "Now complete this task. Reply with only the implementation in a single ```python code block and no prose.\n\n" + input
+	}
+	return "Complete the following Python function. Reply with the complete implementation in a single ```python code block and no prose.\n\n" + input
+}
+
+// runEvalShardCodeExec runs an execution-based code eval shard (HumanEval/MBPP and
+// their EvalPlus variants): generate n solution samples per item against the model
+// endpoint, grade each by running solution+tests in the sandbox, then record the
+// submitted greedy/first-sample pass@1 plus a pass@k estimate over all samples.
+func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[string]any, cfg runShardConfig) ([]shardItemResult, shardStats, map[string]any, error) {
+	n := cfg.nSamples
+	if n < 1 {
+		n = 1
+	}
+	k := cfg.passK
+	if k < 1 {
+		k = 1
+	}
+	if k > n {
+		k = n
+	}
+	if cfg.concurrency < 1 {
+		cfg.concurrency = 1
+	}
+
+	type cell struct {
+		prompt    string
+		code      string
+		program   string
+		errText   string
+		latencyMs int64
+	}
+	grid := make([][]cell, len(items))
+	for i := range grid {
+		grid[i] = make([]cell, n)
+	}
+
+	type job struct{ i, s int }
+	jobs := make(chan job)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	completed := 0
+	total := len(items) * n
+	worker := func() {
+		defer wg.Done()
+		for jb := range jobs {
+			item := items[jb.i]
+			prompt := codePrompt(cfg, item)
+			entry := stringValue(item["entry_point"])
+			start := time.Now()
+			var content string
+			var err error
+			for attempt := 0; attempt < 3; attempt++ {
+				content, _, err = callOpenAIChatDetailed(baseURL, model, prompt, cfg.apiKey, cfg.maxTokens, cfg.temperature, cfg.topP, nil)
+				if err == nil {
+					break
+				}
+			}
+			c := cell{prompt: prompt, latencyMs: time.Since(start).Milliseconds()}
+			if err != nil {
+				c.errText = err.Error()
+			} else {
+				c.code = extractGeneratedCode(content, stringValue(item["input"]), entry)
+				c.program = buildCodeProgram(item, c.code)
+			}
+			grid[jb.i][jb.s] = c
+			mu.Lock()
+			completed++
+			done := completed
+			mu.Unlock()
+			if done%25 == 0 || done == total {
+				printStatus(args, "eval_shard_progress", map[string]any{"done": done, "total": total, "phase": "generate"})
+			}
+		}
+	}
+	for w := 0; w < cfg.concurrency; w++ {
+		wg.Add(1)
+		go worker()
+	}
+	for i := range items {
+		for s := 0; s < n; s++ {
+			jobs <- job{i, s}
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	// Safety valve: if most first-sample generations failed the endpoint is likely
+	// down, so abort rather than submit an all-fail run.
+	genFailures := 0
+	for i := range items {
+		if grid[i][0].errText != "" {
+			genFailures++
+		}
+	}
+	if len(items) > 0 && genFailures > len(items)/2 {
+		return nil, shardStats{}, nil, cliError{"generation_failures", fmt.Sprintf("%d/%d generations failed; aborting before grading", genFailures, len(items)), []string{"Check the model endpoint (--base-url) is reachable and healthy."}, nil}
+	}
+
+	qids := make([]string, len(items))
+	for i, item := range items {
+		qids[i] = firstNonEmpty(stringValue(item["question_id"]), stringValue(item["questionId"]), stringValue(item["id"]))
+	}
+	key := func(i, s int) string { return fmt.Sprintf("%s#%d", qids[i], s) }
+
+	// Build the sandbox batch: one task per (item, sample) with a runnable program.
+	var batch strings.Builder
+	enc := json.NewEncoder(&batch)
+	programs := 0
+	for i := range items {
+		for s := 0; s < n; s++ {
+			c := grid[i][s]
+			if c.errText != "" || c.program == "" {
+				continue
+			}
+			if err := enc.Encode(map[string]any{"question_id": key(i, s), "program": c.program}); err != nil {
+				return nil, shardStats{}, nil, err
+			}
+			programs++
+		}
+	}
+
+	type sandboxResult struct {
+		QuestionID string `json:"question_id"`
+		Passed     bool   `json:"passed"`
+		ReturnCode int    `json:"returncode"`
+		TimedOut   bool   `json:"timed_out"`
+		Stderr     string `json:"stderr"`
+		DurationMs int64  `json:"duration_ms"`
+	}
+	byKey := map[string]sandboxResult{}
+	if programs > 0 {
+		cmd, snippet := sandboxCommand(args)
+		printStatus(args, "eval_shard_sandbox", map[string]any{"command": snippet, "programs": programs, "nSamples": n})
+		cmd.Stdin = strings.NewReader(batch.String())
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return nil, shardStats{}, nil, cliError{"sandbox_failed", fmt.Sprintf("code sandbox failed: %v", err), []string{strings.TrimSpace(stderr.String()), "Build the image with `docker build -t lmx-sandbox sandbox`, or override with --sandbox-cmd."}, nil}
+		}
+		scanner := bufio.NewScanner(bytes.NewReader(stdout.Bytes()))
+		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var sr sandboxResult
+			if err := json.Unmarshal([]byte(line), &sr); err != nil {
+				return nil, shardStats{}, nil, fmt.Errorf("parse sandbox result: %w", err)
+			}
+			byKey[sr.QuestionID] = sr
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, shardStats{}, nil, err
+		}
+	}
+
+	results := make([]shardItemResult, len(items))
+	stats := shardStats{}
+	passAtKSum, passAt1Sum := 0.0, 0.0
+	for i, item := range items {
+		passedSamples := 0
+		for s := 0; s < n; s++ {
+			c := grid[i][s]
+			if c.errText != "" || c.program == "" {
+				continue
+			}
+			if sr, ok := byKey[key(i, s)]; ok && sr.Passed {
+				passedSamples++
+			}
+		}
+		first := grid[i][0]
+		firstPass := false
+		summary := ""
+		switch {
+		case first.errText != "":
+			summary = "generation failed: " + first.errText
+		case first.program == "":
+			summary = "no runnable code extracted from model response"
+		default:
+			if sr, ok := byKey[key(i, 0)]; ok {
+				firstPass = sr.Passed
+				summary = fmt.Sprintf("sandbox: passed=%v returncode=%d timed_out=%v", sr.Passed, sr.ReturnCode, sr.TimedOut)
+				if sr.Stderr != "" {
+					summary += "\n" + sr.Stderr
+				}
+			} else {
+				summary = "sandbox returned no result"
+			}
+		}
+		pk := passAtK(n, passedSamples, k)
+		passAtKSum += pk
+		passAt1Sum += float64(passedSamples) / float64(n)
+		latency := first.latencyMs
+		if sr, ok := byKey[key(i, 0)]; ok {
+			latency += sr.DurationMs
+		}
+		reasoning := summary
+		if n > 1 {
+			reasoning = fmt.Sprintf("pass@%d=%.3f (%d/%d samples passed)\n%s", k, pk, passedSamples, n, summary)
+		}
+		results[i] = shardItemResult{
+			questionID: qids[i],
+			itemIndex:  i,
+			question:   renderEvalQuestion(item),
+			prompt:     first.prompt,
+			promptHash: sha256Hex(first.prompt),
+			response:   first.code,
+			reasoning:  reasoning,
+			predicted:  boolPassLabel(firstPass),
+			gold:       "pass",
+			scored:     true,
+			pass:       firstPass,
+			latencyMs:  latency,
+		}
+		stats.scored++
+		if firstPass {
+			stats.correct++
+		}
+		stats.totalLatencyMs += latency
+	}
+	metrics := map[string]any{"nSamples": n, "k": k, "temperature": cfg.temperature}
+	if len(items) > 0 {
+		metrics["passAtK"] = passAtKSum / float64(len(items))
+		metrics["passAt1"] = passAt1Sum / float64(len(items))
+	}
+	if cfg.fewShot > 0 && isMbppFamily(cfg.dataset) {
+		metrics["fewShot"] = cfg.fewShot
+	}
+	return results, stats, metrics, nil
+}
+
+func boolPassLabel(pass bool) string {
+	if pass {
+		return "pass"
+	}
+	return "fail"
+}
+
+// scoreShardItem renders/scores one eval-shard row. HellaSwag-style multiple
+// choice can use loglikelihood continuation ranking; otherwise choices are
+// scored by generated letter matching and numeric QA by extracted final answer.
+func scoreShardItem(itemIndex int, item map[string]any, cfg runShardConfig, baseURL, model string) shardItemResult {
+	qid := firstNonEmpty(stringValue(item["question_id"]), stringValue(item["questionId"]), stringValue(item["id"]))
+	res := shardItemResult{questionID: qid, itemIndex: itemIndex, question: renderEvalQuestion(item)}
+	if qid == "" {
+		res.errText = "row is missing question_id"
+		return res
+	}
+	if item["gold"] == nil {
+		res.errText = "row is missing gold answer for local scoring"
+		return res
+	}
+	gold := strings.TrimSpace(fmt.Sprint(item["gold"]))
+	choices := stringChoices(item["choices"])
+	template := cfg.promptTemplate
+	if template == "" {
+		if len(choices) > 0 {
+			template = "Answer the question. Reply with only the letter of the correct choice.\n\n{{input}}\n\n{{choices}}"
+		} else {
+			template = "Solve the problem. Show your reasoning step by step, then end your reply with a line in the form 'Final answer: <number>'.\n\n{{input}}"
+		}
+	}
+	prompt := renderEvalPrompt(template, item)
+	res.prompt = prompt
+	res.promptHash = sha256Hex(prompt)
+	if cfg.scoring == "loglikelihood" {
+		contextText := strings.TrimSpace(fmt.Sprint(item["input"]))
+		if cfg.promptTemplate != "" {
+			contextText = renderEvalPrompt(cfg.promptTemplate, item)
+		}
+		res.prompt = contextText
+		res.promptHash = sha256Hex(contextText)
+		started := time.Now()
+		score, predicted, goldLabel, err := scoreLoglikelihoodItem(baseURL, model, cfg.apiKey, map[string]any{
+			"runConfig": map[string]any{"loglikelihoodTarget": "choice_text", "loglikelihoodNorm": "byte"},
+		}, item, contextText)
+		res.latencyMs = time.Since(started).Milliseconds()
+		if err != nil {
+			res.errText = err.Error()
+			return res
+		}
+		res.scored = true
+		res.predicted = predicted
+		res.gold = goldLabel
+		res.pass = score >= 1
+		res.response = predicted
+		return res
+	}
+	started := time.Now()
+	content, reasoning, err := callOpenAIChatDetailed(baseURL, model, prompt, cfg.apiKey, cfg.maxTokens, cfg.temperature, cfg.topP, nil)
+	res.latencyMs = time.Since(started).Milliseconds()
+	if err != nil {
+		res.errText = err.Error()
+		return res
+	}
+	// Score and display the answer (message.content); keep the reasoning trace
+	// separately. If the server only returned reasoning, treat it as the answer.
+	response := content
+	if response == "" {
+		response = reasoning
+		reasoning = ""
+	}
+	res.response = response
+	res.reasoning = reasoning
+	res.scored = true
+	if len(choices) > 0 {
+		predicted := normalizeChoice(response, choices)
+		goldLabel := normalizeChoice(gold, choices)
+		res.predicted = predicted
+		res.gold = goldLabel
+		res.pass = predicted != "" && predicted == goldLabel
+		return res
+	}
+	extraction := cfg.extraction
+	if extraction == "" {
+		extraction = "final_answer"
+	}
+	candidate := response
+	if extraction != "none" {
+		candidate = extractAnswer(response, extraction, cfg.answerRegex)
+	}
+	res.predicted = candidate
+	res.gold = gold
+	res.pass = answersMatch(candidate, gold)
+	return res
+}
+
+func boolScore(ok bool) float64 {
+	if ok {
+		return 1
+	}
+	return 0
+}
+
+func floatOption(args cliArgs, key string, fallback float64) float64 {
+	if v := opt(args, key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return fallback
+}
+
 func loadSuiteForEvalRun(suiteSlug string, args cliArgs) (map[string]any, error) {
 	if path := opt(args, "suite-file"); path != "" {
 		value, err := readJSON(path)
@@ -6338,6 +7695,9 @@ func loadSuiteForEvalRun(suiteSlug string, args cliArgs) (map[string]any, error)
 		bundle, err := fetchJSON("GET", apiURL(args)+"/api/evals/suites/"+url.PathEscape(suiteSlug)+"/run-bundle", key, nil)
 		if err == nil {
 			return suiteFromRunBundle(bundle, suiteSlug)
+		}
+		if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "403") {
+			return nil, cliError{"run_bundle_auth_failed", "Could not download the authenticated eval run bundle for " + suiteSlug + ".", []string{"Bucket-backed eval datasets include gold labels and require a valid --api-key.", "Check that the API key is valid for this LocalMaxxing instance.", "If you only want public metadata, use eval suite show instead of eval run/pull."}, err.Error()}
 		}
 		printStatus(args, "run_bundle_unavailable", map[string]any{"suite": suiteSlug, "reason": err.Error()})
 	}
@@ -6430,6 +7790,19 @@ func applyRunBundleDownloadURLs(suite map[string]any, bundle map[string]any) {
 	if doc == nil {
 		return
 	}
+	// The run-bundle exposes per-task bucket/url download access under bundle["tasks"].
+	bundleTaskURL := map[string]string{}
+	for _, item := range anySlice(bundle["tasks"]) {
+		bt := asObject(item)
+		if bt == nil {
+			continue
+		}
+		if ds := asObject(bt["dataset"]); ds != nil {
+			if u := firstDatasetDownloadURL(ds); u != "" {
+				bundleTaskURL[stringValue(bt["key"])] = u
+			}
+		}
+	}
 	candidates := []any{bundle["downloadUrls"], bundle["datasetDownloadUrls"], bundle["datasets"]}
 	tasks := anySlice(doc["tasks"])
 	for i, item := range tasks {
@@ -6441,12 +7814,12 @@ func applyRunBundleDownloadURLs(suite map[string]any, bundle map[string]any) {
 		if dataset != nil && firstDatasetDownloadURL(dataset) != "" {
 			continue
 		}
-		urlText := ""
+		urlText := bundleTaskURL[stringValue(task["key"])]
 		for _, candidate := range candidates {
-			urlText = downloadURLForTask(candidate, task, i, len(tasks))
 			if urlText != "" {
 				break
 			}
+			urlText = downloadURLForTask(candidate, task, i, len(tasks))
 		}
 		if urlText == "" {
 			continue
@@ -6454,9 +7827,19 @@ func applyRunBundleDownloadURLs(suite map[string]any, bundle map[string]any) {
 		if dataset == nil {
 			dataset = map[string]any{}
 		}
-		dataset["source"] = "url"
-		dataset["url"] = urlText
 		dataset["downloadUrl"] = urlText
+		if stringValue(dataset["url"]) == "" {
+			dataset["url"] = urlText
+		}
+		if stringValue(dataset["source"]) == "" {
+			dataset["source"] = "url"
+		}
+		// Preserve the bucket object's declared format so JSONL parses deterministically.
+		if sr := asObject(dataset["storageRef"]); sr != nil {
+			if f := stringValue(sr["format"]); f != "" && stringValue(dataset["format"]) == "" {
+				dataset["format"] = f
+			}
+		}
 		task["dataset"] = dataset
 	}
 }
@@ -6613,6 +7996,8 @@ func lmEvalMetricCandidates(scoring string) []string {
 		return []string{"score,none", "score", "acc,none", "acc"}
 	case "perplexity":
 		return []string{"word_perplexity,none", "perplexity,none", "ppl,none", "word_perplexity", "perplexity", "ppl"}
+	case "loglikelihood":
+		return []string{"acc_norm,none", "acc,none", "acc_norm", "acc"}
 	default:
 		return []string{"acc_norm,none", "acc,none", "exact_match,none", "exact,none", "em,none", "pass_at_1,none", "pass@1,none", "inst_level_strict_acc,none", "prompt_level_strict_acc,none", "acc_norm", "acc", "exact_match", "exact", "em", "pass_at_1", "pass@1", "inst_level_strict_acc", "prompt_level_strict_acc"}
 	}
@@ -6680,6 +8065,21 @@ func runCustomLocalEval(suite map[string]any, args cliArgs) (map[string]any, err
 			prompt := renderEvalPrompt(stringValue(task["promptTemplate"]), item)
 			started := time.Now()
 			artifact := map[string]any{"taskKey": stringValue(task["key"]), "itemIndex": i, "promptHash": sha256Hex(prompt), "question": renderEvalQuestion(item), "prompt": prompt}
+			if scoring == "loglikelihood" {
+				score, predicted, gold, err := scoreLoglikelihoodItem(baseURL, model, opt(args, "model-api-key"), doc, item, prompt)
+				if err == nil {
+					artifact["response"] = fmt.Sprintf("argmax=%s gold=%s", predicted, gold)
+					artifact["score"] = score
+					totalScore += score
+				} else {
+					failures++
+					artifact["error"] = err.Error()
+				}
+				counted++
+				artifact["latencyMs"] = time.Since(started).Milliseconds()
+				artifacts = append(artifacts, artifact)
+				continue
+			}
 			response, err := callOpenAIChat(baseURL, model, prompt, opt(args, "model-api-key"), int(firstNonZero(int(numberField(task, "maxNewTokens")), 256)), evalTemperature(doc), evalTopP(doc), stringSlice(task["stopSequences"]))
 			if err == nil {
 				artifact["response"] = response
@@ -6712,7 +8112,8 @@ func loadEvalDataset(dataset map[string]any) ([]map[string]any, error) {
 	if dataset == nil {
 		return nil, errors.New("dataset missing")
 	}
-	if stringValue(dataset["source"]) == "inline" {
+	source := stringValue(dataset["source"])
+	if source == "inline" {
 		items := []map[string]any{}
 		for _, item := range anySlice(dataset["items"]) {
 			if obj := asObject(item); obj != nil {
@@ -6724,7 +8125,10 @@ func loadEvalDataset(dataset map[string]any) ([]map[string]any, error) {
 	if urlText := firstNonEmpty(firstDatasetDownloadURL(dataset), stringValue(dataset["url"])); urlText != "" {
 		return fetchDatasetItems(urlText, stringValue(dataset["format"]))
 	}
-	if stringValue(dataset["source"]) == "huggingface" {
+	if source == "bucket" {
+		return nil, cliError{"bucket_dataset_requires_run_bundle", "Bucket-backed eval dataset is missing a signed download URL.", []string{"Run with --api-key so the CLI can fetch the authenticated run-bundle.", "Use lmx eval pull <suiteSlug> --api-key ... to cache the dataset before running offline.", "Gold-label datasets are not available from the public suite metadata."}, nil}
+	}
+	if source == "huggingface" {
 		hfPath := stringValue(dataset["hfPath"])
 		if hfPath == "" {
 			return nil, errors.New("huggingface dataset missing hfPath")
@@ -6746,7 +8150,32 @@ func loadEvalDataset(dataset map[string]any) ([]map[string]any, error) {
 		}
 		return items, nil
 	}
-	return nil, fmt.Errorf("unknown dataset source %q", stringValue(dataset["source"]))
+	return nil, fmt.Errorf("unknown dataset source %q", source)
+}
+
+func normalizeHardwarePayload(value any) any {
+	hw := asObject(value)
+	if hw == nil {
+		return value
+	}
+	if gpuName := firstNonEmpty(stringValue(hw["gpuName"]), stringValue(hw["gpuModel"]), stringValue(hw["gpu"])); gpuName != "" {
+		hw["gpuName"] = gpuName
+	}
+	if slots := anySlice(hw["gpus"]); len(slots) > 0 {
+		for _, slotValue := range slots {
+			slot := asObject(slotValue)
+			if slot == nil {
+				continue
+			}
+			if gpuName := firstNonEmpty(stringValue(slot["gpuName"]), stringValue(slot["name"]), stringValue(slot["gpuModel"]), stringValue(slot["gpu"])); gpuName != "" {
+				slot["gpuName"] = gpuName
+			}
+			delete(slot, "name")
+			delete(slot, "gpuModel")
+			delete(slot, "gpu")
+		}
+	}
+	return hw
 }
 
 func fetchDatasetItems(urlText, format string) ([]map[string]any, error) {
@@ -6816,7 +8245,22 @@ func renderEvalQuestion(item map[string]any) string {
 }
 
 func callOpenAIChat(baseURL, model, prompt, apiKey string, maxTokens int, temperature, topP float64, stop []string) (string, error) {
-	body := map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": prompt}}, "max_tokens": maxTokens, "temperature": temperature, "top_p": topP}
+	content, reasoning, err := callOpenAIChatDetailed(baseURL, model, prompt, apiKey, maxTokens, temperature, topP, stop)
+	if err != nil {
+		return "", err
+	}
+	return firstNonEmpty(content, reasoning), nil
+}
+
+// callOpenAIChatDetailed returns the answer (message.content) and any separate
+// reasoning trace (message.reasoning_content) a thinking-model server provides,
+// so callers can store/score the answer and the reasoning independently.
+func callOpenAIChatDetailed(baseURL, model, prompt, apiKey string, maxTokens int, temperature, topP float64, stop []string) (content, reasoning string, err error) {
+	body := map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": prompt}}, "temperature": temperature, "top_p": topP}
+	// max_tokens <= 0 means "no cap": omit it so the model can finish its reasoning.
+	if maxTokens > 0 {
+		body["max_tokens"] = maxTokens
+	}
 	if len(stop) > 0 {
 		body["stop"] = stop
 	}
@@ -6825,7 +8269,7 @@ func callOpenAIChat(baseURL, model, prompt, apiKey string, maxTokens int, temper
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "POST", openAIBaseURL(baseURL)+"/v1/chat/completions", bytes.NewReader(data))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
@@ -6833,18 +8277,24 @@ func callOpenAIChat(baseURL, model, prompt, apiKey string, maxTokens int, temper
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		text, _ := io.ReadAll(res.Body)
-		return "", fmt.Errorf("OpenAI-compatible server returned %s: %s", res.Status, strings.TrimSpace(string(text)))
+		return "", "", fmt.Errorf("OpenAI-compatible server returned %s: %s", res.Status, strings.TrimSpace(string(text)))
 	}
 	var response map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return strings.TrimSpace(nonStreamingContent(response)), nil
+	if choices, _ := response["choices"].([]any); len(choices) > 0 {
+		if message := asObject(asObject(choices[0])["message"]); message != nil {
+			content = strings.TrimSpace(stringValue(message["content"]))
+			reasoning = strings.TrimSpace(stringValue(message["reasoning_content"]))
+		}
+	}
+	return content, reasoning, nil
 }
 
 func scoreCustomEvalItem(scoring string, task, item map[string]any, response, prompt string, artifact map[string]any, judgeBaseURL, judgeModel, judgeAPIKey string) (float64, map[string]any, error) {
@@ -6860,7 +8310,12 @@ func scoreCustomEvalItem(scoring string, task, item map[string]any, response, pr
 			}
 			return 0, artifact, nil
 		}
-		if normalizeEvalText(response) == normalizeEvalText(fmt.Sprint(gold)) {
+		candidate := response
+		if mode := stringValue(task["answerExtraction"]); mode != "" && mode != "none" {
+			candidate = extractAnswer(response, mode, stringValue(task["answerRegex"]))
+			artifact["extractedAnswer"] = candidate
+		}
+		if answersMatch(candidate, fmt.Sprint(gold)) {
 			return 1, artifact, nil
 		}
 		return 0, artifact, nil
@@ -6878,6 +8333,133 @@ func scoreCustomEvalItem(scoring string, task, item map[string]any, response, pr
 	default:
 		return 0, artifact, fmt.Errorf("CLI custom evals do not support scoringMethod %q yet", scoring)
 	}
+}
+
+// scoreLoglikelihoodItem ranks each multiple-choice answer by the model's
+// forced-continuation log-probability (lm-eval style) instead of parsing
+// generated text. Returns the 0/1 score plus the predicted and gold labels.
+func scoreLoglikelihoodItem(baseURL, model, apiKey string, doc, item map[string]any, contextText string) (float64, string, string, error) {
+	choices := stringChoices(item["choices"])
+	if len(choices) == 0 {
+		return 0, "", "", errors.New("loglikelihood items require choices")
+	}
+	if item["gold"] == nil {
+		return 0, "", "", errors.New("item is missing gold answer for loglikelihood scoring")
+	}
+	goldLabel := normalizeChoice(fmt.Sprint(item["gold"]), choices)
+	runConfig := asObject(doc["runConfig"])
+	mode := firstNonEmpty(stringValue(runConfig["loglikelihoodTarget"]), "choice_text")
+	norm := firstNonEmpty(stringValue(runConfig["loglikelihoodNorm"]), "byte")
+	continuations := make([]string, len(choices))
+	for i, choice := range choices {
+		if mode == "letter" {
+			continuations[i] = " " + choiceLabel(i)
+		} else {
+			// Leading space keeps the context/continuation split on a natural token boundary.
+			continuations[i] = " " + strings.TrimSpace(choice)
+		}
+	}
+	sums, byteLens, err := scoreContinuationsLogprob(baseURL, model, apiKey, contextText, continuations)
+	if err != nil {
+		return 0, "", "", err
+	}
+	bestIdx := 0
+	bestScore := math.Inf(-1)
+	for i := range sums {
+		s := sums[i]
+		if norm == "byte" {
+			denom := float64(byteLens[i])
+			if denom < 1 {
+				denom = 1
+			}
+			s = s / denom
+		}
+		if s > bestScore {
+			bestScore = s
+			bestIdx = i
+		}
+	}
+	predicted := choiceLabel(bestIdx)
+	if predicted == goldLabel {
+		return 1, predicted, goldLabel, nil
+	}
+	return 0, predicted, goldLabel, nil
+}
+
+// scoreContinuationsLogprob scores every continuation for one context in a single
+// /v1/completions request using echo+logprobs (no text generated). Returns the
+// summed continuation logprob and continuation byte length per choice.
+func scoreContinuationsLogprob(baseURL, model, apiKey, contextText string, continuations []string) ([]float64, []int, error) {
+	prompts := make([]string, len(continuations))
+	for i, c := range continuations {
+		prompts[i] = contextText + c
+	}
+	body := map[string]any{"model": model, "prompt": prompts, "max_tokens": 0, "echo": true, "logprobs": 1, "temperature": 0}
+	data, _ := json.Marshal(body)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultEndpointTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", openAIBaseURL(baseURL)+"/v1/completions", bytes.NewReader(data))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		text, _ := io.ReadAll(res.Body)
+		return nil, nil, cliError{"model_server_error", fmt.Sprintf("completions logprob request returned %s: %s", res.Status, strings.TrimSpace(string(text))), []string{
+			"loglikelihood scoring needs POST /v1/completions with echo:true + prompt token logprobs (vLLM/SGLang-style OpenAI compatibility).",
+			"Chat-only servers, and llama.cpp OpenAI-compatible completions that only return generated-token probabilities, cannot run canonical loglikelihood scoring; use a logprob-capable server or override with --scoring exact_match for debugging.",
+		}, nil}
+	}
+	var response struct {
+		Choices []struct {
+			Index    int `json:"index"`
+			Logprobs struct {
+				TokenLogprobs []*float64 `json:"token_logprobs"`
+				TextOffset    []int      `json:"text_offset"`
+			} `json:"logprobs"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		return nil, nil, err
+	}
+	if len(response.Choices) != len(prompts) {
+		return nil, nil, cliError{"logprobs_unavailable", fmt.Sprintf("expected %d logprob results, got %d", len(prompts), len(response.Choices)), []string{"Confirm the endpoint echoes logprobs for batched prompts."}, nil}
+	}
+	sums := make([]float64, len(prompts))
+	byteLens := make([]int, len(prompts))
+	contextLen := len(contextText)
+	for _, choice := range response.Choices {
+		idx := choice.Index
+		if idx < 0 || idx >= len(prompts) {
+			return nil, nil, cliError{"logprobs_unavailable", "completion choice index out of range", nil, nil}
+		}
+		offsets := choice.Logprobs.TextOffset
+		logprobs := choice.Logprobs.TokenLogprobs
+		if len(offsets) == 0 || len(offsets) != len(logprobs) {
+			return nil, nil, cliError{"logprobs_unavailable", "server did not return aligned echo prompt logprobs", []string{"Confirm the endpoint returns token_logprobs and text_offset for echoed prompt tokens on /v1/completions.", "llama.cpp OpenAI compatibility may expose only generated-token probabilities; use vLLM/SGLang or another echo-logprobs endpoint for canonical HellaSwag."}, nil}
+		}
+		sum := 0.0
+		for t := range offsets {
+			if offsets[t] < contextLen {
+				continue
+			}
+			if logprobs[t] == nil {
+				continue
+			}
+			sum += *logprobs[t]
+		}
+		sums[idx] = sum
+		byteLens[idx] = len(continuations[idx])
+	}
+	return sums, byteLens, nil
 }
 
 func judgeEvalResponse(baseURL, model, apiKey string, task, item map[string]any, prompt, response string) (float64, string, error) {
@@ -7022,6 +8604,112 @@ func normalizeEvalText(value string) string {
 	return strings.TrimSpace(re.ReplaceAllString(lower, ""))
 }
 
+var numberAnswerPattern = regexp.MustCompile(`-?\$?\d[\d,]*(?:\.\d+)?%?`)
+var finalAnswerMarkerPattern = regexp.MustCompile(`(?i)(?:####|final answer|the answer is|answer is|answer)\s*[:=]?\s*`)
+var equationResultPattern = regexp.MustCompile(`=\s*(-?\$?\d[\d,]*(?:\.\d+)?%?)`)
+var boldSegmentPattern = regexp.MustCompile(`\*\*([^*]*\d[^*]*)\*\*`)
+
+// extractFinalAnswer pulls the most likely final answer out of chain-of-thought
+// math output, in priority order:
+//  1. number after an explicit marker ("####", "Final answer:", "the answer is", ...)
+//  2. number after the last "= " (the result of the final computation)
+//  3. the last bolded number that is not a heading (headings contain ":")
+//  4. the last number anywhere (fallback)
+//
+// This survives truncated responses (no marker) and ignores noise like step
+// headers ("**Step 4: ...**") and trailing quantities ("... for the 2 shirts.").
+func extractFinalAnswer(response string) string {
+	if locs := finalAnswerMarkerPattern.FindAllStringIndex(response, -1); len(locs) > 0 {
+		tail := response[locs[len(locs)-1][1]:]
+		if num := numberAnswerPattern.FindString(tail); num != "" {
+			return num
+		}
+	}
+	if eqs := equationResultPattern.FindAllStringSubmatch(response, -1); len(eqs) > 0 {
+		return eqs[len(eqs)-1][1]
+	}
+	if bolds := boldSegmentPattern.FindAllStringSubmatch(response, -1); len(bolds) > 0 {
+		for i := len(bolds) - 1; i >= 0; i-- {
+			if strings.Contains(bolds[i][1], ":") {
+				continue
+			}
+			if num := numberAnswerPattern.FindString(bolds[i][1]); num != "" {
+				return num
+			}
+		}
+	}
+	matches := numberAnswerPattern.FindAllString(response, -1)
+	if len(matches) == 0 {
+		return response
+	}
+	return matches[len(matches)-1]
+}
+
+// extractAnswer pulls a final answer out of a (possibly chain-of-thought) response.
+//   - "final_answer": number after an answer marker / last bolded number, else last number.
+//   - "last_number": the last number-like token (handles $, commas, decimals, %, sign).
+//   - "regex": the last match of answerRegex (capture group 1 if present, else whole match).
+//
+// On no match or a bad pattern it falls back to the raw response so scoring still runs.
+func extractAnswer(response, mode, pattern string) string {
+	switch mode {
+	case "final_answer":
+		return extractFinalAnswer(response)
+	case "last_number":
+		matches := numberAnswerPattern.FindAllString(response, -1)
+		if len(matches) == 0 {
+			return response
+		}
+		return matches[len(matches)-1]
+	case "regex":
+		if pattern == "" {
+			return response
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return response
+		}
+		matches := re.FindAllStringSubmatch(response, -1)
+		if len(matches) == 0 {
+			return response
+		}
+		last := matches[len(matches)-1]
+		if len(last) > 1 {
+			return last[1]
+		}
+		return last[0]
+	default:
+		return response
+	}
+}
+
+// normalizeNumericAnswer strips currency/grouping/percent formatting so "$1,234.0"
+// and "1234" compare equal.
+func normalizeNumericAnswer(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.NewReplacer("$", "", ",", "", "%", "", " ", "").Replace(value)
+	return strings.TrimSuffix(value, ".")
+}
+
+// answersMatch compares an extracted answer to gold: exact normalized-text equality,
+// formatting-insensitive equality, or numeric equality (so 18 == 18.0).
+func answersMatch(pred, gold string) bool {
+	if normalizeEvalText(pred) == normalizeEvalText(gold) {
+		return true
+	}
+	pn := normalizeNumericAnswer(pred)
+	gn := normalizeNumericAnswer(gold)
+	if pn != "" && pn == gn {
+		return true
+	}
+	pf, perr := strconv.ParseFloat(pn, 64)
+	gf, gerr := strconv.ParseFloat(gn, 64)
+	if perr == nil && gerr == nil {
+		return math.Abs(pf-gf) < 1e-9
+	}
+	return false
+}
+
 func tokenF1(pred, gold string) float64 {
 	predTokens := strings.Fields(normalizeEvalText(pred))
 	goldTokens := strings.Fields(normalizeEvalText(gold))
@@ -7128,12 +8816,18 @@ func submitPayload(endpoint string, dryRun bool, label string, args cliArgs, pay
 	if err != nil {
 		return err
 	}
-	printJSON(value)
+	printFullResponse := label != "run" || hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose")
+	if printFullResponse {
+		printJSON(value)
+	}
 	status := label + "_submitted"
 	if dryRun {
 		status = label + "_dry_run_valid"
 	}
 	fields := map[string]any{"endpoint": endpoint, "status": map[bool]string{true: "valid", false: "submitted"}[dryRun]}
+	if label == "run" {
+		addEvalRunReceiptFields(fields, value)
+	}
 	if receipt := receiptURL(value); receipt != "" {
 		fields["url"] = receipt
 	}
@@ -7147,6 +8841,44 @@ func submitPayload(endpoint string, dryRun bool, label string, args cliArgs, pay
 		}
 	}
 	return nil
+}
+
+func addEvalRunReceiptFields(fields map[string]any, value any) {
+	obj := asObject(value)
+	if obj == nil {
+		return
+	}
+	parsed := asObject(obj["parsed"])
+	source := obj
+	if parsed != nil {
+		source = parsed
+	}
+	for _, key := range []string{"id", "scoreAggregate", "status"} {
+		if source[key] != nil {
+			fields[key] = source[key]
+		}
+	}
+	if suite := asObject(source["suite"]); suite != nil {
+		fields["suite"] = firstNonEmpty(stringValue(suite["slug"]), stringValue(suite["name"]))
+	} else if slug := stringValue(source["suiteSlug"]); slug != "" {
+		fields["suite"] = slug
+	}
+	if model := asObject(source["model"]); model != nil {
+		fields["model"] = firstNonEmpty(stringValue(model["hfId"]), stringValue(model["displayName"]))
+	} else if hfID := stringValue(source["hfId"]); hfID != "" {
+		fields["model"] = hfID
+	}
+	count := asObject(source["_count"])
+	if count == nil {
+		count = asObject(obj["_count"])
+	}
+	if count != nil && count["artifacts"] != nil {
+		fields["artifacts"] = count["artifacts"]
+		return
+	}
+	if artifacts := anySlice(source["artifacts"]); len(artifacts) > 0 {
+		fields["artifacts"] = len(artifacts)
+	}
 }
 
 func printNextSteps(kind, out string) {
@@ -7408,6 +9140,9 @@ var usageExamples = []string{
 	`lmx eval suite validate my-eval.json`,
 	`lmx eval suite submit my-eval.json --api-key bhk_...`,
 	`lmx eval execute <suiteSlug> --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --submit`,
+	`lmx eval shard gsm8k --base-url http://localhost:8000 --questions 200 --dry-run`,
+	`lmx eval shard hellaswag --base-url http://localhost:8000 --questions 200 --dry-run`,
+	`lmx eval shard gsm8k --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
 	`lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`,
 	`lmx benchmark fixup runs/Model/run.json`,
 	`lmx hardware template --gpu-name "RTX 3090" --gpu-count 2 --vram-gb 24 --cpu "Ryzen 9 9950X" --ram-gb 96 --os Linux`,
@@ -7424,12 +9159,24 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --model-args <args>      lm-eval --model_args value
   --num-fewshot <n>        lm-eval --num_fewshot override
   --lm-eval-bin <path>     lm-eval executable (default: lm_eval)
+  --questions <n>          Eval-shard questions to run (default: 95%/±5% CI recommendation)
+  --shard <index>          Pin a specific eval-shard index instead of the least-run one
+  --answer-extraction <m>  Eval-shard answer extraction: none, final_answer, last_number, or regex (default: final_answer)
+  --answer-regex <re>      Regex used when --answer-extraction regex
+  --prompt-template <t>    Eval-shard prompt template using {{input}} and {{choices}}
+  --concurrency <n>        Eval-shard parallel requests (default: 1)
+  --artifact-limit <n>     Shard traces to submit (default: 0 = all, for a complete whole-shard bundle; >0 keeps a balanced pass/fail sample)
+  --scoring <mode>          Eval-shard scoring: exact_match, loglikelihood, llama_cpp_loglikelihood, code_execution (hellaswag defaults to loglikelihood; humaneval/mbpp default to code_execution)
+  --temperature <f>        Sampling temperature for eval-shard runs (default: 0)
+  --top-p <f>              Sampling top_p for eval-shard runs (default: 1)
+  --quant-format <label>   Quantization container format for eval-shard submit (auto-detected as "gguf" from the model path; override if needed)
+  --model-revision <rev>   Model revision for eval-shard submit (default: main)
   --base-url <url>         OpenAI-compatible model endpoint; accepts host or host/v1
   --mode <mode>            Benchmark mode: remote endpoint or local host command
   --served-model <name>    Model name served by the OpenAI-compatible endpoint
   --model-api-key <key>    Optional bearer token for remote endpoint benchmarking
   --prompt <text>          Prompt for remote endpoint benchmark
-  --max-tokens <n>         Max generated tokens for remote endpoint benchmark
+  --max-tokens <n>         Max generated tokens (eval shard default: 0 = no cap, let the model finish)
   --endpoint-timeout-seconds <n> Timeout for remote endpoint benchmark (default: 600)
   --warmup <n>             Untimed warmup requests before remote endpoint measurement (default: 1)
   --iterations <n>         Timed remote endpoint measurement iterations; median is reported (default: 3)
@@ -7439,6 +9186,15 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --host <addr>            Local model server host for generated server commands
   --port <n>               Local model server port for generated server/benchmark commands
   --model-path <path>      llama.cpp model path; generates llama-bench command
+  --llama-scorer <path>     Local helper binary for llama_cpp_loglikelihood scoring (default: lmx-llama-score-hellaswag next to lmx)
+  --sandbox-image <name>    Docker image for code_execution scoring (default: lmx-sandbox; build with: docker build -t lmx-sandbox sandbox)
+  --sandbox-runtime <bin>   Container runtime for code_execution (default: docker)
+  --sandbox-cmd <cmd>       Override the sandbox launcher entirely (e.g. podman, or "python3 sandbox/run_sandbox.py" without Docker)
+  --sandbox-memory <size>   Memory cap for the code sandbox container (default: 2g)
+  --sandbox-cpus <n>        CPU cap for the code sandbox container (default: 2)
+  --n-samples <n>           Samples per question for code evals (default: 1 greedy; >1 enables pass@k sampling)
+  --k <n>                   k for pass@k over --n-samples (default: 1)
+  --few-shot <n>            Few-shot examples for MBPP-family code evals (default: 3 for mbpp*, 0 otherwise)
   --depth <n>              llama-bench -d depth for benchmark run; KV sweeps use --levels
   --batch-size <n>         llama-bench -b batch size
   --micro-batch-size <n>   llama-bench -ub micro-batch size
@@ -7476,7 +9232,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --json-status            Emit progress events as JSON lines on stderr
   --quiet                  Suppress progress events
   --hardware <path>        JSON hardware object required when submitting
-  --quantization <label>   Quantization label
+  --quantization <label>   Quantization label (auto-detected from the endpoint for remote benchmark and eval-shard runs when omitted)
   --results <path>         Existing lm-eval output JSON for run upload
   --kind <kind>            Storage upload kind, usually artifact or dataset
   --format <format>        Storage file format, e.g. json, jsonl, parquet, zip
@@ -7508,14 +9264,18 @@ var commandDescriptions = map[string]string{
 	"benchmark fixup":        "Inspect a saved run and print remediation commands.",
 	"hardware":               "Detect local hardware metadata.",
 	"hardware template":      "Generate hardware metadata from explicit flags.",
-	"setups":                "List and pull your saved hardware/engine setups.",
-	"setups list":           "List saved setups stored in your LocalMaxxing account.",
-	"setups pull":           "Write a hardware.json from a saved setup.",
+	"setups":                 "List and pull your saved hardware/engine setups.",
+	"setups list":            "List saved setups stored in your LocalMaxxing account.",
+	"setups pull":            "Write a hardware.json from a saved setup.",
 	"model":                  "Search or resolve HuggingFace model IDs.",
 	"model search":           "Search LocalMaxxing model records.",
 	"model resolve-remote":   "Resolve a remote endpoint alias to likely HF candidates.",
 	"eval":                   "Discover, run, and submit evaluation suites.",
 	"eval suite":             "List, inspect, initialize, and submit eval suites.",
+	"eval run":               "Run an approved suite locally and write/submit a run payload.",
+	"eval pull":              "Download a suite + datasets for offline runs and inspection.",
+	"eval submit":            "Submit a previously saved run payload (deferred submit).",
+	"eval shard":             "Run a blob-backed eval-shard dataset against a local endpoint and submit pass/fail.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",
 	"auth":                   "Manage LocalMaxxing API authentication.",

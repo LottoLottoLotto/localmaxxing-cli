@@ -196,6 +196,112 @@ lmx eval execute local-reasoning-mini \
 
 Use `eval run` for localhost/private endpoints. Use `eval execute` when LocalMaxxing should call a public endpoint and score server-side.
 
+Multiple-choice suites can also be scored by forced-continuation log-probability (lm-eval style) with `scoringMethod: loglikelihood`. This ranks each choice by the model's logprob of emitting it, instead of parsing generated text, and needs a `/v1/completions` endpoint exposing `echo`+`logprobs` (vLLM, SGLang, llama.cpp server).
+
+For numeric word-problem suites (GSM8K-style **one-offs** you author to avoid leaked public benchmarks), scaffold with `lmx eval suite init --kind math`. The model reasons step by step and the runner extracts the final answer from the chain-of-thought (`answerExtraction: last_number`) before scoring `exact_match`, with numeric-aware matching (`72` == `72.0`, `1,000` == `1000`). No answer-only prompting required.
+
+### Offline pull, run, and deferred submit
+
+Pull a suite (including datasets and gold labels) once, then run offline and submit later — useful for inspecting data, air-gapped runs, or so a site outage never costs you a completed run:
+
+```bash
+lmx eval pull local-reasoning-mini --api-key bhk_... --out localmaxxing-eval-local-reasoning-mini
+lmx eval run local-reasoning-mini \
+  --suite-file localmaxxing-eval-local-reasoning-mini/suite.json \
+  --model Qwen/Qwen3-8B --base-url http://localhost:8000 \
+  --hardware hardware.json --out run.json
+lmx eval submit run.json --model Qwen/Qwen3-8B --hardware hardware.json --api-key bhk_...
+```
+
+`eval run --suite-file` needs only the local model endpoint — no LocalMaxxing connection. The pulled files contain gold labels; do not publish them.
+
+### Run A Blob-Backed Eval Shard (GSM8K, MMLU, …)
+
+Official datasets like `gsm8k`, `mmlu`, and `hellaswag` are stored as
+deterministic JSONL shards in object storage and scored by pooled pass/fail with
+a Wilson confidence interval (no suite registration needed). The `eval shard` command
+fetches a shard, runs the first N questions against your local endpoint, scores
+them locally (gold answers travel inside the shard), and submits the
+`question_id`/`pass` pairs plus a per-question trace for every scored question.
+The server pools the pass/fail counts and stores the traces as one whole-shard
+JSONL bundle (downloadable from the run), keeping only a small preview sample in
+its database. Use `--artifact-limit <n>` to submit only a balanced pass/fail
+sample instead of the full set.
+
+Scoring mode is dataset-aware: HellaSwag uses canonical continuation
+loglikelihood. With a logprob-capable OpenAI endpoint, the CLI uses
+`--scoring loglikelihood` (`/v1/completions` with echoed prompt token logprobs).
+With llama.cpp GGUF files, pass `--model-path model.gguf`; the CLI switches to
+`llama_cpp_loglikelihood` and calls the bundled local scorer
+(`lmx-llama-score-hellaswag`) so no server echo-logprobs are required.
+GSM8K-style short-answer datasets default to `exact_match` with answer
+extraction. Use `--scoring exact_match` only for debugging chat-letter prompts on
+multiple-choice shards.
+
+HumanEval and MBPP are **execution-based** code evals (`scoring: code_execution`,
+the default for those datasets). The CLI generates a solution per problem, then
+runs `solution + hidden tests` inside a hardened sandbox and records pass/fail.
+Build the sandbox image once:
+
+```bash
+docker build -t lmx-sandbox sandbox
+```
+
+The container runs with `--network none`, a read-only root filesystem, dropped
+capabilities, `no-new-privileges`, and CPU/memory/PID/time limits; the harness
+adds per-task CPU/RAM/wall limits as defense in depth. Override the launcher with
+`--sandbox-runtime podman`, `--sandbox-image <name>`, `--sandbox-memory`,
+`--sandbox-cpus`, or replace it entirely with `--sandbox-cmd` (e.g.
+`--sandbox-cmd "python3 sandbox/run_sandbox.py"` for hosts without Docker — note
+that bypasses container isolation and should only be used on disposable boxes).
+
+Scoring follows canonical pass@1: HumanEval programs keep the prompt stub's
+imports (so a dropped `import` is not a false fail), and a generation that errors
+(after retries) or yields no runnable code is counted as a fail rather than
+dropped, so the denominator stays at the number of questions run. If most
+generations fail, the run aborts instead of submitting an all-fail result.
+
+EvalPlus variants `humaneval-plus` and `mbpp-plus` use the extended EvalPlus test
+suites (the sandbox image bundles numpy for them). MBPP-family datasets default to
+canonical 3-shot prompting (`--few-shot N` to change). For pass@k, pass
+`--n-samples N` (sampling temperature defaults to 0.8 when N>1) and `--k K`; the
+CLI reports `passAtK`/`passAt1` and submits the greedy/first-sample pass@1 per
+question (matching the modern EvalPlus greedy-pass@1 leaderboard).
+
+Start a local OpenAI-compatible server, then dry-run first:
+
+```bash
+lmx eval shard gsm8k \
+  --base-url http://localhost:8000 \
+  --questions 200 \
+  --concurrency 4 \
+  --dry-run
+```
+
+The command auto-detects the served model id, prints accuracy, and (with `--out`)
+writes per-question predictions for inspection. With no `--questions`, it defaults
+to the dataset's recommended sample size for a 95% / ±5% confidence interval.
+
+When the dry-run looks right, submit with a real model id, an API key, and
+hardware metadata:
+
+```bash
+lmx eval shard gsm8k \
+  --base-url http://localhost:8000 \
+  --model Qwen/Qwen3-8B \
+  --hardware hardware.json \
+  --questions 200 \
+  --submit
+```
+
+Scoring is automatic per row: rows with `choices` are scored as multiple choice
+(letter match); otherwise the final answer is extracted (default
+`--answer-extraction last_number`) and compared numerically, so GSM8K-style
+chain-of-thought output scores correctly without answer-only prompting. Override
+with `--prompt-template`, `--answer-extraction none|last_number|regex`, and
+`--answer-regex`. Submitting repeatedly with different shards or question counts
+grows unique-question coverage; the pooled score dedupes by `question_id`.
+
 ## 8. Upload Large Artifacts
 
 Small artifacts can be included inline by eval runs. Large traces should be uploaded as an artifact bundle:
