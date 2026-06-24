@@ -7032,6 +7032,20 @@ func runEvalShard(args cliArgs, baseURL, model string, items []map[string]any, c
 	return results, stats
 }
 
+func llamaScorerGPULayers(args cliArgs) string {
+	if v := opt(args, "gpu-layers"); v != "" {
+		return v
+	}
+	// The local HellaSwag scorer loads the GGUF directly; it does not reuse the
+	// llama.cpp server process behind --base-url. When a server is already running,
+	// default the scorer to CPU so it does not try to allocate a second copy of the
+	// model in VRAM. Users with spare VRAM can still opt in with --gpu-layers.
+	if opt(args, "base-url") != "" {
+		return "0"
+	}
+	return ""
+}
+
 func runEvalShardLlamaCpp(args cliArgs, items []map[string]any) ([]shardItemResult, shardStats, error) {
 	modelPath := opt(args, "model-path")
 	if modelPath == "" {
@@ -7065,7 +7079,7 @@ func runEvalShardLlamaCpp(args cliArgs, items []map[string]any) ([]shardItemResu
 	if v := opt(args, "batch-size"); v != "" {
 		cmdArgs = append(cmdArgs, "--batch-size", v)
 	}
-	if v := opt(args, "gpu-layers"); v != "" {
+	if v := llamaScorerGPULayers(args); v != "" {
 		cmdArgs = append(cmdArgs, "--gpu-layers", v)
 	}
 	cmd := exec.Command(scorer, cmdArgs...)

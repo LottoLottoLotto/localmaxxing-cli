@@ -127,6 +127,19 @@ func TestDefaultShardScoring(t *testing.T) {
 		t.Fatalf("gsm8k default scoring = %q, want exact_match", got)
 	}
 }
+func TestLlamaScorerDefaultsToCPUWhenServerConfigured(t *testing.T) {
+	got := llamaScorerGPULayers(cliArgs{opts: map[string]string{"base-url": "http://127.0.0.1:8080"}})
+	if got != "0" {
+		t.Fatalf("llamaScorerGPULayers with base-url = %q, want 0", got)
+	}
+}
+
+func TestLlamaScorerRespectsExplicitGPULayers(t *testing.T) {
+	got := llamaScorerGPULayers(cliArgs{opts: map[string]string{"base-url": "http://127.0.0.1:8080", "gpu-layers": "99"}})
+	if got != "99" {
+		t.Fatalf("llamaScorerGPULayers explicit gpu-layers = %q, want 99", got)
+	}
+}
 
 func TestScoreShardItemRequiresGoldAndID(t *testing.T) {
 	srv := chatContentServer(t, func(string) string { return "anything" })
