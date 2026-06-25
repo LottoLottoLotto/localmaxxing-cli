@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 )
 
 const defaultAPIURL = "https://www.localmaxxing.com"
@@ -399,11 +400,44 @@ func readJSON(path string) (any, error) {
 	if err != nil {
 		return nil, cliError{"file_read_error", fmt.Sprintf("Could not read %s: %v", path, err), []string{"Check that the path exists and is readable.", "Use an absolute path if the file is outside the current directory."}, nil}
 	}
+	data, err = decodeJSONBytes(data)
+	if err != nil {
+		return nil, cliError{"json_parse_error", fmt.Sprintf("Could not parse %s as JSON: %v", path, err), []string{"Save the file as UTF-8 JSON and retry.", "PowerShell 5.1 redirection may write UTF-16; use Set-Content -Encoding utf8 hardware.json."}, nil}
+	}
 	var value any
 	if err := json.Unmarshal(data, &value); err != nil {
 		return nil, cliError{"json_parse_error", fmt.Sprintf("Could not parse %s as JSON: %v", path, err), []string{"Fix the JSON syntax and retry."}, nil}
 	}
 	return value, nil
+}
+
+func decodeJSONBytes(data []byte) ([]byte, error) {
+	if bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}) {
+		return data[3:], nil
+	}
+	if bytes.HasPrefix(data, []byte{0xFF, 0xFE}) {
+		return decodeUTF16JSONBytes(data[2:], true)
+	}
+	if bytes.HasPrefix(data, []byte{0xFE, 0xFF}) {
+		return decodeUTF16JSONBytes(data[2:], false)
+	}
+	return data, nil
+}
+
+func decodeUTF16JSONBytes(data []byte, littleEndian bool) ([]byte, error) {
+	if len(data)%2 != 0 {
+		return nil, errors.New("UTF-16 JSON has an odd byte length")
+	}
+	words := make([]uint16, len(data)/2)
+	for i := range words {
+		j := i * 2
+		if littleEndian {
+			words[i] = uint16(data[j]) | uint16(data[j+1])<<8
+		} else {
+			words[i] = uint16(data[j])<<8 | uint16(data[j+1])
+		}
+	}
+	return []byte(string(utf16.Decode(words))), nil
 }
 
 func writeJSON(path string, value any) error {

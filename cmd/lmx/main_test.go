@@ -62,6 +62,44 @@ func TestEndpointTimeout(t *testing.T) {
 	}
 }
 
+func TestReadJSONAcceptsWindowsUTF16LE(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hardware.json")
+	raw := []byte(`{"cpu":"Ryzen 7 5800X3D","gpuCount":1}`)
+	data := []byte{0xFF, 0xFE}
+	for _, b := range raw {
+		data = append(data, b, 0)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write utf16 hardware: %v", err)
+	}
+
+	value, err := readJSON(path)
+	if err != nil {
+		t.Fatalf("readJSON returned error: %v", err)
+	}
+	hardware := asObject(value)
+	if hardware == nil || hardware["cpu"] != "Ryzen 7 5800X3D" || hardware["gpuCount"] != 1.0 {
+		t.Fatalf("hardware = %#v", value)
+	}
+}
+
+func TestReadJSONAcceptsUTF8BOM(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hardware.json")
+	data := append([]byte{0xEF, 0xBB, 0xBF}, []byte(`{"os":"Windows"}`)...)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write bom hardware: %v", err)
+	}
+
+	value, err := readJSON(path)
+	if err != nil {
+		t.Fatalf("readJSON returned error: %v", err)
+	}
+	hardware := asObject(value)
+	if hardware == nil || hardware["os"] != "Windows" {
+		t.Fatalf("hardware = %#v", value)
+	}
+}
+
 func TestReadOpenAIStreamParsesContentAndUsage(t *testing.T) {
 	stream := strings.Join([]string{
 		`data: {"choices":[{"delta":{"content":"hello"}}]}`,
