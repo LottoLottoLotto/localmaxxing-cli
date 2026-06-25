@@ -1419,7 +1419,7 @@ func applyNvidiaSMIHardware(base map[string]any, output string) {
 		if len(parts) < 2 {
 			continue
 		}
-		gpu := map[string]any{"name": strings.TrimSpace(parts[0])}
+		gpu := map[string]any{"gpuName": strings.TrimSpace(parts[0]), "count": 1}
 		if mb, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64); err == nil {
 			gpu["vramGb"] = round1(mb / 1024)
 			totalVramMb += mb
@@ -1432,7 +1432,7 @@ func applyNvidiaSMIHardware(base map[string]any, output string) {
 	base["hwClass"] = "DISCRETE_GPU"
 	base["gpuCount"] = len(gpus)
 	base["gpus"] = gpus
-	base["gpuName"] = gpus[0]["name"]
+	base["gpuName"] = gpus[0]["gpuName"]
 	if vramGb, ok := gpus[0]["vramGb"]; ok {
 		base["vramGb"] = vramGb
 	}
@@ -4013,6 +4013,36 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 	return out
 }
 
+// normalizeSubmitGpus reshapes each gpus[] entry into the wire shape the
+// localmaxxing.com /api/benchmarks schema expects: { gpuName, count, vramGb }.
+// Accepts legacy entries that used "name" instead of "gpuName".
+func normalizeSubmitGpus(items []any) []any {
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		gpu := asObject(item)
+		if gpu == nil {
+			continue
+		}
+		entry := map[string]any{}
+		if name := firstNonEmpty(stringValue(gpu["gpuName"]), stringValue(gpu["name"])); name != "" {
+			entry["gpuName"] = name
+		}
+		if v := numberField(gpu, "vramGb"); v > 0 {
+			entry["vramGb"] = v
+		}
+		count := numberField(gpu, "count")
+		if count <= 0 {
+			count = numberField(gpu, "gpuCount")
+		}
+		if count <= 0 {
+			count = 1
+		}
+		entry["count"] = int(count)
+		out = append(out, entry)
+	}
+	return out
+}
+
 func remapHardware(hw map[string]any) map[string]any {
 	hwClass := "CPU_ONLY"
 	if firstNonEmpty(stringValue(hw["gpuName"]), stringValue(hw["gpus"])) != "" || len(anySlice(hw["gpus"])) > 0 {
@@ -4032,7 +4062,7 @@ func remapHardware(hw map[string]any) map[string]any {
 			remapped["gpuCount"] = c
 		}
 		if gpus := anySlice(hw["gpus"]); len(gpus) > 0 {
-			remapped["gpus"] = gpus
+			remapped["gpus"] = normalizeSubmitGpus(gpus)
 			delete(remapped, "gpuName")
 			delete(remapped, "vramGb")
 		}
