@@ -17,7 +17,7 @@ if [[ -n "${LLAMA_SRC:-}" ]]; then
 fi
 
 cmake "${cmake_args[@]}"
-cmake --build "$build" --config Release -j
+cmake --build "$build" --config Release -j "${JOBS:-4}"
 
 cp "$build/lmx-llama-score-hellaswag" "$here/lmx-llama-score-hellaswag"
 echo "built $here/lmx-llama-score-hellaswag"

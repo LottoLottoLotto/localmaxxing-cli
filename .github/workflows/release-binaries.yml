@@ -59,7 +59,9 @@ jobs:
       - name: Build HellaSwag scorer
         run: |
           cmake -S tools -B tools/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build tools/build --config Release -j
+          # Bounded parallelism: bare -j is unlimited and OOM-kills the smaller
+          # runners (notably the ~7GB Apple Silicon macOS runner).
+          cmake --build tools/build --config Release -j 2
 
       - name: Package (unix)
         if: runner.os != 'Windows'
