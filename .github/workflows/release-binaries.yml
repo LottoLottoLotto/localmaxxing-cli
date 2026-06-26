@@ -28,10 +28,6 @@ jobs:
             runner: ubuntu-24.04-arm
             ext: ""
           - goos: darwin
-            goarch: amd64
-            runner: macos-13
-            ext: ""
-          - goos: darwin
             goarch: arm64
             runner: macos-14
             ext: ""
