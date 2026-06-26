@@ -148,6 +148,13 @@ static double logprob_of(const float * logits, int n_vocab, llama_token tok) {
     return (double)logits[tok] - mx - std::log(sum);
 }
 
+static std::string trim(const std::string & s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
 static double score_choice(llama_context * ctx, const llama_vocab * vocab, int n_vocab, const std::string & context, const std::string & choice, int n_batch) {
     std::string full = context + " " + choice;
     std::vector<llama_token> full_toks = tokenize(vocab, full, true);
@@ -189,7 +196,7 @@ static double score_choice(llama_context * ctx, const llama_vocab * vocab, int n
         count++;
     }
     llama_batch_free(batch);
-    return count > 0 ? sum / (double)count : -INFINITY; // token-normalized, as llama-perplexity --hellaswag
+    return count > 0 ? sum : -INFINITY; // summed continuation logprob; caller normalizes by byte length (lm-eval acc_norm)
 }
 
 int main(int argc, char ** argv) {
@@ -252,7 +259,16 @@ int main(int argc, char ** argv) {
         int best = 0;
         if (ok) {
             try {
-                for (int c = 0; c < 4; ++c) scores[c] = score_choice(ctx, vocab, n_vocab, input, choices[c], n_batch);
+                std::string ctxText = trim(input);
+                for (int c = 0; c < 4; ++c) {
+                    std::string cont = trim(choices[c]);
+                    double sum = score_choice(ctx, vocab, n_vocab, ctxText, cont, n_batch);
+                    // Byte length of the scored continuation (" " + cont), matching the
+                    // CLI remote loglikelihood path so local GGUF acc_norm is comparable.
+                    double denom = (double)(1 + cont.size());
+                    if (denom < 1.0) denom = 1.0;
+                    scores[c] = sum / denom;
+                }
                 for (int c = 1; c < 4; ++c) if (scores[c] > scores[best]) best = c;
             } catch (const std::exception & e) {
                 err = e.what();
@@ -265,7 +281,7 @@ int main(int argc, char ** argv) {
         std::cout << "{\"question_id\":\"" << json_escape(qid) << "\",\"itemIndex\":" << idx
                   << ",\"predicted\":\"" << pred << "\",\"gold\":\"" << json_escape(gold) << "\",\"pass\":" << (pass ? "true" : "false")
                   << ",\"choices\":[\"" << json_escape(choices[0]) << "\",\"" << json_escape(choices[1]) << "\",\"" << json_escape(choices[2]) << "\",\"" << json_escape(choices[3]) << "\"]"
-                  << ",\"scoreNormalization\":\"token_avg\""
+                  << ",\"scoreNormalization\":\"byte\""
                   << ",\"scores\":{\"A\":" << scores[0] << ",\"B\":" << scores[1] << ",\"C\":" << scores[2] << ",\"D\":" << scores[3] << "}";
         if (!err.empty()) std::cout << ",\"error\":\"" << json_escape(err) << "\"";
         std::cout << "}\n";
