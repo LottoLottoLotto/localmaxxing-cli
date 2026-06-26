@@ -10,3 +10,4 @@ runs/
 localmaxxing-kvcache.json
 /lmx
 /lmx-llama-score-hellaswag
+tools/build/

@@ -238,6 +238,17 @@ GSM8K-style short-answer datasets default to `exact_match` with answer
 extraction. Use `--scoring exact_match` only for debugging chat-letter prompts on
 multiple-choice shards.
 
+Release archives bundle this scorer next to `lmx`. To build it from a source
+checkout (CPU-only, statically linked against a pinned llama.cpp):
+
+```bash
+scripts/build-scorer.sh                                # fetches + builds llama.cpp
+LLAMA_SRC=/path/to/llama.cpp scripts/build-scorer.sh   # reuse a local checkout
+```
+
+The CLI auto-discovers `lmx-llama-score-hellaswag` next to `lmx` (or in `dist/`);
+override the path with `--llama-scorer <path>`.
+
 HumanEval and MBPP are **execution-based** code evals (`scoring: code_execution`,
 the default for those datasets). The CLI generates a solution per problem, then
 runs `solution + hidden tests` inside a hardened sandbox and records pass/fail.

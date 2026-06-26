@@ -11,7 +11,9 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
-    runs-on: ubuntu-latest
+    # Each target builds on a native runner: the Go CLI cross-compiles fine, but
+    # the companion llama.cpp scorer is native C++ and must be built per platform.
+    runs-on: ${{ matrix.runner }}
 
     strategy:
       fail-fast: false
@@ -19,18 +21,23 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            runner: ubuntu-latest
             ext: ""
           - goos: linux
             goarch: arm64
+            runner: ubuntu-24.04-arm
             ext: ""
           - goos: darwin
             goarch: amd64
+            runner: macos-13
             ext: ""
           - goos: darwin
             goarch: arm64
+            runner: macos-14
             ext: ""
           - goos: windows
             goarch: amd64
+            runner: windows-latest
             ext: ".exe"
 
     steps:
@@ -42,20 +49,35 @@ jobs:
         with:
           go-version: "1.22"
 
-      - name: Build
+      # --- Go CLI ---
+      - name: Build lmx
         env:
           CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags="-s -w" -o "lmx${{ matrix.ext }}" ./cmd/lmx
+
+      # --- Companion HellaSwag scorer (CMake + llama.cpp, CPU-only static) ---
+      - name: Build HellaSwag scorer
+        run: |
+          cmake -S tools -B tools/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build tools/build --config Release -j
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "lmx${{ matrix.ext }}" ./cmd/lmx
-          if [ "$GOOS" = "windows" ]; then
-            mv "lmx${{ matrix.ext }}" "dist/lmx-${GOOS}-${GOARCH}${{ matrix.ext }}"
-          else
-            # Archive always contains the binary named `lmx` (asset name encodes platform).
-            tar -czf "dist/lmx-${GOOS}-${GOARCH}.tar.gz" lmx
-          fi
+          cp tools/build/lmx-llama-score-hellaswag .
+          # Archive always contains binaries named `lmx` and the scorer (asset
+          # name encodes platform).
+          tar -czf "dist/lmx-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" \
+            lmx lmx-llama-score-hellaswag
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "tools\build\Release\lmx-llama-score-hellaswag.exe" .
+          Compress-Archive -Force -Path lmx.exe, lmx-llama-score-hellaswag.exe `
+            -DestinationPath "dist/lmx-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
