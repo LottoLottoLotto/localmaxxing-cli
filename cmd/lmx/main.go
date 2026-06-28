@@ -152,6 +152,8 @@ func runWithArgs(args cliArgs) error {
 			return handleEvalSubmit(positional(args, 2), args)
 		case "shard":
 			return handleEvalShard(positional(args, 2), args)
+		case "terminal":
+			return handleEvalTerminal(positional(args, 2), args)
 		}
 	}
 
@@ -8763,6 +8765,9 @@ func extractFinalAnswer(response string) string {
 			return num
 		}
 	}
+	if num := lastNumberFromSummaryLine(response); num != "" {
+		return num
+	}
 	if eqs := equationResultPattern.FindAllStringSubmatch(response, -1); len(eqs) > 0 {
 		return eqs[len(eqs)-1][1]
 	}
@@ -9281,6 +9286,9 @@ var usageExamples = []string{
 	`lmx eval shard gsm8k --base-url http://localhost:8000 --questions 200 --dry-run`,
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --questions 200 --dry-run`,
 	`lmx eval shard gsm8k --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
+	`lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1`,
+	`lmx eval terminal verify ./tb-bundles/smoke --oracle`,
+	`lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
 	`lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`,
 	`lmx benchmark fixup runs/Model/run.json`,
 	`lmx hardware template --gpu-name "RTX 3090" --gpu-count 2 --vram-gb 24 --cpu "Ryzen 9 9950X" --ram-gb 96 --os Linux`,
@@ -9304,6 +9312,18 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --prompt-template <t>    Eval-shard prompt template using {{input}} and {{choices}}
   --concurrency <n>        Eval-shard parallel requests (default: 1)
   --artifact-limit <n>     Shard traces to submit (default: 0 = all, for a complete whole-shard bundle; >0 keeps a balanced pass/fail sample)
+  --task-dir <dir>        Terminal eval bundle directory (one bundle or parent of bundles)
+  --dataset <slug>        Terminal eval dataset slug to submit local --task-dir runs against
+  --max-turns <n>         Terminal eval agent turn cap (defaults to task manifest)
+  --agent-timeout <sec>   Terminal eval whole-agent timeout (defaults to task manifest)
+  --agent-cmd <cmd>       Terminal eval external agent command; gets LMX_TERMINAL_* env vars
+  --agent-execution <m>   External agent execution: host (default), container, or routed-shell
+  --agent-name <name>     Label for external terminal agent submissions (default: external-agent)
+  --container-base-url <url> Base URL visible from task containers for container-native agents
+  --command-timeout <sec> Terminal eval per-shell-command timeout (default: 120)
+  --cleanup-images        Remove locally built terminal task images after each task
+  --shell-mode <mode>     Terminal eval built-in harness shell: persistent (default, one shared shell) or stateless (fresh shell per command)
+  --oracle                Run terminal task solution/solve.sh instead of the model agent
   --scoring <mode>          Eval-shard scoring: exact_match, loglikelihood, llama_cpp_loglikelihood, code_execution (hellaswag defaults to loglikelihood; humaneval/mbpp default to code_execution)
   --temperature <f>        Sampling temperature for eval-shard runs (default: 0)
   --top-p <f>              Sampling top_p for eval-shard runs (default: 1)

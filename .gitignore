@@ -11,3 +11,8 @@ localmaxxing-kvcache.json
 /lmx
 /lmx-llama-score-hellaswag
 tools/build/
+.tb21-bundles/
+.tb21-sample/
+.terminal-smoke/
+dryrun-*-shard*.json
+submit-*-shard*.json

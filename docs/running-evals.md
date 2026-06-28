@@ -280,6 +280,115 @@ canonical 3-shot prompting (`--few-shot N` to change). For pass@k, pass
 CLI reports `passAtK`/`passAt1` and submits the greedy/first-sample pass@1 per
 question (matching the modern EvalPlus greedy-pass@1 leaderboard).
 
+### Run Terminal-Bench (our runner)
+
+Terminal-Bench bundles are task directories containing `task.json`, `environment/`,
+`tests/`, and optionally `solution/`. The CLI imports harbor-format tasks into
+that bundle format, then runs each task in Docker. By default it uses the
+localmaxxing fenced-bash agent harness; with `--agent-cmd` it can hand the running
+container to your preferred host-side agent harness.
+
+Import an operator-supplied harbor task tree:
+
+```bash
+lmx eval terminal import ./terminal-bench-2.1-tasks \
+  --out ./tb-bundles \
+  --version 2.1
+```
+
+Verify a bundle with its oracle solution before scoring a model:
+
+```bash
+lmx eval terminal verify ./tb-bundles/adaptive-rejection-sampler --oracle --out oracle.json
+```
+
+Run local bundles against an OpenAI-compatible endpoint:
+
+```bash
+lmx eval terminal run --task-dir ./tb-bundles \
+  --base-url http://localhost:8000 \
+  --model Qwen/Qwen3-8B \
+  --hardware hardware.json \
+  --out terminal-run.json \
+  --dry-run
+```
+
+By default the built-in harness runs every turn in one persistent shell session
+(`docker exec -i <container> bash -l`), so `cd`, `export`, and `source` carry
+across turns (`protocol: "react-shell"`). Pass `--shell-mode stateless` to run
+each command in a fresh `docker exec` with no shared state (`protocol:
+"react-bash"`).
+
+Run and submit an approved public dataset:
+
+```bash
+lmx eval terminal run terminal-bench-2-1 \
+  --base-url http://localhost:8000 \
+  --model Qwen/Qwen3-8B \
+  --hardware hardware.json \
+  --submit
+```
+
+Use a preferred external agent harness:
+
+```bash
+lmx eval terminal run --task-dir ./tb-bundles \
+  --agent-cmd './my-agent-wrapper.sh' \
+  --agent-name my-agent \
+  --agent-execution routed-shell \
+  --model Qwen/Qwen3-8B \
+  --hardware hardware.json \
+  --out terminal-run.json \
+  --dry-run
+```
+
+`--agent-cmd` runs on the host after the task container starts and before the
+verifier runs. The command receives:
+
+- `LMX_TERMINAL_CONTAINER` — Docker container name.
+- `LMX_TERMINAL_TASK_ID` — task id.
+- `LMX_TERMINAL_BUNDLE_DIR` / `LMX_TERMINAL_TASK_DIR` — imported bundle path.
+- `LMX_TERMINAL_TASK_JSON` — manifest path.
+- `LMX_TERMINAL_INSTRUCTION_FILE` — temporary file containing the task prompt.
+- `LMX_TERMINAL_BASE_URL` and `LMX_TERMINAL_MODEL` — values passed to the CLI,
+  when your external agent wants to call the model itself.
+- `LMX_TERMINAL_CONTAINER_BASE_URL` — model/API URL as seen from Docker
+  containers (default: `http://172.17.0.1:8080`, override with
+  `--container-base-url`).
+- `LMX_TERMINAL_WORKDIR` — canonical task workdir (`/app`).
+- `LMX_TERMINAL_TRACE_DIR` — host directory for agent traces/logs; text files
+  written here are appended to the submitted artifact.
+- `LMX_TERMINAL_EXECUTION_MODE` — `host`, `container`, or `routed-shell`.
+- `LMX_TERMINAL_SHELL_COMMAND` — helper script for routed-shell wrappers. Call
+  `"$LMX_TERMINAL_SHELL_COMMAND" 'ls /app'`; it executes in the task container,
+  not on the host.
+
+Choose an execution mode explicitly for comparability:
+
+- `--agent-execution container`: the wrapper copies/runs the agent inside the
+  task container. The model/agent sees `/app` directly, closest to Harbor's
+  environment-routed model.
+- `--agent-execution routed-shell`: the agent stays on the host, but its shell
+  tool must call `LMX_TERMINAL_SHELL_COMMAND` so commands execute in `/app`
+  inside the task container. Use this for agents with complex host installs or
+  host-only auth.
+- `--agent-execution host`: legacy mode. The agent has host shell access and is
+  responsible for routing into Docker. This is marked separately in
+  `runConfig.protocol` and should not be mixed with container-shell scores.
+
+Example wrappers are in `examples/agents/`. External-agent submissions are
+labeled with `runConfig.protocol="external-command/<mode>"`,
+`runConfig.agent=<--agent-name>`, `runConfig.agentExecution=<mode>`, and
+`runConfig.toolRouting`.
+
+Security and footprint warning: terminal tasks execute arbitrary task Docker
+images, copy verifier assets into those containers, and give a model/agent control
+over shell commands in the task container. Run them on a disposable host with
+Docker installed. Honor task CPU/memory settings (`--concurrency` defaults to 1
+because containers are heavy). `no-network` is enforced with Docker `--network none`; `allowlist`
+currently degrades to normal Docker egress and emits a `terminal_network_degraded`
+warning because per-host firewalling is outside v1.
+
 Start a local OpenAI-compatible server, then dry-run first:
 
 ```bash
