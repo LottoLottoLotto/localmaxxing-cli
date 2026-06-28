@@ -35,7 +35,8 @@ row = dst.execute("select models from model_cache where provider_id='llama.cpp'"
 if row:
     models = json.loads(row[0])
     for model in models:
-        model["baseUrl"] = base_url
+        model["baseUrl"] = base_url.rstrip("/") + "/v1"
+        model["api"] = "openai-completions"
     dst.execute(
         "update model_cache set models=? where provider_id='llama.cpp'",
         (json.dumps(models, separators=(",", ":")),),
@@ -96,7 +97,7 @@ STATUS=$?
 if [ "$STATUS" -eq 0 ] && grep -q '"stopReason":"error"\|"errorMessage"' "$LOG"; then
   STATUS=1
 fi
-if [ "$STATUS" -eq 0 ] && ! grep -q '"type":"function_call"' "$LOG"; then
+if [ "$STATUS" -eq 0 ] && ! grep -q '"type":"function_call"\|"type":"toolCall"' "$LOG"; then
   STATUS=1
 fi
 
