@@ -481,10 +481,14 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		}
 		task := bundles[i].Task
 		submitResults = append(submitResults, map[string]any{"question_id": task.ID, "pass": r.pass})
-		submitArtifacts = append(submitArtifacts, map[string]any{"question_id": task.ID, "itemIndex": i, "promptHash": shortHash(task.ID + ":" + r.prompt), "question": task.Instruction, "prompt": r.prompt, "response": r.transcript + "\n\n# Verifier\n\n" + r.verifierOutput, "score": boolScore(r.pass), "testPassed": r.pass, "latencyMs": r.latencyMs})
+		artifactResponse := truncateString(r.transcript+"\n\n# Verifier\n\n"+r.verifierOutput, 4_900_000)
+		submitArtifacts = append(submitArtifacts, map[string]any{"question_id": task.ID, "itemIndex": i, "promptHash": shortHash(task.ID + ":" + r.prompt), "question": task.Instruction, "prompt": r.prompt, "response": artifactResponse, "score": boolScore(r.pass), "testPassed": r.pass, "latencyMs": r.latencyMs})
 	}
 	if len(submitResults) == 0 {
 		return cliError{"no_scored_questions", "Every terminal task failed to score, so there is nothing to submit.", []string{"Check Docker and the model endpoint.", "Inspect failures with --out results.json."}, map[string]any{"errors": errorCodes}}
+	}
+	if rawBaseURL != "" && opt(args, "quantization") == "" && resolvedQuant == "" {
+		return cliError{"model_detection_failed", "Could not verify the local endpoint model/quantization before submission.", []string{"Keep the model endpoint running through submission.", "Or pass --quantization and --quant-format explicitly if the endpoint cannot expose model metadata."}, map[string]any{"baseUrl": baseURL}}
 	}
 	submitArgs := argsWithTerminalBaseURL(args, rawBaseURL)
 	hfID, modelResolution := resolveEvalModelID(submitArgs, declaredModel)
@@ -780,6 +784,8 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 		result.prompt = "external agent command"
 		if err != nil {
 			result.errCode, result.errText = cliErrorCodeText(err)
+			result.latencyMs = time.Since(started).Milliseconds()
+			return result
 		}
 	} else if cfg.shellMode == "stateless" {
 		turns, transcript, err := runTerminalAgentLoop(ctx, task, containerName, baseURL, model, cfg)
@@ -866,6 +872,7 @@ func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir,
 		"LMX_TERMINAL_WORKDIR=" + workdir,
 		"LMX_TERMINAL_TRACE_DIR=" + traceDir,
 		"LMX_TERMINAL_EXECUTION_MODE=" + cfg.agentExecution,
+		"LMX_TERMINAL_AGENT_TIMEOUT_SEC=" + strconv.Itoa(firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)),
 		"LMX_TERMINAL_SHELL_COMMAND=" + shellCommand,
 	}
 	timeout := time.Duration(firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)) * time.Second

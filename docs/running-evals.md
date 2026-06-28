@@ -381,6 +381,14 @@ labeled with `runConfig.protocol="external-command/<mode>"`,
 `runConfig.agent=<--agent-name>`, `runConfig.agentExecution=<mode>`, and
 `runConfig.toolRouting`.
 
+For Oh My Pi / OMP container parity, use
+`examples/agents/omp-container-shell.sh` with `--agent-execution container`.
+The wrapper mirrors Harbor's installed-agent shape: it runs OMP inside `/app`,
+passes the task as direct prompt text, emits JSON event logs, copies live SQLite
+model-cache state for local llama.cpp models, and exits non-zero on model/API
+errors or no-tool-call runs so setup failures are not submitted as scored task
+failures.
+
 Security and footprint warning: terminal tasks execute arbitrary task Docker
 images, copy verifier assets into those containers, and give a model/agent control
 over shell commands in the task container. Run them on a disposable host with
