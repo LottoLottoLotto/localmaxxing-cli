@@ -6632,6 +6632,8 @@ type shardItemResult struct {
 	promptHash         string
 	response           string
 	reasoning          string
+	thinkingRequested  string
+	thinkingObserved   string
 	predicted          string
 	gold               string
 	choices            []string
@@ -6672,6 +6674,33 @@ func normalizeShardScoring(value string) (string, error) {
 	default:
 		return "", cliError{"invalid_shard_scoring", fmt.Sprintf("Unsupported shard scoring mode %q.", value), []string{"Use exact_match for chat answer matching, loglikelihood for OpenAI echo-logprobs endpoints, llama_cpp_loglikelihood with --model-path for local GGUF scoring, or code_execution for HumanEval/MBPP."}, nil}
 	}
+}
+
+func shardEvaluationConfig(meta map[string]any) map[string]any {
+	if cfg := asObject(meta["evaluation"]); cfg != nil {
+		return cfg
+	}
+	return nil
+}
+
+func shardConfigString(cliArgs cliArgs, meta map[string]any, optName, fieldName string) string {
+	if value := opt(cliArgs, optName); value != "" {
+		return value
+	}
+	return stringValue(meta[fieldName])
+}
+
+func shardConfigInt(cliArgs cliArgs, meta map[string]any, optName, fieldName string, fallback int) (int, error) {
+	value, err := intOption(cliArgs, fallback, 0, optName)
+	if err != nil {
+		return 0, err
+	}
+	if opt(cliArgs, optName) == "" && value == fallback {
+		if configured := int(numberField(meta, fieldName)); configured > 0 {
+			return configured, nil
+		}
+	}
+	return value, nil
 }
 
 // handleEvalShard runs a blob-backed eval-shard dataset against a local
@@ -6766,7 +6795,9 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		resolvedQuantFormat = "gguf"
 	}
 
-	maxTokens, err := intOption(args, 0, 0, "max-tokens")
+	evalConfig := shardEvaluationConfig(metaObj)
+
+	maxTokens, err := shardConfigInt(args, evalConfig, "max-tokens", "maxNewTokens", 0)
 	if err != nil {
 		return err
 	}
@@ -6784,7 +6815,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	if strings.EqualFold(dataset, "hellaswag") && opt(args, "model-path") != "" {
 		defaultScoring = "llama_cpp_loglikelihood"
 	}
-	scoring, err := normalizeShardScoring(firstNonEmpty(opt(args, "scoring"), opt(args, "scoring-method"), defaultScoring))
+	scoring, err := normalizeShardScoring(firstNonEmpty(opt(args, "scoring"), opt(args, "scoring-method"), stringValue(evalConfig["scoring"]), defaultScoring))
 	if err != nil {
 		return err
 	}
@@ -6815,9 +6846,9 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		maxTokens:      maxTokens,
 		temperature:    temperature,
 		topP:           floatOption(args, "top-p", 1),
-		extraction:     opt(args, "answer-extraction"),
-		answerRegex:    opt(args, "answer-regex"),
-		promptTemplate: opt(args, "prompt-template"),
+		extraction:     shardConfigString(args, evalConfig, "answer-extraction", "answerExtraction"),
+		answerRegex:    shardConfigString(args, evalConfig, "answer-regex", "answerRegex"),
+		promptTemplate: shardConfigString(args, evalConfig, "prompt-template", "promptTemplate"),
 		concurrency:    concurrency,
 		apiKey:         opt(args, "model-api-key"),
 		scoring:        scoring,
@@ -6875,18 +6906,20 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	// sample (half passing, half failing). Send the full answer and reasoning.
 	toArtifact := func(r shardItemResult) map[string]any {
 		artifact := map[string]any{
-			"question_id":     r.questionID,
-			"itemIndex":       r.itemIndex,
-			"promptHash":      r.promptHash,
-			"question":        r.question,
-			"prompt":          r.prompt,
-			"response":        r.response,
-			"reasoning":       r.reasoning,
-			"extractedAnswer": r.predicted,
-			"gold":            r.gold,
-			"score":           boolScore(r.pass),
-			"testPassed":      r.pass,
-			"latencyMs":       r.latencyMs,
+			"question_id":       r.questionID,
+			"itemIndex":         r.itemIndex,
+			"promptHash":        r.promptHash,
+			"question":          r.question,
+			"prompt":            r.prompt,
+			"response":          r.response,
+			"reasoning":         r.reasoning,
+			"thinkingRequested": r.thinkingRequested,
+			"thinkingObserved":  r.thinkingObserved,
+			"extractedAnswer":   r.predicted,
+			"gold":              r.gold,
+			"score":             boolScore(r.pass),
+			"testPassed":        r.pass,
+			"latencyMs":         r.latencyMs,
 		}
 		if len(r.choices) == 4 {
 			artifact["choices"] = r.choices
@@ -6927,7 +6960,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	if out := opt(args, "out"); out != "" {
 		records := make([]any, len(results))
 		for i, r := range results {
-			records[i] = map[string]any{"question_id": r.questionID, "pass": r.pass, "scored": r.scored, "predicted": r.predicted, "gold": r.gold, "latencyMs": r.latencyMs, "error": r.errText, "question": r.question, "promptHash": r.promptHash, "prompt": r.prompt, "response": r.response, "reasoning": r.reasoning, "choices": r.choices, "choiceScores": r.choiceScores, "scoreNormalization": r.scoreNormalization}
+			records[i] = map[string]any{"question_id": r.questionID, "pass": r.pass, "scored": r.scored, "predicted": r.predicted, "gold": r.gold, "latencyMs": r.latencyMs, "error": r.errText, "question": r.question, "promptHash": r.promptHash, "prompt": r.prompt, "response": r.response, "reasoning": r.reasoning, "thinkingRequested": r.thinkingRequested, "thinkingObserved": r.thinkingObserved, "choices": r.choices, "choiceScores": r.choiceScores, "scoreNormalization": r.scoreNormalization}
 		}
 		if err := writeJSON(out, map[string]any{"summary": summary, "results": records}); err != nil {
 			return err
@@ -7406,11 +7439,13 @@ func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[strin
 	}
 
 	type cell struct {
-		prompt    string
-		code      string
-		program   string
-		errText   string
-		latencyMs int64
+		prompt            string
+		code              string
+		program           string
+		errText           string
+		latencyMs         int64
+		thinkingRequested string
+		thinkingObserved  string
 	}
 	grid := make([][]cell, len(items))
 	for i := range grid {
@@ -7431,14 +7466,15 @@ func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[strin
 			entry := stringValue(item["entry_point"])
 			start := time.Now()
 			var content string
+			var modelReasoning string
 			var err error
 			for attempt := 0; attempt < 3; attempt++ {
-				content, _, err = callOpenAIChatDetailed(baseURL, model, prompt, cfg.apiKey, cfg.maxTokens, cfg.temperature, cfg.topP, nil)
+				content, modelReasoning, err = callOpenAIChatDetailed(baseURL, model, prompt, cfg.apiKey, cfg.maxTokens, cfg.temperature, cfg.topP, nil)
 				if err == nil {
 					break
 				}
 			}
-			c := cell{prompt: prompt, latencyMs: time.Since(start).Milliseconds()}
+			c := cell{prompt: prompt, latencyMs: time.Since(start).Milliseconds(), thinkingRequested: promptThinkingDirective(prompt), thinkingObserved: observedThinkingMode(promptThinkingDirective(prompt), modelReasoning)}
 			if err != nil {
 				c.errText = err.Error()
 			} else {
@@ -7584,18 +7620,20 @@ func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[strin
 			reasoning = fmt.Sprintf("pass@%d=%.3f (%d/%d samples passed)\n%s", k, pk, passedSamples, n, summary)
 		}
 		results[i] = shardItemResult{
-			questionID: qids[i],
-			itemIndex:  i,
-			question:   renderEvalQuestion(item),
-			prompt:     first.prompt,
-			promptHash: sha256Hex(first.prompt),
-			response:   first.code,
-			reasoning:  reasoning,
-			predicted:  boolPassLabel(firstPass),
-			gold:       "pass",
-			scored:     true,
-			pass:       firstPass,
-			latencyMs:  latency,
+			questionID:        qids[i],
+			itemIndex:         i,
+			question:          renderEvalQuestion(item),
+			prompt:            first.prompt,
+			promptHash:        sha256Hex(first.prompt),
+			response:          first.code,
+			reasoning:         reasoning,
+			thinkingRequested: first.thinkingRequested,
+			thinkingObserved:  first.thinkingObserved,
+			predicted:         boolPassLabel(firstPass),
+			gold:              "pass",
+			scored:            true,
+			pass:              firstPass,
+			latencyMs:         latency,
 		}
 		stats.scored++
 		if firstPass {
@@ -7619,6 +7657,27 @@ func boolPassLabel(pass bool) string {
 		return "pass"
 	}
 	return "fail"
+}
+
+func promptThinkingDirective(prompt string) string {
+	trimmed := strings.TrimSpace(prompt)
+	if strings.HasPrefix(trimmed, "/no_think") || strings.Contains(prompt, "\n/no_think") {
+		return "disabled"
+	}
+	if strings.HasPrefix(trimmed, "/think") || strings.Contains(prompt, "\n/think") {
+		return "enabled"
+	}
+	return "unspecified"
+}
+
+func observedThinkingMode(requested, reasoning string) string {
+	if strings.TrimSpace(reasoning) != "" {
+		return "enabled"
+	}
+	if requested == "disabled" {
+		return "disabled"
+	}
+	return "unknown"
 }
 
 // scoreShardItem renders/scores one eval-shard row. HellaSwag-style multiple
@@ -7648,6 +7707,7 @@ func scoreShardItem(itemIndex int, item map[string]any, cfg runShardConfig, base
 	prompt := renderEvalPrompt(template, item)
 	res.prompt = prompt
 	res.promptHash = sha256Hex(prompt)
+	res.thinkingRequested = promptThinkingDirective(prompt)
 	if cfg.scoring == "loglikelihood" {
 		contextText := strings.TrimSpace(fmt.Sprint(item["input"]))
 		if cfg.promptTemplate != "" {
@@ -7655,6 +7715,8 @@ func scoreShardItem(itemIndex int, item map[string]any, cfg runShardConfig, base
 		}
 		res.prompt = contextText
 		res.promptHash = sha256Hex(contextText)
+		res.thinkingRequested = promptThinkingDirective(contextText)
+		res.thinkingObserved = "not_applicable"
 		started := time.Now()
 		score, predicted, goldLabel, err := scoreLoglikelihoodItem(baseURL, model, cfg.apiKey, map[string]any{
 			"runConfig": map[string]any{"loglikelihoodTarget": "choice_text", "loglikelihoodNorm": "byte"},
@@ -7687,6 +7749,7 @@ func scoreShardItem(itemIndex int, item map[string]any, cfg runShardConfig, base
 	}
 	res.response = response
 	res.reasoning = reasoning
+	res.thinkingObserved = observedThinkingMode(res.thinkingRequested, reasoning)
 	res.scored = true
 	if len(choices) > 0 {
 		predicted := normalizeChoice(response, choices)
@@ -8653,19 +8716,46 @@ func normalizeEvalText(value string) string {
 }
 
 var numberAnswerPattern = regexp.MustCompile(`-?\$?\d[\d,]*(?:\.\d+)?%?`)
-var finalAnswerMarkerPattern = regexp.MustCompile(`(?i)(?:####|final answer|the answer is|answer is|answer)\s*[:=]?\s*`)
+var finalAnswerMarkerPattern = regexp.MustCompile(`(?im)(?:####|final\s+answer|(?:the\s+)?answer\s+is|^\s*answer)\s*[:=]?\s*`)
 var equationResultPattern = regexp.MustCompile(`=\s*(-?\$?\d[\d,]*(?:\.\d+)?%?)`)
 var boldSegmentPattern = regexp.MustCompile(`\*\*([^*]*\d[^*]*)\*\*`)
+var summaryAnswerLinePattern = regexp.MustCompile(`(?i)\b(?:total|result|therefore|so)\b`)
 
 // extractFinalAnswer pulls the most likely final answer out of chain-of-thought
 // math output, in priority order:
 //  1. number after an explicit marker ("####", "Final answer:", "the answer is", ...)
-//  2. number after the last "= " (the result of the final computation)
-//  3. the last bolded number that is not a heading (headings contain ":")
-//  4. the last number anywhere (fallback)
+//  2. last number on a summary line ("Total ... = 107", "therefore 107")
+//  3. number after the last "= " (the result of the final computation)
+//  4. the last bolded number that is not a heading (headings contain ":")
+//  5. the last number anywhere (fallback)
 //
-// This survives truncated responses (no marker) and ignores noise like step
-// headers ("**Step 4: ...**") and trailing quantities ("... for the 2 shirts.").
+// Avoid treating generic prose like "the question asks for the answer" as an
+// answer marker; reasoning models often mention "answer" before correcting
+// themselves, which can otherwise extract an early conversion factor.
+func lastNumberFromSummaryLine(response string) string {
+	lines := strings.Split(response, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !summaryAnswerLinePattern.MatchString(line) {
+			continue
+		}
+		if bolds := boldSegmentPattern.FindAllStringSubmatch(line, -1); len(bolds) > 0 {
+			for j := len(bolds) - 1; j >= 0; j-- {
+				if strings.Contains(bolds[j][1], ":") {
+					continue
+				}
+				if num := numberAnswerPattern.FindString(bolds[j][1]); num != "" {
+					return num
+				}
+			}
+		}
+		matches := numberAnswerPattern.FindAllString(line, -1)
+		if len(matches) > 0 {
+			return matches[len(matches)-1]
+		}
+	}
+	return ""
+}
 func extractFinalAnswer(response string) string {
 	if locs := finalAnswerMarkerPattern.FindAllStringIndex(response, -1); len(locs) > 0 {
 		tail := response[locs[len(locs)-1][1]:]
@@ -9324,6 +9414,7 @@ var commandDescriptions = map[string]string{
 	"eval pull":              "Download a suite + datasets for offline runs and inspection.",
 	"eval submit":            "Submit a previously saved run payload (deferred submit).",
 	"eval shard":             "Run a blob-backed eval-shard dataset against a local endpoint and submit pass/fail.",
+	"eval terminal":          "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",
 	"auth":                   "Manage LocalMaxxing API authentication.",

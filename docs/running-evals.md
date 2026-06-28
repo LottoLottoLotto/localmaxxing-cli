@@ -234,9 +234,10 @@ loglikelihood. With a logprob-capable OpenAI endpoint, the CLI uses
 With llama.cpp GGUF files, pass `--model-path model.gguf`; the CLI switches to
 `llama_cpp_loglikelihood` and calls the bundled local scorer
 (`lmx-llama-score-hellaswag`) so no server echo-logprobs are required.
-GSM8K-style short-answer datasets default to `exact_match` with answer
-extraction. Use `--scoring exact_match` only for debugging chat-letter prompts on
-multiple-choice shards.
+GSM8K-style short-answer datasets use the server-published canonical evaluation
+config when available: `exact_match`, the official prompt template, and
+`answerExtraction: final_answer`. Use `--scoring exact_match` only for debugging
+chat-letter prompts on multiple-choice shards.
 
 Release archives bundle this scorer next to `lmx`. To build it from a source
 checkout (CPU-only, statically linked against a pinned llama.cpp):
@@ -306,10 +307,11 @@ lmx eval shard gsm8k \
 ```
 
 Scoring is automatic per row: rows with `choices` are scored as multiple choice
-(letter match); otherwise the final answer is extracted (default
-`--answer-extraction last_number`) and compared numerically, so GSM8K-style
-chain-of-thought output scores correctly without answer-only prompting. Override
-with `--prompt-template`, `--answer-extraction none|last_number|regex`, and
+(letter match); otherwise the final answer is extracted (server default for
+GSM8K: `answerExtraction: final_answer`) and compared numerically, so
+chain-of-thought output scores correctly when it ends with the canonical final
+answer line. Override only for experiments with `--prompt-template`,
+`--answer-extraction none|final_answer|last_number|regex`, and
 `--answer-regex`. Submitting repeatedly with different shards or question counts
 grows unique-question coverage; the pooled score dedupes by `question_id`.
 

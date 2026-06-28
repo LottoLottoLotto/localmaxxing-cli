@@ -175,11 +175,27 @@ func TestExtractFinalAnswerModes(t *testing.T) {
 		{"equation_over_heading", "**Step 4: total**\nGrand Total = 84 + 88 = 172\nThen 20 + 22 + 64", "172"},
 		{"ignores_bold_heading", "**Step 2: setup**\nso 2 + 2 gives us... 88 total chairs.", "88"},
 		{"fallback", "no markers, just 7 then 19", "19"},
+		{"generic_answer_word_not_marker", "The question asks for the answer. 1 SS = 1 SB.\nTotal buttons = 20 + 87 = 107.\nCheck: 1 LB = 3 SS.", "107"},
 	}
 	for _, tc := range cases {
 		if got := extractAnswer(tc.in, "final_answer", ""); got != tc.want {
 			t.Errorf("%s: extractAnswer(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestThinkingModeLogging(t *testing.T) {
+	if got := promptThinkingDirective("/no_think\n\nQuestion"); got != "disabled" {
+		t.Fatalf("promptThinkingDirective(/no_think) = %q, want disabled", got)
+	}
+	if got := promptThinkingDirective("/think\n\nQuestion"); got != "enabled" {
+		t.Fatalf("promptThinkingDirective(/think) = %q, want enabled", got)
+	}
+	if got := observedThinkingMode("disabled", ""); got != "disabled" {
+		t.Fatalf("observedThinkingMode(disabled, empty) = %q, want disabled", got)
+	}
+	if got := observedThinkingMode("disabled", "hidden reasoning"); got != "enabled" {
+		t.Fatalf("observedThinkingMode(disabled, reasoning) = %q, want enabled", got)
 	}
 }
 
@@ -270,6 +286,7 @@ func shardTestServer(t *testing.T, rows []map[string]any, reply string, posted *
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"shard":       map[string]any{"shardIndex": 1, "itemCount": len(rows), "selectedQuestionCount": len(rows)},
 				"sampling":    map[string]any{"recommendations": map[string]any{"margin05": len(rows)}},
+				"evaluation":  map[string]any{"scoring": "exact_match", "promptTemplate": "/no_think\n\nCANONICAL GSM8K\n\n{{input}}", "answerExtraction": "final_answer", "maxNewTokens": 512},
 				"downloadUrl": "http://" + r.Host + "/blob",
 			})
 		case r.URL.Path == "/blob":
@@ -380,6 +397,12 @@ func TestHandleEvalShardSubmitsPassFail(t *testing.T) {
 	}
 	if stringValue(artifact["promptHash"]) == "" || numberField(artifact, "latencyMs") < 0 {
 		t.Fatalf("artifact missing promptHash/latency: %#v", artifact)
+	}
+	if prompt := stringValue(artifact["prompt"]); !strings.HasPrefix(prompt, "/no_think\n\nCANONICAL GSM8K\n\n5 + 5?") {
+		t.Fatalf("artifact prompt = %q, want server-canonical GSM8K prompt", prompt)
+	}
+	if stringValue(artifact["thinkingRequested"]) != "disabled" || stringValue(artifact["thinkingObserved"]) != "disabled" {
+		t.Fatalf("artifact thinking fields wrong: %#v", artifact)
 	}
 	if stringValue(posted["hfId"]) != "Qwen/Qwen3-8B" {
 		t.Fatalf("posted hfId = %v, want Qwen/Qwen3-8B", posted["hfId"])
