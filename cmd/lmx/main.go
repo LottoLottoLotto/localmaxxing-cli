@@ -5265,9 +5265,15 @@ func canonicalModelAlias(name string) bool {
 	return true
 }
 
+// quantCorePattern matches a single quantization token: GGUF/IQ levels
+// (Q4_K_M, Q8_0, IQ4_NL) or float formats with an optional NVIDIA/MX vendor
+// prefix (FP16, BF16, FP8, FP4, NVFP4, MXFP4, MXFP6, MXFP8).
+const quantCorePattern = `(?:IQ|Q)[0-9][A-Z0-9_]*|(?:(?:NV|MX)FP|BF|F|FP)[0-9]+`
+
 var (
-	ggufShardSuffix = regexp.MustCompile(`(?i)-\d{5}-of-\d{5}$`)
-	ggufQuantToken  = regexp.MustCompile(`(?i)^(?:(?:IQ|Q)[0-9][A-Z0-9_]*|(?:BF|F|FP)[0-9]+)$`)
+	ggufShardSuffix    = regexp.MustCompile(`(?i)-\d{5}-of-\d{5}$`)
+	ggufQuantToken     = regexp.MustCompile(`(?i)^(?:` + quantCorePattern + `)$`)
+	filenameQuantToken = regexp.MustCompile(`(?i)(?:^|[-_.])(` + quantCorePattern + `)(?:[-_.]|$)`)
 )
 
 // modelNameFromGGUFFilename strips the extension, shard suffix, and trailing
@@ -5532,8 +5538,7 @@ func quantizationFromModelInfo(info map[string]any) string {
 func quantizationFromFilename(path string) string {
 	name := filepath.Base(path)
 	name = strings.TrimSuffix(name, filepath.Ext(name))
-	pattern := regexp.MustCompile(`(?i)(?:^|[-_.])((?:IQ|Q)[0-9][A-Z0-9_]*|(?:BF|F|FP)[0-9]+)(?:[-_.]|$)`)
-	matches := pattern.FindAllStringSubmatch(name, -1)
+	matches := filenameQuantToken.FindAllStringSubmatch(name, -1)
 	if len(matches) == 0 {
 		return ""
 	}

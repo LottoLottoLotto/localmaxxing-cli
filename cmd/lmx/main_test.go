@@ -2243,3 +2243,34 @@ func TestHandleSetupsRequiresAPIKey(t *testing.T) {
 	t.Setenv("LMX_API_KEY", "")
 	requireCliErrorCode(t, runWithArgs(parseArgs([]string{"setups", "list"})), "missing_api_key")
 }
+
+func TestQuantizationFromFilenameDetectsVendorFP(t *testing.T) {
+	cases := map[string]string{
+		"Qwen3-8B-NVFP4":          "NVFP4",
+		"Qwen3-30B-A3B-NVFP4":     "NVFP4",
+		"model-nvfp4.safetensors": "NVFP4",
+		"gpt-oss-20b-MXFP4.gguf":  "MXFP4",
+		"DeepSeek-R1-MXFP8":       "MXFP8",
+		"Llama-3-70B-FP8":         "FP8",
+		"model-Q4_K_M.gguf":       "Q4_K_M",
+		"plain-model":             "",
+	}
+	for in, want := range cases {
+		if got := quantizationFromFilename(in); got != want {
+			t.Errorf("quantizationFromFilename(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestModelNameFromGGUFFilenameStripsVendorFPQuant(t *testing.T) {
+	cases := map[string]string{
+		"gpt-oss-20b-MXFP4.gguf":      "gpt-oss-20b",
+		"Qwen3-8B-NVFP4.gguf":         "Qwen3-8B",
+		"Meta-Llama-3-8B-Q4_K_M.gguf": "Meta-Llama-3-8B",
+	}
+	for in, want := range cases {
+		if got := modelNameFromGGUFFilename(in); got != want {
+			t.Errorf("modelNameFromGGUFFilename(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
