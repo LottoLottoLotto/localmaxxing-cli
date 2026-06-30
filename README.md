@@ -69,6 +69,19 @@ lmx auth --logout
 
 Saved config lives under `~/.config/localmaxxing`. You can also pass `--api-key bhk_...` to any command directly.
 
+## Agent Skill
+
+The binary embeds an Agent Skill documenting the CLI so coding agents can discover and use `lmx` without external docs.
+
+```bash
+lmx skill print                       # print SKILL.md to stdout
+lmx skill print --out SKILL.md        # or write it to a file
+lmx skill install                     # install into ./.claude/skills/localmaxxing-cli
+lmx skill install --dir ~/.claude/skills
+```
+
+`lmx skill install` writes the skill tree to `<dir>/localmaxxing-cli/`. It works with any harness that discovers `skills/<name>/SKILL.md`, including Claude `.claude/skills` and GitHub `.github/skills`.
+
 ## Hardware Metadata
 
 Submissions require a hardware JSON object. Generate one on the machine running the benchmark:

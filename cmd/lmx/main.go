@@ -115,6 +115,8 @@ func runWithArgs(args cliArgs) error {
 		return handleHardware(positional(args, 1), args)
 	case "setups":
 		return handleSetups(positional(args, 1), args)
+	case "skill":
+		return handleSkill(positional(args, 1), args)
 	case "context", "agent-context":
 		return handleContext(args)
 	case "model":
@@ -163,7 +165,7 @@ func runWithArgs(args cliArgs) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "benchmark", "bench", "auth", "hardware", "setups", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep":
+	case "eval", "benchmark", "bench", "auth", "hardware", "setups", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill":
 		return true
 	default:
 		return false
@@ -9255,6 +9257,8 @@ var usageExamples = []string{
 	`lmx setups pull --default --out hardware.json`,
 	`lmx setups pull --name "2x RTX 3090" --out hardware.json`,
 	`lmx engines`,
+	`lmx skill print`,
+	`lmx skill install --dir .claude/skills`,
 	`lmx endpoint discover --hf-id Qwen/Qwen3-8B --quantization fp16`,
 	`lmx server dry-run vllm --hf-id Qwen/Qwen3-8B --quantization fp16`,
 	`lmx server dry-run llama.cpp --model-path model.gguf`,
@@ -9394,6 +9398,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --yes                    Confirm saved-run deletion
   --json-status            Emit progress events as JSON lines on stderr
   --quiet                  Suppress progress events
+  --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
   --hardware <path>        JSON hardware object required when submitting
   --quantization <label>   Quantization label (auto-detected from the endpoint for remote benchmark and eval-shard runs when omitted)
   --results <path>         Existing lm-eval output JSON for run upload
@@ -9430,6 +9435,9 @@ var commandDescriptions = map[string]string{
 	"setups":                 "List and pull your saved hardware/engine setups.",
 	"setups list":            "List saved setups stored in your LocalMaxxing account.",
 	"setups pull":            "Write a hardware.json from a saved setup.",
+	"skill":                  "Print or install the bundled agent skill that documents the CLI.",
+	"skill print":            "Print the bundled SKILL.md to stdout (or --out <path>).",
+	"skill install":          "Write the bundled skill files into a skills directory (default .claude/skills).",
 	"model":                  "Search or resolve HuggingFace model IDs.",
 	"model search":           "Search LocalMaxxing model records.",
 	"model resolve-remote":   "Resolve a remote endpoint alias to likely HF candidates.",
