@@ -9,6 +9,15 @@ lmx hardware --out hardware.json
 lmx hardware init --out hardware.json
 ```
 
+Validate a hardware file against the live LocalMaxxing hardware schema and allowlist:
+
+```bash
+lmx hardware validate hardware.json
+```
+
+`benchmark submit` and `benchmark dry-run` sanitize generated hardware before posting, including converting detector GPU slots from `{ "name": ... }` to API slots shaped as `{ "gpuName": ... }`. Validation still checks the current allowlist; choose a GPU name from `lmx context` if the detector reports a vendor-specific marketing string.
+
+
 ## Hardware templates
 
 Generate a hardware object from explicit flags when automatic detection is unavailable:

@@ -40,6 +40,82 @@ func TestApplyNvidiaSMIHardwareParsesMultipleGPUs(t *testing.T) {
 	}
 }
 
+func TestBenchmarkSubmitNormalizesGeneratedHardware(t *testing.T) {
+	payload := map[string]any{
+		"hfId":         "nvidia/Gemma-4-31B-IT-NVFP4",
+		"engineName":   "vllm",
+		"quantization": "NVFP4",
+		"tokSOut":      31.7,
+		"hardware": map[string]any{
+			"cpu":         "Intel(R) Core(TM) i7-8850H CPU @ 2.60GHz",
+			"cpuThreads":  12,
+			"gpuCount":    1,
+			"gpuName":     "NVIDIA RTX PRO 5000 72GB Blackwell",
+			"gpus":        []any{map[string]any{"name": "NVIDIA RTX PRO 5000 72GB Blackwell", "vramGb": 71.7}},
+			"hwClass":     "DISCRETE_GPU",
+			"os":          "linux",
+			"totalVramGb": 71.7,
+			"vramGb":      71.7,
+		},
+	}
+
+	submit := toBenchmarkSubmit(payload)
+	hardware := asObject(submit["hardware"])
+	if hardware == nil {
+		t.Fatalf("submit hardware = %#v", submit["hardware"])
+	}
+	if hardware["gpuName"] != "NVIDIA RTX PRO 5000 72GB Blackwell" {
+		t.Fatalf("gpuName = %v", hardware["gpuName"])
+	}
+	if hardware["vramGb"] != 71.7 {
+		t.Fatalf("vramGb = %v, want 71.7", hardware["vramGb"])
+	}
+	if _, ok := hardware["gpus"]; ok {
+		t.Fatalf("single generated GPU should submit flat hardware, got gpus = %#v", hardware["gpus"])
+	}
+	if _, ok := hardware["cpuThreads"]; ok {
+		t.Fatalf("cpuThreads leaked into submit hardware: %#v", hardware)
+	}
+}
+
+func TestNormalizeHardwareForSubmitMapsGpuSlotName(t *testing.T) {
+	normalized := normalizeHardwareForSubmit(map[string]any{
+		"hwClass": "DISCRETE_GPU",
+		"gpus": []any{
+			map[string]any{"name": "NVIDIA GeForce RTX 4090", "vramGb": 24.0},
+			map[string]any{"gpuName": "NVIDIA GeForce RTX 3090", "count": 2.0, "vramGb": 24.0},
+		},
+	})
+
+	gpus := normalizedGpuSlotSlice(normalized["gpus"])
+	if len(gpus) != 2 {
+		t.Fatalf("gpus = %#v, want two slots", normalized["gpus"])
+	}
+	if gpus[0]["gpuName"] != "NVIDIA GeForce RTX 4090" {
+		t.Fatalf("slot gpuName = %v", gpus[0]["gpuName"])
+	}
+	if _, ok := normalized["gpuName"]; ok {
+		t.Fatalf("heterogeneous hardware should not include flat gpuName: %#v", normalized)
+	}
+}
+
+func TestValidateHardwareAgainstContextRejectsUnsupportedGpu(t *testing.T) {
+	hardware := normalizeHardwareForSubmit(map[string]any{
+		"hwClass": "DISCRETE_GPU",
+		"gpuName": "NVIDIA RTX PRO 5000 72GB Blackwell",
+		"vramGb":  71.7,
+	})
+	context := map[string]any{"hardwareOptions": map[string]any{"discreteGpuNames": []any{"NVIDIA RTX PRO 6000 Blackwell"}}}
+
+	err := validateHardwareAgainstContext(hardware, context)
+	if err == nil {
+		t.Fatal("validateHardwareAgainstContext accepted unsupported GPU")
+	}
+	if cliErr, ok := err.(cliError); !ok || cliErr.Code != "unsupported_hardware" {
+		t.Fatalf("error = %#v, want unsupported_hardware", err)
+	}
+}
+
 func TestEndpointTimeout(t *testing.T) {
 	defaultTimeout, err := endpointTimeout(cliArgs{opts: map[string]string{}, flags: map[string]bool{}})
 	if err != nil {

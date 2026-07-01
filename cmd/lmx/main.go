@@ -153,6 +153,9 @@ func runWithArgs(args cliArgs) error {
 		case "submit":
 			return handleEvalSubmit(positional(args, 2), args)
 		case "shard":
+			if positional(args, 2) == "status" {
+				return handleEvalShardStatus(positional(args, 3), args)
+			}
 			return handleEvalShard(positional(args, 2), args)
 		case "terminal":
 			return handleEvalTerminal(positional(args, 2), args)
@@ -769,6 +772,9 @@ func handleHardware(action string, args cliArgs) error {
 	if action == "template" {
 		return handleHardwareTemplate(args)
 	}
+	if action == "validate" {
+		return validateHardwareFile(positional(args, 2), args)
+	}
 	hardware := detectHardware()
 	if action == "init" && opt(args, "out") == "" {
 		args.opts["out"] = "hardware.json"
@@ -794,6 +800,35 @@ func handleHardware(action string, args cliArgs) error {
 	data, _ := json.MarshalIndent(hardware, "", "  ")
 	fmt.Println(string(data))
 	return nil
+}
+
+func validateHardwareFile(path string, args cliArgs) error {
+	if path == "" {
+		path = opt(args, "hardware")
+	}
+	if path == "" {
+		return cliError{"missing_hardware", "hardware validate requires a hardware JSON path.", []string{"Run lmx hardware validate hardware.json."}, nil}
+	}
+	value, err := readJSON(path)
+	if err != nil {
+		return err
+	}
+	hw := asObject(value)
+	if hw == nil {
+		return cliError{"invalid_hardware", "Hardware file must contain a JSON object.", []string{"Generate one with lmx hardware --out hardware.json."}, value}
+	}
+	normalized := normalizeHardwareForSubmit(hw)
+	if err := validateNormalizedHardwareShape(normalized); err != nil {
+		return err
+	}
+	contextValue, err := fetchJSON("GET", apiURL(args)+"/api/agent-context", "", nil)
+	if err != nil {
+		return err
+	}
+	if err := validateHardwareAgainstContext(normalized, contextValue); err != nil {
+		return err
+	}
+	return writeOrPrintJSON("hardware_valid", args, map[string]any{"path": path, "status": "valid", "hardware": normalized})
 }
 
 func hardwareTemplateFromArgs(args cliArgs) (map[string]any, error) {
@@ -4008,7 +4043,7 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 	}
 
 	if hw := asObject(payload["hardware"]); hw != nil {
-		out["hardware"] = remapHardware(hw)
+		out["hardware"] = normalizeHardwareForSubmit(hw)
 	}
 	if ef := asObject(payload["engineFlags"]); ef != nil {
 		out["engineFlags"] = remapEngineFlags(ef, payload)
@@ -4017,9 +4052,9 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 	return out
 }
 
-func remapHardware(hw map[string]any) map[string]any {
+func normalizeHardwareForSubmit(hw map[string]any) map[string]any {
 	hwClass := "CPU_ONLY"
-	if firstNonEmpty(stringValue(hw["gpuName"]), stringValue(hw["gpus"])) != "" || len(anySlice(hw["gpus"])) > 0 {
+	if firstNonEmpty(stringValue(hw["gpuName"]), stringValue(hw["name"])) != "" || len(anySlice(hw["gpus"])) > 0 {
 		hwClass = "DISCRETE_GPU"
 	} else if firstNonEmpty(stringValue(hw["chipVendor"]), stringValue(hw["chipFamily"])) != "" || stringValue(hw["hwClass"]) == "UNIFIED" || stringValue(hw["hwClass"]) == "APPLE_SILICON" {
 		hwClass = "UNIFIED"
@@ -4027,18 +4062,23 @@ func remapHardware(hw map[string]any) map[string]any {
 
 	remapped := map[string]any{"hwClass": hwClass}
 	if hwClass == "DISCRETE_GPU" {
-		remapped["gpuName"] = firstNonEmpty(stringValue(hw["gpuName"]), "Unknown GPU")
-		remapped["vramGb"] = numberField(hw, "vramGb")
-		if remapped["vramGb"] == 0 {
-			remapped["vramGb"] = numberField(hw, "gpuVramGb")
-		}
-		if c := numberField(hw, "gpuCount"); c > 0 {
-			remapped["gpuCount"] = c
-		}
-		if gpus := anySlice(hw["gpus"]); len(gpus) > 0 {
+		flatGPUName := firstNonEmpty(stringValue(hw["gpuName"]), stringValue(hw["name"]))
+		flatVRAM := firstPositiveFloat(numberField(hw, "vramGb"), numberField(hw, "gpuVramGb"), numberField(hw, "totalVramGb"))
+		gpus := normalizeGpuSlots(anySlice(hw["gpus"]))
+		if len(gpus) > 1 {
 			remapped["gpus"] = gpus
-			delete(remapped, "gpuName")
-			delete(remapped, "vramGb")
+		} else {
+			if flatGPUName == "" && len(gpus) == 1 {
+				flatGPUName = stringValue(gpus[0]["gpuName"])
+			}
+			if flatVRAM == 0 && len(gpus) == 1 {
+				flatVRAM = numberField(gpus[0], "vramGb")
+			}
+			remapped["gpuName"] = firstNonEmpty(flatGPUName, "Unknown GPU")
+			remapped["vramGb"] = flatVRAM
+			if c := numberField(hw, "gpuCount"); c > 0 {
+				remapped["gpuCount"] = c
+			}
 		}
 	}
 	if hwClass == "UNIFIED" {
@@ -4063,6 +4103,122 @@ func remapHardware(hw map[string]any) map[string]any {
 	}
 
 	return remapped
+}
+
+func normalizeGpuSlots(slots []any) []map[string]any {
+	out := []map[string]any{}
+	for _, slotValue := range slots {
+		slot := asObject(slotValue)
+		if slot == nil {
+			continue
+		}
+		gpuName := firstNonEmpty(stringValue(slot["gpuName"]), stringValue(slot["name"]))
+		vramGb := firstPositiveFloat(numberField(slot, "vramGb"), numberField(slot, "gpuVramGb"))
+		if gpuName == "" && vramGb == 0 {
+			continue
+		}
+		normalized := map[string]any{}
+		if gpuName != "" {
+			normalized["gpuName"] = gpuName
+		}
+		if count := numberField(slot, "count"); count > 0 {
+			normalized["count"] = count
+		}
+		if vramGb > 0 {
+			normalized["vramGb"] = vramGb
+		}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func validateNormalizedHardwareShape(hw map[string]any) error {
+	switch stringValue(hw["hwClass"]) {
+	case "DISCRETE_GPU":
+		if slots := normalizedGpuSlotSlice(hw["gpus"]); len(slots) > 0 {
+			for i, slot := range slots {
+				if stringValue(slot["gpuName"]) == "" || numberField(slot, "vramGb") <= 0 {
+					return cliError{"invalid_hardware", fmt.Sprintf("hardware.gpus[%d] must include gpuName and vramGb.", i), []string{"Use gpus entries shaped like {\"gpuName\":\"NVIDIA GeForce RTX 4090\",\"count\":1,\"vramGb\":24}."}, hw}
+				}
+			}
+			return nil
+		}
+		if stringValue(hw["gpuName"]) == "" || numberField(hw, "vramGb") <= 0 {
+			return cliError{"invalid_hardware", "DISCRETE_GPU hardware requires gpuName and vramGb.", []string{"Use lmx hardware template --gpu-name \"NVIDIA GeForce RTX 4090\" --vram-gb 24."}, hw}
+		}
+	case "UNIFIED":
+		if stringValue(hw["chipVendor"]) == "" || stringValue(hw["chipFamily"]) == "" || stringValue(hw["chipVariant"]) == "" || numberField(hw, "unifiedMemoryGb") <= 0 {
+			return cliError{"invalid_hardware", "UNIFIED hardware requires chipVendor, chipFamily, chipVariant, and unifiedMemoryGb.", nil, hw}
+		}
+	case "CPU_ONLY":
+		if stringValue(hw["cpu"]) == "" || numberField(hw, "ramGb") <= 0 {
+			return cliError{"invalid_hardware", "CPU_ONLY hardware requires cpu and ramGb.", nil, hw}
+		}
+	default:
+		return cliError{"invalid_hardware", "hardware.hwClass must be DISCRETE_GPU, UNIFIED, or CPU_ONLY.", nil, hw}
+	}
+	return nil
+}
+
+func validateHardwareAgainstContext(hw map[string]any, contextValue any) error {
+	contextObj := asObject(contextValue)
+	options := asObject(contextObj["hardwareOptions"])
+	if options == nil {
+		return nil
+	}
+	switch stringValue(hw["hwClass"]) {
+	case "DISCRETE_GPU":
+		allowed := stringSet(anySlice(options["discreteGpuNames"]))
+		if len(allowed) == 0 {
+			return nil
+		}
+		if slots := normalizedGpuSlotSlice(hw["gpus"]); len(slots) > 0 {
+			for _, slot := range slots {
+				if name := stringValue(slot["gpuName"]); name != "" && !allowed[name] {
+					return unsupportedHardwareName("GPU", name, "hardwareOptions.discreteGpuNames")
+				}
+			}
+			return nil
+		}
+		if name := stringValue(hw["gpuName"]); name != "" && !allowed[name] {
+			return unsupportedHardwareName("GPU", name, "hardwareOptions.discreteGpuNames")
+		}
+	case "UNIFIED":
+		if allowed := stringSet(anySlice(options["chipVendors"])); len(allowed) > 0 {
+			if name := stringValue(hw["chipVendor"]); name != "" && !allowed[name] {
+				return unsupportedHardwareName("chip vendor", name, "hardwareOptions.chipVendors")
+			}
+		}
+	}
+	return nil
+}
+
+func normalizedGpuSlotSlice(value any) []map[string]any {
+	raw := anySlice(value)
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if obj := asObject(item); obj != nil {
+			out = append(out, obj)
+		}
+	}
+	return out
+}
+
+func stringSet(values []any) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		if text := stringValue(value); text != "" {
+			out[text] = true
+		}
+	}
+	return out
+}
+
+func unsupportedHardwareName(kind, name, source string) error {
+	return cliError{"unsupported_hardware", fmt.Sprintf("%s %q is not in the current LocalMaxxing allowlist.", kind, name), []string{"Run lmx context --out context.json and choose a value from " + source + ".", "If this hardware should be accepted, request an allowlist update before submitting."}, nil}
 }
 
 func remapEngineFlags(ef map[string]any, payload map[string]any) map[string]any {
@@ -6673,6 +6829,52 @@ func defaultShardScoring(dataset string) string {
 	}
 }
 
+func isHellaSwagDataset(dataset string) bool {
+	return strings.EqualFold(dataset, "hellaswag")
+}
+
+func chatOrInstructModelHint(model string, info map[string]any) string {
+	candidates := []string{model}
+	if info != nil {
+		for _, key := range []string{"id", "name", "model", "root", "parent"} {
+			candidates = append(candidates, stringValue(info[key]))
+		}
+	}
+	for _, candidate := range candidates {
+		normalized := strings.ToLower(strings.NewReplacer("_", "-", " ", "-").Replace(candidate))
+		if normalized == "" {
+			continue
+		}
+		for _, marker := range []string{"-instruct", "instruct-", "-chat", "chat-", "-it", "-sft", "-dpo", "-rlhf"} {
+			if strings.Contains(normalized, marker) {
+				return candidate
+			}
+		}
+		if strings.HasSuffix(normalized, "-it") || strings.HasSuffix(normalized, "-instruct") || strings.HasSuffix(normalized, "-chat") {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func shouldWarnHellaSwagDefaultLoglikelihood(dataset, scoring, explicitScoring, model string, info map[string]any) (string, bool) {
+	if !isHellaSwagDataset(dataset) || scoring != "loglikelihood" || explicitScoring != "" {
+		return "", false
+	}
+	hint := chatOrInstructModelHint(model, info)
+	return hint, hint != ""
+}
+
+func printHellaSwagDefaultLoglikelihoodWarning(args cliArgs, modelHint string) {
+	printStatus(args, "hellaswag_loglikelihood_chat_warning", map[string]any{
+		"warning":       "HellaSwag default scoring is loglikelihood. For chat/instruct endpoints this may under-score due to prompt/template mismatch. If you intend generated multiple-choice answers, pass --scoring exact_match explicitly.",
+		"modelHint":     modelHint,
+		"canonical":     "For canonical continuation scoring, use a /v1/completions endpoint with echo prompt logprobs, or pass --model-path <model.gguf> to use the bundled llama_cpp_loglikelihood helper.",
+		"helper":        "lmx-llama-score-hellaswag",
+		"overrideExact": "--scoring exact_match",
+	})
+}
+
 func normalizeShardScoring(value string) (string, error) {
 	if value == "" {
 		return "", nil
@@ -6710,6 +6912,143 @@ func shardConfigInt(cliArgs cliArgs, meta map[string]any, optName, fieldName str
 		}
 	}
 	return value, nil
+}
+
+func evalShardRunnerVersion(args cliArgs) string {
+	return firstNonEmpty(opt(args, "runner-version"), "localmaxxing-go eval-shard")
+}
+
+func evalShardHarnessKeyForCoverage(args cliArgs) string {
+	return evalShardRunnerVersion(args) + "|unknown-protocol|unknown-agent"
+}
+
+func intSetFromAny(value any) map[int]bool {
+	set := map[int]bool{}
+	for _, item := range anySlice(value) {
+		n := 0
+		switch v := item.(type) {
+		case float64:
+			n = int(v)
+		case float32:
+			n = int(v)
+		case int:
+			n = v
+		case int64:
+			n = int(v)
+		case string:
+			parsed, _ := strconv.Atoi(v)
+			n = parsed
+		}
+		if n > 0 {
+			set[n] = true
+		}
+	}
+	return set
+}
+
+func sortedIntsFromSet(set map[int]bool) []int {
+	values := make([]int, 0, len(set))
+	for n := range set {
+		values = append(values, n)
+	}
+	sort.Ints(values)
+	return values
+}
+
+func missingShardIndexes(shardCount int, covered map[int]bool) []int {
+	if shardCount <= 0 {
+		return nil
+	}
+	missing := []int{}
+	for i := 1; i <= shardCount; i++ {
+		if !covered[i] {
+			missing = append(missing, i)
+		}
+	}
+	return missing
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func copyBoolMap(in map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func fetchEvalShardCoverage(dataset, hfID, quantization, quantFormat string, args cliArgs) (map[string]any, error) {
+	if hfID == "" {
+		return nil, cliError{"missing_model", "eval shard status requires --model <HuggingFace model id>", []string{"Pass the same --model used for shard submissions."}, nil}
+	}
+	query := url.Values{}
+	query.Set("hfId", hfID)
+	query.Set("harnessKey", evalShardHarnessKeyForCoverage(args))
+	if quantization != "" {
+		query.Set("quantization", quantization)
+	}
+	if quantFormat != "" {
+		query.Set("quantFormat", quantFormat)
+	}
+	value, err := fetchJSON("GET", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/coverage?"+query.Encode(), apiKey(args), nil)
+	if err != nil {
+		return nil, err
+	}
+	obj := asObject(value)
+	if obj == nil {
+		return nil, cliError{"invalid_coverage_response", "Eval shard coverage response was not a JSON object.", nil, value}
+	}
+	return obj, nil
+}
+
+func shardCoverageDetails(value any) (shardCount int, covered map[int]bool, missing []int) {
+	obj := asObject(value)
+	dataset := asObject(obj["dataset"])
+	coverage := asObject(obj["coverage"])
+	shardCount = int(numberField(dataset, "shardCount"))
+	covered = intSetFromAny(coverage["shardsCovered"])
+	missing = missingShardIndexes(shardCount, covered)
+	return shardCount, covered, missing
+}
+
+func handleEvalShardStatus(dataset string, args cliArgs) error {
+	if dataset == "" {
+		return errors.New("eval shard status requires a dataset slug")
+	}
+	hfID := opt(args, "model")
+	value, err := fetchEvalShardCoverage(dataset, hfID, opt(args, "quantization"), opt(args, "quant-format"), args)
+	if err != nil {
+		return err
+	}
+	shardCount, covered, missing := shardCoverageDetails(value)
+	obj := asObject(value)
+	coverage := asObject(obj["coverage"])
+	fields := map[string]any{
+		"dataset":             dataset,
+		"model":               hfID,
+		"quantization":        firstNonEmpty(opt(args, "quantization"), "(none)"),
+		"quantFormat":         firstNonEmpty(opt(args, "quant-format"), "(none)"),
+		"harnessKey":          evalShardHarnessKeyForCoverage(args),
+		"shardCount":          shardCount,
+		"coveredShards":       sortedIntsFromSet(covered),
+		"missingShards":       missing,
+		"uniqueQuestionCount": coverage["uniqueQuestionCount"],
+		"questionsNeeded":     coverage["questionsNeeded"],
+		"coverageMeaning":     "APPROVED aggregate shards for this dataset/model/quantization/quantFormat/harness key",
+		"duplicateGuardHint":  "lmx eval shard " + dataset + " --model " + hfID + " --missing-only --submit",
+	}
+	if hasFlag(args, "json") || hasFlag(args, "print") || opt(args, "out") != "" {
+		return writeOrPrintJSON("eval_shard_status", args, map[string]any{"status": fields, "raw": value})
+	}
+	printInfo("eval_shard_status", fields)
+	return nil
 }
 
 // handleEvalShard runs a blob-backed eval-shard dataset against a local
@@ -6824,9 +7163,13 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	if strings.EqualFold(dataset, "hellaswag") && opt(args, "model-path") != "" {
 		defaultScoring = "llama_cpp_loglikelihood"
 	}
-	scoring, err := normalizeShardScoring(firstNonEmpty(opt(args, "scoring"), opt(args, "scoring-method"), stringValue(evalConfig["scoring"]), defaultScoring))
+	explicitScoring := firstNonEmpty(opt(args, "scoring"), opt(args, "scoring-method"))
+	scoring, err := normalizeShardScoring(firstNonEmpty(explicitScoring, stringValue(evalConfig["scoring"]), defaultScoring))
 	if err != nil {
 		return err
+	}
+	if modelHint, ok := shouldWarnHellaSwagDefaultLoglikelihood(dataset, scoring, explicitScoring, callModel, servedModelInfo); ok {
+		printHellaSwagDefaultLoglikelihoodWarning(args, modelHint)
 	}
 
 	nSamples, err := intOption(args, 1, 1, "n-samples")
@@ -6866,6 +7209,50 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		passK:          passK,
 		fewShot:        fewShot,
 		tempExplicit:   tempExplicit,
+	}
+
+	if submit {
+		hfIDForCoverage := opt(args, "model")
+		if hfIDForCoverage != "" {
+			coverageValue, covErr := fetchEvalShardCoverage(dataset, hfIDForCoverage, resolvedQuant, resolvedQuantFormat, args)
+			if covErr != nil {
+				if hasFlag(args, "missing-only") || hasFlag(args, "all-missing") {
+					return covErr
+				}
+				printStatus(args, "eval_shard_coverage_unavailable", map[string]any{"warning": covErr.Error(), "duplicateGuard": "skipped"})
+			} else {
+				shardCount, covered, missing := shardCoverageDetails(coverageValue)
+				if hasFlag(args, "all-missing") && opt(args, "shard") == "" {
+					if len(missing) == 0 {
+						printInfo("eval_shard_all_missing_complete", map[string]any{"dataset": dataset, "model": hfIDForCoverage, "shardCount": shardCount, "coveredShards": sortedIntsFromSet(covered)})
+						return nil
+					}
+					for _, nextShard := range missing {
+						nextArgs := args
+						nextArgs.opts = copyStringMap(args.opts)
+						nextArgs.flags = copyBoolMap(args.flags)
+						nextArgs.opts["shard"] = strconv.Itoa(nextShard)
+						delete(nextArgs.flags, "all-missing")
+						delete(nextArgs.flags, "missing-only")
+						if err := handleEvalShard(dataset, nextArgs); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				if hasFlag(args, "missing-only") && opt(args, "shard") == "" && covered[shardIndex] && len(missing) > 0 {
+					nextArgs := args
+					nextArgs.opts = copyStringMap(args.opts)
+					nextArgs.flags = copyBoolMap(args.flags)
+					nextArgs.opts["shard"] = strconv.Itoa(missing[0])
+					delete(nextArgs.flags, "missing-only")
+					return handleEvalShard(dataset, nextArgs)
+				}
+				if covered[shardIndex] && !hasFlag(args, "rerun") && !hasFlag(args, "force") {
+					return cliError{"shard_already_submitted", fmt.Sprintf("Shard %d already has APPROVED coverage for this model/dataset/quantization/quantFormat/harness key.", shardIndex), []string{"Use --missing-only to run the next missing shard.", "Use --all-missing to walk every missing shard.", "Use --rerun or --force to submit another run for this shard."}, map[string]any{"dataset": dataset, "model": hfIDForCoverage, "shardIndex": shardIndex, "coveredShards": sortedIntsFromSet(covered), "missingShards": missing, "coverageMeaning": "APPROVED aggregate shards for this dataset/model/quantization/quantFormat/harness key"}}
+				}
+			}
+		}
 	}
 
 	printInfo("eval_shard_start", map[string]any{"dataset": dataset, "shard": shardIndex, "questions": count, "model": callModel, "baseUrl": baseURL, "concurrency": concurrency, "scoring": scoring})
@@ -7025,7 +7412,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		"shardIndex":    shardIndex,
 		"results":       submitResults,
 		"artifacts":     submitArtifacts,
-		"runnerVersion": firstNonEmpty(opt(args, "runner-version"), "localmaxxing-go eval-shard"),
+		"runnerVersion": evalShardRunnerVersion(args),
 		"runConfig":     runConfig,
 	}
 	if resolvedQuant != "" {
@@ -7050,7 +7437,8 @@ func handleEvalShard(dataset string, args cliArgs) error {
 			fields["pooledScore"] = agg["pooledScore"]
 			fields["ciLower"] = agg["ciLower"]
 			fields["ciUpper"] = agg["ciUpper"]
-			fields["coverage"] = agg["shardsCovered"]
+			fields["aggregateCoverage"] = agg["shardsCovered"]
+			fields["coverageMeaning"] = "APPROVED aggregate shards for this dataset/model/quantization/quantFormat/harness key"
 		}
 		if run := asObject(obj["run"]); run != nil {
 			fields["runId"] = run["id"]
@@ -7336,21 +7724,54 @@ func sandboxCommand(args cliArgs) (*exec.Cmd, string) {
 	if custom := opt(args, "sandbox-cmd"); custom != "" {
 		return exec.Command("sh", "-c", custom), custom
 	}
-	runtime := firstNonEmpty(opt(args, "sandbox-runtime"), "docker")
+	runtime := strings.Fields(firstNonEmpty(opt(args, "sandbox-runtime"), "docker"))
+	if len(runtime) == 0 {
+		runtime = []string{"docker"}
+	}
+	if hasFlag(args, "sandbox-use-sudo") && runtime[0] != "sudo" {
+		runtime = append([]string{"sudo"}, runtime...)
+	}
 	image := firstNonEmpty(opt(args, "sandbox-image"), "lmx-sandbox")
-	argv := []string{
-		runtime, "run", "--rm", "-i",
+	argv := append([]string{}, runtime...)
+	argv = append(argv,
+		"run", "--rm", "-i",
 		"--network", "none",
 		"--memory", firstNonEmpty(opt(args, "sandbox-memory"), "2g"),
 		"--cpus", firstNonEmpty(opt(args, "sandbox-cpus"), "2"),
 		"--pids-limit", "128",
-		"--cap-drop", "ALL",
-		"--security-opt", "no-new-privileges",
-		"--read-only",
+	)
+	if !hasFlag(args, "sandbox-relaxed-security") {
+		argv = append(argv,
+			"--cap-drop", "ALL",
+			"--security-opt", "no-new-privileges",
+			"--read-only",
+		)
+	}
+	argv = append(argv,
 		"--tmpfs", "/tmp:exec,size=128m",
 		image,
-	}
+	)
 	return exec.Command(argv[0], argv[1:]...), strings.Join(argv, " ")
+}
+
+func sandboxFailureHints(stderr string) []string {
+	clean := strings.TrimSpace(stderr)
+	hints := make([]string, 0, 5)
+	if clean != "" {
+		hints = append(hints, clean)
+	}
+	lower := strings.ToLower(clean)
+	if strings.Contains(lower, "/var/run/docker.sock") && strings.Contains(lower, "permission denied") {
+		hints = append(hints,
+			"Docker socket permission denied: add your user to the Docker group and re-login, or run the container via sudo with --sandbox-use-sudo.",
+			"Equivalent override: --sandbox-cmd \"sudo docker run --rm -i --network none --memory 2g --cpus 2 --pids-limit 128 --tmpfs /tmp:exec,size=128m lmx-sandbox\"",
+		)
+	}
+	if strings.Contains(lower, "operation not permitted") && strings.Contains(lower, "python3") {
+		hints = append(hints, "If the container starts but cannot exec Python, retry with --sandbox-relaxed-security; some Docker/rootless/security-profile setups reject the stricter cap/no-new-privileges/read-only combination.")
+	}
+	hints = append(hints, "Build the image with `docker build -t lmx-sandbox sandbox`, or override with --sandbox-cmd.")
+	return hints
 }
 
 //go:embed mbpp_fewshot.json
@@ -7564,7 +7985,7 @@ func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[strin
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
-			return nil, shardStats{}, nil, cliError{"sandbox_failed", fmt.Sprintf("code sandbox failed: %v", err), []string{strings.TrimSpace(stderr.String()), "Build the image with `docker build -t lmx-sandbox sandbox`, or override with --sandbox-cmd."}, nil}
+			return nil, shardStats{}, nil, cliError{"sandbox_failed", fmt.Sprintf("code sandbox failed: %v", err), sandboxFailureHints(stderr.String()), nil}
 		}
 		scanner := bufio.NewScanner(bytes.NewReader(stdout.Bytes()))
 		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -9253,6 +9674,7 @@ var usageExamples = []string{
 	`lmx profile save my-4090 --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --hardware hardware.json`,
 	`lmx hardware --out hardware.json`,
 	`lmx hardware init --out hardware.json`,
+	`lmx hardware validate hardware.json`,
 	`lmx setups list`,
 	`lmx setups pull --default --out hardware.json`,
 	`lmx setups pull --name "2x RTX 3090" --out hardware.json`,
@@ -9295,6 +9717,9 @@ var usageExamples = []string{
 	`lmx eval shard gsm8k --base-url http://localhost:8000 --questions 200 --dry-run`,
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --questions 200 --dry-run`,
 	`lmx eval shard gsm8k --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
+	`lmx eval shard status hellaswag --model Qwen/Qwen3-8B`,
+	`lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --missing-only --submit`,
+	`lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --all-missing --submit`,
 	`lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1`,
 	`lmx eval terminal verify ./tb-bundles/smoke --oracle`,
 	`lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
@@ -9316,6 +9741,9 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --lm-eval-bin <path>     lm-eval executable (default: lm_eval)
   --questions <n>          Eval-shard questions to run (default: 95%/±5% CI recommendation)
   --shard <index>          Pin a specific eval-shard index instead of the least-run one
+  --missing-only          With --submit, skip a covered default shard and run the first missing shard
+  --all-missing           With --submit, submit every currently missing shard in ascending order
+  --rerun, --force        Allow submitting a shard already covered for the current aggregate key
   --answer-extraction <m>  Eval-shard answer extraction: none, final_answer, last_number, or regex (default: final_answer)
   --answer-regex <re>      Regex used when --answer-extraction regex
   --prompt-template <t>    Eval-shard prompt template using {{input}} and {{choices}}
@@ -9355,7 +9783,10 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --model-path <path>      llama.cpp model path; generates llama-bench command
   --llama-scorer <path>     Local helper binary for llama_cpp_loglikelihood scoring (default: lmx-llama-score-hellaswag next to lmx)
   --sandbox-image <name>    Docker image for code_execution scoring (default: lmx-sandbox; build with: docker build -t lmx-sandbox sandbox)
-  --sandbox-runtime <bin>   Container runtime for code_execution (default: docker)
+  --sandbox-runtime <bin>   Container runtime for code_execution (default: docker; accepts quoted commands like "sudo docker")
+  --sandbox-use-sudo        Prefix the default container runtime with sudo
+  --sandbox-relaxed-security
+                           Omit cap-drop/no-new-privileges/read-only when the host rejects the hardened profile
   --sandbox-cmd <cmd>       Override the sandbox launcher entirely (e.g. podman, or "python3 sandbox/run_sandbox.py" without Docker)
   --sandbox-memory <size>   Memory cap for the code sandbox container (default: 2g)
   --sandbox-cpus <n>        CPU cap for the code sandbox container (default: 2)
@@ -9430,7 +9861,8 @@ var commandDescriptions = map[string]string{
 	"benchmark runs":         "List and edit saved benchmark run files.",
 	"benchmark add-hardware": "Attach server hardware metadata to a saved run.",
 	"benchmark fixup":        "Inspect a saved run and print remediation commands.",
-	"hardware":               "Detect local hardware metadata.",
+	"hardware":               "Detect, validate, or template hardware metadata.",
+	"hardware validate":      "Validate hardware metadata against the live LocalMaxxing schema and allowlist.",
 	"hardware template":      "Generate hardware metadata from explicit flags.",
 	"setups":                 "List and pull your saved hardware/engine setups.",
 	"setups list":            "List saved setups stored in your LocalMaxxing account.",
@@ -9446,7 +9878,8 @@ var commandDescriptions = map[string]string{
 	"eval run":               "Run an approved suite locally and write/submit a run payload.",
 	"eval pull":              "Download a suite + datasets for offline runs and inspection.",
 	"eval submit":            "Submit a previously saved run payload (deferred submit).",
-	"eval shard":             "Run a blob-backed eval-shard dataset against a local endpoint and submit pass/fail.",
+	"eval shard":             "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
+	"eval shard status":      "Print aggregate shard coverage and missing shard indexes for a model.",
 	"eval terminal":          "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",

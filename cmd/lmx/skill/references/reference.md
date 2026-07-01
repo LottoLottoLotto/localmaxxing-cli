@@ -6,7 +6,7 @@ Raw HTTP API docs are available from the site through `GET /api/agent-context` a
 
 - `lmx context` / `lmx agent-context`: fetch live enum values and schemas.
 - `lmx auth`: manage LocalMaxxing API authentication.
-- `lmx hardware`: detect or template hardware metadata.
+- `lmx hardware`: detect, validate, or template hardware metadata.
 - `lmx setups`: list and pull saved account setups.
 - `lmx model`: search or resolve HuggingFace model IDs.
 - `lmx profile`: save and manage reusable CLI defaults.
@@ -50,6 +50,9 @@ Eval shards and Terminal-Bench:
 
 - `--questions <n>`: eval-shard questions to run.
 - `--shard <index>`: pin a specific eval-shard index.
+- `--missing-only`: with `eval shard --submit`, run the first missing aggregate shard instead of duplicating a covered default shard.
+- `--all-missing`: with `eval shard --submit`, submit every currently missing aggregate shard.
+- `--rerun` / `--force`: allow submitting a shard that already has APPROVED aggregate coverage.
 - `--answer-extraction <m>`: `none`, `final_answer`, `last_number`, or `regex`.
 - `--answer-regex <re>`: regex used with `--answer-extraction regex`.
 - `--prompt-template <t>`: eval-shard prompt template using `{{input}}` and `{{choices}}`.

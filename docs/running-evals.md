@@ -259,13 +259,44 @@ Build the sandbox image once:
 docker build -t lmx-sandbox sandbox
 ```
 
-The container runs with `--network none`, a read-only root filesystem, dropped
-capabilities, `no-new-privileges`, and CPU/memory/PID/time limits; the harness
-adds per-task CPU/RAM/wall limits as defense in depth. Override the launcher with
-`--sandbox-runtime podman`, `--sandbox-image <name>`, `--sandbox-memory`,
-`--sandbox-cpus`, or replace it entirely with `--sandbox-cmd` (e.g.
-`--sandbox-cmd "python3 sandbox/run_sandbox.py"` for hosts without Docker — note
-that bypasses container isolation and should only be used on disposable boxes).
+The default container command is:
+
+```bash
+docker run --rm -i --network none --memory 2g --cpus 2 --pids-limit 128 \
+  --cap-drop ALL --security-opt no-new-privileges --read-only \
+  --tmpfs /tmp:exec,size=128m lmx-sandbox
+```
+
+That uses a read-only root filesystem, dropped capabilities,
+`no-new-privileges`, no network, and CPU/memory/PID/time limits; the harness adds
+per-task CPU/RAM/wall limits as defense in depth.
+
+If your user cannot access `/var/run/docker.sock`, either add the user to the
+Docker group and re-login, or run the default runtime through sudo:
+
+```bash
+lmx eval shard humaneval-plus --sandbox-use-sudo ...
+```
+
+`--sandbox-runtime "sudo docker"` is equivalent for hosts where you prefer to
+spell out the runtime. If the container starts but fails with
+`exec /usr/local/bin/python3: operation not permitted`, retry without the strict
+cap/no-new-privileges/read-only profile:
+
+```bash
+lmx eval shard humaneval-plus --sandbox-use-sudo --sandbox-relaxed-security ...
+```
+
+This keeps `--network none`, memory/CPU/PID caps, and the executable `/tmp`
+tmpfs, but omits `--cap-drop ALL`, `--security-opt no-new-privileges`, and
+`--read-only` for Docker/rootless/security-profile combinations that reject that
+hardening profile.
+
+Other knobs: `--sandbox-runtime podman`, `--sandbox-image <name>`,
+`--sandbox-memory`, `--sandbox-cpus`, or replace the launcher entirely with
+`--sandbox-cmd` (e.g. `--sandbox-cmd "python3 sandbox/run_sandbox.py"` for hosts
+without Docker — note that bypasses container isolation and should only be used
+on disposable boxes).
 
 Scoring follows canonical pass@1: HumanEval programs keep the prompt stub's
 imports (so a dropped `import` is not a false fail), and a generation that errors
@@ -422,6 +453,22 @@ lmx eval shard gsm8k \
   --questions 200 \
   --submit
 ```
+
+Before continuing a sharded run, inspect aggregate coverage for the same model and
+quantization:
+
+```bash
+lmx eval shard status hellaswag \
+  --model Qwen/Qwen3-8B \
+  --quantization Q4_K_M \
+  --quant-format gguf
+```
+
+`coveredShards` and `missingShards` come from APPROVED aggregate coverage for the
+dataset/model/quantization/quantFormat/harness key. A normal `--submit` refuses a
+covered shard unless you pass `--rerun` or `--force`. To avoid duplicates, use
+`--missing-only --submit` for the next missing shard, or `--all-missing --submit`
+to walk every currently missing shard in ascending order.
 
 Scoring is automatic per row: rows with `choices` are scored as multiple choice
 (letter match); otherwise the final answer is extracted (server default for

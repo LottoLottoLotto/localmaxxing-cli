@@ -3,13 +3,16 @@
 # Build:
 #   docker build -t lmx-sandbox sandbox
 #
-# The container is run by `lmx eval shard <code-dataset>` with strict flags:
+# The default `lmx eval shard <code-dataset>` launcher uses:
 #   docker run --rm -i \
 #     --network none \
-#     --memory 512m --cpus 1 --pids-limit 128 \
+#     --memory 2g --cpus 2 --pids-limit 128 \
 #     --cap-drop ALL --security-opt no-new-privileges \
 #     --read-only --tmpfs /tmp:exec,size=128m \
 #     lmx-sandbox
+# Hosts whose Docker/rootless/security profile rejects the strict exec profile can
+# keep the network/resource limits but omit cap/no-new-privileges/read-only with
+# `--sandbox-relaxed-security`.
 #
 # Tasks arrive as JSONL on stdin; results leave as JSONL on stdout. Only the
 # Python standard library is available (HumanEval/MBPP need nothing else), so the

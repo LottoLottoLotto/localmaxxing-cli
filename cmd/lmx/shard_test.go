@@ -127,6 +127,23 @@ func TestDefaultShardScoring(t *testing.T) {
 		t.Fatalf("gsm8k default scoring = %q, want exact_match", got)
 	}
 }
+
+func TestHellaSwagDefaultLoglikelihoodWarnsForInstructModel(t *testing.T) {
+	hint, ok := shouldWarnHellaSwagDefaultLoglikelihood("hellaswag", "loglikelihood", "", "Qwen/Qwen3-8B-Instruct", nil)
+	if !ok || hint != "Qwen/Qwen3-8B-Instruct" {
+		t.Fatalf("warning = (%q, %v), want instruct model warning", hint, ok)
+	}
+}
+
+func TestHellaSwagDefaultLoglikelihoodWarningRespectsExplicitScoring(t *testing.T) {
+	if hint, ok := shouldWarnHellaSwagDefaultLoglikelihood("hellaswag", "loglikelihood", "loglikelihood", "Qwen/Qwen3-8B-Instruct", nil); ok {
+		t.Fatalf("explicit scoring should not warn, got hint %q", hint)
+	}
+	if hint, ok := shouldWarnHellaSwagDefaultLoglikelihood("hellaswag", "exact_match", "", "Qwen/Qwen3-8B-Instruct", nil); ok {
+		t.Fatalf("exact_match should not warn, got hint %q", hint)
+	}
+}
+
 func TestLlamaScorerDefaultsToCPUWhenServerConfigured(t *testing.T) {
 	got := llamaScorerGPULayers(cliArgs{opts: map[string]string{"base-url": "http://127.0.0.1:8080"}})
 	if got != "0" {
@@ -296,6 +313,11 @@ func shardTestServer(t *testing.T, rows []map[string]any, reply string, posted *
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []any{map[string]any{"message": map[string]any{"content": reply}}},
 			})
+		case r.URL.Path == "/api/evals/gsm8k/coverage":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"dataset":  map[string]any{"slug": "gsm8k", "shardCount": 3},
+				"coverage": map[string]any{"uniqueQuestionCount": 0, "questionsNeeded": len(rows), "shardsCovered": []any{}},
+			})
 		case r.URL.Path == "/api/evals/gsm8k/submit":
 			m := map[string]any{}
 			_ = json.NewDecoder(r.Body).Decode(&m)
@@ -409,6 +431,133 @@ func TestHandleEvalShardSubmitsPassFail(t *testing.T) {
 	}
 }
 
+func TestHandleEvalShardRejectsCoveredShardWithoutRerun(t *testing.T) {
+	rows := []map[string]any{{"question_id": "gsm8k:1", "input": "5 + 5?", "gold": "10"}}
+	var blob strings.Builder
+	for _, row := range rows {
+		line, _ := json.Marshal(row)
+		blob.Write(line)
+		blob.WriteByte('\n')
+	}
+	var posted map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/evals/gsm8k/shard":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"shard":       map[string]any{"shardIndex": 1, "itemCount": len(rows)},
+				"sampling":    map[string]any{"recommendations": map[string]any{"margin05": len(rows)}},
+				"downloadUrl": "http://" + r.Host + "/blob",
+			})
+		case "/blob":
+			_, _ = w.Write([]byte(blob.String()))
+		case "/api/evals/gsm8k/coverage":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"dataset":  map[string]any{"slug": "gsm8k", "shardCount": 1},
+				"coverage": map[string]any{"uniqueQuestionCount": 1, "questionsNeeded": 0, "shardsCovered": []any{1}},
+			})
+		case "/v1/chat/completions":
+			t.Fatal("duplicate guard should run before model calls")
+		case "/api/evals/gsm8k/submit":
+			_ = json.NewDecoder(r.Body).Decode(&posted)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	args := shardSubmitArgs(t, srv.URL, map[string]string{"questions": "1"})
+	if err := handleEvalShard("gsm8k", args); err == nil || !strings.Contains(err.Error(), "Shard 1 already") {
+		t.Fatalf("handleEvalShard duplicate err = %v, want shard already submitted", err)
+	}
+	if posted != nil {
+		t.Fatal("duplicate guard must not submit")
+	}
+}
+
+func TestHandleEvalShardMissingOnlySelectsUncoveredShard(t *testing.T) {
+	rows := []map[string]any{{"question_id": "gsm8k:2", "input": "5 + 5?", "gold": "10"}}
+	var blob strings.Builder
+	for _, row := range rows {
+		line, _ := json.Marshal(row)
+		blob.Write(line)
+		blob.WriteByte('\n')
+	}
+	var posted map[string]any
+	var shardRequests []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/evals/gsm8k/shard":
+			shard := r.URL.Query().Get("shard")
+			shardRequests = append(shardRequests, shard)
+			if shard == "" {
+				shard = "1"
+			}
+			shardIndex := 1
+			if shard == "2" {
+				shardIndex = 2
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"shard":       map[string]any{"shardIndex": shardIndex, "itemCount": len(rows)},
+				"sampling":    map[string]any{"recommendations": map[string]any{"margin05": len(rows)}},
+				"downloadUrl": "http://" + r.Host + "/blob",
+			})
+		case "/blob":
+			_, _ = w.Write([]byte(blob.String()))
+		case "/api/evals/gsm8k/coverage":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"dataset":  map[string]any{"slug": "gsm8k", "shardCount": 2},
+				"coverage": map[string]any{"uniqueQuestionCount": 1, "questionsNeeded": 1, "shardsCovered": []any{1}},
+			})
+		case "/v1/chat/completions":
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "The final answer is 10."}}}})
+		case "/api/evals/gsm8k/submit":
+			_ = json.NewDecoder(r.Body).Decode(&posted)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"run": map[string]any{"id": "run_2", "status": "APPROVED"}, "aggregate": map[string]any{"shardsCovered": []any{1, 2}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	args := shardSubmitArgs(t, srv.URL, map[string]string{"questions": "1"})
+	args.flags["missing-only"] = true
+	if err := handleEvalShard("gsm8k", args); err != nil {
+		t.Fatalf("handleEvalShard missing-only: %v", err)
+	}
+	if numberField(posted, "shardIndex") != 2 {
+		t.Fatalf("posted shardIndex = %v, want 2; shard requests=%v", posted["shardIndex"], shardRequests)
+	}
+}
+
+func TestHandleEvalShardStatusReadsCoverage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/evals/gsm8k/coverage" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("hfId") != "Qwen/Qwen3-8B" {
+			t.Fatalf("hfId query = %q", r.URL.Query().Get("hfId"))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"dataset":  map[string]any{"slug": "gsm8k", "shardCount": 3},
+			"coverage": map[string]any{"uniqueQuestionCount": 20, "questionsNeeded": 10, "shardsCovered": []any{1, 3}},
+		})
+	}))
+	defer srv.Close()
+	out := filepath.Join(t.TempDir(), "status.json")
+	args := cliArgs{opts: map[string]string{"api-url": srv.URL, "model": "Qwen/Qwen3-8B", "out": out}, flags: map[string]bool{}}
+	if err := handleEvalShardStatus("gsm8k", args); err != nil {
+		t.Fatalf("handleEvalShardStatus: %v", err)
+	}
+	saved, err := readJSON(out)
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	status := asObject(asObject(saved)["status"])
+	if got := anySlice(status["missingShards"]); len(got) != 1 || int(numberField(map[string]any{"v": got[0]}, "v")) != 2 {
+		t.Fatalf("missingShards = %#v, want [2]", got)
+	}
+}
+
 // shardArtifactRows returns 4 passing (gold 10) + 2 failing rows for the fixed
 // reply "The final answer is 10."
 func shardArtifactRows() []map[string]any {
@@ -513,6 +662,11 @@ func TestHandleEvalShardPullsQuantFromEndpoint(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"model_path": "/models/gemma-4-12b-it-Q4_K_M.gguf"})
 		case "/v1/chat/completions":
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "The final answer is 10."}}}})
+		case "/api/evals/gsm8k/coverage":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"dataset":  map[string]any{"slug": "gsm8k", "shardCount": 3},
+				"coverage": map[string]any{"uniqueQuestionCount": 0, "questionsNeeded": len(rows), "shardsCovered": []any{}},
+			})
 		case "/api/evals/gsm8k/submit":
 			m := map[string]any{}
 			_ = json.NewDecoder(r.Body).Decode(&m)
@@ -565,6 +719,56 @@ func TestBuildCodeProgramAppendsCheck(t *testing.T) {
 	program := buildCodeProgram(item, "def add(a, b):\n    return a + b")
 	if !strings.Contains(program, "def add(a, b):") || !strings.HasSuffix(strings.TrimSpace(program), "check(add)") {
 		t.Fatalf("program missing solution or check call: %q", program)
+	}
+}
+
+func TestSandboxCommandUseSudoAndRelaxedSecurity(t *testing.T) {
+	args := cliArgs{
+		opts:  map[string]string{"sandbox-memory": "1g", "sandbox-cpus": "1"},
+		flags: map[string]bool{"sandbox-use-sudo": true, "sandbox-relaxed-security": true},
+	}
+	cmd, snippet := sandboxCommand(args)
+	if cmd.Args[0] != "sudo" {
+		t.Fatalf("cmd.Args[0] = %q, want sudo", cmd.Args[0])
+	}
+	if !strings.HasPrefix(snippet, "sudo docker run --rm -i") {
+		t.Fatalf("snippet missing sudo docker prefix: %q", snippet)
+	}
+	if strings.Contains(snippet, "--cap-drop") || strings.Contains(snippet, "--security-opt") || strings.Contains(snippet, "--read-only") {
+		t.Fatalf("relaxed security should omit hardening flags: %q", snippet)
+	}
+	if !strings.Contains(snippet, "--tmpfs /tmp:exec,size=128m") || !strings.Contains(snippet, "--memory 1g") || !strings.Contains(snippet, "--cpus 1") {
+		t.Fatalf("snippet missing resource/tmpfs flags: %q", snippet)
+	}
+}
+
+func TestSandboxCommandQuotedRuntime(t *testing.T) {
+	cmd, snippet := sandboxCommand(cliArgs{
+		opts:  map[string]string{"sandbox-runtime": "sudo docker", "sandbox-image": "custom-sandbox"},
+		flags: map[string]bool{},
+	})
+	if cmd.Args[0] != "sudo" {
+		t.Fatalf("cmd.Args[0] = %q, want sudo", cmd.Args[0])
+	}
+	if !strings.HasPrefix(snippet, "sudo docker run --rm -i") || !strings.HasSuffix(snippet, " custom-sandbox") {
+		t.Fatalf("snippet did not preserve runtime/image: %q", snippet)
+	}
+	if !strings.Contains(snippet, "--cap-drop ALL") || !strings.Contains(snippet, "--security-opt no-new-privileges") || !strings.Contains(snippet, "--read-only") {
+		t.Fatalf("default command should keep hardening flags: %q", snippet)
+	}
+}
+
+func TestSandboxFailureHintsDockerPermission(t *testing.T) {
+	hints := strings.Join(sandboxFailureHints("permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"), "\n")
+	if !strings.Contains(hints, "Docker socket permission denied") || !strings.Contains(hints, "--sandbox-use-sudo") || !strings.Contains(hints, "docker build -t lmx-sandbox sandbox") {
+		t.Fatalf("missing docker permission hints:\n%s", hints)
+	}
+}
+
+func TestSandboxFailureHintsPythonOperationNotPermitted(t *testing.T) {
+	hints := strings.Join(sandboxFailureHints("exec /usr/local/bin/python3: operation not permitted"), "\n")
+	if !strings.Contains(hints, "--sandbox-relaxed-security") {
+		t.Fatalf("missing relaxed-security hint:\n%s", hints)
 	}
 }
 

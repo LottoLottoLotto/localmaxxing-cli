@@ -63,9 +63,11 @@ Eval shards run a blob-backed dataset against an endpoint and submit pass/fail t
 lmx eval shard gsm8k --base-url http://localhost:8000 --questions 200 --dry-run
 lmx eval shard hellaswag --base-url http://localhost:8000 --questions 200 --dry-run
 lmx eval shard gsm8k --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit
+lmx eval shard status hellaswag --model Qwen/Qwen3-8B
+lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --missing-only --submit
 ```
 
-Useful shard flags include `--questions`, `--shard`, `--answer-extraction`, `--answer-regex`, `--prompt-template`, `--concurrency`, `--artifact-limit`, `--temperature`, `--top-p`, `--quant-format`, and `--model-revision`.
+Useful shard flags include `--questions`, `--shard`, `--missing-only`, `--all-missing`, `--rerun`/`--force`, `--answer-extraction`, `--answer-regex`, `--prompt-template`, `--concurrency`, `--artifact-limit`, `--temperature`, `--top-p`, `--quant-format`, and `--model-revision`. The printed `aggregateCoverage` is APPROVED aggregate coverage for the dataset/model/quantization/quantFormat/harness key, not a recent-window sample.
 
 ## Terminal-Bench
 
