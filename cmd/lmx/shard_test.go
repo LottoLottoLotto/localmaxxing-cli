@@ -123,6 +123,9 @@ func TestDefaultShardScoring(t *testing.T) {
 	if got := defaultShardScoring("hellaswag"); got != "loglikelihood" {
 		t.Fatalf("hellaswag default scoring = %q, want loglikelihood", got)
 	}
+	if got := defaultShardScoring("cruxeval"); got != "cruxeval_execution" {
+		t.Fatalf("cruxeval default scoring = %q, want cruxeval_execution", got)
+	}
 	if got := defaultShardScoring("gsm8k"); got != "exact_match" {
 		t.Fatalf("gsm8k default scoring = %q, want exact_match", got)
 	}
@@ -800,6 +803,60 @@ func TestRunEvalShardCodeExecGradesViaSandbox(t *testing.T) {
 	}
 	if results[1].pass {
 		t.Fatalf("T2 should fail (wrong assertion)")
+	}
+}
+
+func TestRunEvalShardCruxExecAcceptsEquivalentInput(t *testing.T) {
+	srv := chatContentServer(t, func(string) string { return "Final answer: \"abc\"" })
+	defer srv.Close()
+	items := []map[string]any{
+		{
+			"question_id":     "cruxeval-i:sample_641",
+			"task_type":       "input_prediction",
+			"input":           "Given this Python function and its output, predict the input expression(s) that produced it. Return only the Python input expression(s).\n\ndef f(number):\n    return True if number.isdecimal() else False\n\nOutput:\nFalse",
+			"code":            "def f(number):\n    return True if number.isdecimal() else False",
+			"observed_output": "False",
+			"gold":            "'dummy33;d'",
+		},
+	}
+	cfg := runShardConfig{scoring: "cruxeval_execution", concurrency: 1}
+	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 ../../sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
+	results, stats, _, err := runEvalShardCruxExec(args, srv.URL, "m", items, cfg)
+	if err != nil {
+		t.Skipf("sandbox unavailable: %v", err)
+	}
+	if stats.scored != 1 || stats.correct != 1 || !results[0].pass {
+		t.Fatalf("equivalent input should pass: stats=%+v result=%+v", stats, results[0])
+	}
+	if results[0].predicted != "\"abc\"" {
+		t.Fatalf("predicted = %q, want quoted candidate", results[0].predicted)
+	}
+}
+
+func TestRunEvalShardCruxExecScoresOutputPrediction(t *testing.T) {
+	srv := chatContentServer(t, func(string) string { return "Final answer: False" })
+	defer srv.Close()
+	items := []map[string]any{
+		{
+			"question_id":    "cruxeval-o:sample_739",
+			"task_type":      "output_prediction",
+			"input":          "Given this Python function and input expression(s), predict the exact Python repr output. Return only the output value.\n\ndef f(st, pattern):\n    for p in pattern:\n        if not st.startswith(p): return False\n        st = st[len(p):]\n    return True\n\nInput:\n'qwbnjrxs', ['jr', 'b', 'r', 'qw']",
+			"code":           "def f(st, pattern):\n    for p in pattern:\n        if not st.startswith(p): return False\n        st = st[len(p):]\n    return True",
+			"function_input": "'qwbnjrxs', ['jr', 'b', 'r', 'qw']",
+			"gold":           "False",
+		},
+	}
+	cfg := runShardConfig{scoring: "cruxeval_execution", concurrency: 1}
+	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 ../../sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
+	results, stats, _, err := runEvalShardCruxExec(args, srv.URL, "m", items, cfg)
+	if err != nil {
+		t.Skipf("sandbox unavailable: %v", err)
+	}
+	if stats.scored != 1 || stats.correct != 1 || !results[0].pass {
+		t.Fatalf("output prediction should pass: stats=%+v result=%+v", stats, results[0])
+	}
+	if results[0].predicted != "False" {
+		t.Fatalf("predicted = %q, want False", results[0].predicted)
 	}
 }
 

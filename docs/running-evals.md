@@ -250,9 +250,11 @@ LLAMA_SRC=/path/to/llama.cpp scripts/build-scorer.sh   # reuse a local checkout
 The CLI auto-discovers `lmx-llama-score-hellaswag` next to `lmx` (or in `dist/`);
 override the path with `--llama-scorer <path>`.
 
-HumanEval and MBPP are **execution-based** code evals (`scoring: code_execution`,
-the default for those datasets). The CLI generates a solution per problem, then
-runs `solution + hidden tests` inside a hardened sandbox and records pass/fail.
+HumanEval, MBPP, and CRUXEval are **execution-based** code evals. HumanEval/MBPP
+use `scoring: code_execution`; CRUXEval uses `scoring: cruxeval_execution`, where
+input-prediction passes if `f(generated_input) == observed_output` and output-
+prediction passes if `generated_output == f(function_input)`. The CLI runs these
+checks inside a hardened sandbox and records pass/fail.
 Build the sandbox image once:
 
 ```bash
@@ -350,6 +352,28 @@ across turns (`protocol: "react-shell"`). Pass `--shell-mode stateless` to run
 each command in a fresh `docker exec` with no shared state (`protocol:
 "react-bash"`).
 
+Scoring follows harbor canonical verifier semantics: after the agent finishes,
+`tests/` is copied to `/tests` in the task container and the verifier command
+(default `bash /tests/test.sh`) runs in a non-login shell. The reward file is
+the sole pass signal — `/logs/verifier/reward.json` (`{"reward": <num>}`) takes
+precedence over `/logs/verifier/reward.txt` (bare float), and a task passes
+when `reward >= 1.0`. The verifier's exit code is ignored once a reward was
+written; a verifier timeout or a missing/unparseable reward file scores the
+task as failed (it is still submitted, matching harbor's fail-on-error
+accounting). Agent timeouts do not abort the trial either: the task is
+verified with whatever state the agent left behind, so partial work completed
+before the deadline still counts. Oracle runs (`verify --oracle`) mirror
+harbor's OracleAgent — `solution/` is copied to `/solution` and `solve.sh`
+runs as root with `DEBIAN_FRONTEND=noninteractive` plus the task's
+`[solution].env`, bounded by the agent timeout, and verification proceeds even
+when `solve.sh` exits non-zero. Task env values support harbor `${VAR}` /
+`${VAR:-default}` templates resolved from the host environment, and
+`[agent].user` / `[verifier].user` are honored on every `docker exec`.
+Harbor tasks whose environment is a `docker-compose.yaml` are skipped at
+import with a `terminal_import_skipped` event; this runner only supports
+single-container Dockerfile or prebuilt-image environments (all of Terminal-
+Bench 2.1 qualifies).
+
 Run and submit an approved public dataset:
 
 ```bash
@@ -390,9 +414,16 @@ verifier runs. The command receives:
 - `LMX_TERMINAL_TRACE_DIR` — host directory for agent traces/logs; text files
   written here are appended to the submitted artifact.
 - `LMX_TERMINAL_EXECUTION_MODE` — `host`, `container`, or `routed-shell`.
+- `LMX_TERMINAL_AGENT_USER` — the task's `[agent].user` (empty for the image
+  default); routed-shell helpers already apply it.
 - `LMX_TERMINAL_SHELL_COMMAND` — helper script for routed-shell wrappers. Call
   `"$LMX_TERMINAL_SHELL_COMMAND" 'ls /app'`; it executes in the task container,
   not on the host.
+
+If the wrapper is still running when the agent timeout elapses, it is killed
+and the task proceeds to verification anyway (harbor canonical: agent timeouts
+are scored, not errored). A wrapper that exits non-zero before the timeout is
+treated as an infrastructure failure and left unscored.
 
 Choose an execution mode explicitly for comparability:
 

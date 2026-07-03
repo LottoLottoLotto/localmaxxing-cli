@@ -58,7 +58,7 @@ Eval shards and Terminal-Bench:
 - `--prompt-template <t>`: eval-shard prompt template using `{{input}}` and `{{choices}}`.
 - `--concurrency <n>`: eval-shard parallel requests; default 1.
 - `--artifact-limit <n>`: shard traces to submit; default 0 means all.
-- `--scoring <mode>`: `exact_match`, `loglikelihood`, `llama_cpp_loglikelihood`, or `code_execution`.
+- `--scoring <mode>`: `exact_match`, `loglikelihood`, `llama_cpp_loglikelihood`, `code_execution`, or `cruxeval_execution`.
 - `--temperature <f>`: sampling temperature; eval-shard default 0.
 - `--top-p <f>`: sampling top_p; default 1.
 - `--quant-format <label>`: quantization container format for eval-shard submit.

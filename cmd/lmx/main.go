@@ -6824,6 +6824,8 @@ func defaultShardScoring(dataset string) string {
 		return "loglikelihood"
 	case strings.HasPrefix(d, "humaneval") || strings.HasPrefix(d, "mbpp"):
 		return "code_execution"
+	case d == "cruxeval":
+		return "cruxeval_execution"
 	default:
 		return "exact_match"
 	}
@@ -6880,10 +6882,10 @@ func normalizeShardScoring(value string) (string, error) {
 		return "", nil
 	}
 	switch value {
-	case "exact_match", "loglikelihood", "llama_cpp_loglikelihood", "code_execution":
+	case "exact_match", "loglikelihood", "llama_cpp_loglikelihood", "code_execution", "cruxeval_execution":
 		return value, nil
 	default:
-		return "", cliError{"invalid_shard_scoring", fmt.Sprintf("Unsupported shard scoring mode %q.", value), []string{"Use exact_match for chat answer matching, loglikelihood for OpenAI echo-logprobs endpoints, llama_cpp_loglikelihood with --model-path for local GGUF scoring, or code_execution for HumanEval/MBPP."}, nil}
+		return "", cliError{"invalid_shard_scoring", fmt.Sprintf("Unsupported shard scoring mode %q.", value), []string{"Use exact_match for chat answer matching, loglikelihood for OpenAI echo-logprobs endpoints, llama_cpp_loglikelihood with --model-path for local GGUF scoring, code_execution for HumanEval/MBPP, or cruxeval_execution for canonical CRUXEval execution checks."}, nil}
 	}
 }
 
@@ -7272,6 +7274,14 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		}
 		if len(codeMetrics) > 0 {
 			printInfo("eval_shard_passk", codeMetrics)
+		}
+	} else if scoring == "cruxeval_execution" {
+		results, stats, codeMetrics, err = runEvalShardCruxExec(args, baseURL, callModel, items, cfg)
+		if err != nil {
+			return err
+		}
+		if len(codeMetrics) > 0 {
+			printInfo("eval_shard_execution", codeMetrics)
 		}
 	} else {
 		results, stats = runEvalShard(args, baseURL, callModel, items, cfg)
@@ -8072,6 +8082,7 @@ func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[strin
 		stats.totalLatencyMs += latency
 	}
 	metrics := map[string]any{"nSamples": n, "k": k, "temperature": cfg.temperature}
+
 	if len(items) > 0 {
 		metrics["passAtK"] = passAtKSum / float64(len(items))
 		metrics["passAt1"] = passAt1Sum / float64(len(items))
@@ -8080,6 +8091,343 @@ func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[strin
 		metrics["fewShot"] = cfg.fewShot
 	}
 	return results, stats, metrics, nil
+}
+
+// runEvalShardCruxExec scores CRUXEval with its canonical execution metric:
+// input-prediction passes if f(generated_input) == observed_output, and
+// output-prediction passes if generated_output == f(function_input).
+func runEvalShardCruxExec(args cliArgs, baseURL, model string, items []map[string]any, cfg runShardConfig) ([]shardItemResult, shardStats, map[string]any, error) {
+	if cfg.concurrency < 1 {
+		cfg.concurrency = 1
+	}
+
+	type cell struct {
+		prompt            string
+		response          string
+		candidate         string
+		program           string
+		errText           string
+		latencyMs         int64
+		thinkingRequested string
+		thinkingObserved  string
+	}
+
+	cells := make([]cell, len(items))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	completed := 0
+	total := len(items)
+	worker := func() {
+		defer wg.Done()
+		for i := range jobs {
+			item := items[i]
+			prompt := cruxPrompt(cfg, item)
+			start := time.Now()
+			content, reasoning, err := callOpenAIChatDetailed(baseURL, model, prompt, cfg.apiKey, cfg.maxTokens, cfg.temperature, cfg.topP, nil)
+			c := cell{
+				prompt:            prompt,
+				latencyMs:         time.Since(start).Milliseconds(),
+				thinkingRequested: promptThinkingDirective(prompt),
+				thinkingObserved:  observedThinkingMode(promptThinkingDirective(prompt), reasoning),
+			}
+			if err != nil {
+				c.errText = err.Error()
+			} else {
+				response := content
+				if response == "" {
+					response = reasoning
+				}
+				c.response = response
+				c.candidate = extractCRUXCandidate(response)
+				if c.candidate == "" {
+					c.errText = "no CRUXEval candidate answer extracted"
+				} else {
+					c.program = buildCRUXEvalProgram(item, c.candidate)
+				}
+			}
+			cells[i] = c
+			mu.Lock()
+			completed++
+			done := completed
+			mu.Unlock()
+			if done%25 == 0 || done == total {
+				printStatus(args, "eval_shard_progress", map[string]any{"done": done, "total": total, "phase": "generate"})
+			}
+		}
+	}
+	for w := 0; w < cfg.concurrency; w++ {
+		wg.Add(1)
+		go worker()
+	}
+	for i := range items {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	genFailures := 0
+	for i := range items {
+		if cells[i].errText != "" {
+			genFailures++
+		}
+	}
+	if len(items) > 0 && genFailures > len(items)/2 {
+		return nil, shardStats{}, nil, cliError{"generation_failures", fmt.Sprintf("%d/%d generations failed; aborting before grading", genFailures, len(items)), []string{"Check the model endpoint (--base-url) is reachable and healthy."}, nil}
+	}
+
+	qids := make([]string, len(items))
+	var batch strings.Builder
+	enc := json.NewEncoder(&batch)
+	programs := 0
+	for i, item := range items {
+		qids[i] = firstNonEmpty(stringValue(item["question_id"]), stringValue(item["questionId"]), stringValue(item["id"]))
+		if cells[i].errText != "" || cells[i].program == "" {
+			continue
+		}
+		if err := enc.Encode(map[string]any{"question_id": qids[i], "program": cells[i].program}); err != nil {
+			return nil, shardStats{}, nil, err
+		}
+		programs++
+	}
+
+	type sandboxResult struct {
+		QuestionID string `json:"question_id"`
+		Passed     bool   `json:"passed"`
+		ReturnCode int    `json:"returncode"`
+		TimedOut   bool   `json:"timed_out"`
+		Stderr     string `json:"stderr"`
+		DurationMs int64  `json:"duration_ms"`
+	}
+	byQID := map[string]sandboxResult{}
+	if programs > 0 {
+		cmd, snippet := sandboxCommand(args)
+		printStatus(args, "eval_shard_sandbox", map[string]any{"command": snippet, "programs": programs, "scoring": "cruxeval_execution"})
+		cmd.Stdin = strings.NewReader(batch.String())
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return nil, shardStats{}, nil, cliError{"sandbox_failed", fmt.Sprintf("CRUXEval sandbox failed: %v", err), sandboxFailureHints(stderr.String()), nil}
+		}
+		scanner := bufio.NewScanner(bytes.NewReader(stdout.Bytes()))
+		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var sr sandboxResult
+			if err := json.Unmarshal([]byte(line), &sr); err != nil {
+				return nil, shardStats{}, nil, fmt.Errorf("parse sandbox result: %w", err)
+			}
+			byQID[sr.QuestionID] = sr
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, shardStats{}, nil, err
+		}
+	}
+
+	results := make([]shardItemResult, len(items))
+	stats := shardStats{}
+	for i, item := range items {
+		c := cells[i]
+		pass := false
+		summary := ""
+		switch {
+		case c.errText != "":
+			summary = "generation failed: " + c.errText
+		case c.program == "":
+			summary = "no runnable CRUXEval checker generated"
+		default:
+			if sr, ok := byQID[qids[i]]; ok {
+				pass = sr.Passed
+				summary = fmt.Sprintf("sandbox: passed=%v returncode=%d timed_out=%v", sr.Passed, sr.ReturnCode, sr.TimedOut)
+				if sr.Stderr != "" {
+					summary += "\n" + sr.Stderr
+				}
+				c.latencyMs += sr.DurationMs
+			} else {
+				summary = "sandbox returned no result"
+			}
+		}
+		results[i] = shardItemResult{
+			questionID:        qids[i],
+			itemIndex:         i,
+			question:          renderEvalQuestion(item),
+			prompt:            c.prompt,
+			promptHash:        sha256Hex(c.prompt),
+			response:          c.response,
+			reasoning:         summary,
+			thinkingRequested: c.thinkingRequested,
+			thinkingObserved:  c.thinkingObserved,
+			predicted:         c.candidate,
+			gold:              cruxExpectedLabel(item),
+			scored:            true,
+			pass:              pass,
+			latencyMs:         c.latencyMs,
+		}
+		stats.scored++
+		if pass {
+			stats.correct++
+		}
+		stats.totalLatencyMs += c.latencyMs
+	}
+	return results, stats, map[string]any{"executionMetric": "cruxeval", "answerExtraction": "cruxeval_candidate"}, nil
+}
+
+func cruxPrompt(cfg runShardConfig, item map[string]any) string {
+	if cfg.promptTemplate != "" {
+		return renderEvalPrompt(cfg.promptTemplate, item)
+	}
+	return renderEvalPrompt("/no_think\n\nReturn only the exact Python expression/value requested. Do not explain, do not include Markdown, and do not call f unless the requested answer itself is a call.\n\n{{input}}", item)
+}
+
+var cruxFinalAnswerPattern = regexp.MustCompile(`(?is)(?:final\s+answer|answer)\s*[:=]\s*`)
+
+func extractCRUXCandidate(response string) string {
+	text := strings.TrimSpace(response)
+	if text == "" {
+		return ""
+	}
+	if locs := cruxFinalAnswerPattern.FindAllStringIndex(text, -1); len(locs) > 0 {
+		text = strings.TrimSpace(text[locs[len(locs)-1][1]:])
+	}
+	if fenced := lastMarkdownCodeFence(text); fenced != "" {
+		text = fenced
+	}
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		line = cleanCRUXCandidateLine(line)
+		if line != "" {
+			return line
+		}
+	}
+	return cleanCRUXCandidateLine(text)
+}
+
+func lastMarkdownCodeFence(text string) string {
+	re := regexp.MustCompile("(?s)```(?:python|py)?\\s*(.*?)```")
+	matches := re.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(matches[len(matches)-1][1])
+}
+
+func cleanCRUXCandidateLine(line string) string {
+	line = strings.TrimSpace(line)
+	line = strings.TrimPrefix(line, "- ")
+	line = strings.TrimPrefix(line, "* ")
+	line = strings.TrimSpace(line)
+	line = strings.Trim(line, "`")
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(strings.ToLower(line), "final answer") {
+		if idx := strings.Index(line, ":"); idx >= 0 {
+			line = strings.TrimSpace(line[idx+1:])
+		}
+	}
+	return strings.TrimSpace(line)
+}
+
+func cruxExpectedLabel(item map[string]any) string {
+	if observed := stringValue(item["observed_output"]); observed != "" {
+		return observed
+	}
+	if gold := stringValue(item["gold"]); gold != "" {
+		return gold
+	}
+	return stringValue(item["function_input"])
+}
+
+func buildCRUXEvalProgram(item map[string]any, candidate string) string {
+	taskType := strings.ToLower(firstNonEmpty(stringValue(item["task_type"]), stringValue(item["taskType"])))
+	if taskType == "" {
+		qid := strings.ToLower(firstNonEmpty(stringValue(item["question_id"]), stringValue(item["questionId"]), stringValue(item["id"])))
+		if strings.Contains(qid, "cruxeval-i:") {
+			taskType = "input_prediction"
+		} else {
+			taskType = "output_prediction"
+		}
+	}
+	code := stringValue(item["code"])
+	if code == "" {
+		code = extractPythonFunction(renderEvalQuestion(item))
+	}
+	observedOutput := firstNonEmpty(stringValue(item["observed_output"]), stringValue(item["gold"]))
+	functionInput := stringValue(item["function_input"])
+	return fmt.Sprintf(`import ast
+import inspect
+
+%s
+
+TASK_TYPE = %s
+CANDIDATE_SRC = %s
+OBSERVED_OUTPUT_SRC = %s
+FUNCTION_INPUT_SRC = %s
+
+def _literal(src):
+    return ast.literal_eval(src.strip())
+
+def _strip_call(src):
+    src = src.strip()
+    if src.startswith("f(") and src.endswith(")"):
+        return src[2:-1].strip()
+    return src
+
+def _required_positional_count(fn):
+    count = 0
+    variadic = False
+    for p in inspect.signature(fn).parameters.values():
+        if p.kind == p.VAR_POSITIONAL:
+            variadic = True
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty:
+            count += 1
+    return count, variadic
+
+def _parse_args(src):
+    src = _strip_call(src)
+    count, variadic = _required_positional_count(f)
+    if not variadic and count == 1:
+        return (_literal(src),)
+    tuple_src = "(" + src
+    if "," not in src:
+        tuple_src += ","
+    tuple_src += ")"
+    value = _literal(tuple_src)
+    if not isinstance(value, tuple):
+        value = (value,)
+    return value
+
+if TASK_TYPE == "input_prediction":
+    expected = _literal(OBSERVED_OUTPUT_SRC)
+    args = _parse_args(CANDIDATE_SRC)
+    actual = f(*args)
+    assert actual == expected, f"expected f(*candidate) == {expected!r}, got {actual!r}; candidate={CANDIDATE_SRC!r}"
+else:
+    args = _parse_args(FUNCTION_INPUT_SRC)
+    expected = f(*args)
+    candidate = _literal(CANDIDATE_SRC)
+    assert candidate == expected, f"expected output {expected!r}, got {candidate!r}; candidate={CANDIDATE_SRC!r}"
+`, code, goPythonString(taskType), goPythonString(candidate), goPythonString(observedOutput), goPythonString(functionInput))
+}
+
+func goPythonString(value string) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+func extractPythonFunction(text string) string {
+	start := strings.Index(text, "def f(")
+	if start < 0 {
+		return ""
+	}
+	tail := text[start:]
+	end := strings.Index(tail, "\n\n")
+	if end < 0 {
+		return tail
+	}
+	return tail[:end]
 }
 
 func boolPassLabel(pass bool) string {
@@ -9761,7 +10109,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --cleanup-images        Remove locally built terminal task images after each task
   --shell-mode <mode>     Terminal eval built-in harness shell: persistent (default, one shared shell) or stateless (fresh shell per command)
   --oracle                Run terminal task solution/solve.sh instead of the model agent
-  --scoring <mode>          Eval-shard scoring: exact_match, loglikelihood, llama_cpp_loglikelihood, code_execution (hellaswag defaults to loglikelihood; humaneval/mbpp default to code_execution)
+  --scoring <mode>          Eval-shard scoring: exact_match, loglikelihood, llama_cpp_loglikelihood, code_execution, cruxeval_execution (dataset defaults are canonical)
   --temperature <f>        Sampling temperature for eval-shard runs (default: 0)
   --top-p <f>              Sampling top_p for eval-shard runs (default: 1)
   --quant-format <label>   Quantization container format for eval-shard submit (auto-detected as "gguf" from the model path; override if needed)
