@@ -253,8 +253,10 @@ override the path with `--llama-scorer <path>`.
 HumanEval, MBPP, and CRUXEval are **execution-based** code evals. HumanEval/MBPP
 use `scoring: code_execution`; CRUXEval uses `scoring: cruxeval_execution`, where
 input-prediction passes if `f(generated_input) == observed_output` and output-
-prediction passes if `generated_output == f(function_input)`. The CLI runs these
-checks inside a hardened sandbox and records pass/fail.
+prediction passes if `generated_output == f(function_input)`. The CRUXEval prompt
+uses a `CRUX_ANSWER:` safeword plus `<END_CRUX>` stop sequence so models can reason
+before the final extractable answer. The CLI runs checks inside a hardened sandbox
+and records pass/fail.
 Build the sandbox image once:
 
 ```bash

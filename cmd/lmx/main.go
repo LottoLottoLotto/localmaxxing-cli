@@ -8124,7 +8124,7 @@ func runEvalShardCruxExec(args cliArgs, baseURL, model string, items []map[strin
 			item := items[i]
 			prompt := cruxPrompt(cfg, item)
 			start := time.Now()
-			content, reasoning, err := callOpenAIChatDetailed(baseURL, model, prompt, cfg.apiKey, cfg.maxTokens, cfg.temperature, cfg.topP, nil)
+			content, reasoning, err := callOpenAIChatDetailed(baseURL, model, prompt, cfg.apiKey, cfg.maxTokens, cfg.temperature, cfg.topP, cruxStopSequences())
 			c := cell{
 				prompt:            prompt,
 				latencyMs:         time.Since(start).Milliseconds(),
@@ -8273,17 +8273,21 @@ func runEvalShardCruxExec(args cliArgs, baseURL, model string, items []map[strin
 		}
 		stats.totalLatencyMs += c.latencyMs
 	}
-	return results, stats, map[string]any{"executionMetric": "cruxeval", "answerExtraction": "cruxeval_candidate"}, nil
+	return results, stats, map[string]any{"executionMetric": "cruxeval", "answerExtraction": "cruxeval_safeword"}, nil
 }
 
 func cruxPrompt(cfg runShardConfig, item map[string]any) string {
 	if cfg.promptTemplate != "" {
 		return renderEvalPrompt(cfg.promptTemplate, item)
 	}
-	return renderEvalPrompt("/no_think\n\nReturn only the exact Python expression/value requested. Do not explain, do not include Markdown, and do not call f unless the requested answer itself is a call.\n\n{{input}}", item)
+	return renderEvalPrompt("Think privately if needed. When you know the answer, write one final line exactly in this form:\nCRUX_ANSWER: <Python expression/value>\n<END_CRUX>\n\nOnly the text after CRUX_ANSWER is scored. Do not put any explanation after CRUX_ANSWER.\n\n{{input}}", item)
 }
 
-var cruxFinalAnswerPattern = regexp.MustCompile(`(?is)(?:final\s+answer|answer)\s*[:=]\s*`)
+func cruxStopSequences() []string {
+	return []string{"\n<END_CRUX>", "<END_CRUX>"}
+}
+
+var cruxFinalAnswerPattern = regexp.MustCompile(`(?is)(?:CRUX_ANSWER|final\s+answer|answer)\s*[:=]\s*`)
 
 func extractCRUXCandidate(response string) string {
 	text := strings.TrimSpace(response)

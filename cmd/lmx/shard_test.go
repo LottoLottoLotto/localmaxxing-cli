@@ -806,6 +806,23 @@ func TestRunEvalShardCodeExecGradesViaSandbox(t *testing.T) {
 	}
 }
 
+func TestExtractCRUXCandidatePrefersSafeword(t *testing.T) {
+	response := "I can reason for a while.\nThe output is not the answer.\nCRUX_ANSWER: f('h grateful k', ' ')\n<END_CRUX>"
+	if got := extractCRUXCandidate(response); got != "f('h grateful k', ' ')" {
+		t.Fatalf("extractCRUXCandidate() = %q", got)
+	}
+}
+
+func TestCruxPromptRequestsSafeword(t *testing.T) {
+	prompt := cruxPrompt(runShardConfig{}, map[string]any{"input": "Question body"})
+	if !strings.Contains(prompt, "CRUX_ANSWER:") || !strings.Contains(prompt, "<END_CRUX>") {
+		t.Fatalf("prompt missing CRUX safeword:\n%s", prompt)
+	}
+	if got := cruxStopSequences(); len(got) == 0 || !strings.Contains(got[0], "<END_CRUX>") {
+		t.Fatalf("unexpected stop sequences: %#v", got)
+	}
+}
+
 func TestRunEvalShardCruxExecAcceptsEquivalentInput(t *testing.T) {
 	srv := chatContentServer(t, func(string) string { return "Final answer: \"abc\"" })
 	defer srv.Close()
