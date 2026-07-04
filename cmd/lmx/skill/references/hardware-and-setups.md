@@ -39,7 +39,7 @@ Hardware classes:
 - `UNIFIED`: use `chipVendor`, `chipFamily`, and `unifiedMemoryGb`.
 - `CPU_ONLY`: use CPU/system metadata without GPU fields.
 
-Common fields include `cpu`, `ramGb`, `os`, and `powerWatts`.
+Common fields include `cpu`, `ramGb`, `os`, and `powerWatts`. Per-account saved setups can also carry `gpuPowerWatts` (measured watts per physical GPU) and `hardwareCost` (purchase records with canonical component name from `hardwareOptions.hardwareCostComponentNames`, `NEW`/`USED`, optional year purchased, price, and currency); these are personal prefill metadata and are not part of the shared hardware identity.
 
 ## Saved setups
 
@@ -57,3 +57,8 @@ Selection flags:
 - `--default`: pull the default saved setup.
 - `--name <name>`: pull by saved setup name, case-insensitive.
 - `--id <id>`: pull by saved setup id.
+
+Pulled setup JSON may include:
+
+- `gpuPowerWatts`: measured watts per physical GPU, used to prefill benchmark submissions.
+- `hardwareCost`: purchase records used to prefill submissions, e.g. `[{ "component": "NVIDIA GeForce RTX 3090", "condition": "USED", "yearPurchased": 2021, "price": 700, "currency": "USD" }]`.

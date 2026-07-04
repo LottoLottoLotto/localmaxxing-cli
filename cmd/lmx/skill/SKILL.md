@@ -42,7 +42,23 @@ lmx hardware --out hardware.json
 3. Validate with `lmx benchmark dry-run <file>` (authenticated API validation, no write).
 4. Submit with `lmx benchmark submit <file>`.
 
-Submissions require `hfId`, `hardware`, `engineName`, `quantization`, and `tokSOut` plus at least one secondary metric: `tokSPrefill`, `tokSTotal`, `ttftMs`, or `peakVramGb`. For remote endpoints, the `hardware` object must describe the server running the model, not the client running `lmx`. Benchmark submissions are rate-limited to 30 per rolling hour, or 300 for Pro users.
+Submissions require `hfId`, `hardware`, `engineName`, `quantization`, and `tokSOut` plus at least one secondary metric: `tokSPrefill`, `tokSTotal`, `ttftMs`, or `peakVramGb`. Optionally include `gpuPowerWatts`: an array of measured watts, one entry per physical GPU (heterogeneous rigs list each card, e.g. `[285.5, 310.2]`; 1–64 entries, each positive and ≤10000). Pass it to `benchmark run` as `--gpu-power-watts 285.5,310.2`; the server computes and returns `totalPowerWatts`. For remote endpoints, the `hardware` object must describe the server running the model, not the client running `lmx`. Benchmark submissions are rate-limited to 30 per rolling hour, or 300 for Pro users.
+
+`quantization` is free-form; prefer labels from `lmx context` → `commonSchemas.benchmarkFields.quantization.commonValues` when possible. The common list includes GGUF (`Q4_K_M`, `IQ4_XS`), NVIDIA (`NVFP4`), Unsloth dynamic (`Unsloth-Dynamic-Q4_K_M`), bitsandbytes (`bnb-nf4`), AWQ/GPTQ/EXL2/FP8 variants, and engine-specific strings.
+
+Hardware purchase metadata is optional and personal to the submitting user/setup. Use `--hardware-cost` to record one purchase record per canonical hardware component. Component names must come from `lmx context` → `hardwareOptions.hardwareCostComponentNames` so costs can be filtered and linked.
+
+```bash
+lmx context --out localmaxxing-agent-context.json
+
+lmx benchmark run llama.cpp \
+  --hardware-cost "NVIDIA GeForce RTX 3090|used|2021|700|USD;NVIDIA GeForce RTX 4090|new|2024|1599|USD"
+
+lmx benchmark run llama.cpp \
+  --hardware-cost '[{"component":"NVIDIA GeForce RTX 3090","condition":"USED","yearPurchased":2021,"price":700,"currency":"USD"}]'
+```
+
+Compact format is `component|condition|year|price|currency` separated by semicolons; `year` may be empty. JSON format is an array of `{ component, condition: "NEW"|"USED", yearPurchased?, price, currency }`. Currencies are not converted or summed across codes. The server validates and canonicalizes component names during dry-run/submit.
 
 ## Prompt control for spec decoding
 

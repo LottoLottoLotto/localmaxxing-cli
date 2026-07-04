@@ -100,6 +100,138 @@ func TestRunTerminalEvalEmptyTaskDirIsBundleInvalid(t *testing.T) {
 	}
 }
 
+func TestParseReward(t *testing.T) {
+	cases := []struct {
+		json, txt string
+		want      float64
+		ok        bool
+	}{
+		{json: `{"reward": 1}`, want: 1, ok: true},
+		{json: `{"reward": 0.85, "precision": 0.9}`, want: 0.85, ok: true},
+		{json: `{"precision": 0.9}`, ok: false},
+		{json: `not json`, ok: false},
+		{txt: "1", want: 1, ok: true},
+		{txt: "1.0\n", want: 1, ok: true},
+		{txt: "0.5", want: 0.5, ok: true},
+		{txt: "  0  ", want: 0, ok: true},
+		{txt: "pass", ok: false},
+		{txt: "", ok: false},
+	}
+	for _, c := range cases {
+		var got float64
+		var ok bool
+		if c.json != "" {
+			got, ok = parseRewardJSON(c.json)
+		} else {
+			got, ok = parseRewardText(c.txt)
+		}
+		if ok != c.ok || (ok && got != c.want) {
+			t.Fatalf("parseReward(json=%q txt=%q) = (%v, %v), want (%v, %v)", c.json, c.txt, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestResolveEnvTemplates(t *testing.T) {
+	t.Setenv("LMX_TEST_SET", "live")
+	t.Setenv("LMX_TEST_EMPTY", "")
+	got := resolveEnvTemplates(map[string]string{
+		"plain":    "value",
+		"set":      "${LMX_TEST_SET}",
+		"fallback": "${LMX_TEST_UNSET_VAR:-def}",
+		"empty":    "${LMX_TEST_EMPTY:-def}",
+		"missing":  "${LMX_TEST_UNSET_VAR}",
+	})
+	want := map[string]string{"plain": "value", "set": "live", "fallback": "def", "empty": "def", "missing": ""}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("resolveEnvTemplates[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestTerminalImportSkipsComposeTasks(t *testing.T) {
+	src := t.TempDir()
+	writeHarborTask := func(id string, compose bool) {
+		taskDir := filepath.Join(src, id)
+		mustMkdir(t, filepath.Join(taskDir, "environment"))
+		mustMkdir(t, filepath.Join(taskDir, "tests"))
+		mustWrite(t, filepath.Join(taskDir, "task.toml"), "[environment]\ndocker_image = \"ubuntu:24.04\"\n\n[solution]\nenv = { SOLVE_MODE = \"fast\" }\n")
+		mustWrite(t, filepath.Join(taskDir, "instruction.md"), "Do it.\n")
+		mustWrite(t, filepath.Join(taskDir, "tests", "test.sh"), "#!/usr/bin/env bash\n")
+		if compose {
+			mustWrite(t, filepath.Join(taskDir, "environment", "docker-compose.yaml"), "services: {}\n")
+		}
+	}
+	writeHarborTask("plain-task", false)
+	writeHarborTask("compose-task", true)
+
+	out := t.TempDir()
+	args := parseArgs([]string{"eval", "terminal", "import", src, "--out", out, "--version", "2.1"})
+	if err := runTerminalImport(args); err != nil {
+		t.Fatalf("runTerminalImport failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "compose-task")); !os.IsNotExist(err) {
+		t.Fatalf("compose task should be skipped, stat err = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(out, "plain-task", "task.json"))
+	if err != nil {
+		t.Fatalf("plain task not imported: %v", err)
+	}
+	var task terminalTask
+	if err := json.Unmarshal(data, &task); err != nil {
+		t.Fatalf("task.json invalid: %v", err)
+	}
+	if task.Solution.Env["SOLVE_MODE"] != "fast" {
+		t.Fatalf("[solution].env not imported: %#v", task.Solution.Env)
+	}
+
+	// A tree with only compose tasks must fail loudly rather than import nothing.
+	onlyCompose := t.TempDir()
+	src = onlyCompose
+	writeHarborTask("compose-only", true)
+	args = parseArgs([]string{"eval", "terminal", "import", onlyCompose, "--out", t.TempDir()})
+	err = runTerminalImport(args)
+	var ce cliError
+	if err == nil || !errorsAsCli(err, &ce) || ce.Code != "task_import_failed" {
+		t.Fatalf("expected task_import_failed for compose-only tree, got %v", err)
+	}
+}
+
+// TestRunTerminalTaskHarborSemantics exercises the full task pipeline against a
+// real container: the external agent must actually run (regression: branch
+// wiring), reward.json must take precedence, and a non-zero verifier exit code
+// must not override a written reward — harbor canonical behavior.
+func TestRunTerminalTaskHarborSemantics(t *testing.T) {
+	if dockerPreflight() != nil {
+		t.Skip("docker unavailable")
+	}
+	bundle := t.TempDir()
+	mustMkdir(t, filepath.Join(bundle, "tests"))
+	mustWrite(t, filepath.Join(bundle, "tests", "test.sh"), "#!/bin/bash\nmkdir -p /logs/verifier\nif [ -f /agent-ran ]; then echo '{\"reward\": 1}' > /logs/verifier/reward.json; else echo 0 > /logs/verifier/reward.txt; fi\nexit 3\n")
+	task := terminalTask{
+		ID:          "harbor-semantics",
+		Instruction: "synthetic",
+		Image:       terminalImage{Prebuilt: "ubuntu:24.04"},
+		Agent:       terminalAgentConfig{TimeoutSec: 60},
+		Verifier:    terminalVerifierConfig{TimeoutSec: 60, Command: "bash /tests/test.sh", RewardFile: "/logs/verifier/reward.txt"},
+		Environment: terminalEnvironmentConfig{CPUs: 1, MemoryMb: 512, Network: "public"},
+	}
+	cfg := terminalConfig{
+		args:              parseArgs([]string{"eval", "terminal", "run"}),
+		commandTimeoutSec: 60,
+		agentTimeoutSec:   30,
+		agentExecution:    "routed-shell",
+		agentCommand:      `docker exec "$LMX_TERMINAL_CONTAINER" touch /agent-ran`,
+	}
+	res := runTerminalTask(context.Background(), task, bundle, "", "", cfg)
+	if res.errCode != "" {
+		t.Fatalf("unexpected error: %s %s", res.errCode, res.errText)
+	}
+	if !res.scored || !res.pass {
+		t.Fatalf("expected scored pass (agent ran, reward.json=1 wins over exit 3): %+v", res)
+	}
+}
+
 func mustMkdir(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {
@@ -147,7 +279,7 @@ func TestTerminalShellPersistsState(t *testing.T) {
 	}
 	defer runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", name)
 
-	shell, err := startTerminalShell(name)
+	shell, err := startTerminalShell(name, "")
 	if err != nil {
 		t.Fatalf("startTerminalShell: %v", err)
 	}

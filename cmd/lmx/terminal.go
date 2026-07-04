@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -41,6 +42,7 @@ type terminalTask struct {
 	Image       terminalImage             `json:"image"`
 	Agent       terminalAgentConfig       `json:"agent"`
 	Verifier    terminalVerifierConfig    `json:"verifier"`
+	Solution    terminalSolutionConfig    `json:"solution"`
 	Environment terminalEnvironmentConfig `json:"environment"`
 }
 
@@ -63,6 +65,10 @@ type terminalVerifierConfig struct {
 	RewardFile string            `json:"rewardFile"`
 	User       string            `json:"user"`
 	Env        map[string]string `json:"env,omitempty"`
+}
+
+type terminalSolutionConfig struct {
+	Env map[string]string `json:"env,omitempty"`
 }
 
 type terminalEnvironmentConfig struct {
@@ -129,6 +135,9 @@ type harborTaskToml struct {
 		MaxTurns   tomlNumber `toml:"max_turns"`
 		User       string     `toml:"user"`
 	} `toml:"agent"`
+	Solution struct {
+		Env map[string]string `toml:"env"`
+	} `toml:"solution"`
 	Environment struct {
 		DockerImage     string            `toml:"docker_image"`
 		BuildTimeoutSec tomlNumber        `toml:"build_timeout_sec"`
@@ -198,12 +207,22 @@ func runTerminalImport(args cliArgs) error {
 	if len(taskDirs) == 0 {
 		return cliError{"task_import_failed", "No harbor task.toml files were found.", []string{"Pass a harbor task directory or a parent directory containing task subdirectories."}, map[string]any{"src": src}}
 	}
+	imported, skipped := 0, 0
 	for _, taskDir := range taskDirs {
+		if composeFile := harborComposeFile(taskDir); composeFile != "" {
+			printStatus(args, "terminal_import_skipped", map[string]any{"taskId": filepath.Base(filepath.Clean(taskDir)), "reason": "docker-compose task environments are not supported by this runner", "composeFile": composeFile})
+			skipped++
+			continue
+		}
 		if err := importHarborTask(taskDir, out, version); err != nil {
 			return err
 		}
+		imported++
 	}
-	printInfo("terminal_import_complete", map[string]any{"src": src, "out": out, "tasks": len(taskDirs), "version": version})
+	if imported == 0 {
+		return cliError{"task_import_failed", "Every harbor task was skipped.", []string{"docker-compose task environments are not supported; import tasks that use environment/Dockerfile or [environment].docker_image."}, map[string]any{"src": src, "skipped": skipped}}
+	}
+	printInfo("terminal_import_complete", map[string]any{"src": src, "out": out, "tasks": imported, "skipped": skipped, "version": version})
 	return nil
 }
 
@@ -234,6 +253,17 @@ func findHarborTaskDirs(src string) ([]string, error) {
 	}
 	sort.Strings(dirs)
 	return dirs, nil
+}
+
+// harborComposeFile reports the docker-compose file name inside a harbor task's
+// environment/, or "" when the task is a plain Dockerfile/prebuilt-image task.
+func harborComposeFile(taskDir string) string {
+	for _, name := range []string{"docker-compose.yaml", "docker-compose.yml"} {
+		if _, err := os.Stat(filepath.Join(taskDir, "environment", name)); err == nil {
+			return name
+		}
+	}
+	return ""
 }
 
 func importHarborTask(taskDir, out, version string) error {
@@ -279,6 +309,7 @@ func importHarborTask(taskDir, out, version string) error {
 		Image:       image,
 		Agent:       terminalAgentConfig{TimeoutSec: firstPositive(ht.Agent.TimeoutSec.Int(), 900), MaxTurns: firstPositive(ht.Agent.MaxTurns.Int(), 50), User: ht.Agent.User},
 		Verifier:    terminalVerifierConfig{TimeoutSec: firstPositive(ht.Verifier.TimeoutSec.Int(), 900), Command: firstNonEmpty(ht.Verifier.Command, "bash /tests/test.sh"), RewardFile: firstNonEmpty(ht.Verifier.RewardFile, "/logs/verifier/reward.txt"), User: ht.Verifier.User, Env: nonNilStringMap(ht.Verifier.Env)},
+		Solution:    terminalSolutionConfig{Env: nonNilStringMap(ht.Solution.Env)},
 		Environment: terminalEnvironmentConfig{CPUs: firstPositiveFloat(ht.Environment.CPUs.Float(), 1), MemoryMb: firstPositive(ht.Environment.MemoryMb.Int(), 2048), StorageMb: firstPositive(ht.Environment.StorageMb.Int(), 10240), GPUs: ht.Environment.GPUs.Int(), Network: network, AllowedHosts: ht.Environment.AllowedHosts, Env: nonNilStringMap(ht.Environment.Env)},
 	}
 	dest := filepath.Join(out, id)
@@ -759,7 +790,7 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 	if task.Environment.Network == "allowlist" {
 		printStatus(cfg.args, "terminal_network_degraded", map[string]any{"taskId": task.ID, "allowedHosts": strings.Join(task.Environment.AllowedHosts, ",")})
 	}
-	for k, v := range task.Environment.Env {
+	for k, v := range resolveEnvTemplates(task.Environment.Env) {
 		startArgs = append(startArgs, "-e", k+"="+v)
 	}
 	startArgs = append(startArgs, imageRef, "sleep", "infinity")
@@ -773,7 +804,10 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 	defer runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
 	defer cleanupTerminalImage(cleanupImage, cfg.cleanupImages)
 	if cfg.oracle {
-		if err := runOracleSolution(ctx, task, bundleDir, containerName, cfg); err != nil {
+		transcript, err := runOracleSolution(ctx, task, bundleDir, containerName, cfg)
+		result.transcript = transcript
+		result.prompt = "oracle solution"
+		if err != nil {
 			result.errCode, result.errText = cliErrorCodeText(err)
 			result.latencyMs = time.Since(started).Milliseconds()
 			return result
@@ -813,6 +847,7 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 	result.verifierOutput = verifierOutput
 	if err != nil {
 		result.pass = false
+		result.errCode, result.errText = cliErrorCodeText(err)
 	}
 	result.latencyMs = time.Since(started).Milliseconds()
 	return result
@@ -850,7 +885,11 @@ func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir,
 	}
 	workdir := "/app"
 	shellCommand := filepath.Join(tmp, "container-shell")
-	shellScript := "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"$#\" -eq 0 ]; then\n  exec docker exec -i -w " + shellQuote(workdir) + " " + shellQuote(containerName) + " bash -l\nfi\nexec docker exec -i -w " + shellQuote(workdir) + " " + shellQuote(containerName) + " bash -lc \"$*\"\n"
+	userFlag := ""
+	if task.Agent.User != "" {
+		userFlag = " --user " + shellQuote(task.Agent.User)
+	}
+	shellScript := "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"$#\" -eq 0 ]; then\n  exec docker exec -i" + userFlag + " -w " + shellQuote(workdir) + " " + shellQuote(containerName) + " bash -l\nfi\nexec docker exec -i" + userFlag + " -w " + shellQuote(workdir) + " " + shellQuote(containerName) + " bash -lc \"$*\"\n"
 	if err := os.WriteFile(shellCommand, []byte(shellScript), 0o700); err != nil {
 		return "", cliError{"command_exec_failed", "Could not write routed shell helper.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
 	}
@@ -873,6 +912,7 @@ func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir,
 		"LMX_TERMINAL_TRACE_DIR=" + traceDir,
 		"LMX_TERMINAL_EXECUTION_MODE=" + cfg.agentExecution,
 		"LMX_TERMINAL_AGENT_TIMEOUT_SEC=" + strconv.Itoa(firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)),
+		"LMX_TERMINAL_AGENT_USER=" + task.Agent.User,
 		"LMX_TERMINAL_SHELL_COMMAND=" + shellCommand,
 	}
 	timeout := time.Duration(firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)) * time.Second
@@ -883,7 +923,12 @@ func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir,
 		transcript += "\n\n# External agent trace directory\n\n" + traceText
 	}
 	printStatus(cfg.args, "terminal_external_agent_done", map[string]any{"taskId": task.ID, "exitCode": code, "timedOut": timedOut, "execution": cfg.agentExecution})
-	if runErr != nil || timedOut || code != 0 {
+	if timedOut {
+		transcript += "\n[agent timed out after " + timeout.String() + "; proceeding to verification]\n"
+		printStatus(cfg.args, "terminal_external_agent_timeout", map[string]any{"taskId": task.ID, "timeoutSec": int(timeout.Seconds())})
+		return transcript, nil
+	}
+	if runErr != nil || code != 0 {
 		return transcript, terminalCommandError("command_exec_failed", "External terminal agent command failed.", "bash", []string{"-lc", cfg.agentCommand}, code, out, timedOut)
 	}
 	return transcript, nil
@@ -957,7 +1002,12 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 		messages = append(messages, map[string]any{"role": "assistant", "content": content})
 		terminalTraceHeader(&transcript, turn, reasoning, content)
 		transcript.WriteString("## Command\n$ " + cmdText + "\n")
-		out, code, timedOut, _ := runCommand(ctx, time.Duration(firstPositive(cfg.commandTimeoutSec, 120))*time.Second, "docker", "exec", containerName, "bash", "-lc", cmdText)
+		execArgs := []string{"exec"}
+		if task.Agent.User != "" {
+			execArgs = append(execArgs, "--user", task.Agent.User)
+		}
+		execArgs = append(execArgs, containerName, "bash", "-lc", cmdText)
+		out, code, timedOut, _ := runCommand(ctx, time.Duration(firstPositive(cfg.commandTimeoutSec, 120))*time.Second, "docker", execArgs...)
 		if timedOut {
 			out += "\n[command timed out]"
 			code = 124
@@ -972,6 +1022,7 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 
 type terminalShell struct {
 	containerName string
+	user          string
 	nonce         string
 	cmd           *exec.Cmd
 	stdin         io.WriteCloser
@@ -979,8 +1030,8 @@ type terminalShell struct {
 	pr            *os.File
 }
 
-func startTerminalShell(containerName string) (*terminalShell, error) {
-	s := &terminalShell{containerName: containerName, nonce: randomHex(8)}
+func startTerminalShell(containerName, user string) (*terminalShell, error) {
+	s := &terminalShell{containerName: containerName, user: user, nonce: randomHex(8)}
 	if err := s.start(); err != nil {
 		return nil, err
 	}
@@ -990,7 +1041,12 @@ func startTerminalShell(containerName string) (*terminalShell, error) {
 func (s *terminalShell) start() error {
 	// No context timeout on the shell process itself; per-command timeouts are
 	// enforced in exec(). The shell lives for the whole agent loop.
-	cmd := exec.Command("docker", "exec", "-i", s.containerName, "bash", "-l")
+	execArgs := []string{"exec", "-i"}
+	if s.user != "" {
+		execArgs = append(execArgs, "--user", s.user)
+	}
+	execArgs = append(execArgs, s.containerName, "bash", "-l")
+	cmd := exec.Command("docker", execArgs...)
 	configureCommandProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -1082,7 +1138,7 @@ func (s *terminalShell) exec(command string, timeout time.Duration) (output stri
 }
 
 func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, containerName, baseURL, model string, cfg terminalConfig) (int, string, error) {
-	shell, err := startTerminalShell(containerName)
+	shell, err := startTerminalShell(containerName, task.Agent.User)
 	if err != nil {
 		return 0, "", cliError{"command_exec_failed", "Could not open a persistent shell in the task container.", []string{"Check Docker and that the task image provides /bin/bash.", "Or rerun with --shell-mode stateless."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
 	}
@@ -1136,21 +1192,41 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 	return maxTurns, transcript.String(), nil
 }
 
-func runOracleSolution(ctx context.Context, task terminalTask, bundleDir, containerName string, cfg terminalConfig) error {
+// runOracleSolution mirrors harbor's OracleAgent: solution/ is copied to
+// /solution, solve.sh runs as root with DEBIAN_FRONTEND=noninteractive and the
+// task's [solution].env, bounded by the agent timeout. A non-zero exit or
+// timeout does not abort the trial — harbor records it and still verifies.
+func runOracleSolution(ctx context.Context, task terminalTask, bundleDir, containerName string, cfg terminalConfig) (string, error) {
 	if _, err := os.Stat(filepath.Join(bundleDir, "solution", "solve.sh")); err != nil {
-		return cliError{"bundle_invalid", "Oracle mode requires solution/solve.sh.", []string{"Import a harbor task with solution/ or do not use --oracle."}, map[string]any{"taskId": task.ID, "bundleDir": bundleDir}}
+		return "", cliError{"bundle_invalid", "Oracle mode requires solution/solve.sh.", []string{"Import a harbor task with solution/ or do not use --oracle."}, map[string]any{"taskId": task.ID, "bundleDir": bundleDir}}
 	}
 	out, code, timedOut, err := runCommand(ctx, 120*time.Second, "docker", "cp", filepath.Join(bundleDir, "solution")+"/.", containerName+":/solution")
 	if err != nil || timedOut || code != 0 {
-		return terminalCommandError("command_exec_failed", "Could not copy oracle solution into container.", "docker", []string{"cp", filepath.Join(bundleDir, "solution") + "/.", containerName + ":/solution"}, code, out, timedOut)
+		return "", terminalCommandError("command_exec_failed", "Could not copy oracle solution into container.", "docker", []string{"cp", filepath.Join(bundleDir, "solution") + "/.", containerName + ":/solution"}, code, out, timedOut)
 	}
-	out, code, timedOut, err = runCommand(ctx, time.Duration(firstPositive(cfg.commandTimeoutSec, task.Agent.TimeoutSec, 900))*time.Second, "docker", "exec", containerName, "bash", "/solution/solve.sh")
-	if err != nil || timedOut || code != 0 {
-		return terminalCommandError("command_exec_failed", "Oracle solution failed in the task container.", "docker", []string{"exec", containerName, "bash", "/solution/solve.sh"}, code, out, timedOut)
+	execArgs := []string{"exec", "--user", "root", "-e", "DEBIAN_FRONTEND=noninteractive"}
+	for k, v := range resolveEnvTemplates(task.Solution.Env) {
+		execArgs = append(execArgs, "-e", k+"="+v)
 	}
-	return nil
+	execArgs = append(execArgs, containerName, "bash", "/solution/solve.sh")
+	timeout := time.Duration(firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)) * time.Second
+	out, code, timedOut, _ = runCommand(ctx, timeout, "docker", execArgs...)
+	transcript := "$ bash /solution/solve.sh\n" + truncateString(out, 200_000) + "\n[exit=" + strconv.Itoa(code) + "]\n"
+	if timedOut {
+		transcript += "[oracle solution timed out after " + timeout.String() + "; proceeding to verification]\n"
+	}
+	if timedOut || code != 0 {
+		printStatus(cfg.args, "terminal_oracle_solution_failed", map[string]any{"taskId": task.ID, "exitCode": code, "timedOut": timedOut})
+	}
+	return transcript, nil
 }
 
+// runTerminalVerifier follows harbor canonical semantics: tests/ is copied to
+// /tests, the verifier command runs in a non-login shell, and the reward file
+// is the sole pass signal — reward.json ({"reward": <num>}) takes precedence
+// over reward.txt (bare float), pass means reward >= 1.0, and the verifier's
+// exit code is ignored once a reward was written. A verifier timeout or a
+// missing/unparseable reward file scores the task as failed.
 func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, containerName string, cfg terminalConfig) (bool, string, error) {
 	_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "mkdir", "-p", "/logs/verifier")
 	out, code, timedOut, err := runCommand(ctx, 120*time.Second, "docker", "cp", filepath.Join(bundleDir, "tests")+"/.", containerName+":/tests")
@@ -1161,25 +1237,34 @@ func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, cont
 	if task.Verifier.User != "" {
 		cmdArgs = append(cmdArgs, "--user", task.Verifier.User)
 	}
-	for k, v := range task.Verifier.Env {
+	for k, v := range resolveEnvTemplates(task.Verifier.Env) {
 		cmdArgs = append(cmdArgs, "-e", k+"="+v)
 	}
-	cmdArgs = append(cmdArgs, containerName, "bash", "-lc", task.Verifier.Command)
+	cmdArgs = append(cmdArgs, containerName, "bash", "-c", task.Verifier.Command)
 	out, code, timedOut, _ = runCommand(ctx, time.Duration(firstPositive(task.Verifier.TimeoutSec, 900))*time.Second, "docker", cmdArgs...)
-	rewardPath := firstNonEmpty(task.Verifier.RewardFile, "/logs/verifier/reward.txt")
-	reward, rewardCode, _, _ := runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "cat", rewardPath)
-	trimmed := strings.TrimSpace(reward)
-	pass := false
-	if rewardCode == 0 {
-		pass = trimmed == "1"
-	} else {
-		pass = code == 0 && !timedOut
+	if timedOut {
+		printStatus(cfg.args, "terminal_verifier", map[string]any{"taskId": task.ID, "reward": "", "exitCode": code, "timedOut": true})
+		return false, out + "\n[verifier timed out]", cliError{"verifier_failed", "Verifier timed out; the task is scored as failed.", []string{"Raise [verifier].timeout_sec in the task if legitimate verifications need longer."}, map[string]any{"taskId": task.ID, "timeoutSec": firstPositive(task.Verifier.TimeoutSec, 900), "output": truncateString(out, 4096)}}
 	}
-	printStatus(cfg.args, "terminal_verifier", map[string]any{"taskId": task.ID, "reward": trimmed, "exitCode": code})
-	if timedOut || code != 0 {
-		return pass, out + "\n" + reward, cliError{"verifier_failed", "Verifier completed with a failing exit status or timed out.", []string{"Inspect the task transcript and verifier output in --out results.json."}, map[string]any{"taskId": task.ID, "exitCode": code, "timedOut": timedOut, "output": truncateString(out, 4096)}}
+	rewardFile := firstNonEmpty(task.Verifier.RewardFile, "/logs/verifier/reward.txt")
+	rewardJSONFile := path.Join(path.Dir(rewardFile), "reward.json")
+	reward, rewardRaw, rewardOK := 0.0, "", false
+	if jsonText, jsonCode, _, _ := runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "cat", rewardJSONFile); jsonCode == 0 {
+		reward, rewardOK = parseRewardJSON(jsonText)
+		rewardRaw = strings.TrimSpace(jsonText)
 	}
-	return pass, out + "\n" + reward, nil
+	if !rewardOK {
+		if txtText, txtCode, _, _ := runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "cat", rewardFile); txtCode == 0 {
+			reward, rewardOK = parseRewardText(txtText)
+			rewardRaw = strings.TrimSpace(txtText)
+		}
+	}
+	output := out + "\n[verifier exit=" + strconv.Itoa(code) + "]\nreward: " + rewardRaw
+	printStatus(cfg.args, "terminal_verifier", map[string]any{"taskId": task.ID, "reward": rewardRaw, "exitCode": code})
+	if !rewardOK {
+		return false, output, cliError{"verifier_failed", "Verifier did not produce a parseable reward file; the task is scored as failed.", []string{"Harbor verifiers must write /logs/verifier/reward.txt (float) or reward.json ({\"reward\": <num>})."}, map[string]any{"taskId": task.ID, "rewardFile": rewardFile, "exitCode": code, "output": truncateString(out, 4096)}}
+	}
+	return reward >= 1.0, output, nil
 }
 
 func callOpenAIChatMessages(baseURL, model string, messages []map[string]any, apiKey string, maxTokens int, temperature, topP float64, stop []string) (content, reasoning string, err error) {
@@ -1454,6 +1539,46 @@ func normalizeTerminalNetwork(value string) string {
 	default:
 		return ""
 	}
+}
+
+// parseRewardJSON parses a harbor reward.json payload: a JSON object mapping
+// metric names to numbers. The canonical pass signal is the "reward" key.
+func parseRewardJSON(text string) (float64, bool) {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(text), &m); err != nil {
+		return 0, false
+	}
+	v, ok := m["reward"].(float64)
+	return v, ok
+}
+
+func parseRewardText(text string) (float64, bool) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// resolveEnvTemplates expands harbor ${VAR} / ${VAR:-default} templates from
+// the host environment, matching harbor's resolve_env_vars behavior.
+func resolveEnvTemplates(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return env
+	}
+	resolved := make(map[string]string, len(env))
+	for k, v := range env {
+		resolved[k] = os.Expand(v, func(name string) string {
+			if key, def, ok := strings.Cut(name, ":-"); ok {
+				if val, found := os.LookupEnv(key); found && val != "" {
+					return val
+				}
+				return def
+			}
+			return os.Getenv(name)
+		})
+	}
+	return resolved
 }
 
 func nonNilStringMap(in map[string]string) map[string]string {

@@ -31,6 +31,12 @@ Important remote flags:
 - `--no-stream`: disable streaming.
 - `--endpoint-timeout-seconds <n>`: remote endpoint timeout; default is 600.
 
+Optional cost/power metadata for submissions:
+
+- `--gpu-power-watts 285.5,310.2`: measured watts per physical GPU; heterogeneous rigs list each card separately.
+- `--hardware-cost "NVIDIA GeForce RTX 3090|used|2021|700|USD;NVIDIA GeForce RTX 4090|new|2024|1599|USD"`: one purchase record per canonical hardware component, compact form `component|condition|year|price|currency`. `year` may be empty. Component must come from `lmx context` → `hardwareOptions.hardwareCostComponentNames`.
+- `--hardware-cost '[{"component":"NVIDIA GeForce RTX 3090","condition":"USED","yearPurchased":2021,"price":700,"currency":"USD"}]'`: JSON array form. `condition` is `NEW` or `USED`; currency is a 3-letter ISO code. The server stores this as run-level personal purchase metadata and does not sum across currencies.
+
 ## Local llama.cpp benchmarks
 
 Use local mode when running `llama-bench` on the host that owns the model/hardware. With `--model-path`, `lmx` generates:

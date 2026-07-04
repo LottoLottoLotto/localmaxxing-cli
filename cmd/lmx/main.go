@@ -2242,7 +2242,7 @@ func exportBenchmarkRuns(target string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	fields := parseCSVList(firstNonEmpty(opt(args, "fields"), "path,updatedAt,kind,hfId,modelRevision,engineName,benchmarkMode,quantization,hardware,tokSOut,tokSPrefill,tokSTotal,ttftMs,peakVramGb,promptTokens,outputTokens,contextLength,contextTokens,batchSize,metricSource,timingSource,notes"))
+	fields := parseCSVList(firstNonEmpty(opt(args, "fields"), "path,updatedAt,kind,hfId,modelRevision,engineName,benchmarkMode,quantization,hardware,tokSOut,tokSPrefill,tokSTotal,ttftMs,peakVramGb,totalPowerWatts,hardwareCost,promptTokens,outputTokens,contextLength,contextTokens,batchSize,metricSource,timingSource,notes"))
 	rows := benchmarkRunExportRows(records, fields)
 	format := strings.ToLower(firstNonEmpty(opt(args, "format"), "json"))
 	if format == "csv" {
@@ -2496,7 +2496,7 @@ func compareBenchmarkRunGroups(records []benchmarkRunRecord, args cliArgs) map[s
 }
 
 func compareTwoBenchmarkRuns(left, right benchmarkRunRecord, args cliArgs) map[string]any {
-	metrics := parseCSVList(firstNonEmpty(opt(args, "metrics"), opt(args, "metric"), "tokSOut,tokSPrefill,tokSTotal,ttftMs,peakVramGb"))
+	metrics := parseCSVList(firstNonEmpty(opt(args, "metrics"), opt(args, "metric"), "tokSOut,tokSPrefill,tokSTotal,ttftMs,peakVramGb,totalPowerWatts"))
 	comparisons := []any{}
 	for _, metric := range metrics {
 		leftValue := numberField(left.Payload, metric)
@@ -2693,7 +2693,7 @@ func roundMetric(value float64) float64 {
 
 func lowerIsBetterMetric(metric string) bool {
 	metric = strings.ToLower(metric)
-	return strings.Contains(metric, "latency") || strings.Contains(metric, "ttft") || strings.Contains(metric, "ms")
+	return strings.Contains(metric, "latency") || strings.Contains(metric, "ttft") || strings.Contains(metric, "ms") || strings.Contains(metric, "watt")
 }
 
 func metricBetter(value, baseline float64, metric string) bool {
@@ -2753,6 +2753,120 @@ func setNumericFlagFields(payload map[string]any, args cliArgs, mapping map[stri
 			}
 		}
 	}
+}
+
+// parseGpuPowerWatts parses a comma-separated list of measured per-GPU
+// wattages, one entry per physical GPU (heterogeneous rigs list each card).
+func parseGpuPowerWatts(raw string) ([]float64, error) {
+	hints := []string{"Pass comma-separated measured watts, one entry per physical GPU, e.g. --gpu-power-watts 285.5,310.2."}
+	entries := parseCSVList(raw)
+	if len(entries) == 0 {
+		return nil, cliError{"invalid_gpu_power_watts", "--gpu-power-watts requires at least one wattage value.", hints, raw}
+	}
+	watts := make([]float64, 0, len(entries))
+	for _, entry := range entries {
+		value, err := strconv.ParseFloat(entry, 64)
+		if err != nil {
+			return nil, cliError{"invalid_gpu_power_watts", fmt.Sprintf("--gpu-power-watts entry %q is not a number.", entry), hints, raw}
+		}
+		if value <= 0 {
+			return nil, cliError{"invalid_gpu_power_watts", fmt.Sprintf("--gpu-power-watts entry %q must be a positive wattage.", entry), hints, raw}
+		}
+		watts = append(watts, value)
+	}
+	return watts, nil
+}
+
+func hardwareCostHints() []string {
+	return []string{
+		`Pass compact entries as component|condition|year|price|currency separated by semicolons, e.g. --hardware-cost "NVIDIA GeForce RTX 3090|used|2021|700|USD;NVIDIA GeForce RTX 4090|new|2024|1599|USD".`,
+		`Or pass a JSON array: --hardware-cost '[{"component":"NVIDIA GeForce RTX 3090","condition":"USED","yearPurchased":2021,"price":700,"currency":"USD"}]'. Component names are validated by the server against hardwareOptions.hardwareCostComponentNames from lmx context.`,
+	}
+}
+
+func validateHardwareCostEntry(entry map[string]any, label string) (map[string]any, error) {
+	component := strings.TrimSpace(stringValue(entry["component"]))
+	if component == "" {
+		return nil, cliError{"invalid_hardware_cost", fmt.Sprintf("%s component is required.", label), hardwareCostHints(), entry}
+	}
+	condition := strings.ToUpper(strings.TrimSpace(stringValue(entry["condition"])))
+	if condition != "NEW" && condition != "USED" {
+		return nil, cliError{"invalid_hardware_cost", fmt.Sprintf("%s condition must be NEW or USED.", label), hardwareCostHints(), entry}
+	}
+	price := numberField(entry, "price")
+	if price <= 0 {
+		return nil, cliError{"invalid_hardware_cost", fmt.Sprintf("%s price must be a positive number.", label), hardwareCostHints(), entry}
+	}
+	currency := strings.ToUpper(strings.TrimSpace(stringValue(entry["currency"])))
+	if !regexp.MustCompile(`^[A-Z]{3}$`).MatchString(currency) {
+		return nil, cliError{"invalid_hardware_cost", fmt.Sprintf("%s currency must be a 3-letter ISO code.", label), hardwareCostHints(), entry}
+	}
+	out := map[string]any{"component": component, "condition": condition, "price": price, "currency": currency}
+	if y := numberField(entry, "yearPurchased"); y != 0 {
+		year := int(y)
+		if float64(year) != y || year < 1980 || year > time.Now().Year() {
+			return nil, cliError{"invalid_hardware_cost", fmt.Sprintf("%s yearPurchased must be an integer from 1980 through this year.", label), hardwareCostHints(), entry}
+		}
+		out["yearPurchased"] = year
+	}
+	return out, nil
+}
+
+func parseHardwareCost(raw string) ([]map[string]any, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, cliError{"invalid_hardware_cost", "--hardware-cost requires at least one entry.", hardwareCostHints(), raw}
+	}
+	if strings.HasPrefix(raw, "[") {
+		var decoded []map[string]any
+		if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+			return nil, cliError{"invalid_hardware_cost", "--hardware-cost JSON must be an array of objects.", hardwareCostHints(), err.Error()}
+		}
+		if len(decoded) == 0 {
+			return nil, cliError{"invalid_hardware_cost", "--hardware-cost requires at least one entry.", hardwareCostHints(), raw}
+		}
+		out := make([]map[string]any, 0, len(decoded))
+		for i, entry := range decoded {
+			valid, err := validateHardwareCostEntry(entry, fmt.Sprintf("hardwareCost[%d]", i))
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, valid)
+		}
+		return out, nil
+	}
+	parts := strings.Split(raw, ";")
+	out := make([]map[string]any, 0, len(parts))
+	for i, part := range parts {
+		fields := strings.Split(part, "|")
+		if len(fields) != 5 {
+			return nil, cliError{"invalid_hardware_cost", fmt.Sprintf("--hardware-cost compact entry %d must have 5 pipe-separated fields.", i+1), hardwareCostHints(), part}
+		}
+		entry := map[string]any{
+			"component": strings.TrimSpace(fields[0]),
+			"condition": strings.TrimSpace(fields[1]),
+			"price":     strings.TrimSpace(fields[3]),
+			"currency":  strings.TrimSpace(fields[4]),
+		}
+		if strings.TrimSpace(fields[2]) != "" {
+			year, err := strconv.Atoi(strings.TrimSpace(fields[2]))
+			if err != nil {
+				return nil, cliError{"invalid_hardware_cost", fmt.Sprintf("--hardware-cost compact entry %d year is not an integer.", i+1), hardwareCostHints(), part}
+			}
+			entry["yearPurchased"] = float64(year)
+		}
+		price, err := strconv.ParseFloat(strings.TrimSpace(fields[3]), 64)
+		if err != nil {
+			return nil, cliError{"invalid_hardware_cost", fmt.Sprintf("--hardware-cost compact entry %d price is not a number.", i+1), hardwareCostHints(), part}
+		}
+		entry["price"] = price
+		valid, err := validateHardwareCostEntry(entry, fmt.Sprintf("hardwareCost[%d]", i))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, valid)
+	}
+	return out, nil
 }
 
 func medianOf(values []float64) float64 {
@@ -3974,6 +4088,20 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	}
 	payload := builder.ToMap()
 	setNumericFlagFields(payload, args, map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "prompt-tokens": "promptTokens", "prefill-tokens": "promptTokens", "output-tokens": "outputTokens", "num-prompts": "numPrompts"})
+	if raw := opt(args, "gpu-power-watts"); raw != "" {
+		watts, err := parseGpuPowerWatts(raw)
+		if err != nil {
+			return nil, err
+		}
+		payload["gpuPowerWatts"] = watts
+	}
+	if raw := opt(args, "hardware-cost"); raw != "" {
+		cost, err := parseHardwareCost(raw)
+		if err != nil {
+			return nil, err
+		}
+		payload["hardwareCost"] = cost
+	}
 	applyCommandTokenHints(payload)
 	if notes := opt(args, "notes"); notes != "" {
 		payload["notes"] = notes
@@ -4035,7 +4163,7 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 		"quantization", "backend", "promptTokens", "outputTokens",
 		"contextLength", "batchSize", "temperature", "topP",
 		"ttftMs", "tokSOut", "tokSPrefill", "tokSTotal",
-		"peakVramGb", "prefillTokens", "notes",
+		"peakVramGb", "gpuPowerWatts", "hardwareCost", "prefillTokens", "notes",
 	} {
 		if v, ok := payload[key]; ok && submitValuePresent(v) {
 			out[key] = v
@@ -4291,6 +4419,10 @@ func submitValuePresent(value any) bool {
 		return v != 0
 	case float32:
 		return v != 0
+	case []float64:
+		return len(v) > 0
+	case []any:
+		return len(v) > 0
 	default:
 		return true
 	}

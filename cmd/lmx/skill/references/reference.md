@@ -147,7 +147,7 @@ KV-cache and saved runs:
 Hardware and submission metadata:
 
 - `--hardware <path>`: JSON hardware object required when submitting.
-- `--quantization <label>`: quantization label; auto-detected for some remote benchmark/eval-shard paths when omitted.
+- `--quantization <label>`: quantization label; free-form but common values are exposed by `lmx context` (`commonSchemas.benchmarkFields.quantization.commonValues`) and include GGUF (`Q4_K_M`, `IQ4_XS`), NVIDIA (`NVFP4`), Unsloth (`Unsloth-Dynamic-Q4_K_M`), bitsandbytes (`bnb-nf4`), AWQ/GPTQ/EXL2/FP8 variants. Auto-detected for some remote benchmark/eval-shard paths when omitted.
 - `--gpu-name <name>`: hardware template GPU name.
 - `--gpu-count <n>`: hardware template GPU count.
 - `--vram-gb <gb>`: hardware template VRAM in GB.
@@ -155,6 +155,8 @@ Hardware and submission metadata:
 - `--ram-gb <gb>`: hardware template system RAM in GB.
 - `--os <name>`: hardware template OS name; default runtime OS.
 - `--power-watts <n>`: hardware template power draw in watts.
+- `--gpu-power-watts <list>`: benchmark submission per-GPU measured watts, e.g. `285.5,310.2`.
+- `--hardware-cost <entries|json>`: benchmark submission purchase records. Component names must come from `lmx context` → `hardwareOptions.hardwareCostComponentNames`. Compact entries use `component|condition|year|price|currency` separated by semicolons; JSON uses an array of objects with `component`, `condition`, optional `yearPurchased`, `price`, and `currency`.
 - `--hw-class <class>`: hardware template class, e.g. `DISCRETE_GPU` or `CPU_ONLY`.
 - `--name <name>`: saved setup name to pull, case-insensitive.
 - `--id <id>`: saved setup id to pull.
