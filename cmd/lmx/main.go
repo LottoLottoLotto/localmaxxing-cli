@@ -1,8 +1,11 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -109,6 +112,8 @@ func runWithArgs(args cliArgs) error {
 	}
 
 	switch cmd {
+	case "update", "upgrade":
+		return handleUpdate(args)
 	case "auth":
 		return handleAuth(args)
 	case "hardware":
@@ -168,7 +173,7 @@ func runWithArgs(args cliArgs) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "benchmark", "bench", "auth", "hardware", "setups", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill":
+	case "eval", "benchmark", "bench", "auth", "hardware", "setups", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill", "update", "upgrade":
 		return true
 	default:
 		return false
@@ -467,6 +472,238 @@ func writeOrPrintJSON(title string, args cliArgs, value any) error {
 		return err
 	}
 	printInfo(title+"_written", map[string]any{"path": out})
+	return nil
+}
+
+func handleUpdate(args cliArgs) error {
+	asset, checksum, err := releaseAssetURLs(args)
+	if err != nil {
+		return err
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return cliError{"update_executable_unknown", "Could not locate the running lmx executable.", []string{"Run the release install command from the README manually."}, err.Error()}
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return cliError{"update_executable_unknown", "Could not resolve the running lmx executable.", []string{"Run the release install command from the README manually."}, err.Error()}
+	}
+	if hasFlag(args, "dry-run") {
+		printInfo("update_plan", map[string]any{"asset": asset, "checksums": checksum, "target": exe})
+		return nil
+	}
+	if err := updateFromRelease(asset, checksum, exe); err != nil {
+		return err
+	}
+	printInfo("updated", map[string]any{"target": exe, "asset": asset})
+	if !hasFlag(args, "quiet") {
+		fmt.Printf("Updated lmx from %s\n", asset)
+	}
+	return nil
+}
+
+func releaseAssetURLs(args cliArgs) (string, string, error) {
+	name, err := releaseAssetName(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return "", "", err
+	}
+	base := strings.TrimRight(firstNonEmpty(opt(args, "release-url"), "https://github.com/LottoLottoLotto/localmaxxing-cli/releases/latest/download"), "/")
+	return base + "/" + name, base + "/checksums.txt", nil
+}
+
+func releaseAssetName(goos, goarch string) (string, error) {
+	switch {
+	case goos == "linux" && (goarch == "amd64" || goarch == "arm64"):
+		return "lmx-" + goos + "-" + goarch + ".tar.gz", nil
+	case goos == "darwin" && goarch == "arm64":
+		return "lmx-darwin-arm64.tar.gz", nil
+	case goos == "windows" && goarch == "amd64":
+		return "lmx-windows-amd64.zip", nil
+	default:
+		return "", cliError{"unsupported_update_platform", fmt.Sprintf("No LocalMaxxing release asset is published for %s/%s.", goos, goarch), []string{"Download or build lmx manually for this platform."}, nil}
+	}
+}
+
+func updateFromRelease(assetURL, checksumURL, exePath string) error {
+	archiveBytes, assetName, err := downloadReleaseAsset(assetURL)
+	if err != nil {
+		return err
+	}
+	checksumBytes, _, err := downloadReleaseAsset(checksumURL)
+	if err != nil {
+		return err
+	}
+	if err := verifyReleaseChecksum(assetName, archiveBytes, string(checksumBytes)); err != nil {
+		return err
+	}
+	files, err := extractReleaseArchive(assetName, archiveBytes)
+	if err != nil {
+		return err
+	}
+	binaryName := "lmx"
+	if runtime.GOOS == "windows" {
+		binaryName = "lmx.exe"
+	}
+	binary, ok := files[binaryName]
+	if !ok {
+		return cliError{"update_asset_invalid", fmt.Sprintf("Release asset %s does not contain %s.", assetName, binaryName), nil, nil}
+	}
+	if runtime.GOOS == "windows" {
+		return cliError{"update_windows_manual", "Windows cannot safely replace the running lmx.exe process.", []string{"Download the latest zip from GitHub releases and replace lmx.exe after this process exits."}, nil}
+	}
+	if err := replaceExecutable(exePath, binary, 0o755); err != nil {
+		return err
+	}
+	scorerName := "lmx-llama-score-hellaswag"
+	if scorer, ok := files[scorerName]; ok {
+		scorerPath := filepath.Join(filepath.Dir(exePath), scorerName)
+		if err := replaceExecutable(scorerPath, scorer, 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func downloadReleaseAsset(rawURL string) ([]byte, string, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", "lmx-update")
+	resp, err := apiHTTPClient.Do(req)
+	if err != nil {
+		return nil, "", cliError{"update_download_failed", "Could not download the latest lmx release asset.", []string{"Check network access to GitHub releases, then retry."}, err.Error()}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, "", cliError{"update_download_failed", fmt.Sprintf("Release download returned HTTP %d.", resp.StatusCode), []string{"Check that a release asset exists for this platform."}, nil}
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return body, filepath.Base(rawURL), nil
+	}
+	return body, filepath.Base(u.Path), nil
+}
+
+func verifyReleaseChecksum(assetName string, archiveBytes []byte, checksums string) error {
+	sum := sha256.Sum256(archiveBytes)
+	want := ""
+	for _, line := range strings.Split(checksums, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.TrimPrefix(fields[1], "*")
+		if filepath.Base(name) == assetName {
+			want = strings.ToLower(fields[0])
+			break
+		}
+	}
+	if want == "" {
+		return cliError{"update_checksum_missing", fmt.Sprintf("checksums.txt does not include %s.", assetName), nil, nil}
+	}
+	got := hex.EncodeToString(sum[:])
+	if got != want {
+		return cliError{"update_checksum_mismatch", fmt.Sprintf("Downloaded %s did not match checksums.txt.", assetName), []string{"Do not install this asset; retry later or inspect the GitHub release."}, map[string]string{"expected": want, "actual": got}}
+	}
+	return nil
+}
+
+func extractReleaseArchive(assetName string, archiveBytes []byte) (map[string][]byte, error) {
+	if strings.HasSuffix(assetName, ".tar.gz") {
+		return extractReleaseTarGz(archiveBytes)
+	}
+	if strings.HasSuffix(assetName, ".zip") {
+		return extractZip(archiveBytes)
+	}
+	return nil, cliError{"update_asset_invalid", fmt.Sprintf("Unsupported release archive %s.", assetName), nil, nil}
+}
+
+func extractReleaseTarGz(data []byte) (map[string][]byte, error) {
+	gz, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	files := map[string][]byte{}
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return files, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		base := filepath.Base(hdr.Name)
+		if base != "lmx" && base != "lmx-llama-score-hellaswag" {
+			continue
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, err
+		}
+		files[base] = body
+	}
+}
+
+func extractZip(data []byte) (map[string][]byte, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, err
+	}
+	files := map[string][]byte{}
+	for _, f := range zr.File {
+		base := filepath.Base(f.Name)
+		if base != "lmx.exe" && base != "lmx-llama-score-hellaswag.exe" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, err
+		}
+		body, readErr := io.ReadAll(rc)
+		closeErr := rc.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		files[base] = body
+	}
+	return files, nil
+}
+
+func replaceExecutable(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".update-*")
+	if err != nil {
+		return cliError{"update_replace_failed", fmt.Sprintf("Could not create a temporary file in %s.", dir), []string{"Check write permissions for the lmx installation directory."}, err.Error()}
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return cliError{"update_replace_failed", fmt.Sprintf("Could not replace %s.", path), []string{"Check write permissions, or rerun with appropriate privileges."}, err.Error()}
+	}
 	return nil
 }
 
@@ -10147,6 +10384,7 @@ func printError(args cliArgs, err error) {
 }
 
 var usageExamples = []string{
+	`lmx update`,
 	`lmx context --out localmaxxing-agent-context.json`,
 	`lmx auth --key bhk_...`,
 	`lmx auth login`,
@@ -10322,7 +10560,8 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --item-count <n>         Optional record/sample count for storage metadata
   --limit <n>              Optional search/list result limit
   --submit                 Upload run to LocalMaxxing
-  --dry-run                For benchmark run: write a measurement plan; for submit commands: authenticated API validation without creating a run
+  --dry-run                For update: print release asset plan; for benchmark run: write a measurement plan; for submit commands: authenticated API validation without creating a run
+  --release-url <url>      Override release download base for lmx update (default: GitHub latest release)
   --include-server-metadata Probe optional endpoint /props and /hardware metadata during discover
   --gpu-name <name>       Hardware template GPU name
   --gpu-count <n>         Hardware template GPU count
@@ -10338,6 +10577,8 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --out <path>             Write computed payload/result JSON`
 
 var commandDescriptions = map[string]string{
+	"update":                 "Download the newest LocalMaxxing CLI release and replace the current binary.",
+	"upgrade":                "Alias for update.",
 	"endpoint discover":      "Discover an OpenAI-compatible endpoint and benchmark command hints.",
 	"endpoint":               "Discover OpenAI-compatible model endpoints.",
 	"benchmark":              "Create, manage, validate, and submit benchmark runs.",

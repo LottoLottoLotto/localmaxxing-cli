@@ -1,6 +1,11 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +19,124 @@ import (
 	"testing"
 	"time"
 )
+
+func TestReleaseAssetName(t *testing.T) {
+	tests := []struct {
+		goos string
+		arch string
+		want string
+	}{
+		{"linux", "amd64", "lmx-linux-amd64.tar.gz"},
+		{"linux", "arm64", "lmx-linux-arm64.tar.gz"},
+		{"darwin", "arm64", "lmx-darwin-arm64.tar.gz"},
+		{"windows", "amd64", "lmx-windows-amd64.zip"},
+	}
+	for _, tt := range tests {
+		got, err := releaseAssetName(tt.goos, tt.arch)
+		if err != nil {
+			t.Fatalf("releaseAssetName(%q, %q) returned error: %v", tt.goos, tt.arch, err)
+		}
+		if got != tt.want {
+			t.Fatalf("releaseAssetName(%q, %q) = %q, want %q", tt.goos, tt.arch, got, tt.want)
+		}
+	}
+	if _, err := releaseAssetName("darwin", "amd64"); err == nil {
+		t.Fatal("releaseAssetName accepted unpublished darwin/amd64 asset")
+	}
+}
+
+func TestUpdateFromReleaseReplacesBinaryAndScorer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot replace a running exe")
+	}
+	archive := testReleaseTarGz(t, map[string]string{
+		"lmx":                       "new lmx",
+		"lmx-llama-score-hellaswag": "new scorer",
+	})
+	sum := sha256.Sum256(archive)
+	checksums := hex.EncodeToString(sum[:]) + "  lmx-linux-amd64.tar.gz\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/lmx-linux-amd64.tar.gz":
+			_, _ = w.Write(archive)
+		case "/checksums.txt":
+			_, _ = io.WriteString(w, checksums)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "lmx")
+	if err := os.WriteFile(exe, []byte("old lmx"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateFromRelease(server.URL+"/lmx-linux-amd64.tar.gz", server.URL+"/checksums.txt", exe); err != nil {
+		t.Fatalf("updateFromRelease returned error: %v", err)
+	}
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new lmx" {
+		t.Fatalf("updated lmx = %q", data)
+	}
+	scorer, err := os.ReadFile(filepath.Join(dir, "lmx-llama-score-hellaswag"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(scorer) != "new scorer" {
+		t.Fatalf("updated scorer = %q", scorer)
+	}
+}
+
+func TestUpdateFromReleaseRejectsChecksumMismatch(t *testing.T) {
+	archive := testReleaseTarGz(t, map[string]string{"lmx": "new lmx"})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/lmx-linux-amd64.tar.gz":
+			_, _ = w.Write(archive)
+		case "/checksums.txt":
+			_, _ = io.WriteString(w, strings.Repeat("0", 64)+"  lmx-linux-amd64.tar.gz\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := updateFromRelease(server.URL+"/lmx-linux-amd64.tar.gz", server.URL+"/checksums.txt", filepath.Join(t.TempDir(), "lmx"))
+	if err == nil {
+		t.Fatal("updateFromRelease accepted a checksum mismatch")
+	}
+	var ce cliError
+	if !errors.As(err, &ce) || ce.Code != "update_checksum_mismatch" {
+		t.Fatalf("error = %#v, want update_checksum_mismatch", err)
+	}
+}
+
+func testReleaseTarGz(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for name, body := range files {
+		data := []byte(body)
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o755, Size: int64(len(data))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
 
 func TestApplyNvidiaSMIHardwareParsesMultipleGPUs(t *testing.T) {
 	hardware := map[string]any{"hwClass": "CPU_ONLY"}

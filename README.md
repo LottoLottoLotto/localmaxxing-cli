@@ -12,11 +12,10 @@ Download a pre-built archive for your platform from the [latest release](https:/
 |----------|-------|
 | Linux (amd64) | `lmx-linux-amd64.tar.gz` |
 | Linux (arm64) | `lmx-linux-arm64.tar.gz` |
-| macOS (Intel) | `lmx-darwin-amd64.tar.gz` |
 | macOS (Apple Silicon) | `lmx-darwin-arm64.tar.gz` |
-| Windows (amd64) | `lmx-windows-amd64.exe` |
+| Windows (amd64) | `lmx-windows-amd64.zip` |
 
-Linux and macOS binaries ship inside `.tar.gz` archives so the executable bit survives the download — no `chmod` needed. Each archive extracts to a single executable named `lmx` regardless of the asset name; rename it yourself if you keep multiple platforms side by side.
+Linux and macOS binaries ship inside `.tar.gz` archives so executable bits survive the download. Windows binaries ship inside a `.zip`. Each archive includes `lmx`/`lmx.exe` and the bundled `lmx-llama-score-hellaswag` helper.
 
 ```bash
 # Linux / macOS (adjust the asset name for your platform)
@@ -31,11 +30,23 @@ lmx --help
 
 Every release includes `checksums.txt` with SHA-256 hashes keyed by asset basename, so `--check --ignore-missing` succeeds even when you downloaded a single asset.
 
-On Windows, download the `.exe` and compare hashes in PowerShell:
+### Update
+
+Once `lmx` is installed from a release archive, update it in place:
+
+```bash
+lmx update
+```
+
+`lmx update` downloads the newest GitHub release asset for the current OS/architecture, verifies it against `checksums.txt`, replaces the running `lmx` binary, and updates the bundled scorer next to it when present. Use `lmx update --dry-run` to print the asset URL and target path without changing files.
+
+Windows cannot safely replace a running `.exe`; download the latest zip and replace `lmx.exe` after the process exits.
+
+On Windows, download the `.zip`, extract `lmx.exe`, and compare hashes in PowerShell:
 
 ```powershell
-(Get-FileHash lmx-windows-amd64.exe -Algorithm SHA256).Hash
-Select-String -Path checksums.txt -Pattern lmx-windows-amd64.exe
+(Get-FileHash lmx-windows-amd64.zip -Algorithm SHA256).Hash
+Select-String -Path checksums.txt -Pattern lmx-windows-amd64.zip
 ```
 
 > macOS: release binaries are not signed or notarized. If Gatekeeper blocks the first run, clear the quarantine attribute: `xattr -d com.apple.quarantine /usr/local/bin/lmx`.
