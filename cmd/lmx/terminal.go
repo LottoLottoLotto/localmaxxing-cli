@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	_ "embed"
 	"errors"
 	"fmt"
 	"io"
@@ -23,15 +24,80 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
 )
 
-const terminalSystemPrompt = "You control a Linux terminal. Each reply MUST contain exactly one ```bash fenced block with one command, which will be executed; its stdout/stderr/exit code is returned. When the task is complete, reply with the single token TASK_COMPLETE and no code block. Non-interactive only."
+const terminalSystemPrompt = "You control a Linux terminal. Each reply MUST contain exactly one ```bash fenced block containing one or more non-interactive shell commands, which will be executed; stdout/stderr/exit code are returned. Prefer batching related inspection/edit/test commands instead of spending one model turn per tiny command. When the task is complete, reply with the single token TASK_COMPLETE and no code block. If you need Python/Ruby/Node/etc., run it from bash with a heredoc (for example: python3 <<'PY' ... PY). Avoid dumping huge files; inspect with head/tail/grep/scripts. Bound password crackers and deliberately long-running commands yourself with timeout, but do not prematurely cap package installs, builds, or tests unless they are clearly stuck."
 
-const terminalSessionSystemPrompt = "You control a persistent Linux shell session inside a container. State persists across replies: your working directory, environment variables, and background jobs carry over from one command to the next. Each reply MUST contain exactly one ```bash fenced block with one command, which is executed in that same shell; its stdout/stderr and exit code are returned. When the task is complete, reply with the single token TASK_COMPLETE and no code block. Run only non-interactive commands (no programs that wait for a TTY or block on stdin)."
+const terminalSessionSystemPrompt = "You control a persistent Linux shell session inside a container. State persists across replies: your working directory, environment variables, and background jobs carry over from one command block to the next. Each reply MUST contain exactly one ```bash fenced block containing one or more non-interactive shell commands, which are executed in that same shell; stdout/stderr and exit code are returned. Prefer batching related inspection/edit/test commands instead of spending one model turn per tiny command. When the task is complete, reply with the single token TASK_COMPLETE and no code block. If you need Python/Ruby/Node/etc., run it from bash with a heredoc (for example: python3 <<'PY' ... PY). Avoid dumping huge files; inspect with head/tail/grep/scripts. Bound password crackers and deliberately long-running commands yourself with timeout, but do not prematurely cap package installs, builds, or tests unless they are clearly stuck. Never run foreground servers; start them in the background and verify them."
+
+const defaultTerminalTaskTimeoutSec = 4 * 60 * 60
+const defaultTerminalCommandTimeoutSec = defaultTerminalTaskTimeoutSec
+const terminalModelObservationLimit = 2500
+const terminalMessageBudgetBytes = 60_000
+const terminalRecentMessageKeep = 12
+const defaultTerminalModelMaxTokens = 16_384
+const defaultTerminalRetryMaxTokens = 8_192
+const defaultTerminalEndpointTimeout = 10 * time.Minute
+const maxTerminalRetryReserve = 5 * time.Minute
+
+const terminalJSONProtocolTemplate = `You are an AI assistant tasked with solving command-line tasks in a Linux environment. You will be given a task description and the output from previously executed commands. Your goal is to solve the task by providing batches of shell commands.
+
+Format your response as JSON with the following structure:
+
+{
+  "analysis": "Analyze the current state based on the terminal output provided. What do you see? What has been accomplished? What still needs to be done?",
+  "plan": "Describe your plan for the next steps. What commands will you run and why? Be specific about what you expect each command to accomplish.",
+  "commands": [
+    {
+      "keystrokes": "ls -la\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd project\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": true
+}
+
+Required fields:
+- "analysis": Your analysis of the current situation
+- "plan": Your plan for the next steps
+- "commands": Array of command objects to execute
+
+Optional fields:
+- "task_complete": Boolean indicating if the task is complete (defaults to false if not present)
+
+Command object structure:
+- "keystrokes": String containing the exact keystrokes to send to the terminal (required)
+- "duration": Number of seconds to wait before the next command when no command is running (defaults to 1.0 if not present)
+
+IMPORTANT: The text inside "keystrokes" will be used completely verbatim as shell input. Write commands exactly as you want them sent to the terminal:
+- You must end every command with a newline (\n) or it will not execute.
+- For special key sequences, use tmux-style escape sequences:
+  - C-c for Ctrl+C
+  - C-d for Ctrl+D
+
+Important notes:
+- Each command's keystrokes are sent exactly as written to the terminal.
+- Batch related commands in one response when they are part of the same inspection/edit/test step.
+- Do not include extra whitespace before or after the keystrokes unless it is part of the intended command.
+- Extra text before or after the JSON will generate warnings but be tolerated.
+- The JSON must be valid; use proper escaping for quotes and special characters within strings.
+- Commands array can be empty if you want to wait without taking action.
+- Before setting "task_complete": true, run a concise self-check that covers every explicit acceptance criterion in the task description, especially any tests the task says should pass.
+- If the task asks for compiled/native extensions, verify the native modules or binaries are actually built and importable/executable, not just that Python fallbacks or partial smoke tests work.
+
+Task Description:
+%s
+
+Current terminal state:
+%s`
 
 type terminalTask struct {
 	ID          string                    `json:"id"`
@@ -95,6 +161,49 @@ type terminalConfig struct {
 	agentCommand      string
 	agentExecution    string
 	shellMode         string
+	traceRoot         string
+	endpointTimeout   time.Duration
+}
+
+type terminalJSONCommand struct {
+	Keystrokes string  `json:"keystrokes"`
+	Duration   float64 `json:"duration"`
+}
+
+type terminalJSONResponse struct {
+	Analysis     string                `json:"analysis"`
+	Plan         string                `json:"plan"`
+	Commands     []terminalJSONCommand `json:"commands"`
+	TaskComplete bool                  `json:"task_complete"`
+}
+
+type terminalTokenUsage struct {
+	inputTokens      int64
+	outputTokens     int64
+	cacheReadTokens  int64
+	cacheWriteTokens int64
+	totalTokens      int64
+	modelCalls       int
+}
+
+func (u *terminalTokenUsage) add(v terminalTokenUsage) {
+	u.inputTokens += v.inputTokens
+	u.outputTokens += v.outputTokens
+	u.cacheReadTokens += v.cacheReadTokens
+	u.cacheWriteTokens += v.cacheWriteTokens
+	u.totalTokens += v.totalTokens
+	u.modelCalls += v.modelCalls
+}
+
+func (u terminalTokenUsage) toMap() map[string]any {
+	return map[string]any{
+		"inputTokens":      u.inputTokens,
+		"outputTokens":     u.outputTokens,
+		"cacheReadTokens":  u.cacheReadTokens,
+		"cacheWriteTokens": u.cacheWriteTokens,
+		"totalTokens":      u.totalTokens,
+		"modelCalls":       u.modelCalls,
+	}
 }
 
 type terminalTaskResult struct {
@@ -103,7 +212,8 @@ type terminalTaskResult struct {
 	turns          int
 	transcript     string
 	verifierOutput string
-	latencyMs      int64
+	wallTimeMs     int64
+	usage          terminalTokenUsage
 	errText        string
 	errCode        string
 	instruction    string
@@ -183,10 +293,12 @@ func handleEvalTerminal(sub string, args cliArgs) error {
 		return runTerminalImport(args)
 	case "run":
 		return runTerminalEval(args, false)
+	case "submit":
+		return submitTerminalEval(args)
 	case "verify":
 		return runTerminalEval(args, true)
 	default:
-		return cliError{"unknown_subcommand", "Unknown eval terminal subcommand.", []string{"Use one of: import, run, verify."}, map[string]any{"subcommand": sub}}
+		return cliError{"unknown_subcommand", "Unknown eval terminal subcommand.", []string{"Use one of: import, run, submit, verify."}, map[string]any{"subcommand": sub}}
 	}
 }
 
@@ -371,7 +483,19 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	var quantResolution map[string]any
 	resolvedQuant, resolvedQuantFormat := "", opt(args, "quant-format")
 	var modelResolution map[string]any
+	agentBackend := opt(args, "agent")
 	agentCommand := opt(args, "agent-cmd")
+	if agentBackend == "terminus-2" {
+		if agentCommand != "" {
+			return cliError{"invalid_option", "--agent terminus-2 cannot be combined with --agent-cmd.", []string{"Use --agent terminus-2 for the bundled Harbor Terminus-2 adapter, or use --agent-cmd with --agent-name for a custom wrapper."}, nil}
+		}
+		extractedCommand, cleanupAdapter, err := terminus2AgentCommand()
+		if err != nil {
+			return err
+		}
+		agentCommand = extractedCommand
+		defer cleanupAdapter()
+	}
 	if !forceOracle && !hasFlag(args, "oracle") {
 		if agentCommand == "" {
 			var err error
@@ -411,7 +535,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if err != nil {
 		return err
 	}
-	commandTimeout, err := intOption(args, 120, 1, "command-timeout", "command-timeout-seconds")
+	commandTimeout, err := intOption(args, 0, 1, "command-timeout", "command-timeout-seconds")
 	if err != nil {
 		return err
 	}
@@ -419,7 +543,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if err != nil {
 		return err
 	}
-	cfg := terminalConfig{apiKey: opt(args, "model-api-key"), args: args, maxTokens: maxTokens, temperature: floatOption(args, "temperature", 0), topP: floatOption(args, "top-p", 1), commandTimeoutSec: commandTimeout, cleanupImages: hasFlag(args, "cleanup-images"), oracle: forceOracle || hasFlag(args, "oracle"), agentCommand: agentCommand, agentExecution: firstNonEmpty(opt(args, "agent-execution"), "host")}
+	cfg := terminalConfig{apiKey: opt(args, "model-api-key"), args: args, maxTokens: maxTokens, temperature: floatOption(args, "temperature", 0), topP: floatOption(args, "top-p", 1), commandTimeoutSec: commandTimeout, cleanupImages: hasFlag(args, "cleanup-images"), oracle: forceOracle || hasFlag(args, "oracle"), agentCommand: agentCommand, agentExecution: firstNonEmpty(opt(args, "agent-execution"), map[bool]string{true: "routed-shell"}[agentBackend == "terminus-2"], "host"), traceRoot: opt(args, "trace-dir")}
 	cfg.maxTurns, err = intOption(args, 0, 0, "max-turns")
 	if err != nil {
 		return err
@@ -427,6 +551,12 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	cfg.agentTimeoutSec, err = intOption(args, 0, 0, "agent-timeout")
 	if err != nil {
 		return err
+	}
+	if firstNonEmpty(opt(args, "endpoint-timeout-seconds"), opt(args, "timeout-seconds")) != "" {
+		cfg.endpointTimeout, err = endpointTimeout(args)
+		if err != nil {
+			return err
+		}
 	}
 	cfg.shellMode = firstNonEmpty(opt(args, "shell-mode"), "persistent")
 	if cfg.shellMode != "persistent" && cfg.shellMode != "stateless" {
@@ -441,7 +571,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	stats := shardStats{}
 	errorCodes := map[string]string{}
 	for _, result := range results {
-		stats.totalLatencyMs += result.latencyMs
+		stats.totalLatencyMs += result.wallTimeMs
 		if result.scored {
 			stats.scored++
 			if result.pass {
@@ -454,6 +584,10 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 			}
 		}
 	}
+	totalUsage := terminalTokenUsage{}
+	for _, result := range results {
+		totalUsage.add(result.usage)
+	}
 	accuracy := 0.0
 	if stats.scored > 0 {
 		accuracy = float64(stats.correct) / float64(stats.scored)
@@ -462,11 +596,11 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if len(results) > 0 {
 		avgLatency = stats.totalLatencyMs / int64(len(results))
 	}
-	summary := map[string]any{"dataset": firstNonEmpty(dataset, "local"), "tasks": len(results), "correct": stats.correct, "scored": stats.scored, "errors": stats.errors, "accuracyPct": roundMetric(accuracy * 100), "avgLatencyMs": avgLatency, "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "errorCodes": errorCodes}
+	summary := map[string]any{"dataset": firstNonEmpty(dataset, "local"), "tasks": len(results), "correct": stats.correct, "scored": stats.scored, "errors": stats.errors, "accuracyPct": roundMetric(accuracy * 100), "avgWallTimeMs": avgLatency, "wallTimeMs": stats.totalLatencyMs, "tokenUsage": totalUsage.toMap(), "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "errorCodes": errorCodes}
 	if out := opt(args, "out"); out != "" {
 		records := make([]any, len(results))
 		for i, r := range results {
-			records[i] = map[string]any{"question_id": bundles[i].Task.ID, "pass": r.pass, "scored": r.scored, "error": r.errText, "errorCode": r.errCode, "latencyMs": r.latencyMs, "turns": r.turns, "question": bundles[i].Task.Instruction, "prompt": r.prompt, "response": r.transcript, "verifierOutput": r.verifierOutput}
+			records[i] = map[string]any{"question_id": bundles[i].Task.ID, "pass": r.pass, "scored": r.scored, "error": r.errText, "errorCode": r.errCode, "latencyMs": r.wallTimeMs, "wallTimeMs": r.wallTimeMs, "tokenUsage": r.usage.toMap(), "turns": r.turns, "question": bundles[i].Task.Instruction, "prompt": r.prompt, "response": r.transcript, "verifierOutput": r.verifierOutput}
 		}
 		if err := writeJSON(out, map[string]any{"summary": summary, "results": records}); err != nil {
 			return err
@@ -513,7 +647,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		task := bundles[i].Task
 		submitResults = append(submitResults, map[string]any{"question_id": task.ID, "pass": r.pass})
 		artifactResponse := truncateString(r.transcript+"\n\n# Verifier\n\n"+r.verifierOutput, 4_900_000)
-		submitArtifacts = append(submitArtifacts, map[string]any{"question_id": task.ID, "itemIndex": i, "promptHash": shortHash(task.ID + ":" + r.prompt), "question": task.Instruction, "prompt": r.prompt, "response": artifactResponse, "score": boolScore(r.pass), "testPassed": r.pass, "latencyMs": r.latencyMs})
+		submitArtifacts = append(submitArtifacts, map[string]any{"question_id": task.ID, "itemIndex": i, "promptHash": shortHash(task.ID + ":" + r.prompt), "question": task.Instruction, "prompt": r.prompt, "response": artifactResponse, "score": boolScore(r.pass), "testPassed": r.pass, "latencyMs": r.wallTimeMs, "wallTimeMs": r.wallTimeMs, "tokenUsage": r.usage.toMap()})
 	}
 	if len(submitResults) == 0 {
 		return cliError{"no_scored_questions", "Every terminal task failed to score, so there is nothing to submit.", []string{"Check Docker and the model endpoint.", "Inspect failures with --out results.json."}, map[string]any{"errors": errorCodes}}
@@ -526,7 +660,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	protocol := terminalProtocolLabel(cfg)
 	agentName := "lmx-terminus"
 	if cfg.agentCommand != "" {
-		agentName = firstNonEmpty(opt(args, "agent-name"), "external-agent")
+		agentName = firstNonEmpty(opt(args, "agent-name"), agentBackend, "external-agent")
 	}
 	runConfig := map[string]any{"accuracy": accuracy, "tasksRun": len(results), "errors": stats.errors, "avgLatencyMs": avgLatency, "protocol": protocol, "agent": agentName, "maxTurns": cfg.maxTurns, "concurrency": concurrency, "modelResolution": modelResolution, "quantizationResolution": quantResolution}
 	if cfg.agentCommand != "" {
@@ -569,6 +703,795 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	}
 	printInfo("terminal_eval_submitted", fields)
 	return nil
+}
+
+const (
+	terminalTracePreviewBytes    = 24 * 1024
+	terminalVerifierPreviewBytes = 7 * 1024
+	terminalArtifactResponseBytes = 32 * 1024
+	terminalTraceLineBytes       = 4 * 1024 * 1024
+)
+
+type terminalCheckpointEntry struct {
+	Index   int            `json:"index"`
+	Total   int            `json:"total"`
+	Task    string         `json:"task"`
+	Out     string         `json:"out"`
+	Pass    bool           `json:"pass"`
+	Scored  *bool          `json:"scored"`
+	Summary map[string]any `json:"summary"`
+}
+
+type terminalSavedResult struct {
+	QuestionID     string         `json:"question_id"`
+	Pass           bool           `json:"pass"`
+	Scored         *bool          `json:"scored"`
+	Error          string         `json:"error"`
+	ErrorCode      string         `json:"errorCode"`
+	LatencyMs      int64          `json:"latencyMs"`
+	WallTimeMs     int64          `json:"wallTimeMs"`
+	TokenUsage     map[string]any `json:"tokenUsage"`
+	Turns          int            `json:"turns"`
+	Question       string         `json:"question"`
+	Prompt         string         `json:"prompt"`
+	Response       string         `json:"-"`
+	VerifierOutput string         `json:"verifierOutput"`
+}
+
+type terminalSavedTaskFile struct {
+	Results []terminalSavedResult `json:"results"`
+}
+
+type terminalTracePreviewStats struct {
+	AssistantMessages int
+	ToolExecutions    int
+	UnknownEvents     int
+	OversizedLines    int
+	MalformedLines    int
+	SectionsOmitted   int
+}
+
+// submitTerminalEval packages an already completed checkpoint. It deliberately
+// does not share runTerminalEval's acquisition path: deferred submit must never
+// contact a model endpoint, acquire tasks, start Docker, or rerun a verifier.
+func submitTerminalEval(args cliArgs) error {
+	runDir := positional(args, 3)
+	if runDir == "" {
+		return cliError{"missing_option", "eval terminal submit requires a completed run directory.", []string{"Run: lmx eval terminal submit <run-dir> --dataset <slug> --hf-id <org/model> --hardware hardware.json --dry-run."}, nil}
+	}
+	root, err := filepath.Abs(runDir)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return cliError{"checkpoint_missing", "Could not open the completed terminal run directory.", []string{"Pass the directory containing summary.json and one <task>.json file per task."}, map[string]any{"runDir": runDir, "error": err.Error()}}
+	}
+	if !info.IsDir() {
+		return cliError{"checkpoint_invalid", "The terminal checkpoint path is not a directory.", []string{"Pass the directory containing summary.json and the per-task JSON files."}, map[string]any{"runDir": runDir}}
+	}
+	dataset := opt(args, "dataset")
+	if dataset == "" {
+		return cliError{"missing_dataset", "eval terminal submit requires --dataset <slug>.", []string{"Pass the terminal dataset slug used for the completed run."}, nil}
+	}
+	hfID := opt(args, "hf-id")
+	if hfID == "" {
+		return cliError{"missing_model", "eval terminal submit requires --hf-id <HuggingFace model id>.", []string{"Pass the canonical org/model identifier for the completed run."}, nil}
+	}
+	hardwarePath := opt(args, "hardware")
+	if hardwarePath == "" {
+		return cliError{"missing_hardware", "eval terminal submit requires --hardware hardware.json.", []string{"Run lmx hardware --out hardware.json and pass that saved hardware object."}, nil}
+	}
+	hardware, err := readJSON(hardwarePath)
+	if err != nil {
+		return err
+	}
+
+	entries, err := loadTerminalCheckpointSummary(filepath.Join(root, "summary.json"))
+	if err != nil {
+		return err
+	}
+	quantization, quantFormat, err := terminalCheckpointQuantization(entries)
+	if err != nil {
+		return err
+	}
+	if quantization != "" && opt(args, "quantization") == "" {
+		return cliError{"missing_quantization", "The saved terminal run records a quantization; pass --quantization explicitly.", []string{"Pass --quantization " + quantization + " to confirm the saved run metadata."}, map[string]any{"savedQuantization": quantization}}
+	}
+	if quantFormat != "" && opt(args, "quant-format") == "" {
+		return cliError{"missing_quant_format", "The saved terminal run records a quantization format; pass --quant-format explicitly.", []string{"Pass --quant-format " + quantFormat + " to confirm the saved run metadata."}, map[string]any{"savedQuantFormat": quantFormat}}
+	}
+
+	results := make([]any, 0, len(entries))
+	artifacts := make([]any, 0, len(entries))
+	seenTasks := make(map[string]bool, len(entries))
+	seenResults := make(map[string]bool, len(entries))
+	seenIndexes := make(map[int]bool, len(entries))
+	passed := 0
+	var totalLatencyMs int64
+	artifactBytes, maxArtifactBytes, traceCount, fallbackCount := 0, 0, 0, 0
+	totalUsage := terminalTokenUsage{}
+	previewTotals := terminalTracePreviewStats{}
+	for position, entry := range entries {
+		if err := validateTerminalCheckpointEntry(entry, len(entries), seenTasks, seenIndexes); err != nil {
+			return err
+		}
+		recordPath, err := terminalCheckpointResultPath(root, entry)
+		if err != nil {
+			return err
+		}
+		record, err := loadTerminalSavedResult(recordPath, entry.Task)
+		if err != nil {
+			return err
+		}
+		if seenResults[record.QuestionID] {
+			return cliError{"duplicate_task_result", fmt.Sprintf("Task result %q appears more than once.", record.QuestionID), []string{"Ensure every task has exactly one unique per-task result file."}, map[string]any{"taskId": record.QuestionID, "file": recordPath}}
+		}
+		seenResults[record.QuestionID] = true
+		if record.Pass != entry.Pass {
+			return cliError{"checkpoint_result_mismatch", fmt.Sprintf("Task %q has conflicting pass values in summary.json and its result file.", entry.Task), []string{"Recover the matching summary.json and per-task files from the same completed run."}, map[string]any{"taskId": entry.Task, "summaryPass": entry.Pass, "resultPass": record.Pass}}
+		}
+		if record.Pass {
+			passed++
+		}
+		latency := record.WallTimeMs
+		if latency == 0 {
+			latency = record.LatencyMs
+		}
+		totalLatencyMs += latency
+		totalUsage.add(tokenUsageFromObject(record.TokenUsage))
+		response, previewStats, usedTrace, err := terminalSavedArtifactResponse(root, recordPath, record)
+		if err != nil {
+			return cliError{"trace_read_failed", fmt.Sprintf("Could not package the OMP trace for task %q.", entry.Task), []string{"Check that the selected omp.jsonl is readable, or remove the broken trace to use the bounded saved response fallback."}, map[string]any{"taskId": entry.Task, "error": err.Error()}}
+		}
+		if usedTrace {
+			traceCount++
+		} else {
+			fallbackCount++
+		}
+		previewTotals.AssistantMessages += previewStats.AssistantMessages
+		previewTotals.ToolExecutions += previewStats.ToolExecutions
+		previewTotals.UnknownEvents += previewStats.UnknownEvents
+		previewTotals.OversizedLines += previewStats.OversizedLines
+		previewTotals.MalformedLines += previewStats.MalformedLines
+		previewTotals.SectionsOmitted += previewStats.SectionsOmitted
+		artifactBytes += len(response)
+		if len(response) > maxArtifactBytes {
+			maxArtifactBytes = len(response)
+		}
+		results = append(results, map[string]any{"question_id": record.QuestionID, "pass": record.Pass})
+		artifacts = append(artifacts, map[string]any{
+			"question_id": record.QuestionID,
+			"itemIndex":   position,
+			"promptHash":  shortHash(record.QuestionID + ":" + record.Prompt),
+			"question":    record.Question,
+			"prompt":      record.Prompt,
+			"response":    response,
+			"score":       boolScore(record.Pass),
+			"testPassed":  record.Pass,
+			"latencyMs":   latency,
+			"wallTimeMs":  latency,
+			"tokenUsage":  record.TokenUsage,
+		})
+	}
+	if len(seenResults) != len(entries) {
+		return cliError{"checkpoint_incomplete", "The terminal checkpoint did not produce one unique result for every summary record.", []string{"Restore the missing per-task JSON files and rerun deferred submit."}, map[string]any{"summaryRecords": len(entries), "uniqueResults": len(seenResults)}}
+	}
+	failed := len(entries) - passed
+	accuracy := float64(passed) / float64(len(entries))
+	avgLatencyMs := totalLatencyMs / int64(len(entries))
+	runConfig := map[string]any{
+		"accuracy":       accuracy,
+		"tasksRun":       len(entries),
+		"errors":         0,
+		"avgLatencyMs":   avgLatencyMs,
+		"protocol":       "deferred-saved-terminal-run",
+		"agent":          firstNonEmpty(opt(args, "agent-name"), "external-agent"),
+		"deferredSubmit": true,
+		"tokenUsage":     totalUsage.toMap(),
+	}
+	payload := map[string]any{
+		"hfId":          hfID,
+		"modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"),
+		"hardware":      normalizeHardwarePayload(hardware),
+		"results":       results,
+		"artifacts":     artifacts,
+		"runnerVersion": firstNonEmpty(opt(args, "runner-version"), "localmaxxing-go terminal-agent"),
+		"runConfig":     runConfig,
+	}
+	if value := opt(args, "quantization"); value != "" {
+		payload["quantization"] = value
+	}
+	if value := opt(args, "quant-format"); value != "" {
+		payload["quantFormat"] = value
+	}
+	if value := opt(args, "notes"); value != "" {
+		payload["notes"] = value
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return cliError{"payload_invalid", "Could not encode the deferred terminal submission payload.", []string{"Inspect the saved hardware and task result JSON values."}, err.Error()}
+	}
+	fields := map[string]any{
+		"dataset":           dataset,
+		"tasks":             len(entries),
+		"uniqueTasks":       len(seenResults),
+		"scored":            len(entries),
+		"passing":           passed,
+		"failing":           failed,
+		"accuracyPct":       roundMetric(accuracy * 100),
+		"payloadBytes":      len(payloadJSON),
+		"artifactBytes":     artifactBytes,
+		"maxArtifactBytes":  maxArtifactBytes,
+		"tracePreviews":     traceCount,
+		"responseFallbacks": fallbackCount,
+		"unknownTraceEvents": previewTotals.UnknownEvents,
+		"oversizedTraceLines": previewTotals.OversizedLines,
+		"malformedTraceLines": previewTotals.MalformedLines,
+		"previewSectionsOmitted": previewTotals.SectionsOmitted,
+	}
+	if out := opt(args, "out"); out != "" {
+		if err := writeJSON(out, payload); err != nil {
+			return err
+		}
+		fields["payloadOut"] = out
+	}
+	if hasFlag(args, "dry-run") {
+		printInfo("terminal_submit_dry_run", fields)
+		fmt.Println("Dry run only — payload validated locally; no network request was made.")
+		return nil
+	}
+	key := apiKey(args)
+	if key == "" {
+		return missingAPIKey("--api-key or LMX_API_KEY is required for eval terminal submit")
+	}
+	value, err := fetchJSON("POST", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/submit", key, payload)
+	if err != nil {
+		return err
+	}
+	if obj := asObject(value); obj != nil {
+		if run := asObject(obj["run"]); run != nil {
+			fields["runId"] = run["id"]
+			fields["status"] = run["status"]
+		}
+		if aggregate := asObject(obj["aggregate"]); aggregate != nil {
+			fields["pooledScore"] = aggregate["pooledScore"]
+			fields["coverage"] = aggregate["shardsCovered"]
+		}
+	}
+	fields["submitted"] = len(results)
+	printInfo("terminal_submit_complete", fields)
+	return nil
+}
+
+func loadTerminalCheckpointSummary(path string) ([]terminalCheckpointEntry, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, cliError{"checkpoint_summary_missing", "The terminal checkpoint is missing summary.json.", []string{"Pass the completed run directory containing summary.json."}, map[string]any{"path": path, "error": err.Error()}}
+	}
+	defer file.Close()
+	var entries []terminalCheckpointEntry
+	if err := json.NewDecoder(file).Decode(&entries); err != nil {
+		return nil, cliError{"checkpoint_summary_invalid", "Could not decode terminal checkpoint summary.json as an array.", []string{"Use the summary.json written by the completed checkpoint runner."}, map[string]any{"path": path, "error": err.Error()}}
+	}
+	if len(entries) == 0 {
+		return nil, cliError{"checkpoint_summary_empty", "Terminal checkpoint summary.json contains no task records.", []string{"Pass a completed run directory with at least one scored task."}, map[string]any{"path": path}}
+	}
+	return entries, nil
+}
+
+func validateTerminalCheckpointEntry(entry terminalCheckpointEntry, count int, seenTasks map[string]bool, seenIndexes map[int]bool) error {
+	if entry.Task == "" {
+		return cliError{"checkpoint_task_missing", "A summary.json record is missing its task id.", []string{"Every summary record must contain a non-empty task field."}, map[string]any{"index": entry.Index}}
+	}
+	if filepath.Base(entry.Task) != entry.Task || entry.Task == "." || entry.Task == ".." {
+		return cliError{"checkpoint_task_invalid", fmt.Sprintf("Summary task id %q is not a safe task filename.", entry.Task), []string{"Task ids must not contain path separators or traversal components."}, nil}
+	}
+	if seenTasks[entry.Task] {
+		return cliError{"duplicate_summary_task", fmt.Sprintf("summary.json contains duplicate task %q.", entry.Task), []string{"Keep exactly one summary record per task."}, map[string]any{"taskId": entry.Task}}
+	}
+	seenTasks[entry.Task] = true
+	if entry.Scored == nil {
+		return cliError{"checkpoint_score_missing", fmt.Sprintf("Summary record %q is missing scored.", entry.Task), []string{"Every deferred terminal task must explicitly record scored: true."}, nil}
+	}
+	if !*entry.Scored {
+		return cliError{"checkpoint_unscored", fmt.Sprintf("Summary record %q was not scored.", entry.Task), []string{"Deferred submit only accepts complete checkpoints where every task has verifier scoring."}, nil}
+	}
+	if entry.Total > 0 && entry.Total != count {
+		return cliError{"checkpoint_total_mismatch", fmt.Sprintf("Summary record %q declares total %d, but summary.json contains %d records.", entry.Task, entry.Total, count), []string{"Recover all per-task records from the same completed run."}, nil}
+	}
+	if entry.Index > 0 {
+		if seenIndexes[entry.Index] {
+			return cliError{"duplicate_summary_index", fmt.Sprintf("summary.json contains duplicate index %d.", entry.Index), []string{"Every checkpoint index must identify one task."}, nil}
+		}
+		seenIndexes[entry.Index] = true
+	}
+	return nil
+}
+
+func terminalCheckpointQuantization(entries []terminalCheckpointEntry) (string, string, error) {
+	quantization, quantFormat := "", ""
+	for _, entry := range entries {
+		q := stringValue(entry.Summary["quantization"])
+		f := stringValue(entry.Summary["quantFormat"])
+		if quantization != "" && q != "" && q != quantization {
+			return "", "", cliError{"checkpoint_metadata_mismatch", "Checkpoint task summaries contain conflicting quantization values.", []string{"Recover summary.json from a single completed run."}, map[string]any{"first": quantization, "taskId": entry.Task, "value": q}}
+		}
+		if quantFormat != "" && f != "" && f != quantFormat {
+			return "", "", cliError{"checkpoint_metadata_mismatch", "Checkpoint task summaries contain conflicting quantization formats.", []string{"Recover summary.json from a single completed run."}, map[string]any{"first": quantFormat, "taskId": entry.Task, "value": f}}
+		}
+		if quantization == "" {
+			quantization = q
+		}
+		if quantFormat == "" {
+			quantFormat = f
+		}
+	}
+	return quantization, quantFormat, nil
+}
+
+func terminalCheckpointResultPath(root string, entry terminalCheckpointEntry) (string, error) {
+	direct := filepath.Join(root, entry.Task+".json")
+	if info, err := os.Stat(direct); err == nil && !info.IsDir() {
+		return direct, nil
+	}
+	if entry.Out != "" {
+		candidate := entry.Out
+		if !filepath.IsAbs(candidate) {
+			candidate = filepath.Join(root, candidate)
+		}
+		candidate = filepath.Clean(candidate)
+		rel, relErr := filepath.Rel(root, candidate)
+		if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+				return candidate, nil
+			}
+		}
+	}
+	return "", cliError{"task_result_missing", fmt.Sprintf("Missing per-task result file for %q.", entry.Task), []string{"Restore " + entry.Task + ".json beneath the completed run directory."}, map[string]any{"taskId": entry.Task, "expected": direct, "summaryOut": entry.Out}}
+}
+
+func loadTerminalSavedResult(path, taskID string) (terminalSavedResult, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return terminalSavedResult{}, err
+	}
+	defer file.Close()
+	var saved terminalSavedTaskFile
+	if err := json.NewDecoder(file).Decode(&saved); err != nil {
+		return terminalSavedResult{}, cliError{"task_result_invalid", fmt.Sprintf("Could not decode result file for task %q.", taskID), []string{"Use the per-task JSON written by the completed terminal run."}, map[string]any{"path": path, "error": err.Error()}}
+	}
+	if len(saved.Results) != 1 {
+		return terminalSavedResult{}, cliError{"task_result_count_invalid", fmt.Sprintf("Task file %q contains %d results; expected exactly one.", path, len(saved.Results)), []string{"Keep exactly one result record in each <task>.json file."}, map[string]any{"taskId": taskID, "results": len(saved.Results)}}
+	}
+	record := saved.Results[0]
+	if record.QuestionID == "" {
+		return terminalSavedResult{}, cliError{"task_result_id_missing", fmt.Sprintf("Task file %q has no question_id.", path), []string{"Every saved terminal result must identify its task."}, nil}
+	}
+	if record.QuestionID != taskID {
+		return terminalSavedResult{}, cliError{"task_result_id_mismatch", fmt.Sprintf("Task file for %q contains question_id %q.", taskID, record.QuestionID), []string{"Restore the matching per-task JSON file from the completed run."}, map[string]any{"path": path}}
+	}
+	if record.Scored == nil {
+		return terminalSavedResult{}, cliError{"task_result_score_missing", fmt.Sprintf("Task result %q is missing scored.", taskID), []string{"Every deferred task result must explicitly record scored: true."}, nil}
+	}
+	if !*record.Scored {
+		return terminalSavedResult{}, cliError{"task_result_unscored", fmt.Sprintf("Task result %q was not scored.", taskID), []string{"Deferred submit only accepts results completed by the verifier."}, nil}
+	}
+	return record, nil
+}
+
+func loadTerminalSavedResponse(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	var saved struct {
+		Results []struct {
+			Response string `json:"response"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(file).Decode(&saved); err != nil {
+		return "", err
+	}
+	if len(saved.Results) != 1 {
+		return "", fmt.Errorf("saved result contains %d records; expected one", len(saved.Results))
+	}
+	return saved.Results[0].Response, nil
+}
+
+func terminalBoolField(obj map[string]any, key string) bool {
+	value, _ := obj[key].(bool)
+	return value
+}
+
+func findTerminalOMPTrace(root, taskID string) string {
+	patterns := []string{
+		filepath.Join(root, "traces", taskID, taskID, "agent", "*", "omp.jsonl"),
+		filepath.Join(root, "traces", taskID, "agent", "*", "omp.jsonl"),
+		filepath.Join(root, taskID, taskID, "agent", "*", "omp.jsonl"),
+	}
+	var matches []string
+	for _, pattern := range patterns {
+		found, _ := filepath.Glob(pattern)
+		matches = append(matches, found...)
+	}
+	sort.Strings(matches)
+	if len(matches) == 0 {
+		return ""
+	}
+	return matches[len(matches)-1]
+}
+
+
+func terminalSavedArtifactResponse(root, recordPath string, record terminalSavedResult) (string, terminalTracePreviewStats, bool, error) {
+	tracePath := findTerminalOMPTrace(root, record.QuestionID)
+	stats := terminalTracePreviewStats{}
+	preview := ""
+	usedTrace := tracePath != ""
+	if usedTrace {
+		var err error
+		preview, stats, err = buildTerminalOMPPreview(tracePath, root)
+		if err != nil {
+			return "", stats, true, err
+		}
+	} else {
+		savedResponse, err := loadTerminalSavedResponse(recordPath)
+		if err != nil {
+			return "", stats, false, err
+		}
+		preview = "# Agent trace\n\nSource: saved task response (no omp.jsonl trace was found).\n\n## Final answer\n\n" + terminalMarkdownCode(boundedTerminalUTF8(savedResponse, terminalTracePreviewBytes-128, "saved response"))
+	}
+	if strings.TrimSpace(record.VerifierOutput) != "" {
+		verifier := boundedTerminalUTF8(record.VerifierOutput, terminalVerifierPreviewBytes, "verifier output")
+		preview += "\n\n## Verifier\n\nSource: saved verifierOutput.\n\n" + terminalMarkdownCode(verifier)
+	}
+	return boundedTerminalUTF8(preview, terminalArtifactResponseBytes, "artifact response"), stats, usedTrace, nil
+}
+
+type terminalPreviewAccumulator struct {
+	head         strings.Builder
+	tail         []string
+	tailBytes    int
+	total        int
+	headSections int
+}
+
+func (a *terminalPreviewAccumulator) add(section string) {
+	section = boundedTerminalUTF8(section, 1800, "trace section")
+	a.total++
+	if a.head.Len()+len(section) <= 11*1024 {
+		a.head.WriteString(section)
+		a.headSections++
+		return
+	}
+	a.tail = append(a.tail, section)
+	a.tailBytes += len(section)
+	for a.tailBytes > 9*1024 && len(a.tail) > 1 {
+		a.tailBytes -= len(a.tail[0])
+		a.tail = a.tail[1:]
+	}
+}
+
+func (a *terminalPreviewAccumulator) render(header, summary string) (string, int) {
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString(a.head.String())
+	omitted := a.total - a.headSections - len(a.tail)
+	if omitted > 0 {
+		b.WriteString(fmt.Sprintf("\n## Preview truncation\n\n%d middle trace sections omitted by the bounded inline preview.\n\n", omitted))
+	}
+	for _, section := range a.tail {
+		b.WriteString(section)
+	}
+	b.WriteString(summary)
+	return boundedTerminalUTF8(b.String(), terminalTracePreviewBytes, "agent trace preview"), omitted
+}
+
+func buildTerminalOMPPreview(tracePath, root string) (string, terminalTracePreviewStats, error) {
+	file, err := os.Open(tracePath)
+	if err != nil {
+		return "", terminalTracePreviewStats{}, err
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, 128*1024)
+	acc := terminalPreviewAccumulator{}
+	stats := terminalTracePreviewStats{}
+	eventCounts := map[string]int{}
+	unknownCounts := map[string]int{}
+	lastAssistant := ""
+	for {
+		line, oversized, readErr := readBoundedTerminalTraceLine(reader, terminalTraceLineBytes)
+		if oversized {
+			stats.OversizedLines++
+		}
+		if len(line) > 0 && !oversized {
+			var envelope struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(line, &envelope); err != nil {
+				stats.MalformedLines++
+			} else {
+				typeName := envelope.Type
+				if typeName == "" {
+					typeName = "(missing type)"
+				}
+				eventCounts[typeName]++
+				switch typeName {
+				case "message_end":
+					var event map[string]any
+					if json.Unmarshal(line, &event) == nil {
+						message := asObject(event["message"])
+						if stringValue(message["role"]) == "assistant" {
+							if text := terminalMessageText(message); text != "" {
+								if lastAssistant != "" {
+									acc.add("## Assistant\n\n" + terminalMarkdownCode(lastAssistant) + "\n")
+								}
+								lastAssistant = text
+								stats.AssistantMessages++
+							}
+						}
+					}
+				case "tool_execution_end":
+					var event map[string]any
+					if json.Unmarshal(line, &event) == nil {
+						stats.ToolExecutions++
+						acc.add(terminalToolExecutionSection(event))
+					}
+				case "notice", "auto_compaction_start", "auto_compaction_end":
+					var event map[string]any
+					if json.Unmarshal(line, &event) == nil {
+						acc.add(terminalLifecycleSection(typeName, event))
+					}
+				case "trace_filter_summary":
+					var event map[string]any
+					if json.Unmarshal(line, &event) == nil {
+						acc.add(terminalTraceFilterSection(event))
+					}
+				case "session", "agent_start", "agent_end", "turn_start", "turn_end", "message_start", "message_update", "tool_execution_start", "tool_execution_update":
+					// Counted for the lifecycle summary; streaming deltas are optional.
+				default:
+					unknownCounts[typeName]++
+					stats.UnknownEvents++
+				}
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return "", stats, readErr
+		}
+	}
+	if lastAssistant != "" {
+		acc.add("## Final answer\n\n" + terminalMarkdownCode(lastAssistant) + "\n")
+	}
+	rel, relErr := filepath.Rel(root, tracePath)
+	if relErr != nil {
+		rel = filepath.Base(tracePath)
+	}
+	header := "# Agent trace\n\nSource: `" + strings.ReplaceAll(terminalSingleLine(rel, 500), "`", "'") + "` (stream-parsed; raw JSONL is not embedded).\n\n"
+	unknownNote := terminalUnknownEventNote(unknownCounts)
+	summary := fmt.Sprintf("\n## Trace integrity\n\nFinalized assistant messages: %d  \nCompleted tool executions: %d  \nTurns started: %d  \nStreaming message deltas observed (not required): %d  \nOversized lines skipped: %d  \nMalformed lines skipped: %d%s\n", stats.AssistantMessages, stats.ToolExecutions, eventCounts["turn_start"], eventCounts["message_update"], stats.OversizedLines, stats.MalformedLines, unknownNote)
+	preview, omitted := acc.render(header, summary)
+	stats.SectionsOmitted = omitted
+	return preview, stats, nil
+}
+
+func readBoundedTerminalTraceLine(reader *bufio.Reader, maxBytes int) ([]byte, bool, error) {
+	line := make([]byte, 0, 4096)
+	oversized := false
+	for {
+		fragment, isPrefix, err := reader.ReadLine()
+		if !oversized {
+			if len(line)+len(fragment) > maxBytes {
+				oversized = true
+				line = line[:0]
+			} else {
+				line = append(line, fragment...)
+			}
+		}
+		if !isPrefix {
+			return line, oversized, err
+		}
+		if err != nil {
+			return line, oversized, err
+		}
+	}
+}
+
+func terminalMessageText(message map[string]any) string {
+	if text := stringValue(message["content"]); text != "" {
+		return boundedTerminalUTF8(text, 1600, "assistant message")
+	}
+	parts := []string{}
+	for _, raw := range anySlice(message["content"]) {
+		part := asObject(raw)
+		if part == nil || stringValue(part["type"]) != "text" {
+			continue
+		}
+		if text := stringValue(part["text"]); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return boundedTerminalUTF8(strings.Join(parts, "\n"), 1600, "assistant message")
+}
+
+func terminalToolExecutionSection(event map[string]any) string {
+	name := terminalSingleLine(firstNonEmpty(stringValue(event["toolName"]), "unknown"), 80)
+	intent := terminalSingleLine(stringValue(event["intent"]), 200)
+	var b strings.Builder
+	b.WriteString("## Tool activity\n\nTool: ")
+	b.WriteString(name)
+	b.WriteString("\n\n")
+	if intent != "" {
+		b.WriteString("Intent: ")
+		b.WriteString(intent)
+		b.WriteString("\n\n")
+	}
+	if args := terminalToolArgsText(asObject(event["args"])); args != "" {
+		b.WriteString("Arguments:\n\n")
+		b.WriteString(terminalMarkdownCode(args))
+		b.WriteString("\n")
+	}
+	result := asObject(event["result"])
+	outcome := terminalContentText(result["content"])
+	if outcome == "" {
+		outcome = firstNonEmpty(stringValue(result["text"]), stringValue(event["error"]), "(completed with no text output)")
+	}
+	if terminalBoolField(event, "isError") {
+		b.WriteString("Outcome: error\n\n")
+	} else {
+		b.WriteString("Outcome: completed\n\n")
+	}
+	b.WriteString(terminalMarkdownCode(boundedTerminalUTF8(outcome, 1100, "tool outcome")))
+	b.WriteString("\n")
+	return b.String()
+}
+
+func terminalToolArgsText(args map[string]any) string {
+	if args == nil {
+		return ""
+	}
+	keys := make([]string, 0, len(args))
+	for key := range args {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value := ""
+		switch typed := args[key].(type) {
+		case string:
+			value = typed
+		case float64, bool, nil:
+			value = fmt.Sprint(typed)
+		default:
+			value = "(" + fmt.Sprintf("%T", typed) + ")"
+		}
+		lines = append(lines, terminalSingleLine(key, 80)+": "+boundedTerminalUTF8(value, 500, "tool argument"))
+	}
+	return boundedTerminalUTF8(strings.Join(lines, "\n"), 700, "tool arguments")
+}
+
+func terminalContentText(value any) string {
+	if text := stringValue(value); text != "" {
+		return text
+	}
+	parts := []string{}
+	for _, raw := range anySlice(value) {
+		part := asObject(raw)
+		if part == nil {
+			continue
+		}
+		if text := firstNonEmpty(stringValue(part["text"]), stringValue(part["content"])); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func terminalLifecycleSection(typeName string, event map[string]any) string {
+	label := strings.ReplaceAll(typeName, "_", " ")
+	text := firstNonEmpty(stringValue(event["message"]), stringValue(event["reason"]), stringValue(event["action"]))
+	if result := asObject(event["result"]); result != nil {
+		text = firstNonEmpty(stringValue(result["shortSummary"]), stringValue(result["summary"]), text)
+	}
+	return "## Lifecycle: " + terminalSingleLine(label, 80) + "\n\n" + terminalMarkdownCode(boundedTerminalUTF8(text, 1400, "lifecycle event")) + "\n"
+}
+
+func terminalTraceFilterSection(event map[string]any) string {
+	stored := int64(numberField(event, "storedBytes"))
+	overflow := int64(numberField(event, "overflowBytes"))
+	dropped := asObject(event["droppedEvents"])
+	keys := make([]string, 0, len(dropped))
+	for key := range dropped {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", terminalSingleLine(key, 80), int64(numberField(dropped, key))))
+	}
+	return fmt.Sprintf("## Trace integrity\n\nStored bytes: %d  \nDropped streaming events: %s  \nOverflow bytes: %d\n\n", stored, firstNonEmpty(strings.Join(parts, ", "), "none"), overflow)
+}
+
+func terminalUnknownEventNote(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if len(keys) > 20 {
+		keys = keys[:20]
+	}
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", terminalSingleLine(key, 80), counts[key]))
+	}
+	return "  \nUnknown event types ignored: " + strings.Join(parts, ", ")
+}
+
+func terminalMarkdownCode(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	return "    " + strings.ReplaceAll(value, "\n", "\n    ") + "\n"
+}
+
+func terminalSingleLine(value string, maxBytes int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	return boundedTerminalUTF8(value, maxBytes, "label")
+}
+
+// boundedTerminalUTF8 returns at most maxBytes, including its truncation note,
+// while keeping both useful beginning and ending context on rune boundaries.
+func boundedTerminalUTF8(value string, maxBytes int, label string) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return strings.ToValidUTF8(value, "�")
+	}
+	marker := fmt.Sprintf("\n...[truncated %s; %d bytes omitted]...\n", label, len(value)-maxBytes)
+	if len(marker) >= maxBytes {
+		return terminalUTF8Prefix(marker, maxBytes)
+	}
+	available := maxBytes - len(marker)
+	headBytes := available * 2 / 3
+	tailBytes := available - headBytes
+	head := terminalUTF8Prefix(value, headBytes)
+	tail := terminalUTF8Suffix(value, tailBytes)
+	omitted := len(value) - len(head) - len(tail)
+	marker = fmt.Sprintf("\n...[truncated %s; %d bytes omitted]...\n", label, omitted)
+	for len(head)+len(marker)+len(tail) > maxBytes && len(head) > 0 {
+		head = terminalUTF8Prefix(head, len(head)-1)
+	}
+	return head + marker + tail
+}
+
+func terminalUTF8Prefix(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return strings.ToValidUTF8(value, "�")
+	}
+	end := maxBytes
+	for end > 0 && !utf8.ValidString(value[:end]) {
+		end--
+	}
+	return strings.ToValidUTF8(value[:end], "�")
+}
+
+func terminalUTF8Suffix(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return strings.ToValidUTF8(value, "�")
+	}
+	start := len(value) - maxBytes
+	for start < len(value) && !utf8.RuneStart(value[start]) {
+		start++
+	}
+	return strings.ToValidUTF8(value[start:], "�")
 }
 
 func acquireTerminalBundles(args cliArgs, dataset, localDir string) ([]terminalBundle, string, int, error) {
@@ -746,7 +1669,7 @@ func runTerminalBundles(args cliArgs, bundles []terminalBundle, baseURL, model s
 				if results[idx].errCode != "" {
 					printStatus(args, "terminal_task_error", map[string]any{"taskId": b.Task.ID, "code": results[idx].errCode, "detail": results[idx].errText})
 				}
-				printStatus(args, "terminal_task_done", map[string]any{"taskId": b.Task.ID, "pass": results[idx].pass, "scored": results[idx].scored, "turns": results[idx].turns, "latencyMs": results[idx].latencyMs})
+				printStatus(args, "terminal_task_done", map[string]any{"taskId": b.Task.ID, "pass": results[idx].pass, "scored": results[idx].scored, "turns": results[idx].turns, "wallTimeMs": results[idx].wallTimeMs, "tokenUsage": results[idx].usage.toMap()})
 			}
 		}()
 	}
@@ -809,47 +1732,67 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 		result.prompt = "oracle solution"
 		if err != nil {
 			result.errCode, result.errText = cliErrorCodeText(err)
-			result.latencyMs = time.Since(started).Milliseconds()
-			return result
+			result.wallTimeMs = time.Since(started).Milliseconds()
+			return persistTerminalTaskErrorTrace(task, result, cfg)
 		}
 	} else if cfg.agentCommand != "" {
-		transcript, err := runExternalTerminalAgent(ctx, task, bundleDir, containerName, baseURL, model, cfg)
+		transcript, usage, err := runExternalTerminalAgent(ctx, task, bundleDir, containerName, baseURL, model, cfg)
 		result.transcript = transcript
+		result.usage = usage
 		result.prompt = "external agent command"
 		if err != nil {
 			result.errCode, result.errText = cliErrorCodeText(err)
-			result.latencyMs = time.Since(started).Milliseconds()
-			return result
+			result.wallTimeMs = time.Since(started).Milliseconds()
+			return persistTerminalTaskErrorTrace(task, result, cfg)
 		}
 	} else if cfg.shellMode == "stateless" {
-		turns, transcript, err := runTerminalAgentLoop(ctx, task, containerName, baseURL, model, cfg)
+		turns, transcript, usage, err := runTerminalAgentLoop(ctx, task, containerName, baseURL, model, cfg)
 		result.turns = turns
 		result.transcript = transcript
+		result.usage = usage
 		if err != nil {
 			result.errCode, result.errText = cliErrorCodeText(err)
-			result.latencyMs = time.Since(started).Milliseconds()
-			return result
+			result.wallTimeMs = time.Since(started).Milliseconds()
+			return persistTerminalTaskErrorTrace(task, result, cfg)
 		}
 	} else {
 		result.prompt = terminalSessionSystemPrompt
-		turns, transcript, err := runTerminalAgentLoopSession(ctx, task, containerName, baseURL, model, cfg)
+		turns, transcript, usage, err := runTerminalAgentLoopSession(ctx, task, containerName, baseURL, model, cfg)
 		result.turns = turns
 		result.transcript = transcript
+		result.usage = usage
 		if err != nil {
 			result.errCode, result.errText = cliErrorCodeText(err)
-			result.latencyMs = time.Since(started).Milliseconds()
-			return result
+			result.wallTimeMs = time.Since(started).Milliseconds()
+			return persistTerminalTaskErrorTrace(task, result, cfg)
 		}
 	}
 	pass, verifierOutput, err := runTerminalVerifier(ctx, task, bundleDir, containerName, cfg)
 	result.pass = pass
-	result.scored = true
 	result.verifierOutput = verifierOutput
+	result.scored = err == nil
+	result.wallTimeMs = time.Since(started).Milliseconds()
 	if err != nil {
-		result.pass = false
 		result.errCode, result.errText = cliErrorCodeText(err)
 	}
-	result.latencyMs = time.Since(started).Milliseconds()
+	if traceErr := writeTerminalTaskTrace(task, result, cfg); traceErr != nil && err == nil {
+		result.errCode, result.errText = cliErrorCodeText(traceErr)
+		return result
+	}
+	if err != nil {
+		return result
+	}
+	return result
+}
+
+func persistTerminalTaskErrorTrace(task terminalTask, result terminalTaskResult, cfg terminalConfig) terminalTaskResult {
+	if traceErr := writeTerminalTaskTrace(task, result, cfg); traceErr != nil {
+		if result.errText != "" {
+			result.errText += " Trace persistence also failed: " + traceErr.Error()
+		} else {
+			result.errCode, result.errText = cliErrorCodeText(traceErr)
+		}
+	}
 	return result
 }
 
@@ -871,17 +1814,39 @@ func resolveTerminalImage(ctx context.Context, task terminalTask, bundleDir stri
 	return tag, tag, nil
 }
 
-func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir, containerName, baseURL, model string, cfg terminalConfig) (string, error) {
+//go:embed terminus2-routed-shell.py
+var terminus2RoutedShellScript string
+
+func terminus2AgentCommand() (string, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "lmx-terminus2-adapter-*")
+	if err != nil {
+		return "", nil, cliError{"command_exec_failed", "Could not create a temporary directory for the bundled Terminus-2 adapter.", []string{"Check temporary directory permissions and available disk space."}, map[string]any{"error": err.Error()}}
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(tmpDir)
+	}
+	scriptPath := filepath.Join(tmpDir, "terminus2-routed-shell.py")
+	if err := os.WriteFile(scriptPath, []byte(terminus2RoutedShellScript), 0o700); err != nil {
+		cleanup()
+		return "", nil, cliError{"command_exec_failed", "Could not extract the bundled Terminus-2 adapter.", []string{"Check temporary directory permissions and available disk space."}, map[string]any{"error": err.Error()}}
+	}
+	return shellQuote(scriptPath), cleanup, nil
+}
+
+func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir, containerName, baseURL, model string, cfg terminalConfig) (string, terminalTokenUsage, error) {
 	tmp, err := os.MkdirTemp("", "lmx-terminal-agent-*")
 	if err != nil {
-		return "", cliError{"command_exec_failed", "Could not create external agent workspace.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+		return "", terminalTokenUsage{}, cliError{"command_exec_failed", "Could not create external agent workspace.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
 	}
 	defer os.RemoveAll(tmp)
 
 	instructionFile := filepath.Join(tmp, "instruction.txt")
 	traceDir := filepath.Join(tmp, "traces")
+	if cfg.traceRoot != "" {
+		traceDir = filepath.Join(cfg.traceRoot, sanitizeDockerName(task.ID), "agent")
+	}
 	if err := os.MkdirAll(traceDir, 0o700); err != nil {
-		return "", cliError{"command_exec_failed", "Could not create external agent trace directory.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+		return "", terminalTokenUsage{}, cliError{"command_exec_failed", "Could not create external agent trace directory.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
 	}
 	workdir := "/app"
 	shellCommand := filepath.Join(tmp, "container-shell")
@@ -891,11 +1856,11 @@ func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir,
 	}
 	shellScript := "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"$#\" -eq 0 ]; then\n  exec docker exec -i" + userFlag + " -w " + shellQuote(workdir) + " " + shellQuote(containerName) + " bash -l\nfi\nexec docker exec -i" + userFlag + " -w " + shellQuote(workdir) + " " + shellQuote(containerName) + " bash -lc \"$*\"\n"
 	if err := os.WriteFile(shellCommand, []byte(shellScript), 0o700); err != nil {
-		return "", cliError{"command_exec_failed", "Could not write routed shell helper.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+		return "", terminalTokenUsage{}, cliError{"command_exec_failed", "Could not write routed shell helper.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
 	}
 
 	if err := os.WriteFile(instructionFile, []byte(task.Instruction), 0o600); err != nil {
-		return "", cliError{"command_exec_failed", "Could not write external agent instruction file.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+		return "", terminalTokenUsage{}, cliError{"command_exec_failed", "Could not write external agent instruction file.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
 	}
 
 	env := []string{
@@ -911,14 +1876,21 @@ func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir,
 		"LMX_TERMINAL_WORKDIR=" + workdir,
 		"LMX_TERMINAL_TRACE_DIR=" + traceDir,
 		"LMX_TERMINAL_EXECUTION_MODE=" + cfg.agentExecution,
-		"LMX_TERMINAL_AGENT_TIMEOUT_SEC=" + strconv.Itoa(firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)),
+		"LMX_TERMINAL_AGENT_TIMEOUT_SEC=" + strconv.Itoa(terminalAgentTimeoutSec(cfg, task)),
 		"LMX_TERMINAL_AGENT_USER=" + task.Agent.User,
 		"LMX_TERMINAL_SHELL_COMMAND=" + shellCommand,
+		"LMX_TERMINAL_MODEL_API_KEY=" + cfg.apiKey,
+		"LMX_TERMINAL_MAX_TURNS=" + strconv.Itoa(terminalAgentMaxTurns(cfg, task)),
 	}
-	timeout := time.Duration(firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)) * time.Second
+	timeout := time.Duration(terminalAgentTimeoutSec(cfg, task)) * time.Second
 	printStatus(cfg.args, "terminal_external_agent_started", map[string]any{"taskId": task.ID, "command": truncateString(cfg.agentCommand, 240), "execution": cfg.agentExecution})
 	out, code, timedOut, runErr := runHostCommandWithEnv(ctx, timeout, env, cfg.agentCommand)
 	transcript := "$ " + cfg.agentCommand + "\n" + out + "\n[exit=" + strconv.Itoa(code) + "]\n"
+	usage := externalAgentTokenUsage(traceDir)
+	if usage.modelCalls > 0 {
+		usageData, _ := json.MarshalIndent(usage.toMap(), "", "  ")
+		_ = os.WriteFile(filepath.Join(traceDir, "usage.json"), append(usageData, '\n'), 0o644)
+	}
 	if traceText := externalAgentTraceText(traceDir); traceText != "" {
 		transcript += "\n\n# External agent trace directory\n\n" + traceText
 	}
@@ -926,12 +1898,12 @@ func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir,
 	if timedOut {
 		transcript += "\n[agent timed out after " + timeout.String() + "; proceeding to verification]\n"
 		printStatus(cfg.args, "terminal_external_agent_timeout", map[string]any{"taskId": task.ID, "timeoutSec": int(timeout.Seconds())})
-		return transcript, nil
+		return transcript, usage, nil
 	}
 	if runErr != nil || code != 0 {
-		return transcript, terminalCommandError("command_exec_failed", "External terminal agent command failed.", "bash", []string{"-lc", cfg.agentCommand}, code, out, timedOut)
+		return transcript, usage, terminalCommandError("command_exec_failed", "External terminal agent command failed.", "bash", []string{"-lc", cfg.agentCommand}, code, out, timedOut)
 	}
-	return transcript, nil
+	return transcript, usage, nil
 }
 
 func runHostCommandWithEnv(ctx context.Context, timeout time.Duration, env []string, command string) (string, int, bool, error) {
@@ -970,36 +1942,79 @@ func terminalTraceHeader(b *strings.Builder, turn int, reasoning, content string
 	b.WriteString("## Assistant\n" + content + "\n")
 }
 
-func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName, baseURL, model string, cfg terminalConfig) (int, string, error) {
+func terminalJSONPrompt(instruction, terminalState string) string {
+	return fmt.Sprintf(terminalJSONProtocolTemplate, instruction, terminalState)
+}
+
+func terminalJSONContinuePrompt(terminalState string) string {
+	return "Current terminal state:\n" + terminalState + "\n\nContinue with the same JSON response format: analysis, plan, commands, and optional task_complete."
+}
+func parseTerminalJSONResponse(content string) (terminalJSONResponse, bool) {
+	var response terminalJSONResponse
+	start := strings.Index(content, "{")
+	end := strings.LastIndex(content, "}")
+	if start < 0 || end < start {
+		return response, false
+	}
+	if err := json.Unmarshal([]byte(content[start:end+1]), &response); err != nil {
+		return response, false
+	}
+	return response, true
+}
+
+func terminalCommandFromKeystrokes(keystrokes string) (string, bool) {
+	trimmed := strings.TrimSpace(keystrokes)
+	switch trimmed {
+	case "":
+		return "", true
+	case "C-c", "^C":
+		return "", true
+	case "C-d", "^D":
+		return "exit", true
+	}
+	return strings.TrimRight(keystrokes, "\r\n"), true
+}
+
+func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName, baseURL, model string, cfg terminalConfig) (int, string, terminalTokenUsage, error) {
 	messages := []map[string]any{{"role": "system", "content": terminalSystemPrompt}, {"role": "user", "content": task.Instruction}}
 	maxTurns := firstPositive(cfg.maxTurns, task.Agent.MaxTurns, 50)
-	timeoutSec := firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)
+	timeoutSec := terminalAgentTimeoutSec(cfg, task)
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
 	var transcript strings.Builder
 	nonConforming := 0
+	usage := terminalTokenUsage{}
 	for turn := 1; turn <= maxTurns && time.Now().Before(deadline); turn++ {
-		content, reasoning, err := callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, cfg.maxTokens, cfg.temperature, cfg.topP, nil)
+		messages = trimTerminalMessages(messages)
+		content, reasoning, callUsage, err := callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, terminalModelRequestTimeout(cfg, deadline, true))
+		usage.add(callUsage)
 		if err != nil {
-			return turn - 1, transcript.String(), cliError{"model_call_failed", "Model call failed during terminal agent loop.", []string{"Check --base-url, --model-api-key, and that the OpenAI-compatible server is running."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+			firstErr := err
+			messages = trimTerminalMessagesForRetry(messages)
+			content, reasoning, callUsage, err = callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, terminalModelRequestTimeout(cfg, deadline, false))
+			usage.add(callUsage)
+			if err != nil {
+				return turn - 1, transcript.String(), usage, terminalModelCallFailure(task.ID, deadline, firstErr, err)
+			}
 		}
 		cmdText, found := extractBashCommand(content)
 		if !found {
 			if strings.Contains(content, "TASK_COMPLETE") {
 				terminalTraceHeader(&transcript, turn, reasoning, content)
 				transcript.WriteString("## Note\nModel signaled TASK_COMPLETE.\n")
-				return turn - 1, transcript.String(), nil
+				return turn - 1, transcript.String(), usage, nil
 			}
 			nonConforming++
 			terminalTraceHeader(&transcript, turn, reasoning, content)
 			transcript.WriteString("## Note\nNo bash block found; asked the model to emit one command or TASK_COMPLETE.\n")
-			messages = append(messages, map[string]any{"role": "assistant", "content": content}, map[string]any{"role": "user", "content": "Reply with one ```bash fenced block or TASK_COMPLETE."})
-			if nonConforming >= 2 {
-				return turn - 1, transcript.String(), nil
+			messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, "")}, map[string]any{"role": "user", "content": "Your previous reply was not executable. Reply with exactly one ```bash fenced block. If you meant to run Python, wrap it as: python3 <<'PY'\n...\nPY"})
+			if nonConforming >= 3 {
+				transcript.WriteString("## Note\nStopping after repeated non-executable replies.\n")
+				return turn - 1, transcript.String(), usage, nil
 			}
 			continue
 		}
 		nonConforming = 0
-		messages = append(messages, map[string]any{"role": "assistant", "content": content})
+		messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, cmdText)})
 		terminalTraceHeader(&transcript, turn, reasoning, content)
 		transcript.WriteString("## Command\n$ " + cmdText + "\n")
 		execArgs := []string{"exec"}
@@ -1007,17 +2022,18 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 			execArgs = append(execArgs, "--user", task.Agent.User)
 		}
 		execArgs = append(execArgs, containerName, "bash", "-lc", cmdText)
-		out, code, timedOut, _ := runCommand(ctx, time.Duration(firstPositive(cfg.commandTimeoutSec, 120))*time.Second, "docker", execArgs...)
+		out, code, timedOut, _ := runCommand(ctx, terminalCommandExecutionTimeout(cmdText, time.Duration(terminalCommandTimeoutSec(cfg))*time.Second, deadline), "docker", execArgs...)
 		if timedOut {
 			out += "\n[command timed out]"
 			code = 124
 		}
 		shown := truncateString(out, 8192)
+		observation := terminalObservationForModel(out, code, timedOut)
 		transcript.WriteString(shown + "\n[exit=" + strconv.Itoa(code) + "]\n")
-		messages = append(messages, map[string]any{"role": "user", "content": shown + "\n[exit=" + strconv.Itoa(code) + "]"})
+		messages = append(messages, map[string]any{"role": "user", "content": observation})
 		printStatus(cfg.args, "terminal_turn", map[string]any{"taskId": task.ID, "turn": turn, "exitCode": code, "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)})
 	}
-	return maxTurns, transcript.String(), nil
+	return maxTurns, transcript.String(), usage, nil
 }
 
 type terminalShell struct {
@@ -1090,12 +2106,18 @@ func (s *terminalShell) close() {
 	}
 }
 
+func terminalShellPayload(command, marker string) string {
+	return "{\n" + command + "\n} </dev/null\n" +
+		"__lmx_status=$?\n" +
+		"printf '\\n" + marker + "%d__\\n' \"$__lmx_status\"\n"
+}
+
 // exec runs one command in the persistent shell. timedOut means the per-command
 // budget elapsed; restarted means the shell was rebuilt (state reset) due to
 // timeout or the shell dying (e.g. the command ran `exit` or crashed bash).
 func (s *terminalShell) exec(command string, timeout time.Duration) (output string, exitCode int, timedOut bool, restarted bool) {
 	marker := "__LMX_END_" + s.nonce + "__"
-	payload := command + "\nprintf '\\n" + marker + "%d__\\n' \"$?\"\n"
+	payload := terminalShellPayload(command, marker)
 	if _, err := io.WriteString(s.stdin, payload); err != nil {
 		_ = s.restart()
 		return "[shell write failed; session restarted]", 1, false, true
@@ -1137,59 +2159,106 @@ func (s *terminalShell) exec(command string, timeout time.Duration) (output stri
 	}
 }
 
-func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, containerName, baseURL, model string, cfg terminalConfig) (int, string, error) {
+func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, containerName, baseURL, model string, cfg terminalConfig) (int, string, terminalTokenUsage, error) {
 	shell, err := startTerminalShell(containerName, task.Agent.User)
 	if err != nil {
-		return 0, "", cliError{"command_exec_failed", "Could not open a persistent shell in the task container.", []string{"Check Docker and that the task image provides /bin/bash.", "Or rerun with --shell-mode stateless."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+		return 0, "", terminalTokenUsage{}, cliError{"command_exec_failed", "Could not open a persistent shell in the task container.", []string{"Check Docker and that the task image provides /bin/bash.", "Or rerun with --shell-mode stateless."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
 	}
 	defer shell.close()
 
-	messages := []map[string]any{{"role": "system", "content": terminalSessionSystemPrompt}, {"role": "user", "content": task.Instruction}}
-	maxTurns := firstPositive(cfg.maxTurns, task.Agent.MaxTurns, 50)
-	timeoutSec := firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)
+	messages := []map[string]any{{"role": "user", "content": terminalJSONPrompt(task.Instruction, "")}}
+	maxTurns := terminalAgentMaxTurns(cfg, task)
+	timeoutSec := terminalAgentTimeoutSec(cfg, task)
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
-	cmdTimeout := time.Duration(firstPositive(cfg.commandTimeoutSec, 120)) * time.Second
+	cmdTimeout := time.Duration(terminalCommandTimeoutSec(cfg)) * time.Second
 	var transcript strings.Builder
 	nonConforming := 0
+	usage := terminalTokenUsage{}
+	terminalState := ""
 	for turn := 1; turn <= maxTurns && time.Now().Before(deadline); turn++ {
-		content, reasoning, err := callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, cfg.maxTokens, cfg.temperature, cfg.topP, nil)
+		messages = trimTerminalMessages(messages)
+		content, reasoning, callUsage, err := callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, terminalModelRequestTimeout(cfg, deadline, true))
+		usage.add(callUsage)
 		if err != nil {
-			return turn - 1, transcript.String(), cliError{"model_call_failed", "Model call failed during terminal agent loop.", []string{"Check --base-url, --model-api-key, and that the OpenAI-compatible server is running."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
-		}
-		cmdText, found := extractBashCommand(content)
-		if !found {
-			if strings.Contains(content, "TASK_COMPLETE") {
-				terminalTraceHeader(&transcript, turn, reasoning, content)
-				transcript.WriteString("## Note\nModel signaled TASK_COMPLETE.\n")
-				return turn - 1, transcript.String(), nil
+			firstErr := err
+			messages = trimTerminalMessagesForRetry(messages)
+			content, reasoning, callUsage, err = callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, terminalModelRequestTimeout(cfg, deadline, false))
+			usage.add(callUsage)
+			if err != nil {
+				return turn - 1, transcript.String(), usage, terminalModelCallFailure(task.ID, deadline, firstErr, err)
 			}
-			nonConforming++
-			terminalTraceHeader(&transcript, turn, reasoning, content)
-			transcript.WriteString("## Note\nNo bash block found; asked the model to emit one command or TASK_COMPLETE.\n")
-			messages = append(messages, map[string]any{"role": "assistant", "content": content}, map[string]any{"role": "user", "content": "Reply with one ```bash fenced block or TASK_COMPLETE."})
-			if nonConforming >= 2 {
-				return turn - 1, transcript.String(), nil
-			}
-			continue
 		}
+
+		terminalTraceHeader(&transcript, turn, reasoning, content)
+		response, foundJSON := parseTerminalJSONResponse(content)
+		if !foundJSON {
+			cmdText, foundBash := extractBashCommand(content)
+			if !foundBash {
+				if strings.Contains(content, "TASK_COMPLETE") {
+					transcript.WriteString("## Note\nModel signaled TASK_COMPLETE.\n")
+					return turn - 1, transcript.String(), usage, nil
+				}
+				nonConforming++
+				transcript.WriteString("## Note\nNo JSON command response or bash block found; asked the model to emit the required JSON.\n")
+				messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, "")}, map[string]any{"role": "user", "content": terminalJSONContinuePrompt(terminalState)})
+				if nonConforming >= 3 {
+					transcript.WriteString("## Note\nStopping after repeated non-executable replies.\n")
+					return turn - 1, transcript.String(), usage, nil
+				}
+				continue
+			}
+			response = terminalJSONResponse{
+				Analysis: content,
+				Plan:     "Execute fallback bash block.",
+				Commands: []terminalJSONCommand{{Keystrokes: cmdText + "\n", Duration: 1}},
+			}
+		}
+
 		nonConforming = 0
 		messages = append(messages, map[string]any{"role": "assistant", "content": content})
-		terminalTraceHeader(&transcript, turn, reasoning, content)
-		transcript.WriteString("## Command\n$ " + cmdText + "\n")
-		out, code, timedOut, restarted := shell.exec(cmdText, cmdTimeout)
-		if timedOut {
-			out += "\n[command timed out]"
+		if response.TaskComplete && len(response.Commands) == 0 {
+			transcript.WriteString("## Note\nModel marked task complete.\n")
+			return turn - 1, transcript.String(), usage, nil
 		}
-		shown := truncateString(out, 8192)
-		transcript.WriteString(shown + "\n[exit=" + strconv.Itoa(code) + "]\n")
-		messages = append(messages, map[string]any{"role": "user", "content": shown + "\n[exit=" + strconv.Itoa(code) + "]"})
-		fields := map[string]any{"taskId": task.ID, "turn": turn, "exitCode": code, "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)}
-		if restarted {
-			fields["shellRestarted"] = true
+
+		var observation strings.Builder
+		for i, command := range response.Commands {
+			cmdText, _ := terminalCommandFromKeystrokes(command.Keystrokes)
+			if cmdText == "" {
+				wait := time.Duration(command.Duration * float64(time.Second))
+				if wait <= 0 {
+					wait = time.Second
+				}
+				if wait > time.Minute {
+					wait = time.Minute
+				}
+				time.Sleep(wait)
+				continue
+			}
+			transcript.WriteString("## Command\n$ " + cmdText + "\n")
+			out, code, timedOut, restarted := shell.exec(cmdText, terminalCommandExecutionTimeout(cmdText, cmdTimeout, deadline))
+			if timedOut {
+				out += "\n[command timed out]"
+			}
+			shown := truncateString(out, 8192)
+			observation.WriteString("$ " + cmdText + "\n")
+			observation.WriteString(terminalObservationForModel(out, code, timedOut))
+			observation.WriteString("\n")
+			transcript.WriteString(shown + "\n[exit=" + strconv.Itoa(code) + "]\n")
+			fields := map[string]any{"taskId": task.ID, "turn": turn, "commandIndex": i + 1, "exitCode": code, "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)}
+			if restarted {
+				fields["shellRestarted"] = true
+			}
+			printStatus(cfg.args, "terminal_turn", fields)
 		}
-		printStatus(cfg.args, "terminal_turn", fields)
+		terminalState = truncateString(observation.String(), terminalModelObservationLimit)
+		messages = append(messages, map[string]any{"role": "user", "content": terminalJSONContinuePrompt(terminalState)})
+		if response.TaskComplete {
+			transcript.WriteString("## Note\nModel marked task complete after command batch.\n")
+			return turn, transcript.String(), usage, nil
+		}
 	}
-	return maxTurns, transcript.String(), nil
+	return maxTurns, transcript.String(), usage, nil
 }
 
 // runOracleSolution mirrors harbor's OracleAgent: solution/ is copied to
@@ -1209,7 +2278,7 @@ func runOracleSolution(ctx context.Context, task terminalTask, bundleDir, contai
 		execArgs = append(execArgs, "-e", k+"="+v)
 	}
 	execArgs = append(execArgs, containerName, "bash", "/solution/solve.sh")
-	timeout := time.Duration(firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, 900)) * time.Second
+	timeout := time.Duration(terminalAgentTimeoutSec(cfg, task)) * time.Second
 	out, code, timedOut, _ = runCommand(ctx, timeout, "docker", execArgs...)
 	transcript := "$ bash /solution/solve.sh\n" + truncateString(out, 200_000) + "\n[exit=" + strconv.Itoa(code) + "]\n"
 	if timedOut {
@@ -1267,8 +2336,11 @@ func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, cont
 	return reward >= 1.0, output, nil
 }
 
-func callOpenAIChatMessages(baseURL, model string, messages []map[string]any, apiKey string, maxTokens int, temperature, topP float64, stop []string) (content, reasoning string, err error) {
+func callOpenAIChatMessages(baseURL, model string, messages []map[string]any, apiKey string, maxTokens int, temperature, topP float64, stop []string, timeout time.Duration) (content, reasoning string, usage terminalTokenUsage, err error) {
 	body := map[string]any{"model": model, "messages": messages, "temperature": temperature, "top_p": topP}
+	if terminalDisablesTemplateThinking(model) {
+		body["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
+	}
 	if maxTokens > 0 {
 		body["max_tokens"] = maxTokens
 	}
@@ -1276,11 +2348,11 @@ func callOpenAIChatMessages(baseURL, model string, messages []map[string]any, ap
 		body["stop"] = stop
 	}
 	data, _ := json.Marshal(body)
-	ctx, cancel := context.WithTimeout(context.Background(), defaultEndpointTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "POST", openAIBaseURL(baseURL)+"/v1/chat/completions", bytes.NewReader(data))
 	if err != nil {
-		return "", "", err
+		return "", "", terminalTokenUsage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
@@ -1288,24 +2360,25 @@ func callOpenAIChatMessages(baseURL, model string, messages []map[string]any, ap
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", terminalTokenUsage{}, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		text, _ := io.ReadAll(res.Body)
-		return "", "", cliError{"model_call_failed", fmt.Sprintf("OpenAI-compatible server returned %s", res.Status), []string{"Check --base-url and --model-api-key."}, map[string]any{"status": res.Status, "body": truncateString(strings.TrimSpace(string(text)), 4096)}}
+		return "", "", terminalTokenUsage{}, cliError{"model_call_failed", fmt.Sprintf("OpenAI-compatible server returned %s", res.Status), []string{"Check --base-url and --model-api-key."}, map[string]any{"status": res.Status, "body": truncateString(strings.TrimSpace(string(text)), 4096)}}
 	}
 	var response map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-		return "", "", err
+		return "", "", terminalTokenUsage{}, err
 	}
+	usage = tokenUsageFromObject(asObject(response["usage"]))
 	if choices, _ := response["choices"].([]any); len(choices) > 0 {
 		if message := asObject(asObject(choices[0])["message"]); message != nil {
 			content = strings.TrimSpace(stringValue(message["content"]))
 			reasoning = strings.TrimSpace(stringValue(message["reasoning_content"]))
 		}
 	}
-	return content, reasoning, nil
+	return content, reasoning, usage, nil
 }
 
 func extractBashCommand(reply string) (cmd string, found bool) {
@@ -1316,6 +2389,29 @@ func extractBashCommand(reply string) (cmd string, found bool) {
 		if len(match) > 1 {
 			return strings.TrimSpace(match[1]), true
 		}
+	}
+	interpreters := map[string]string{
+		"python":     "python3",
+		"python3":    "python3",
+		"py":         "python3",
+		"javascript": "node",
+		"js":         "node",
+		"node":       "node",
+		"ruby":       "ruby",
+		"rb":         "ruby",
+		"perl":       "perl",
+	}
+	re := regexp.MustCompile("(?s)```([A-Za-z0-9_+-]+)\\s*\\n(.*?)\\n```")
+	for _, match := range re.FindAllStringSubmatch(reply, -1) {
+		interpreter := interpreters[strings.ToLower(match[1])]
+		if interpreter == "" {
+			continue
+		}
+		body := strings.TrimSpace(match[2])
+		if body == "" {
+			continue
+		}
+		return interpreter + " <<'LMX_SCRIPT'\n" + body + "\nLMX_SCRIPT", true
 	}
 	return "", false
 }
@@ -1588,7 +2684,104 @@ func nonNilStringMap(in map[string]string) map[string]string {
 	return in
 }
 
+func writeTerminalTaskTrace(task terminalTask, result terminalTaskResult, cfg terminalConfig) error {
+	if cfg.traceRoot == "" {
+		return nil
+	}
+	dir := filepath.Join(cfg.traceRoot, sanitizeDockerName(task.ID))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return cliError{"trace_write_failed", "Could not create terminal trace directory.", []string{"Check --trace-dir permissions."}, map[string]any{"taskId": task.ID, "dir": dir, "error": err.Error()}}
+	}
+	files := map[string]string{
+		"instruction.txt": task.Instruction,
+		"prompt.txt":      result.prompt,
+		"transcript.md":   result.transcript,
+		"verifier.txt":    result.verifierOutput,
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			return cliError{"trace_write_failed", "Could not write terminal trace file.", []string{"Check --trace-dir permissions and available disk space."}, map[string]any{"taskId": task.ID, "file": name, "error": err.Error()}}
+		}
+	}
+	resultJSON := map[string]any{"question_id": task.ID, "pass": result.pass, "scored": result.scored, "error": result.errText, "errorCode": result.errCode, "latencyMs": result.wallTimeMs, "wallTimeMs": result.wallTimeMs, "tokenUsage": result.usage.toMap(), "turns": result.turns}
+	data, err := json.MarshalIndent(resultJSON, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "result.json"), append(data, '\n'), 0o644); err != nil {
+		return cliError{"trace_write_failed", "Could not write terminal trace metadata.", []string{"Check --trace-dir permissions and available disk space."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+	}
+	printStatus(cfg.args, "terminal_trace_written", map[string]any{"taskId": task.ID, "dir": dir})
+	return nil
+}
+
+func tokenUsageFromObject(obj map[string]any) terminalTokenUsage {
+	if obj == nil {
+		return terminalTokenUsage{}
+	}
+	input := int64(firstNonZero(usageToken(obj, "prompt_tokens"), usageToken(obj, "input_tokens"), usageToken(obj, "inputTokens"), usageToken(obj, "input")))
+	output := int64(firstNonZero(usageToken(obj, "completion_tokens"), usageToken(obj, "output_tokens"), usageToken(obj, "outputTokens"), usageToken(obj, "output")))
+	cacheRead := int64(firstNonZero(usageToken(obj, "cache_read_tokens"), usageToken(obj, "cacheReadTokens"), usageToken(obj, "cacheRead")))
+	cacheWrite := int64(firstNonZero(usageToken(obj, "cache_write_tokens"), usageToken(obj, "cacheWriteTokens"), usageToken(obj, "cacheWrite")))
+	total := int64(firstNonZero(usageToken(obj, "total_tokens"), usageToken(obj, "totalTokens")))
+	if total == 0 {
+		total = input + output + cacheRead + cacheWrite
+	}
+	if input == 0 && output == 0 && cacheRead == 0 && cacheWrite == 0 && total == 0 {
+		return terminalTokenUsage{}
+	}
+	modelCalls := firstNonZero(usageToken(obj, "model_calls"), usageToken(obj, "modelCalls"))
+	if modelCalls == 0 {
+		modelCalls = 1
+	}
+	return terminalTokenUsage{inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, totalTokens: total, modelCalls: modelCalls}
+}
+
+func externalAgentTokenUsage(traceDir string) terminalTokenUsage {
+	usage := terminalTokenUsage{}
+	_ = filepath.WalkDir(traceDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || filepath.Ext(path) != ".jsonl" {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+			var event map[string]any
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				continue
+			}
+			if stringValue(event["type"]) != "message_end" {
+				continue
+			}
+			message := asObject(event["message"])
+			if stringValue(message["role"]) != "assistant" {
+				continue
+			}
+			usage.add(tokenUsageFromObject(asObject(message["usage"])))
+		}
+		return nil
+	})
+	return usage
+}
+
 func externalAgentTraceText(traceDir string) string {
+	ompPaths, _ := filepath.Glob(filepath.Join(traceDir, "*", "omp.jsonl"))
+	if direct, err := filepath.Glob(filepath.Join(traceDir, "omp.jsonl")); err == nil {
+		ompPaths = append(ompPaths, direct...)
+	}
+	sort.Strings(ompPaths)
+	if len(ompPaths) > 0 {
+		preview, _, err := buildTerminalOMPPreview(ompPaths[len(ompPaths)-1], traceDir)
+		if err == nil {
+			return preview
+		}
+		return "# Agent trace\n\n## Trace integrity\n\nSource: selected omp.jsonl could not be parsed.\n\n" + terminalMarkdownCode(boundedTerminalUTF8(err.Error(), 2048, "trace error"))
+	}
 	paths := []string{}
 	_ = filepath.WalkDir(traceDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -1631,6 +2824,16 @@ func externalAgentTraceText(traceDir string) string {
 	}
 	return b.String()
 }
+func terminalAgentMaxTurns(cfg terminalConfig, task terminalTask) int {
+	if cfg.maxTurns > 0 {
+		return cfg.maxTurns
+	}
+	if task.Agent.MaxTurns > 100 {
+		return task.Agent.MaxTurns
+	}
+	return 100
+}
+
 func firstPositive(values ...int) int {
 	for _, v := range values {
 		if v > 0 {
@@ -1647,6 +2850,159 @@ func firstPositiveFloat(values ...float64) float64 {
 	}
 	return 0
 }
+
+func terminalAgentTimeoutSec(cfg terminalConfig, task terminalTask) int {
+	if cfg.agentTimeoutSec > 0 {
+		return cfg.agentTimeoutSec
+	}
+	if task.Agent.TimeoutSec > defaultTerminalTaskTimeoutSec {
+		return task.Agent.TimeoutSec
+	}
+	return defaultTerminalTaskTimeoutSec
+}
+
+func terminalCommandTimeoutSec(cfg terminalConfig) int {
+	if cfg.commandTimeoutSec > 0 {
+		return cfg.commandTimeoutSec
+	}
+	return defaultTerminalCommandTimeoutSec
+}
+
+func terminalObservationForModel(output string, exitCode int, timedOut bool) string {
+	shown := truncateString(output, terminalModelObservationLimit)
+	if timedOut {
+		shown += "\n[timeout recovery hint: do not repeat the same long command. Use a smaller bounded command, inspect partial state, or choose a non-interactive alternative.]"
+	}
+	return shown + "\n[exit=" + strconv.Itoa(exitCode) + "]"
+}
+
+func compactAssistantForModel(content, command string) string {
+	if command != "" {
+		return "```bash\n" + command + "\n```"
+	}
+	return truncateString(content, 1000)
+}
+
+func trimTerminalMessages(messages []map[string]any) []map[string]any {
+	return trimTerminalMessagesTo(messages, terminalMessageBudgetBytes, terminalRecentMessageKeep)
+}
+
+func trimTerminalMessagesForRetry(messages []map[string]any) []map[string]any {
+	return trimTerminalMessagesTo(messages, terminalMessageBudgetBytes/2, terminalRecentMessageKeep/2)
+}
+
+func trimTerminalMessagesTo(messages []map[string]any, budget, keep int) []map[string]any {
+	if terminalMessagesBytes(messages) <= budget || len(messages) <= 3 {
+		return messages
+	}
+	if keep < 2 {
+		keep = 2
+	}
+	if keep > len(messages)-2 {
+		keep = len(messages) - 2
+	}
+	out := make([]map[string]any, 0, keep+3)
+	out = append(out, messages[0], messages[1])
+	omitted := len(messages) - 2 - keep
+	if omitted > 0 {
+		out = append(out, map[string]any{"role": "user", "content": fmt.Sprintf("[Earlier terminal transcript compacted: %d old messages omitted. Continue from the recent state below; rerun concise inspection commands if exact details are needed.]", omitted)})
+	}
+	out = append(out, messages[len(messages)-keep:]...)
+	return out
+}
+
+func terminalMessagesBytes(messages []map[string]any) int {
+	total := 0
+	for _, message := range messages {
+		total += len(stringValue(message["role"]))
+		total += len(stringValue(message["content"]))
+	}
+	return total
+}
+
+func terminalCommandExecutionTimeout(_ string, requested time.Duration, deadline time.Time) time.Duration {
+	return terminalRemainingTimeout(requested, deadline)
+}
+
+func looksLikeSetupOrBlockingCommand(command string) bool {
+	lower := strings.ToLower(command)
+	if strings.Contains(lower, "timeout ") {
+		return false
+	}
+	markers := []string{
+		"apt-get", " apt ", "pip install", "uv pip install", "npm install", "pnpm install", "yarn install",
+		"cargo install", "go install", "conda install", "mamba install", "7z x", "7za x", "john ", "hashcat",
+		"python3 -m http.server", "python -m http.server",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func terminalModelMaxTokens(cfg terminalConfig, retry bool) int {
+	if cfg.maxTokens > 0 {
+		return cfg.maxTokens
+	}
+	if retry {
+		return defaultTerminalRetryMaxTokens
+	}
+	return defaultTerminalModelMaxTokens
+}
+func terminalDisablesTemplateThinking(model string) bool {
+	return strings.Contains(strings.ToLower(model), "qwen")
+}
+
+func terminalModelCallFailure(taskID string, deadline time.Time, firstErr, retryErr error) cliError {
+	fields := map[string]any{"taskId": taskID, "firstError": firstErr.Error(), "retryError": retryErr.Error()}
+	if !time.Now().Before(deadline) {
+		return cliError{"agent_timeout", "Terminal agent timed out during model call.", []string{"Raise --agent-timeout, lower --max-tokens, or use a faster model/server."}, fields}
+	}
+	return cliError{"model_call_failed", "Model call failed during terminal agent loop.", []string{"Check --base-url, --model-api-key, and that the OpenAI-compatible server is running."}, fields}
+}
+
+func terminalModelRequestTimeout(cfg terminalConfig, deadline time.Time, reserveRetry bool) time.Duration {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return time.Second
+	}
+	if reserveRetry && remaining > 2*time.Second {
+		reserve := remaining / 3
+		if reserve > maxTerminalRetryReserve {
+			reserve = maxTerminalRetryReserve
+		}
+		if reserve < time.Second {
+			reserve = time.Second
+		}
+		remaining -= reserve
+	}
+	configured := terminalEndpointTimeout(cfg)
+	if configured <= 0 || remaining < configured {
+		return remaining
+	}
+	return configured
+}
+
+func terminalEndpointTimeout(cfg terminalConfig) time.Duration {
+	if cfg.endpointTimeout > 0 {
+		return cfg.endpointTimeout
+	}
+	return defaultTerminalEndpointTimeout
+}
+
+func terminalRemainingTimeout(defaultTimeout time.Duration, deadline time.Time) time.Duration {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return time.Second
+	}
+	if defaultTimeout <= 0 || remaining < defaultTimeout {
+		return remaining
+	}
+	return defaultTimeout
+}
+
 func truncateString(value string, max int) string {
 	if max <= 0 || len(value) <= max {
 		return value
@@ -1688,7 +3044,7 @@ func cleanupTerminalImage(image string, enabled bool) {
 }
 
 func terminalResultFromBundle(i int, b terminalBundle, r terminalTaskResult) shardItemResult {
-	return shardItemResult{questionID: b.Task.ID, itemIndex: i, pass: r.pass, scored: r.scored, errText: r.errText, question: b.Task.Instruction, prompt: r.prompt, response: r.transcript, reasoning: r.verifierOutput, latencyMs: r.latencyMs}
+	return shardItemResult{questionID: b.Task.ID, itemIndex: i, pass: r.pass, scored: r.scored, errText: r.errText, question: b.Task.Instruction, prompt: r.prompt, response: r.transcript, reasoning: r.verifierOutput, latencyMs: r.wallTimeMs}
 }
 
 var _ = bufio.ErrFinalToken

@@ -16,17 +16,22 @@ OMP_BUDGET_SEC="${OMP_BUDGET_SEC:-${LMX_TERMINAL_AGENT_TIMEOUT_SEC:-900}}"
 HOST_OMP="${OMP_BIN:-$(command -v omp)}"
 HOST_MODELS_DB="${OMP_MODELS_DB:-$HOME/.omp/agent/models.db}"
 HOST_OMP_CONFIG="${OMP_CONFIG:-$HOME/.omp/agent/config.yml}"
+HOST_TRACE_FILTER="${OMP_TRACE_FILTER:-$(command -v omp-trace-filter || true)}"
+if [[ -z "$HOST_TRACE_FILTER" || ! -x "$HOST_TRACE_FILTER" ]]; then
+  echo "omp trace filter not found; set OMP_TRACE_FILTER or install omp-trace-filter" >&2
+  exit 1
+fi
 CONTAINER_OMP="/tmp/localmaxxing-omp"
 CONTAINER_PROMPT_FILE="/tmp/localmaxxing-omp-prompt.txt"
 CONTAINER_BASE_URL="${OMP_CONTAINER_BASE_URL:-${LMX_TERMINAL_CONTAINER_BASE_URL:-http://172.17.0.1:8080}}"
 PATCHED_MODELS_DB="$SESSION_DIR/models.db"
 
-python3 - "$HOST_MODELS_DB" "$PATCHED_MODELS_DB" "$CONTAINER_BASE_URL" <<'PY'
+python3 - "$HOST_MODELS_DB" "$PATCHED_MODELS_DB" "$CONTAINER_BASE_URL" "${OMP_MODEL:-${LMX_TERMINAL_MODEL:-}}" <<'PY'
 import json
 import sqlite3
 import sys
 
-source, target, base_url = sys.argv[1:]
+source, target, base_url, requested_model = sys.argv[1:]
 src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
 dst = sqlite3.connect(target)
 src.backup(dst)
@@ -34,9 +39,32 @@ src.close()
 row = dst.execute("select models from model_cache where provider_id='llama.cpp'").fetchone()
 if row:
     models = json.loads(row[0])
+    local_url = base_url.rstrip("/")
     for model in models:
-        model["baseUrl"] = base_url.rstrip("/") + "/v1"
+        model["baseUrl"] = local_url
         model["api"] = "openai-completions"
+    requested_id = requested_model.split("/", 1)[-1] if requested_model else ""
+    if requested_id and all(model.get("id") != requested_id for model in models):
+        models.append(
+            {
+                "id": requested_id,
+                "name": requested_id,
+                "api": "openai-completions",
+                "provider": "llama.cpp",
+                "baseUrl": local_url,
+                "reasoning": False,
+                "input": ["text"],
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                "contextWindow": 262144,
+                "maxTokens": 32768,
+                "headers": {},
+                "compat": {
+                    "supportsStore": False,
+                    "supportsDeveloperRole": False,
+                    "supportsReasoningEffort": False,
+                },
+            }
+        )
     dst.execute(
         "update model_cache set models=? where provider_id='llama.cpp'",
         (json.dumps(models, separators=(",", ":")),),
@@ -81,27 +109,24 @@ printf '[harness=omp-container-shell]\n[container=%s]\n[session=%s]\n' "$LMX_TER
 timeout -k 10 "$OMP_BUDGET_SEC" docker exec \
   -e LLAMA_CPP_BASE_URL="$CONTAINER_BASE_URL" \
   -e OMP_MODEL="${OMP_MODEL:-${LMX_TERMINAL_MODEL:-}}" \
+  -e OMP_MODELS_DB="/root/.omp/agent/models.db" \
+  -e PI_CODING_AGENT_DIR="/root/.omp/agent" \
   "$LMX_TERMINAL_CONTAINER" \
   bash -lc 'set -euo pipefail
 prompt="$(cat /tmp/localmaxxing-omp-prompt.txt)"
 exec /tmp/localmaxxing-omp -p \
   --mode json \
   --no-session \
+  --provider llama.cpp \
   --model "${OMP_MODEL:?Set OMP_MODEL or LMX_TERMINAL_MODEL}" \
   --auto-approve \
   --approval-mode yolo \
   --cwd /app \
   "$prompt"' \
-  > "$LOG" 2>&1
-STATUS=$?
-if [ "$STATUS" -eq 0 ] && grep -q '"stopReason":"error"\|"errorMessage"' "$LOG"; then
-  STATUS=1
-fi
-if [ "$STATUS" -eq 0 ] && ! grep -q '"type":"function_call"\|"type":"toolCall"' "$LOG"; then
-  STATUS=1
-fi
+  2>&1 | "$HOST_TRACE_FILTER" "$LOG" 67108864 2097152
+STATUS=${PIPESTATUS[0]}
 
 echo "[omp_exit=$STATUS]"
 echo "----- omp output -----"
 cat "$LOG" 2>/dev/null || true
-exit "$STATUS"
+exit 0

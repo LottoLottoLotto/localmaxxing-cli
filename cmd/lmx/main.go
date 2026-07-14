@@ -10445,6 +10445,7 @@ var usageExamples = []string{
 	`lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1`,
 	`lmx eval terminal verify ./tb-bundles/smoke --oracle`,
 	`lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
+	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-payload.json`,
 	`lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`,
 	`lmx benchmark fixup runs/Model/run.json`,
 	`lmx hardware template --gpu-name "RTX 3090" --gpu-count 2 --vram-gb 24 --cpu "Ryzen 9 9950X" --ram-gb 96 --os Linux`,
@@ -10457,6 +10458,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --no-browser            Do not open the device-login browser automatically
   --profile <name>         Load saved defaults from lmx profile save
   --model <hfId>           HuggingFace model ID
+  --hf-id <hfId>           Canonical HuggingFace model ID for deferred terminal submit
   --backend <name>         lm-eval backend name for eval lm-eval (default: hf)
   --model-args <args>      lm-eval --model_args value
   --num-fewshot <n>        lm-eval --num_fewshot override
@@ -10472,14 +10474,17 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --concurrency <n>        Eval-shard parallel requests (default: 1)
   --artifact-limit <n>     Shard traces to submit (default: 0 = all, for a complete whole-shard bundle; >0 keeps a balanced pass/fail sample)
   --task-dir <dir>        Terminal eval bundle directory (one bundle or parent of bundles)
-  --dataset <slug>        Terminal eval dataset slug to submit local --task-dir runs against
+  --dataset <slug>        Terminal eval dataset slug; required for deferred submit
   --max-turns <n>         Terminal eval agent turn cap (defaults to task manifest)
-  --agent-timeout <sec>   Terminal eval whole-agent timeout (defaults to task manifest)
+  --agent-timeout <sec>   Terminal eval whole-agent timeout (default: max(task manifest, 14400 = 4h))
+  --agent <name>          Terminal eval built-in agent backend: terminus-2 uses Harbor Terminus-2
   --agent-cmd <cmd>       Terminal eval external agent command; gets LMX_TERMINAL_* env vars
   --agent-execution <m>   External agent execution: host (default), container, or routed-shell
   --agent-name <name>     Label for external terminal agent submissions (default: external-agent)
   --container-base-url <url> Base URL visible from task containers for container-native agents
-  --command-timeout <sec> Terminal eval per-shell-command timeout (default: 120)
+  --command-timeout <sec> Terminal eval per-shell-command timeout (default: remaining task budget, up to 4h)
+  --endpoint-timeout-seconds <n> Terminal model request timeout (default: 600; first attempt reserves retry time)
+  --trace-dir <dir>       Save per-terminal-task traces locally: transcript.md, verifier.txt, prompt.txt, result.json, and external agent logs
   --cleanup-images        Remove locally built terminal task images after each task
   --shell-mode <mode>     Terminal eval built-in harness shell: persistent (default, one shared shell) or stateless (fresh shell per command)
   --oracle                Run terminal task solution/solve.sh instead of the model agent
@@ -10493,7 +10498,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --served-model <name>    Model name served by the OpenAI-compatible endpoint
   --model-api-key <key>    Optional bearer token for remote endpoint benchmarking
   --prompt <text>          Prompt for remote endpoint benchmark
-  --max-tokens <n>         Max generated tokens (eval shard default: 0 = no cap, let the model finish)
+  --max-tokens <n>        Terminal model completion cap (default: 16384; retry: 8192)
   --endpoint-timeout-seconds <n> Timeout for remote endpoint benchmark (default: 600)
   --warmup <n>             Untimed warmup requests before remote endpoint measurement (default: 1)
   --iterations <n>         Timed remote endpoint measurement iterations; median is reported (default: 3)
@@ -10606,6 +10611,7 @@ var commandDescriptions = map[string]string{
 	"eval shard":             "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
 	"eval shard status":      "Print aggregate shard coverage and missing shard indexes for a model.",
 	"eval terminal":          "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
+	"eval terminal submit":   "Validate and submit a completed terminal checkpoint without rerunning tasks.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",
 	"auth":                   "Manage LocalMaxxing API authentication.",

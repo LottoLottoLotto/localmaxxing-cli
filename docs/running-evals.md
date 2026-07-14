@@ -345,6 +345,7 @@ lmx eval terminal run --task-dir ./tb-bundles \
   --model Qwen/Qwen3-8B \
   --hardware hardware.json \
   --out terminal-run.json \
+  --trace-dir terminal-traces \
   --dry-run
 ```
 
@@ -353,6 +354,31 @@ By default the built-in harness runs every turn in one persistent shell session
 across turns (`protocol: "react-shell"`). Pass `--shell-mode stateless` to run
 each command in a fresh `docker exec` with no shared state (`protocol:
 "react-bash"`).
+
+Terminal runs use Harbor-like long task budgets by default. If `--agent-timeout`
+is omitted, each task gets `max(task.json agent.timeoutSec, 14400)` seconds
+(four hours), so imported Terminal-Bench manifests with 15–60 minute limits do
+not prematurely stop local long-running models. Built-in model requests default
+to a 10-minute per-request timeout, and the first attempt reserves part of the
+remaining task budget for one retry. Terminal model completions are capped at
+16,384 tokens by default and 8,192 tokens on retry; pass `--max-tokens` to set
+an explicit cap for both attempts. Per-shell-command execution remains bounded
+by the remaining task budget; override with `--endpoint-timeout-seconds` or
+`--command-timeout` when needed.
+
+Use `--trace-dir <dir>` when you want a local, browsable copy of what happened
+inside each task. The CLI writes one subdirectory per `question_id` containing:
+
+- `transcript.md` — model replies, extracted shell commands, stdout/stderr, exit
+  codes, restarts, and timeouts.
+- `verifier.txt` — verifier stdout/stderr and reward parsing output.
+- `prompt.txt` and `instruction.txt` — the exact harness prompt/task text.
+- `result.json` — pass/scored/error/turn metadata, explicit `wallTimeMs`, and
+  `tokenUsage` (`inputTokens`, `outputTokens`, cache tokens, total tokens, model
+  call count).
+- `agent/` — external-agent logs written via `LMX_TERMINAL_TRACE_DIR`, plus
+  `usage.json` when the agent trace exposes model usage, when `--agent-cmd` is
+  used.
 
 Scoring follows harbor canonical verifier semantics: after the agent finishes,
 `tests/` is copied to `/tests` in the task container and the verifier command
@@ -385,6 +411,33 @@ lmx eval terminal run terminal-bench-2-1 \
   --hardware hardware.json \
   --submit
 ```
+
+
+The approved `terminal-bench-2-1` dataset is one canonical full-benchmark shard,
+so the command above runs and submits all 89 tasks as one comparable run. For a
+Terminal-Bench checkpoint completed by Harbor or another offline runner, package
+and validate it without rerunning tasks or contacting a model endpoint:
+
+```bash
+lmx eval terminal submit ./completed-terminal-run \
+  --dataset terminal-bench-2-1 \
+  --hf-id Qwen/Qwen3-8B \
+  --hardware hardware.json \
+  --quantization Q4_K_M \
+  --quant-format gguf \
+  --dry-run \
+  --out terminal-submit-payload.json
+```
+
+Inspect the payload, then remove `--dry-run` and provide `--api-key` (or
+`LMX_API_KEY`) to submit it. Deferred submission requires a complete
+`summary.json` plus one scored result file per task, preserves aggregate token
+usage in `runConfig.tokenUsage`, and never starts Docker, reruns a verifier, or
+calls the model endpoint.
+
+The built-in `--agent terminus-2` adapter is embedded in release binaries. It
+requires Harbor's Python environment at runtime but does not require a source
+checkout or a loose adapter script.
 
 Use a preferred external agent harness:
 

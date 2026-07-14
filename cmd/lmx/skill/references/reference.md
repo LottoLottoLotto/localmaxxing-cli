@@ -65,13 +65,18 @@ Eval shards and Terminal-Bench:
 - `--model-revision <rev>`: model revision for eval-shard submit; default `main`.
 - `--task-dir <dir>`: Terminal eval bundle directory.
 - `--dataset <slug>`: Terminal eval dataset slug.
+- `--hf-id <hfId>`: canonical HuggingFace model ID for deferred terminal submit.
 - `--max-turns <n>`: Terminal eval agent turn cap.
+- `--max-tokens <n>`: Terminal model completion cap; default 16,384 and 8,192 on retry. An explicit value applies to both attempts.
 - `--agent-timeout <sec>`: Terminal eval whole-agent timeout.
+- `--agent <name>`: built-in terminal agent backend; `terminus-2` uses the embedded Harbor adapter.
 - `--agent-cmd <cmd>`: external agent command with `LMX_TERMINAL_*` env vars.
 - `--agent-execution <m>`: `host`, `container`, or `routed-shell`; default `host`.
 - `--agent-name <name>`: external terminal agent label; default `external-agent`.
 - `--container-base-url <url>`: base URL visible from task containers.
-- `--command-timeout <sec>`: terminal per-shell-command timeout; default 120.
+- `--command-timeout <sec>`: terminal per-shell-command timeout; default is the remaining task budget, up to 4h.
+- `--endpoint-timeout-seconds <n>`: Terminal model request timeout; default 600 seconds. The first attempt reserves part of the remaining task budget for retry.
+- `--trace-dir <dir>`: save per-task `transcript.md`, `verifier.txt`, `prompt.txt`, `instruction.txt`, `result.json` with `wallTimeMs`/`tokenUsage`, and external agent logs.
 - `--cleanup-images`: remove locally built terminal task images after each task.
 - `--shell-mode <mode>`: `persistent` or `stateless`; default `persistent`.
 - `--oracle`: run terminal task `solution/solve.sh` instead of the model agent.

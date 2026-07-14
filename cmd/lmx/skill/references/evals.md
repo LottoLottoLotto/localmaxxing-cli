@@ -75,9 +75,15 @@ Useful shard flags include `--questions`, `--shard`, `--missing-only`, `--all-mi
 lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1
 lmx eval terminal verify ./tb-bundles/smoke --oracle
 lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit
+lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-payload.json
 ```
 
-Useful Terminal-Bench flags include `--task-dir`, `--dataset`, `--max-turns`, `--agent-timeout`, `--agent-cmd`, `--agent-execution`, `--agent-name`, `--container-base-url`, `--command-timeout`, `--cleanup-images`, `--shell-mode`, and `--oracle`.
+The approved Terminal-Bench 2.1 dataset is one full 89-task shard. Deferred
+submit validates a complete scored checkpoint without Docker, verifier, or model
+calls; remove `--dry-run` and provide `--api-key` only after inspecting the
+payload. Saved token totals are retained in `runConfig.tokenUsage`.
+
+Useful Terminal-Bench flags include `--task-dir`, `--dataset`, `--hf-id`, `--max-turns`, `--agent-timeout`, `--agent`, `--agent-cmd`, `--agent-execution`, `--agent-name`, `--container-base-url`, `--command-timeout`, `--endpoint-timeout-seconds`, `--trace-dir`, `--cleanup-images`, `--shell-mode`, and `--oracle`. `--agent terminus-2` uses the release-binary-embedded Harbor adapter.
 
 ## Eval storage
 
