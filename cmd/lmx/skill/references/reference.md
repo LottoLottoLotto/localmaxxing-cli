@@ -66,6 +66,7 @@ Eval shards and Terminal-Bench:
 - `--task-dir <dir>`: Terminal eval bundle directory.
 - `--dataset <slug>`: Terminal eval dataset slug.
 - `--hf-id <hfId>`: canonical HuggingFace model ID for deferred terminal submit.
+- `--shard-index <n>`: explicit shard for an isolated deferred checkpoint; required for noncanonical datasets. Omit only for a complete canonical Terminal-Bench 2.1 checkpoint, which is validated and partitioned into 10 submissions.
 - `--max-turns <n>`: Terminal eval agent turn cap.
 - `--max-tokens <n>`: Terminal model completion cap; default 16,384 and 8,192 on retry. An explicit value applies to both attempts.
 - `--agent-timeout <sec>`: Terminal eval whole-agent timeout.

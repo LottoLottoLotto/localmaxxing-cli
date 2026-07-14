@@ -78,18 +78,14 @@ lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --mode
 lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-payload.json
 ```
 
-The approved Terminal-Bench 2.1 dataset is one full 89-task shard. Deferred
-submit validates a complete scored checkpoint without Docker, verifier, or model
-calls; remove `--dry-run` and provide `--api-key` only after inspecting the
-payload. Saved token totals are retained in `runConfig.tokenUsage`.
+The approved Terminal-Bench 2.1 dataset partitions 89 tasks into 10 disjoint
+shards. A full deferred checkpoint is validated against the exact canonical task
+set and written/submitted as 10 ordered shard payloads; `--shard-index <n>` is
+required for an already-isolated shard or any other dataset. Dry-run performs no
+network calls. Saved shard-local and full-checkpoint token totals remain in
+`runConfig`.
 
-Useful Terminal-Bench flags include `--task-dir`, `--dataset`, `--hf-id`, `--max-turns`, `--agent-timeout`, `--agent`, `--agent-cmd`, `--agent-execution`, `--agent-name`, `--container-base-url`, `--command-timeout`, `--endpoint-timeout-seconds`, `--trace-dir`, `--cleanup-images`, `--shell-mode`, and `--oracle`. `--agent terminus-2` uses the release-binary-embedded Harbor adapter.
+Useful Terminal-Bench flags include `--task-dir`, `--dataset`, `--hf-id`, `--shard-index`, `--max-turns`, `--agent-timeout`, `--agent`, `--agent-cmd`, `--agent-execution`, `--agent-name`, `--container-base-url`, `--command-timeout`, `--endpoint-timeout-seconds`, `--trace-dir`, `--cleanup-images`, `--shell-mode`, and `--oracle`. `--agent terminus-2` uses the release-binary-embedded Harbor adapter.
 
-## Eval storage
 
-```bash
-lmx eval storage upload traces.jsonl --kind artifact --format jsonl --out artifact-bundle.json
-lmx eval storage download <storageKey> --out traces.jsonl
-```
 
-Storage supports eval artifacts/datasets for deferred or offline workflows.

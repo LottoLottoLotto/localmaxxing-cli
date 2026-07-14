@@ -413,10 +413,12 @@ lmx eval terminal run terminal-bench-2-1 \
 ```
 
 
-The approved `terminal-bench-2-1` dataset is one canonical full-benchmark shard,
-so the command above runs and submits all 89 tasks as one comparable run. For a
-Terminal-Bench checkpoint completed by Harbor or another offline runner, package
-and validate it without rerunning tasks or contacting a model endpoint:
+The approved `terminal-bench-2-1` dataset deterministically partitions its 89
+tasks into 10 disjoint shards. Each `eval terminal run` invocation acquires and
+submits one shard; repeat it to build full benchmark coverage. A complete
+89-task checkpoint produced by Harbor or another offline runner can be validated
+and partitioned into the same 10 shard submissions without rerunning tasks or
+contacting a model endpoint:
 
 ```bash
 lmx eval terminal submit ./completed-terminal-run \
@@ -426,14 +428,19 @@ lmx eval terminal submit ./completed-terminal-run \
   --quantization Q4_K_M \
   --quant-format gguf \
   --dry-run \
-  --out terminal-submit-payload.json
+  --out terminal-submit-batch.json
 ```
 
-Inspect the payload, then remove `--dry-run` and provide `--api-key` (or
-`LMX_API_KEY`) to submit it. Deferred submission requires a complete
-`summary.json` plus one scored result file per task, preserves aggregate token
-usage in `runConfig.tokenUsage`, and never starts Docker, reruns a verifier, or
-calls the model endpoint.
+The dry-run output is `{ "dataset": "terminal-bench-2-1", "shards": [...] }`
+with 10 ordered payloads carrying explicit `shardIndex` values. The CLI verifies
+the exact canonical 89-task ID set before partitioning. Inspect the batch, then
+remove `--dry-run` and provide `--api-key` (or `LMX_API_KEY`) to submit all 10
+payloads sequentially. For a checkpoint that already contains one isolated
+shard, pass `--shard-index <n>`; other dataset slugs always require an explicit
+shard index. Deferred submission preserves shard-local and full-checkpoint token
+usage in `runConfig` and never starts Docker, reruns a verifier, or calls the
+model endpoint.
+
 
 The built-in `--agent terminus-2` adapter is embedded in release binaries. It
 requires Harbor's Python environment at runtime but does not require a source

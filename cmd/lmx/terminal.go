@@ -751,6 +751,113 @@ type terminalTracePreviewStats struct {
 	SectionsOmitted   int
 }
 
+const terminalBench21Dataset = "terminal-bench-2-1"
+const terminalBench21ShardCount = 10
+
+// terminalBench21CanonicalTaskIDsText is the exact sorted 89-task set from
+// .terminal-smoke/omp-full-tb21-20260710-localmaxxing-cli/summary.json. Keeping
+// the IDs compiled into the binary makes deferred validation independent of it.
+const terminalBench21CanonicalTaskIDsText = `adaptive-rejection-sampler
+bn-fit-modify
+break-filter-js-from-html
+build-cython-ext
+build-pmars
+build-pov-ray
+caffe-cifar-10
+cancel-async-tasks
+chess-best-move
+circuit-fibsqrt
+cobol-modernization
+code-from-image
+compile-compcert
+configure-git-webserver
+constraints-scheduling
+count-dataset-tokens
+crack-7z-hash
+custom-memory-heap-crash
+db-wal-recovery
+distribution-search
+dna-assembly
+dna-insert
+extract-elf
+extract-moves-from-video
+feal-differential-cryptanalysis
+feal-linear-cryptanalysis
+filter-js-from-html
+financial-document-processor
+fix-code-vulnerability
+fix-git
+fix-ocaml-gc
+gcode-to-text
+git-leak-recovery
+git-multibranch
+gpt2-codegolf
+headless-terminal
+hf-model-inference
+install-windows-3.11
+kv-store-grpc
+large-scale-text-editing
+largest-eigenval
+llm-inference-batching-scheduler
+log-summary-date-ranges
+mailman
+make-doom-for-mips
+make-mips-interpreter
+mcmc-sampling-stan
+merge-diff-arc-agi-task
+model-extraction-relu-logits
+modernize-scientific-stack
+mteb-leaderboard
+mteb-retrieve
+multi-source-data-merger
+nginx-request-logging
+openssl-selfsigned-cert
+overfull-hbox
+password-recovery
+path-tracing
+path-tracing-reverse
+polyglot-c-py
+polyglot-rust-c
+portfolio-optimization
+protein-assembly
+prove-plus-comm
+pypi-server
+pytorch-model-cli
+pytorch-model-recovery
+qemu-alpine-ssh
+qemu-startup
+query-optimize
+raman-fitting
+regex-chess
+regex-log
+reshard-c4-data
+rstan-to-pystan
+sam-cell-seg
+sanitize-git-repo
+schemelike-metacircular-eval
+sparql-university
+sqlite-db-truncate
+sqlite-with-gcov
+torch-pipeline-parallelism
+torch-tensor-parallelism
+train-fasttext
+tune-mjcf
+video-processing
+vulnerable-secret
+winning-avg-corewars
+write-compressor`
+
+var terminalBench21CanonicalTaskIDs = strings.Fields(terminalBench21CanonicalTaskIDsText)
+
+type terminalSubmissionRecord struct {
+	questionID string
+	pass       bool
+	latencyMs  int64
+	usage      terminalTokenUsage
+	result     map[string]any
+	artifact   map[string]any
+}
+
 // submitTerminalEval packages an already completed checkpoint. It deliberately
 // does not share runTerminalEval's acquisition path: deferred submit must never
 // contact a model endpoint, acquire tasks, start Docker, or rerun a verifier.
@@ -774,6 +881,13 @@ func submitTerminalEval(args cliArgs) error {
 	if dataset == "" {
 		return cliError{"missing_dataset", "eval terminal submit requires --dataset <slug>.", []string{"Pass the terminal dataset slug used for the completed run."}, nil}
 	}
+	shardIndex, explicitShard, err := terminalSubmitShardIndex(args, dataset)
+	if err != nil {
+		return err
+	}
+	if dataset != terminalBench21Dataset && !explicitShard {
+		return cliError{"missing_shard_index", "Deferred submission for this dataset requires --shard-index <n>.", []string{"Pass the registered shard index for this already-isolated checkpoint.", "The CLI only performs automatic batching for terminal-bench-2-1 because its exact canonical task set is built in."}, map[string]any{"dataset": dataset}}
+	}
 	hfID := opt(args, "hf-id")
 	if hfID == "" {
 		return cliError{"missing_model", "eval terminal submit requires --hf-id <HuggingFace model id>.", []string{"Pass the canonical org/model identifier for the completed run."}, nil}
@@ -791,6 +905,27 @@ func submitTerminalEval(args cliArgs) error {
 	if err != nil {
 		return err
 	}
+	seenTasks := make(map[string]bool, len(entries))
+	seenIndexes := make(map[int]bool, len(entries))
+	for _, entry := range entries {
+		if err := validateTerminalCheckpointEntry(entry, len(entries), seenTasks, seenIndexes); err != nil {
+			return err
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Task < entries[j].Task })
+	if dataset == terminalBench21Dataset {
+		if explicitShard {
+			if terminalCheckpointHasCanonicalTaskSet(entries) {
+				return cliError{"full_checkpoint_with_shard_index", "A full canonical Terminal-Bench 2.1 checkpoint cannot be labeled as one shard.", []string{"Remove --shard-index to partition all 89 tasks into the 10 canonical shards."}, map[string]any{"tasks": len(entries), "shardIndex": shardIndex}}
+			}
+			if err := validateTerminalBench21ShardTaskSet(entries, shardIndex); err != nil {
+				return err
+			}
+		} else if err := validateTerminalBench21FullTaskSet(entries); err != nil {
+			return err
+		}
+	}
+
 	quantization, quantFormat, err := terminalCheckpointQuantization(entries)
 	if err != nil {
 		return err
@@ -802,20 +937,14 @@ func submitTerminalEval(args cliArgs) error {
 		return cliError{"missing_quant_format", "The saved terminal run records a quantization format; pass --quant-format explicitly.", []string{"Pass --quant-format " + quantFormat + " to confirm the saved run metadata."}, map[string]any{"savedQuantFormat": quantFormat}}
 	}
 
-	results := make([]any, 0, len(entries))
-	artifacts := make([]any, 0, len(entries))
-	seenTasks := make(map[string]bool, len(entries))
+	records := make([]terminalSubmissionRecord, 0, len(entries))
 	seenResults := make(map[string]bool, len(entries))
-	seenIndexes := make(map[int]bool, len(entries))
 	passed := 0
 	var totalLatencyMs int64
 	artifactBytes, maxArtifactBytes, traceCount, fallbackCount := 0, 0, 0, 0
 	totalUsage := terminalTokenUsage{}
 	previewTotals := terminalTracePreviewStats{}
-	for position, entry := range entries {
-		if err := validateTerminalCheckpointEntry(entry, len(entries), seenTasks, seenIndexes); err != nil {
-			return err
-		}
+	for _, entry := range entries {
 		recordPath, err := terminalCheckpointResultPath(root, entry)
 		if err != nil {
 			return err
@@ -838,8 +967,9 @@ func submitTerminalEval(args cliArgs) error {
 		if latency == 0 {
 			latency = record.LatencyMs
 		}
+		usage := tokenUsageFromObject(record.TokenUsage)
 		totalLatencyMs += latency
-		totalUsage.add(tokenUsageFromObject(record.TokenUsage))
+		totalUsage.add(usage)
 		response, previewStats, usedTrace, err := terminalSavedArtifactResponse(root, recordPath, record)
 		if err != nil {
 			return cliError{"trace_read_failed", fmt.Sprintf("Could not package the OMP trace for task %q.", entry.Task), []string{"Check that the selected omp.jsonl is readable, or remove the broken trace to use the bounded saved response fallback."}, map[string]any{"taskId": entry.Task, "error": err.Error()}}
@@ -859,41 +989,261 @@ func submitTerminalEval(args cliArgs) error {
 		if len(response) > maxArtifactBytes {
 			maxArtifactBytes = len(response)
 		}
-		results = append(results, map[string]any{"question_id": record.QuestionID, "pass": record.Pass})
-		artifacts = append(artifacts, map[string]any{
-			"question_id": record.QuestionID,
-			"itemIndex":   position,
-			"promptHash":  shortHash(record.QuestionID + ":" + record.Prompt),
-			"question":    record.Question,
-			"prompt":      record.Prompt,
-			"response":    response,
-			"score":       boolScore(record.Pass),
-			"testPassed":  record.Pass,
-			"latencyMs":   latency,
-			"wallTimeMs":  latency,
-			"tokenUsage":  record.TokenUsage,
+		records = append(records, terminalSubmissionRecord{
+			questionID: record.QuestionID,
+			pass:       record.Pass,
+			latencyMs:  latency,
+			usage:      usage,
+			result:     map[string]any{"question_id": record.QuestionID, "pass": record.Pass},
+			artifact: map[string]any{
+				"question_id": record.QuestionID,
+				"promptHash":  shortHash(record.QuestionID + ":" + record.Prompt),
+				"question":    record.Question,
+				"prompt":      record.Prompt,
+				"response":    response,
+				"score":       boolScore(record.Pass),
+				"testPassed":  record.Pass,
+				"latencyMs":   latency,
+				"wallTimeMs":  latency,
+				"tokenUsage":  record.TokenUsage,
+			},
 		})
 	}
 	if len(seenResults) != len(entries) {
 		return cliError{"checkpoint_incomplete", "The terminal checkpoint did not produce one unique result for every summary record.", []string{"Restore the missing per-task JSON files and rerun deferred submit."}, map[string]any{"summaryRecords": len(entries), "uniqueResults": len(seenResults)}}
 	}
-	failed := len(entries) - passed
-	accuracy := float64(passed) / float64(len(entries))
-	avgLatencyMs := totalLatencyMs / int64(len(entries))
+	sort.Slice(records, func(i, j int) bool { return records[i].questionID < records[j].questionID })
+
+	fullAccuracy := float64(passed) / float64(len(records))
+	fullAvgLatencyMs := totalLatencyMs / int64(len(records))
+	fullProvenance := map[string]any{"fullCheckpoint": false}
+	if !explicitShard {
+		fullTaskIDs := make([]string, len(records))
+		for i := range records {
+			fullTaskIDs[i] = records[i].questionID
+		}
+		fullTaskSetHash := sha256.Sum256([]byte(strings.Join(fullTaskIDs, "\n")))
+		// These fullCheckpoint* keys preserve the source checkpoint aggregate on
+		// every shard while the unprefixed runConfig metrics remain shard-local.
+		fullProvenance = map[string]any{
+			"fullCheckpoint":                    true,
+			"fullCheckpointTasksRun":            len(records),
+			"fullCheckpointAccuracy":            fullAccuracy,
+			"fullCheckpointAvgLatencyMs":        fullAvgLatencyMs,
+			"fullCheckpointTokenUsage":          totalUsage.toMap(),
+			"fullCheckpointTaskSetSha256":       hex.EncodeToString(fullTaskSetHash[:]),
+			"fullCheckpointCanonicalShardCount": terminalBench21ShardCount,
+		}
+	}
+
+	recordShards := [][]terminalSubmissionRecord{records}
+	shardIndexes := []int{shardIndex}
+	if !explicitShard {
+		recordShards = partitionTerminalSubmissionRecords(records, terminalBench21ShardCount)
+		shardIndexes = make([]int, len(recordShards))
+		for i := range shardIndexes {
+			shardIndexes[i] = i + 1
+		}
+	}
+	payloads := make([]any, 0, len(recordShards))
+	shardSizes := make([]int, 0, len(recordShards))
+	for i, shardRecords := range recordShards {
+		payload := terminalSubmissionPayload(args, hfID, hardware, shardIndexes[i], shardRecords, fullProvenance)
+		payloads = append(payloads, payload)
+		shardSizes = append(shardSizes, len(shardRecords))
+	}
+	batch := map[string]any{"dataset": dataset, "shards": payloads}
+	batchJSON, err := json.Marshal(batch)
+	if err != nil {
+		return cliError{"payload_invalid", "Could not encode the deferred terminal submission batch.", []string{"Inspect the saved hardware and task result JSON values."}, err.Error()}
+	}
+	fields := map[string]any{
+		"dataset":                dataset,
+		"tasks":                  len(records),
+		"uniqueTasks":            len(seenResults),
+		"scored":                 len(records),
+		"passing":                passed,
+		"failing":                len(records) - passed,
+		"accuracyPct":            roundMetric(fullAccuracy * 100),
+		"payloadBytes":           len(batchJSON),
+		"shardIndexes":           shardIndexes,
+		"shardSizes":             shardSizes,
+		"artifactBytes":          artifactBytes,
+		"maxArtifactBytes":       maxArtifactBytes,
+		"tracePreviews":          traceCount,
+		"responseFallbacks":      fallbackCount,
+		"unknownTraceEvents":     previewTotals.UnknownEvents,
+		"oversizedTraceLines":    previewTotals.OversizedLines,
+		"malformedTraceLines":    previewTotals.MalformedLines,
+		"previewSectionsOmitted": previewTotals.SectionsOmitted,
+	}
+	if out := opt(args, "out"); out != "" {
+		if err := writeJSON(out, batch); err != nil {
+			return err
+		}
+		fields["payloadOut"] = out
+	}
+	if hasFlag(args, "dry-run") {
+		printInfo("terminal_submit_dry_run", fields)
+		fmt.Println("Dry run only — payload batch validated locally; no network request was made.")
+		return nil
+	}
+	key := apiKey(args)
+	if key == "" {
+		return missingAPIKey("--api-key or LMX_API_KEY is required for eval terminal submit")
+	}
+	completed := make([]int, 0, len(payloads))
+	runIDs := make([]any, 0, len(payloads))
+	receipts := make([]any, 0, len(payloads))
+	for i, rawPayload := range payloads {
+		currentShard := shardIndexes[i]
+		value, err := fetchJSON("POST", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/submit", key, rawPayload)
+		if err != nil {
+			return cliError{"terminal_submit_shard_failed", fmt.Sprintf("Terminal submission stopped after shard %d failed.", currentShard), []string{"Fix the server error, then submit the remaining already-isolated shard checkpoints explicitly with --shard-index."}, map[string]any{"failedShardIndex": currentShard, "completedShardIndexes": completed, "error": err.Error()}}
+		}
+		completed = append(completed, currentShard)
+		receipt := map[string]any{"shardIndex": currentShard}
+		if obj := asObject(value); obj != nil {
+			if run := asObject(obj["run"]); run != nil {
+				receipt["runId"] = run["id"]
+				receipt["status"] = run["status"]
+				runIDs = append(runIDs, run["id"])
+			}
+			if aggregate := asObject(obj["aggregate"]); aggregate != nil {
+				receipt["pooledScore"] = aggregate["pooledScore"]
+				receipt["coverage"] = aggregate["shardsCovered"]
+			}
+		}
+		receipts = append(receipts, receipt)
+	}
+	fields["submitted"] = len(records)
+	fields["completedShardIndexes"] = completed
+	fields["runIds"] = runIDs
+	fields["shardReceipts"] = receipts
+	printInfo("terminal_submit_complete", fields)
+	return nil
+}
+
+func terminalSubmitShardIndex(args cliArgs, dataset string) (int, bool, error) {
+	raw, explicit := args.opts["shard-index"]
+	if hasFlag(args, "shard-index") {
+		return 0, true, cliError{"missing_option_value", "--shard-index requires a positive integer value.", []string{"Pass --shard-index 1, for example."}, nil}
+	}
+	if !explicit {
+		return 0, false, nil
+	}
+	index, err := strconv.Atoi(raw)
+	if err != nil || index < 1 {
+		return 0, true, cliError{"invalid_shard_index", "--shard-index must be a positive integer.", nil, map[string]any{"value": raw}}
+	}
+	if dataset == terminalBench21Dataset && index > terminalBench21ShardCount {
+		return 0, true, cliError{"invalid_shard_index", fmt.Sprintf("--shard-index for Terminal-Bench 2.1 must be between 1 and %d.", terminalBench21ShardCount), nil, map[string]any{"value": index}}
+	}
+	return index, true, nil
+}
+
+func terminalCheckpointHasCanonicalTaskSet(entries []terminalCheckpointEntry) bool {
+	canonical := terminalBench21CanonicalTaskIDs
+	if len(entries) != len(canonical) {
+		return false
+	}
+	for i := range canonical {
+		if entries[i].Task != canonical[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateTerminalBench21FullTaskSet(entries []terminalCheckpointEntry) error {
+	return validateTerminalTaskSet(entries, terminalBench21CanonicalTaskIDs, "canonical Terminal-Bench 2.1 checkpoint", 0)
+}
+
+func validateTerminalBench21ShardTaskSet(entries []terminalCheckpointEntry, shardIndex int) error {
+	canonical := terminalBench21CanonicalTaskIDs
+	start := ((shardIndex - 1) * len(canonical)) / terminalBench21ShardCount
+	end := (shardIndex * len(canonical)) / terminalBench21ShardCount
+	return validateTerminalTaskSet(entries, canonical[start:end], fmt.Sprintf("canonical Terminal-Bench 2.1 shard %d", shardIndex), shardIndex)
+}
+
+func validateTerminalTaskSet(entries []terminalCheckpointEntry, expected []string, label string, shardIndex int) error {
+	actual := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		actual[entry.Task] = true
+	}
+	wanted := make(map[string]bool, len(expected))
+	missing := make([]string, 0)
+	for _, id := range expected {
+		wanted[id] = true
+		if !actual[id] {
+			missing = append(missing, id)
+		}
+	}
+	extra := make([]string, 0)
+	for id := range actual {
+		if !wanted[id] {
+			extra = append(extra, id)
+		}
+	}
+	sort.Strings(extra)
+	if len(missing) == 0 && len(extra) == 0 && len(entries) == len(expected) {
+		return nil
+	}
+	details := map[string]any{"expectedTasks": len(expected), "actualTasks": len(entries), "missingTaskIds": missing, "extraTaskIds": extra}
+	if shardIndex > 0 {
+		details["shardIndex"] = shardIndex
+	}
+	return cliError{"checkpoint_task_set_mismatch", fmt.Sprintf("The checkpoint task IDs do not exactly match the %s task set.", label), []string{"Use the checkpoint produced from the canonical task bundles; task counts alone are not sufficient."}, details}
+}
+
+func partitionTerminalSubmissionRecords(records []terminalSubmissionRecord, count int) [][]terminalSubmissionRecord {
+	shards := make([][]terminalSubmissionRecord, count)
+	for i := range count {
+		start := (i * len(records)) / count
+		end := ((i + 1) * len(records)) / count
+		shards[i] = records[start:end]
+	}
+	return shards
+}
+
+func terminalSubmissionPayload(args cliArgs, hfID string, hardware any, shardIndex int, records []terminalSubmissionRecord, fullProvenance map[string]any) map[string]any {
+	results := make([]any, len(records))
+	artifacts := make([]any, len(records))
+	passed := 0
+	var latencyMs int64
+	usage := terminalTokenUsage{}
+	for i, record := range records {
+		results[i] = record.result
+		artifact := make(map[string]any, len(record.artifact)+1)
+		for key, value := range record.artifact {
+			artifact[key] = value
+		}
+		artifact["itemIndex"] = i
+		artifacts[i] = artifact
+		if record.pass {
+			passed++
+		}
+		latencyMs += record.latencyMs
+		usage.add(record.usage)
+	}
 	runConfig := map[string]any{
-		"accuracy":       accuracy,
-		"tasksRun":       len(entries),
+		"accuracy":       float64(passed) / float64(len(records)),
+		"tasksRun":       len(records),
 		"errors":         0,
-		"avgLatencyMs":   avgLatencyMs,
+		"avgLatencyMs":   latencyMs / int64(len(records)),
 		"protocol":       "deferred-saved-terminal-run",
 		"agent":          firstNonEmpty(opt(args, "agent-name"), "external-agent"),
 		"deferredSubmit": true,
-		"tokenUsage":     totalUsage.toMap(),
+		"tokenUsage":     usage.toMap(),
+	}
+	for key, value := range fullProvenance {
+		runConfig[key] = value
 	}
 	payload := map[string]any{
 		"hfId":          hfID,
 		"modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"),
 		"hardware":      normalizeHardwarePayload(hardware),
+		"shardIndex":    shardIndex,
 		"results":       results,
 		"artifacts":     artifacts,
 		"runnerVersion": firstNonEmpty(opt(args, "runner-version"), "localmaxxing-go terminal-agent"),
@@ -908,60 +1258,7 @@ func submitTerminalEval(args cliArgs) error {
 	if value := opt(args, "notes"); value != "" {
 		payload["notes"] = value
 	}
-	payloadJSON, err := json.Marshal(payload)
-	if err != nil {
-		return cliError{"payload_invalid", "Could not encode the deferred terminal submission payload.", []string{"Inspect the saved hardware and task result JSON values."}, err.Error()}
-	}
-	fields := map[string]any{
-		"dataset":           dataset,
-		"tasks":             len(entries),
-		"uniqueTasks":       len(seenResults),
-		"scored":            len(entries),
-		"passing":           passed,
-		"failing":           failed,
-		"accuracyPct":       roundMetric(accuracy * 100),
-		"payloadBytes":      len(payloadJSON),
-		"artifactBytes":     artifactBytes,
-		"maxArtifactBytes":  maxArtifactBytes,
-		"tracePreviews":     traceCount,
-		"responseFallbacks": fallbackCount,
-		"unknownTraceEvents": previewTotals.UnknownEvents,
-		"oversizedTraceLines": previewTotals.OversizedLines,
-		"malformedTraceLines": previewTotals.MalformedLines,
-		"previewSectionsOmitted": previewTotals.SectionsOmitted,
-	}
-	if out := opt(args, "out"); out != "" {
-		if err := writeJSON(out, payload); err != nil {
-			return err
-		}
-		fields["payloadOut"] = out
-	}
-	if hasFlag(args, "dry-run") {
-		printInfo("terminal_submit_dry_run", fields)
-		fmt.Println("Dry run only — payload validated locally; no network request was made.")
-		return nil
-	}
-	key := apiKey(args)
-	if key == "" {
-		return missingAPIKey("--api-key or LMX_API_KEY is required for eval terminal submit")
-	}
-	value, err := fetchJSON("POST", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/submit", key, payload)
-	if err != nil {
-		return err
-	}
-	if obj := asObject(value); obj != nil {
-		if run := asObject(obj["run"]); run != nil {
-			fields["runId"] = run["id"]
-			fields["status"] = run["status"]
-		}
-		if aggregate := asObject(obj["aggregate"]); aggregate != nil {
-			fields["pooledScore"] = aggregate["pooledScore"]
-			fields["coverage"] = aggregate["shardsCovered"]
-		}
-	}
-	fields["submitted"] = len(results)
-	printInfo("terminal_submit_complete", fields)
-	return nil
+	return payload
 }
 
 func loadTerminalCheckpointSummary(path string) ([]terminalCheckpointEntry, error) {

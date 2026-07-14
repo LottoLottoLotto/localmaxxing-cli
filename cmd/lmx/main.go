@@ -10445,7 +10445,8 @@ var usageExamples = []string{
 	`lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1`,
 	`lmx eval terminal verify ./tb-bundles/smoke --oracle`,
 	`lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
-	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-payload.json`,
+	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-batch.json`,
+	`lmx eval terminal submit ./completed-terminal-shard --dataset <slug> --shard-index 3 --hf-id Qwen/Qwen3-8B --hardware hardware.json --dry-run --out terminal-submit-batch.json`,
 	`lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`,
 	`lmx benchmark fixup runs/Model/run.json`,
 	`lmx hardware template --gpu-name "RTX 3090" --gpu-count 2 --vram-gb 24 --cpu "Ryzen 9 9950X" --ram-gb 96 --os Linux`,
@@ -10459,6 +10460,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --profile <name>         Load saved defaults from lmx profile save
   --model <hfId>           HuggingFace model ID
   --hf-id <hfId>           Canonical HuggingFace model ID for deferred terminal submit
+  --shard-index <n>       Deferred terminal submit shard; required for isolated/noncanonical checkpoints
   --backend <name>         lm-eval backend name for eval lm-eval (default: hf)
   --model-args <args>      lm-eval --model_args value
   --num-fewshot <n>        lm-eval --num_fewshot override
@@ -10611,7 +10613,7 @@ var commandDescriptions = map[string]string{
 	"eval shard":             "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
 	"eval shard status":      "Print aggregate shard coverage and missing shard indexes for a model.",
 	"eval terminal":          "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
-	"eval terminal submit":   "Validate and submit a completed terminal checkpoint without rerunning tasks.",
+	"eval terminal submit":   "Validate a completed terminal checkpoint, batch canonical Terminal-Bench 2.1 into 10 shards, or submit one explicit --shard-index.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",
 	"auth":                   "Manage LocalMaxxing API authentication.",

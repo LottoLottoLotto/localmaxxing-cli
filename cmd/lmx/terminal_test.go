@@ -702,6 +702,7 @@ func TestSubmitTerminalEvalDryRunBuildsCanonicalPayloadWithoutNetworkOrBenchmark
 	args := parseArgs([]string{
 		"eval", "terminal", "submit", runDir,
 		"--dataset", "terminal-bench-fixture",
+		"--shard-index", "7",
 		"--hf-id", "fixture/model",
 		"--model-revision", "fixture-revision",
 		"--hardware", hardwarePath,
@@ -731,11 +732,21 @@ func TestSubmitTerminalEvalDryRunBuildsCanonicalPayloadWithoutNetworkOrBenchmark
 	if !utf8.Valid(data) {
 		t.Fatal("durable payload is not valid UTF-8")
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		t.Fatalf("decode durable payload: %v", err)
+	var batch map[string]any
+	if err := json.Unmarshal(data, &batch); err != nil {
+		t.Fatalf("decode durable payload batch: %v", err)
 	}
-
+	if batch["dataset"] != "terminal-bench-fixture" {
+		t.Fatalf("batch dataset = %#v, want terminal-bench-fixture", batch["dataset"])
+	}
+	shards := anySlice(batch["shards"])
+	if len(shards) != 1 {
+		t.Fatalf("explicit checkpoint payload count = %d, want 1", len(shards))
+	}
+	payload := asObject(shards[0])
+	if payload["shardIndex"] != float64(7) {
+		t.Fatalf("explicit checkpoint shardIndex = %#v, want 7", payload["shardIndex"])
+	}
 	if payload["hfId"] != "fixture/model" || payload["modelRevision"] != "fixture-revision" {
 		t.Fatalf("model identity = (%#v, %#v), want explicit fixture identity", payload["hfId"], payload["modelRevision"])
 	}
@@ -800,7 +811,7 @@ func TestSubmitTerminalEvalDryRunBuildsCanonicalPayloadWithoutNetworkOrBenchmark
 		artifactsByTask[id] = artifact
 	}
 	passArtifact := artifactsByTask["pass-task"]
-	if passArtifact["itemIndex"] != float64(0) || passArtifact["question"] != "Pass question with café" || passArtifact["prompt"] != "Pass prompt" || passArtifact["score"] != float64(1) || passArtifact["testPassed"] != true {
+	if passArtifact["itemIndex"] != float64(1) || passArtifact["question"] != "Pass question with café" || passArtifact["prompt"] != "Pass prompt" || passArtifact["score"] != float64(1) || passArtifact["testPassed"] != true {
 		t.Fatalf("passing artifact schema values = %#v", passArtifact)
 	}
 	if passArtifact["latencyMs"] != float64(100) || passArtifact["wallTimeMs"] != float64(100) {
@@ -849,7 +860,7 @@ func TestSubmitTerminalEvalDryRunBuildsCanonicalPayloadWithoutNetworkOrBenchmark
 	}
 
 	failArtifact := artifactsByTask["fail-task"]
-	if failArtifact["itemIndex"] != float64(1) || failArtifact["score"] != float64(0) || failArtifact["testPassed"] != false {
+	if failArtifact["itemIndex"] != float64(0) || failArtifact["score"] != float64(0) || failArtifact["testPassed"] != false {
 		t.Fatalf("failing artifact schema values = %#v", failArtifact)
 	}
 	if failArtifact["latencyMs"] != float64(200) || failArtifact["wallTimeMs"] != float64(200) {
@@ -894,6 +905,7 @@ func TestSubmitTerminalEvalRejectsInvalidCheckpointRecords(t *testing.T) {
 			args := parseArgs([]string{
 				"eval", "terminal", "submit", runDir,
 				"--dataset", "terminal-bench-fixture",
+				"--shard-index", "7",
 				"--hf-id", "fixture/model",
 				"--hardware", hardwarePath,
 				"--quantization", "Q4_K_M",
@@ -1002,4 +1014,395 @@ func writeDeferredTerminalSubmitFixture(t *testing.T) (runDir, hardwarePath stri
 		t.Fatalf("close OMP fixture: %v", err)
 	}
 	return runDir, hardwarePath
+}
+
+const terminalBench21CanonicalTestTaskIDsText = `adaptive-rejection-sampler
+bn-fit-modify
+break-filter-js-from-html
+build-cython-ext
+build-pmars
+build-pov-ray
+caffe-cifar-10
+cancel-async-tasks
+chess-best-move
+circuit-fibsqrt
+cobol-modernization
+code-from-image
+compile-compcert
+configure-git-webserver
+constraints-scheduling
+count-dataset-tokens
+crack-7z-hash
+custom-memory-heap-crash
+db-wal-recovery
+distribution-search
+dna-assembly
+dna-insert
+extract-elf
+extract-moves-from-video
+feal-differential-cryptanalysis
+feal-linear-cryptanalysis
+filter-js-from-html
+financial-document-processor
+fix-code-vulnerability
+fix-git
+fix-ocaml-gc
+gcode-to-text
+git-leak-recovery
+git-multibranch
+gpt2-codegolf
+headless-terminal
+hf-model-inference
+install-windows-3.11
+kv-store-grpc
+large-scale-text-editing
+largest-eigenval
+llm-inference-batching-scheduler
+log-summary-date-ranges
+mailman
+make-doom-for-mips
+make-mips-interpreter
+mcmc-sampling-stan
+merge-diff-arc-agi-task
+model-extraction-relu-logits
+modernize-scientific-stack
+mteb-leaderboard
+mteb-retrieve
+multi-source-data-merger
+nginx-request-logging
+openssl-selfsigned-cert
+overfull-hbox
+password-recovery
+path-tracing
+path-tracing-reverse
+polyglot-c-py
+polyglot-rust-c
+portfolio-optimization
+protein-assembly
+prove-plus-comm
+pypi-server
+pytorch-model-cli
+pytorch-model-recovery
+qemu-alpine-ssh
+qemu-startup
+query-optimize
+raman-fitting
+regex-chess
+regex-log
+reshard-c4-data
+rstan-to-pystan
+sam-cell-seg
+sanitize-git-repo
+schemelike-metacircular-eval
+sparql-university
+sqlite-db-truncate
+sqlite-with-gcov
+torch-pipeline-parallelism
+torch-tensor-parallelism
+train-fasttext
+tune-mjcf
+video-processing
+vulnerable-secret
+winning-avg-corewars
+write-compressor`
+
+func TestSubmitTerminalEvalCanonicalCheckpointDryRunPartitionsExactTaskSet(t *testing.T) {
+	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
+	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
+	payloadPath := filepath.Join(t.TempDir(), "canonical-batch.json")
+
+	var networkCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		networkCalls.Add(1)
+		http.Error(w, "canonical dry-run must not submit", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	err := submitTerminalEval(parseArgs([]string{
+		"eval", "terminal", "submit", runDir,
+		"--dataset", terminalBench21Dataset,
+		"--hf-id", "fixture/model",
+		"--hardware", hardwarePath,
+		"--api-url", server.URL,
+		"--out", payloadPath,
+		"--dry-run", "--quiet",
+	}))
+	if err != nil {
+		t.Fatalf("submit canonical dry-run: %v", err)
+	}
+	if got := networkCalls.Load(); got != 0 {
+		t.Fatalf("canonical dry-run made %d network requests, want none", got)
+	}
+
+	batch := readTerminalSubmitBatch(t, payloadPath)
+	if batch["dataset"] != terminalBench21Dataset {
+		t.Fatalf("batch dataset = %#v, want %q", batch["dataset"], terminalBench21Dataset)
+	}
+	shards := anySlice(batch["shards"])
+	if len(shards) != terminalBench21ShardCount {
+		t.Fatalf("batch contains %d shards, want %d", len(shards), terminalBench21ShardCount)
+	}
+	wantSizes := []int{8, 9, 9, 9, 9, 9, 9, 9, 9, 9}
+	flattened := make([]string, 0, len(canonicalIDs))
+	offset := 0
+	for i, rawShard := range shards {
+		payload := asObject(rawShard)
+		wantIDs := canonicalIDs[offset : offset+wantSizes[i]]
+		assertTerminalShardPayload(t, payload, i+1, wantIDs)
+		runConfig := asObject(payload["runConfig"])
+		if runConfig["tasksRun"] != float64(wantSizes[i]) {
+			t.Fatalf("shard %d tasksRun = %#v, want %d", i+1, runConfig["tasksRun"], wantSizes[i])
+		}
+		if runConfig["fullCheckpoint"] != true || runConfig["fullCheckpointTasksRun"] != float64(89) {
+			t.Fatalf("shard %d full-checkpoint provenance = %#v, want full 89-task source", i+1, runConfig)
+		}
+		for _, result := range anySlice(payload["results"]) {
+			flattened = append(flattened, stringValue(asObject(result)["question_id"]))
+		}
+		offset += wantSizes[i]
+	}
+	if offset != 89 || len(flattened) != 89 {
+		t.Fatalf("partitioned task total = offset %d, flattened %d; want exactly 89", offset, len(flattened))
+	}
+	if !reflect.DeepEqual(flattened, canonicalIDs) {
+		t.Fatalf("flattened shard task IDs do not equal the exact canonical sorted set\ngot:  %q\nwant: %q", flattened, canonicalIDs)
+	}
+}
+
+func TestSubmitTerminalEvalRejectsNonCanonicalTerminalBench21TaskSets(t *testing.T) {
+	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
+	tests := []struct {
+		name        string
+		taskIDs     []string
+		wantMissing []string
+		wantExtra   []string
+	}{
+		{
+			name:        "missing canonical task",
+			taskIDs:     append([]string(nil), canonicalIDs[:len(canonicalIDs)-1]...),
+			wantMissing: []string{canonicalIDs[len(canonicalIDs)-1]},
+			wantExtra:   []string{},
+		},
+		{
+			name: "substituted task id",
+			taskIDs: func() []string {
+				ids := append([]string(nil), canonicalIDs...)
+				ids[len(ids)/2] = "substituted-noncanonical-task"
+				return ids
+			}(),
+			wantMissing: []string{canonicalIDs[len(canonicalIDs)/2]},
+			wantExtra:   []string{"substituted-noncanonical-task"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, tc.taskIDs, true)
+			err := submitTerminalEval(parseArgs([]string{
+				"eval", "terminal", "submit", runDir,
+				"--dataset", terminalBench21Dataset,
+				"--hf-id", "fixture/model",
+				"--hardware", hardwarePath,
+				"--dry-run", "--quiet",
+			}))
+			var cliErr cliError
+			if !errors.As(err, &cliErr) || cliErr.Code != "checkpoint_task_set_mismatch" {
+				t.Fatalf("error = %#v, want checkpoint_task_set_mismatch", err)
+			}
+			details := asObject(cliErr.Details)
+			if !reflect.DeepEqual(details["missingTaskIds"], tc.wantMissing) {
+				t.Fatalf("missing task IDs = %#v, want %#v", details["missingTaskIds"], tc.wantMissing)
+			}
+			if !reflect.DeepEqual(details["extraTaskIds"], tc.wantExtra) {
+				t.Fatalf("extra task IDs = %#v, want %#v", details["extraTaskIds"], tc.wantExtra)
+			}
+		})
+	}
+}
+
+func TestSubmitTerminalEvalExplicitCanonicalShardWritesIsolatedCheckpointPayload(t *testing.T) {
+	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
+	firstShardEnd := len(canonicalIDs) / terminalBench21ShardCount
+	if firstShardEnd != 8 {
+		t.Fatalf("canonical first shard size = %d, want 8", firstShardEnd)
+	}
+	wantIDs := canonicalIDs[:firstShardEnd]
+	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, wantIDs, true)
+	payloadPath := filepath.Join(t.TempDir(), "isolated-shard.json")
+	err := submitTerminalEval(parseArgs([]string{
+		"eval", "terminal", "submit", runDir,
+		"--dataset", terminalBench21Dataset,
+		"--shard-index", "1",
+		"--hf-id", "fixture/model",
+		"--hardware", hardwarePath,
+		"--out", payloadPath,
+		"--dry-run", "--quiet",
+	}))
+	if err != nil {
+		t.Fatalf("submit explicit canonical shard: %v", err)
+	}
+
+	batch := readTerminalSubmitBatch(t, payloadPath)
+	shards := anySlice(batch["shards"])
+	if len(shards) != 1 {
+		t.Fatalf("explicit checkpoint payload count = %d, want one isolated shard", len(shards))
+	}
+	payload := asObject(shards[0])
+	assertTerminalShardPayload(t, payload, 1, wantIDs)
+	if got := asObject(payload["runConfig"])["fullCheckpoint"]; got != false {
+		t.Fatalf("explicit shard fullCheckpoint = %#v, want false", got)
+	}
+}
+
+func TestSubmitTerminalEvalCustomDatasetRequiresShardIndex(t *testing.T) {
+	runDir := t.TempDir()
+	err := submitTerminalEval(parseArgs([]string{
+		"eval", "terminal", "submit", runDir,
+		"--dataset", "custom-terminal-dataset",
+		"--dry-run", "--quiet",
+	}))
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "missing_shard_index" {
+		t.Fatalf("error = %#v, want missing_shard_index", err)
+	}
+	if got := asObject(cliErr.Details)["dataset"]; got != "custom-terminal-dataset" {
+		t.Fatalf("missing_shard_index dataset evidence = %#v, want custom-terminal-dataset", got)
+	}
+}
+
+func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *testing.T) {
+	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
+	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
+	var requestCount atomic.Int32
+	var received [terminalBench21ShardCount]atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := int(requestCount.Add(1)) - 1
+		var payload struct {
+			ShardIndex int `json:"shardIndex"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode shard request %d: %v", call+1, err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if call < len(received) {
+			received[call].Store(int32(payload.ShardIndex))
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("request %d method = %s, want POST", call+1, r.Method)
+		}
+		if payload.ShardIndex == 3 {
+			http.Error(w, "synthetic shard failure", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"run":{"id":"accepted","status":"approved"}}`))
+	}))
+	defer server.Close()
+
+	err := submitTerminalEval(parseArgs([]string{
+		"eval", "terminal", "submit", runDir,
+		"--dataset", terminalBench21Dataset,
+		"--hf-id", "fixture/model",
+		"--hardware", hardwarePath,
+		"--api-url", server.URL,
+		"--api-key", "fixture-key",
+		"--quiet",
+	}))
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "terminal_submit_shard_failed" {
+		t.Fatalf("error = %#v, want terminal_submit_shard_failed", err)
+	}
+	if got := requestCount.Load(); got != 3 {
+		t.Fatalf("submission request count = %d, want exactly 3 (stop after shard 3)", got)
+	}
+	for i, want := range []int32{1, 2, 3} {
+		if got := received[i].Load(); got != want {
+			t.Fatalf("submission request %d carried shardIndex %d, want %d", i+1, got, want)
+		}
+	}
+	details := asObject(cliErr.Details)
+	if details["failedShardIndex"] != 3 {
+		t.Fatalf("failed shard evidence = %#v, want 3", details["failedShardIndex"])
+	}
+	if !reflect.DeepEqual(details["completedShardIndexes"], []int{1, 2}) {
+		t.Fatalf("completed shard evidence = %#v, want [1 2]", details["completedShardIndexes"])
+	}
+}
+
+func terminalBench21CanonicalTestTaskIDs(t *testing.T) []string {
+	t.Helper()
+	ids := strings.Fields(terminalBench21CanonicalTestTaskIDsText)
+	if len(ids) != 89 {
+		t.Fatalf("canonical test fixture contains %d task IDs, want exactly 89", len(ids))
+	}
+	return ids
+}
+
+func writeTerminalCheckpointSetFixture(t *testing.T, taskIDs []string, reverseSummary bool) (runDir, hardwarePath string) {
+	t.Helper()
+	runDir = t.TempDir()
+	hardwarePath = filepath.Join(t.TempDir(), "hardware.json")
+	writeTerminalTestJSON(t, hardwarePath, map[string]any{"hwClass": "CPU_ONLY", "cpu": "Fixture CPU", "ramGb": 32})
+	summary := make([]any, 0, len(taskIDs))
+	for offset := range taskIDs {
+		i := offset
+		if reverseSummary {
+			i = len(taskIDs) - 1 - offset
+		}
+		id := taskIDs[i]
+		passed := i%3 != 0
+		summary = append(summary, map[string]any{
+			"index": i + 1, "total": len(taskIDs), "task": id, "out": id + ".json", "pass": passed, "scored": true,
+		})
+		writeTerminalTestJSON(t, filepath.Join(runDir, id+".json"), map[string]any{"results": []any{map[string]any{
+			"question_id": id,
+			"pass":        passed,
+			"scored":      true,
+			"wallTimeMs":  i + 1,
+			"question":    "Question for " + id,
+			"prompt":      "Prompt for " + id,
+			"response":    "Response for " + id,
+			"tokenUsage":  map[string]any{"inputTokens": 1, "outputTokens": 1, "totalTokens": 2, "modelCalls": 1},
+		}}})
+	}
+	writeTerminalTestJSON(t, filepath.Join(runDir, "summary.json"), summary)
+	return runDir, hardwarePath
+}
+
+func readTerminalSubmitBatch(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read terminal submit batch: %v", err)
+	}
+	var batch map[string]any
+	if err := json.Unmarshal(data, &batch); err != nil {
+		t.Fatalf("decode terminal submit batch: %v", err)
+	}
+	return batch
+}
+
+func assertTerminalShardPayload(t *testing.T, payload map[string]any, wantShardIndex int, wantIDs []string) {
+	t.Helper()
+	if payload["shardIndex"] != float64(wantShardIndex) {
+		t.Fatalf("shardIndex = %#v, want %d", payload["shardIndex"], wantShardIndex)
+	}
+	results := anySlice(payload["results"])
+	artifacts := anySlice(payload["artifacts"])
+	if len(results) != len(wantIDs) || len(artifacts) != len(wantIDs) {
+		t.Fatalf("shard %d sizes = results %d, artifacts %d; want %d each", wantShardIndex, len(results), len(artifacts), len(wantIDs))
+	}
+	for i, wantID := range wantIDs {
+		result := asObject(results[i])
+		artifact := asObject(artifacts[i])
+		if got := stringValue(result["question_id"]); got != wantID {
+			t.Fatalf("shard %d result %d question_id = %q, want %q", wantShardIndex, i, got, wantID)
+		}
+		if got := stringValue(artifact["question_id"]); got != wantID {
+			t.Fatalf("shard %d artifact %d question_id = %q, want %q", wantShardIndex, i, got, wantID)
+		}
+		if artifact["itemIndex"] != float64(i) {
+			t.Fatalf("shard %d artifact %q itemIndex = %#v, want local index %d", wantShardIndex, wantID, artifact["itemIndex"], i)
+		}
+	}
 }
