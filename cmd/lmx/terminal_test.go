@@ -2051,3 +2051,549 @@ func assertTerminalShardPayload(t *testing.T, payload map[string]any, wantShardI
 		}
 	}
 }
+
+type terminalTestRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn terminalTestRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+func terminalTestHTTPResponse(request *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    request,
+	}
+}
+
+func TestTerminalUXEndpointFileDecodesSelectedEndpointMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "endpoint.json")
+	writeTerminalTestJSON(t, path, map[string]any{"endpoints": []any{
+		map[string]any{"ok": false, "baseUrl": "http://ignored.invalid", "servedModel": "ignored"},
+		map[string]any{
+			"ok":          true,
+			"baseUrl":     "http://selected.test/v1",
+			"servedModel": "selected-alias",
+			"serverMetadata": map[string]any{
+				"quantization": "Q5_K_M",
+				"model_path":   "/models/selected-model-Q5_K_M.gguf",
+			},
+		},
+	}})
+
+	metadata, err := loadTerminalEndpointFile(path)
+	if err != nil {
+		t.Fatalf("loadTerminalEndpointFile: %v", err)
+	}
+	if metadata.baseURL != "http://selected.test/v1" || metadata.servedModel != "selected-alias" {
+		t.Fatalf("selected endpoint identity = %#v", metadata)
+	}
+	if metadata.quantization != "Q5_K_M" || metadata.modelPath != "/models/selected-model-Q5_K_M.gguf" {
+		t.Fatalf("selected endpoint model metadata = %#v", metadata)
+	}
+}
+
+func TestTerminalUXEndpointFileRejectsZeroOrMultipleHealthyEndpoints(t *testing.T) {
+	tests := []struct {
+		name     string
+		items    []any
+		wantCode string
+	}{
+		{
+			name: "zero healthy",
+			items: []any{
+				map[string]any{"ok": false, "baseUrl": "http://one.test"},
+				map[string]any{"ok": false, "baseUrl": "http://two.test"},
+			},
+			wantCode: "endpoint_file_no_selection",
+		},
+		{
+			name: "multiple healthy",
+			items: []any{
+				map[string]any{"ok": true, "baseUrl": "http://one.test"},
+				map[string]any{"ok": true, "baseUrl": "http://two.test"},
+			},
+			wantCode: "endpoint_file_ambiguous",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "endpoint.json")
+			writeTerminalTestJSON(t, path, map[string]any{"endpoints": tc.items})
+			_, err := loadTerminalEndpointFile(path)
+			var cliErr cliError
+			if !errors.As(err, &cliErr) || cliErr.Code != tc.wantCode {
+				t.Fatalf("error = %#v, want cliError code %q", err, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestTerminalUXAutoDiscoverySelectsUniqueHealthyCandidateWithoutNetwork(t *testing.T) {
+	originalClient := apiHTTPClient
+	t.Cleanup(func() { apiHTTPClient = originalClient })
+	requests := []string{}
+	apiHTTPClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests = append(requests, request.URL.String())
+		if request.URL.Host == "localhost:8000" {
+			return terminalTestHTTPResponse(request, http.StatusOK, `{"data":[{"id":"fixture-model","quantization":"Q6_K"}]}`), nil
+		}
+		return nil, errors.New("fixture endpoint unavailable")
+	})}
+
+	baseURL, servedModel, info, err := discoverTerminalEndpoint(parseArgs([]string{"--quiet"}), "")
+	if err != nil {
+		t.Fatalf("discoverTerminalEndpoint: %v", err)
+	}
+	if baseURL != "http://localhost:8000" || servedModel != "fixture-model" || stringValue(info["quantization"]) != "Q6_K" {
+		t.Fatalf("discovery result = (%q, %q, %#v)", baseURL, servedModel, info)
+	}
+	wantRequests := []string{
+		"http://localhost:8080/v1/models",
+		"http://localhost:8000/v1/models",
+		"http://localhost:11434/v1/models",
+		"http://127.0.0.1:30000/v1/models",
+	}
+	if !reflect.DeepEqual(requests, wantRequests) {
+		t.Fatalf("discovery requests = %#v, want %#v", requests, wantRequests)
+	}
+}
+
+func TestTerminalUXAutoDiscoveryRejectsCredentialsWithoutExplicitTarget(t *testing.T) {
+	originalClient := apiHTTPClient
+	t.Cleanup(func() { apiHTTPClient = originalClient })
+	var networkCalls atomic.Int32
+	apiHTTPClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		networkCalls.Add(1)
+		return nil, fmt.Errorf("credentials must not be broadcast to %s", request.URL)
+	})}
+
+	_, _, _, err := discoverTerminalEndpoint(parseArgs([]string{"--model-api-key", "secret"}), "fixture-model")
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "endpoint_credentials_require_explicit_target" {
+		t.Fatalf("error = %#v, want endpoint_credentials_require_explicit_target", err)
+	}
+	if networkCalls.Load() != 0 {
+		t.Fatalf("credentialed auto-discovery made %d requests", networkCalls.Load())
+	}
+}
+
+func TestTerminalUXEndpointSelectionRejectsFileAndBaseTogether(t *testing.T) {
+	err := runTerminalEval(parseArgs([]string{
+		"eval", "terminal", "run", "--task-dir", t.TempDir(),
+		"--endpoint-file", "endpoint.json", "--base-url", "http://model.test",
+	}), false)
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "endpoint_selection_conflict" {
+		t.Fatalf("error = %#v, want endpoint_selection_conflict", err)
+	}
+}
+
+func TestTerminalUXEndpointMetadataRejectsExplicitConflicts(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		field           string
+		explicit, live  string
+		compareFilename bool
+	}{
+		{name: "model path", field: "model-path", explicit: "/models/explicit.gguf", live: "/models/live.gguf", compareFilename: true},
+		{name: "quantization", field: "quantization", explicit: "Q8_0", live: "Q4_K_M"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := reconcileTerminalEndpointField(tc.field, tc.explicit, tc.live, tc.compareFilename)
+			var cliErr cliError
+			if !errors.As(err, &cliErr) || cliErr.Code != "endpoint_metadata_conflict" {
+				t.Fatalf("error = %#v, want endpoint_metadata_conflict", err)
+			}
+		})
+	}
+}
+
+func TestTerminalUXEndpointMetadataAcceptsMatchingExplicitFallbacks(t *testing.T) {
+	modelPath, err := reconcileTerminalEndpointField("model-path", "/client/path/model-Q5_K_M.gguf", "/server/path/model-Q5_K_M.gguf", true)
+	if err != nil || modelPath != "/server/path/model-Q5_K_M.gguf" {
+		t.Fatalf("matching model filename reconciliation = (%q, %v)", modelPath, err)
+	}
+	quantization, err := reconcileTerminalEndpointField("quantization", "q5_k_m", "Q5_K_M", false)
+	if err != nil || quantization != "Q5_K_M" {
+		t.Fatalf("matching quantization reconciliation = (%q, %v)", quantization, err)
+	}
+}
+
+func TestTerminalUXEndpointFileReconcilesLiveMetadataAndCompletionIsNonSubmit(t *testing.T) {
+	bundleDir := t.TempDir()
+	mustMkdir(t, filepath.Join(bundleDir, "tests"))
+	writeTerminalTestJSON(t, filepath.Join(bundleDir, "task.json"), map[string]any{
+		"id": "endpoint-reconciliation", "version": "2.1", "instruction": "Exercise endpoint reconciliation.", "source": "terminal-bench/endpoint-reconciliation",
+		"image":    map[string]any{"prebuilt": "fixture-image"},
+		"agent":    map[string]any{"timeoutSec": 30, "maxTurns": 1},
+		"verifier": map[string]any{"timeoutSec": 30, "command": "bash /tests/test.sh", "rewardFile": "/logs/verifier/reward.txt"},
+	})
+	endpointFile := filepath.Join(t.TempDir(), "endpoint.json")
+	writeTerminalTestJSON(t, endpointFile, map[string]any{"endpoints": []any{map[string]any{
+		"ok": true, "baseUrl": "http://saved-endpoint.test", "servedModel": "explicit-alias", "quantization": "Q8_0", "modelPath": "/server/models/explicit-model-Q8_0.gguf",
+	}}})
+	out := filepath.Join(t.TempDir(), "completed.json")
+
+	binDir := t.TempDir()
+	dockerLog := filepath.Join(t.TempDir(), "docker.log")
+	dockerScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LMX_DOCKER_LOG\"\ncase \"$*\" in\n  *\"cat /logs/verifier/reward.json\"*) printf '{\"reward\":1}\\n' ;;\nesac\nexit 0\n"
+	mustWrite(t, filepath.Join(binDir, "docker"), dockerScript)
+	if err := os.Chmod(filepath.Join(binDir, "docker"), 0o755); err != nil {
+		t.Fatalf("make fake docker executable: %v", err)
+	}
+	t.Setenv("LMX_DOCKER_LOG", dockerLog)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	originalAPIClient := apiHTTPClient
+	originalDefaultClient := http.DefaultClient
+	t.Cleanup(func() {
+		apiHTTPClient = originalAPIClient
+		http.DefaultClient = originalDefaultClient
+	})
+	var endpointCalls atomic.Int32
+	apiHTTPClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.URL.Host == "saved-endpoint.test" && request.URL.Path == "/v1/models":
+			endpointCalls.Add(1)
+			return terminalTestHTTPResponse(request, http.StatusOK, `{"data":[{"id":"explicit-alias","quantization":"Q8_0","model_path":"/server/models/explicit-model-Q8_0.gguf"}]}`), nil
+		case request.URL.Host == "saved-endpoint.test" && request.URL.Path == "/props":
+			endpointCalls.Add(1)
+			return terminalTestHTTPResponse(request, http.StatusOK, `{"model_path":"/server/models/explicit-model-Q8_0.gguf","quantization":"Q8_0"}`), nil
+		case request.URL.Host == "localmaxxing.test" && request.URL.Path == "/api/models/search":
+			return terminalTestHTTPResponse(request, http.StatusOK, `{"models":[]}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected API request %s", request.URL)
+		}
+	})}
+	http.DefaultClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host == "saved-endpoint.test" && request.URL.Path == "/props" {
+			return terminalTestHTTPResponse(request, http.StatusOK, `{"model_path":"/server/models/explicit-model-Q8_0.gguf","quantization":"Q8_0"}`), nil
+		}
+		return nil, fmt.Errorf("unexpected default-client request %s", request.URL)
+	})}
+
+	stdout, err := captureTerminalTestStdout(t, func() error {
+		return runTerminalEval(parseArgs([]string{
+			"eval", "terminal", "run", "--task-dir", bundleDir,
+			"--endpoint-file", endpointFile,
+			"--served-model", "explicit-alias",
+			"--model", "explicit/model",
+			"--model-path", "/client/models/explicit-model-Q8_0.gguf",
+			"--quantization", "Q8_0", "--quant-format", "gguf",
+			"--api-url", "http://localmaxxing.test",
+			"--agent-cmd", "true", "--agent-name", "fixture-agent",
+			"--out", out, "--quiet",
+		}), false)
+	})
+	if err != nil {
+		t.Fatalf("runTerminalEval: %v", err)
+	}
+	if endpointCalls.Load() < 2 {
+		t.Fatalf("selected endpoint received %d metadata probes, want live models and props", endpointCalls.Load())
+	}
+	for _, want := range []string{"[localmaxxing] terminal_eval_complete", "Terminal execution completed; results were not submitted.", "Submit later with: lmx eval terminal submit"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("completion output missing %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "submitted successfully") {
+		t.Fatalf("non-submit completion claimed submission:\n%s", stdout)
+	}
+
+	var artifact map[string]any
+	data, readErr := os.ReadFile(out)
+	if readErr != nil {
+		t.Fatalf("read completed artifact: %v", readErr)
+	}
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		t.Fatalf("decode completed artifact: %v", err)
+	}
+	summary := asObject(artifact["summary"])
+	if summary["servedModel"] != "explicit-alias" || summary["quantization"] != "Q8_0" || summary["quantFormat"] != "gguf" {
+		t.Fatalf("reconciled endpoint metadata = %#v", summary)
+	}
+	resolution := asObject(summary["modelResolution"])
+	if resolution["loadedFilename"] != "explicit-model-Q8_0.gguf" || resolution["declaredBaseModel"] != "explicit/model" {
+		t.Fatalf("reconciled model identity metadata = %#v", resolution)
+	}
+	runConfig := asObject(summary["runConfig"])
+	if runConfig["modelEndpoint"] != "http://saved-endpoint.test" || runConfig["servedModelSource"] != "cli" {
+		t.Fatalf("run endpoint identity = %#v", runConfig)
+	}
+}
+
+func TestTerminalUXLoadedFilenameResolvesCanonicalHuggingFaceRepository(t *testing.T) {
+	originalAPIClient := apiHTTPClient
+	originalDefaultClient := http.DefaultClient
+	t.Cleanup(func() {
+		apiHTTPClient = originalAPIClient
+		http.DefaultClient = originalDefaultClient
+	})
+	var searchQuery string
+	apiHTTPClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/api/models/search" {
+			return nil, fmt.Errorf("unexpected LocalMaxxing request %s", request.URL)
+		}
+		searchQuery = request.URL.Query().Get("q")
+		return terminalTestHTTPResponse(request, http.StatusOK, `{"models":[{"hfId":"unsloth/Qwen3-8B-GGUF"}]}`), nil
+	})}
+	http.DefaultClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/api/models/unsloth/Qwen3-8B-GGUF" {
+			return nil, fmt.Errorf("unexpected HuggingFace request %s", request.URL)
+		}
+		return terminalTestHTTPResponse(request, http.StatusOK, `{"siblings":[{"rfilename":"Qwen3-8B-UD-Q4_K_XL.gguf"}]}`), nil
+	})}
+
+	args := parseArgs([]string{"--api-url", "http://localmaxxing.test", "--hf-api-url", "http://huggingface.test", "--quiet"})
+	resolved, metadata := resolveTerminalModelIdentity(args, "", "/models/Qwen3-8B-UD-Q4_K_XL.gguf", "v1_models", "/models/Qwen3-8B-UD-Q4_K_XL.gguf")
+	if resolved != "unsloth/Qwen3-8B-GGUF" {
+		t.Fatalf("resolved model = %q, want exact repository containing loaded filename", resolved)
+	}
+	if searchQuery != "Qwen3-8B" {
+		t.Fatalf("model search query = %q, want filename-derived Qwen3-8B", searchQuery)
+	}
+	if metadata["loadedFilename"] != "Qwen3-8B-UD-Q4_K_XL.gguf" || metadata["sourceRepoMatch"] != "exact_filename" || metadata["status"] != "source_repo_verified" {
+		t.Fatalf("model resolution metadata = %#v", metadata)
+	}
+}
+
+func TestTerminalUXMonolithicArtifactUsesSavedMetadataForOfflineDeferredSubmit(t *testing.T) {
+	artifactPath := writeTerminalMonolithicFixture(t)
+	payloadPath := filepath.Join(t.TempDir(), "payload.json")
+
+	originalAPIClient := apiHTTPClient
+	originalDefaultClient := http.DefaultClient
+	t.Cleanup(func() {
+		apiHTTPClient = originalAPIClient
+		http.DefaultClient = originalDefaultClient
+	})
+	var networkCalls atomic.Int32
+	denyNetwork := terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		networkCalls.Add(1)
+		return nil, fmt.Errorf("deferred submit must not access %s", request.URL)
+	})
+	apiHTTPClient = &http.Client{Transport: denyNetwork}
+	http.DefaultClient = &http.Client{Transport: denyNetwork}
+
+	binDir := t.TempDir()
+	dockerSentinel := filepath.Join(t.TempDir(), "docker-called")
+	mustWrite(t, filepath.Join(binDir, "docker"), "#!/bin/sh\nprintf called > \"$LMX_DOCKER_SENTINEL\"\nexit 99\n")
+	if err := os.Chmod(filepath.Join(binDir, "docker"), 0o755); err != nil {
+		t.Fatalf("make docker sentinel executable: %v", err)
+	}
+	t.Setenv("LMX_DOCKER_SENTINEL", dockerSentinel)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := submitTerminalEval(parseArgs([]string{
+		"eval", "terminal", "submit", artifactPath,
+		"--dry-run", "--out", payloadPath, "--quiet",
+	})); err != nil {
+		t.Fatalf("submitTerminalEval monolithic dry-run: %v", err)
+	}
+	if networkCalls.Load() != 0 {
+		t.Fatalf("deferred submit made %d model/API requests", networkCalls.Load())
+	}
+	if _, err := os.Stat(dockerSentinel); !os.IsNotExist(err) {
+		t.Fatalf("deferred submit accessed Docker/verifier execution: %v", err)
+	}
+
+	batch := readTerminalSubmitBatch(t, payloadPath)
+	if batch["dataset"] != "fixture-dataset" {
+		t.Fatalf("dataset = %#v, want saved fixture-dataset", batch["dataset"])
+	}
+	shards := anySlice(batch["shards"])
+	if len(shards) != 1 {
+		t.Fatalf("shard payload count = %d, want 1", len(shards))
+	}
+	payload := asObject(shards[0])
+	if payload["hfId"] != "fixture/saved-model" || payload["modelRevision"] != "saved-revision" || payload["shardIndex"] != float64(4) {
+		t.Fatalf("saved model/shard defaults = %#v", payload)
+	}
+	if payload["quantization"] != "Q5_K_M" || payload["quantFormat"] != "gguf" || payload["runnerVersion"] != "saved-runner" {
+		t.Fatalf("saved run metadata defaults = %#v", payload)
+	}
+	hardware := asObject(payload["hardware"])
+	if hardware["cpu"] != "Saved CPU" || hardware["ramGb"] != float64(64) {
+		t.Fatalf("saved hardware = %#v", hardware)
+	}
+	runConfig := asObject(payload["runConfig"])
+	if runConfig["agent"] != "saved-agent" || runConfig["sourceArtifactVersion"] != float64(2) || runConfig["sourceServedModel"] != "saved-served-model" {
+		t.Fatalf("saved/additive monolithic provenance = %#v", runConfig)
+	}
+	artifacts := anySlice(payload["artifacts"])
+	response := stringValue(asObject(artifacts[0])["response"])
+	if !strings.Contains(response, "SAVED_MONOLITHIC_RESPONSE") || !strings.Contains(response, "SAVED_MONOLITHIC_VERIFIER") {
+		t.Fatalf("monolithic response/verifier were not packaged: %q", response)
+	}
+}
+
+func TestTerminalUXMonolithicArtifactRejectsExplicitSavedMetadataConflicts(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "dataset", args: []string{"--dataset", "other-dataset"}},
+		{name: "hf id", args: []string{"--hf-id", "other/model"}},
+		{name: "model revision", args: []string{"--model-revision", "other-revision"}},
+		{name: "shard index", args: []string{"--shard-index", "3"}},
+		{name: "quantization", args: []string{"--quantization", "Q8_0"}},
+		{name: "quant format", args: []string{"--quant-format", "safetensors"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			artifactPath := writeTerminalMonolithicFixture(t)
+			argv := []string{"eval", "terminal", "submit", artifactPath, "--dry-run", "--quiet"}
+			argv = append(argv, tc.args...)
+			err := submitTerminalEval(parseArgs(argv))
+			var cliErr cliError
+			if !errors.As(err, &cliErr) || cliErr.Code != "checkpoint_metadata_conflict" {
+				t.Fatalf("error = %#v, want checkpoint_metadata_conflict", err)
+			}
+		})
+	}
+
+	t.Run("hardware", func(t *testing.T) {
+		artifactPath := writeTerminalMonolithicFixture(t)
+		hardwarePath := filepath.Join(t.TempDir(), "hardware.json")
+		writeTerminalTestJSON(t, hardwarePath, map[string]any{"hwClass": "CPU_ONLY", "cpu": "Different CPU", "ramGb": 64})
+		err := submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", artifactPath, "--hardware", hardwarePath, "--dry-run", "--quiet"}))
+		var cliErr cliError
+		if !errors.As(err, &cliErr) || cliErr.Code != "checkpoint_metadata_conflict" {
+			t.Fatalf("error = %#v, want checkpoint_metadata_conflict", err)
+		}
+	})
+}
+
+func TestTerminalUXLegacyCheckpointDirectoryRemainsAccepted(t *testing.T) {
+	runDir, _ := writeDeferredTerminalSubmitFixture(t)
+	source, err := loadTerminalDeferredSource(runDir)
+	if err != nil {
+		t.Fatalf("loadTerminalDeferredSource legacy directory: %v", err)
+	}
+	if source.monolithic || source.root == "" || len(source.entries) != 2 || len(source.results) != 0 {
+		t.Fatalf("legacy deferred source = %#v", source)
+	}
+	if source.entries[0].Task != "pass-task" || source.entries[1].Task != "fail-task" {
+		t.Fatalf("legacy summary entries = %#v", source.entries)
+	}
+}
+
+func TestTerminalUXFailureSummaryClassifiesOutcomesAndArtifactHints(t *testing.T) {
+	bundles := []terminalBundle{
+		{Task: terminalTask{ID: "passed"}},
+		{Task: terminalTask{ID: "model-error"}},
+		{Task: terminalTask{ID: "unscored"}},
+		{Task: terminalTask{ID: "timed-out"}},
+		{Task: terminalTask{ID: "turn-limit", Agent: terminalAgentConfig{MaxTurns: 3}}},
+		{Task: terminalTask{ID: "verifier-rejected"}},
+	}
+	results := []terminalTaskResult{
+		{scored: true, pass: true},
+		{errCode: "model_call_failed", errText: "endpoint returned 503", turns: 1},
+		{errText: "verifier never started", turns: 2},
+		{scored: true, agentOutcomeCode: "agent_timeout", agentOutcomeText: "external agent timed out before verification", turns: 1},
+		{scored: true, agentOutcomeCode: "max_turns_exhausted", agentOutcomeText: "agent exhausted its maximum turns before verifier success", turns: 3},
+		{scored: true, turns: 1},
+	}
+	stderr := captureTerminalTestStderr(t, func() {
+		printTerminalFailureSummary(
+			parseArgs([]string{"--json-status"}),
+			bundles,
+			results,
+			terminalConfig{maxTurns: 3},
+			"completed.json",
+		)
+	})
+	line := strings.TrimSpace(stderr)
+	var event map[string]any
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		t.Fatalf("decode terminal_failure_summary event %q: %v", line, err)
+	}
+	if event["event"] != "terminal_failure_summary" || event["failedTasks"] != float64(5) {
+		t.Fatalf("failure summary identity = %#v", event)
+	}
+	categories := asObject(event["categories"])
+	for _, category := range []string{"model_call_failed", "infrastructure_error", "agent_timeout", "max_turns_exhausted", "verifier_failed"} {
+		if categories[category] != float64(1) {
+			t.Fatalf("category %q count = %#v; all categories = %#v", category, categories[category], categories)
+		}
+	}
+	failures := anySlice(event["failures"])
+	if len(failures) != 5 {
+		t.Fatalf("failure rows = %d, want 5", len(failures))
+	}
+	byTask := map[string]map[string]any{}
+	for _, raw := range failures {
+		failure := asObject(raw)
+		byTask[stringValue(failure["taskId"])] = failure
+	}
+	if byTask["model-error"]["reason"] != "endpoint returned 503" || byTask["turn-limit"]["outcome"] != "max_turns_exhausted" {
+		t.Fatalf("classified failure rows = %#v", byTask)
+	}
+	if byTask["verifier-rejected"]["artifactHint"] != "completed.json#results[5]" {
+		t.Fatalf("artifact hint = %#v", byTask["verifier-rejected"])
+	}
+	if _, included := byTask["passed"]; included {
+		t.Fatalf("successful task appeared in failure summary: %#v", byTask["passed"])
+	}
+}
+
+func writeTerminalMonolithicFixture(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "completed-terminal-run.json")
+	writeTerminalTestJSON(t, path, map[string]any{
+		"summary": map[string]any{
+			"artifactVersion": 2,
+			"dataset":         "fixture-dataset",
+			"hfId":            "fixture/saved-model",
+			"modelRevision":   "saved-revision",
+			"shardIndex":      4,
+			"hardware":        map[string]any{"hwClass": "CPU_ONLY", "cpu": "Saved CPU", "ramGb": 64},
+			"quantization":    "Q5_K_M",
+			"quantFormat":     "gguf",
+			"agent":           "saved-agent",
+			"runnerVersion":   "saved-runner",
+			"servedModel":     "saved-served-model",
+			"declaredModel":   "fixture/saved-model",
+			"modelResolution": map[string]any{"status": "matched"},
+			"quantizationResolution": map[string]any{
+				"trusted": "Q5_K_M", "trustedSource": "endpoint_file",
+			},
+			"runConfig": map[string]any{"protocol": "react-shell", "modelEndpoint": "http://saved-endpoint.test"},
+		},
+		"results": []any{map[string]any{
+			"question_id": "saved-task", "pass": true, "scored": true,
+			"wallTimeMs": 125,
+			"tokenUsage": map[string]any{"inputTokens": 3, "outputTokens": 2, "totalTokens": 5, "modelCalls": 1},
+			"turns":      1, "question": "Saved question", "prompt": "Saved prompt",
+			"response": "SAVED_MONOLITHIC_RESPONSE", "verifierOutput": "SAVED_MONOLITHIC_VERIFIER",
+		}},
+	})
+	return path
+}
+
+func captureTerminalTestStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	original := os.Stderr
+	os.Stderr = writer
+	fn()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	os.Stderr = original
+	data, err := io.ReadAll(reader)
+	if closeErr := reader.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	return string(data)
+}

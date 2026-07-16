@@ -34,6 +34,7 @@ import (
 const defaultAPIURL = "https://www.localmaxxing.com"
 const defaultHFAPIURL = "https://huggingface.co"
 const defaultEndpointTimeout = 10 * time.Minute
+const defaultMetadataRequestTimeout = 30 * time.Second
 const remoteKVCacheColdMethodology = "Single streaming request with inline filler padded to target context size; measures cold prefill + decode at that context depth."
 const remoteKVCacheReuseMethodology = "Two-step remote cache-reuse probe: pre-warm target context, then time a streaming request with the same prefix plus probe; measures cached-prefix decode at that context depth."
 const remoteKVCacheFallbackWarning = "Remote OpenAI-compatible endpoints do not provide a portable persistent KV-cache session API; this sweep resends the full prefix at each depth and can only verify cache reuse when backend-specific cache metrics are exposed. Results may fall back to cold depth TPS instead of retained KV-cache TPS."
@@ -6113,7 +6114,13 @@ func copyKnownMetaFields(dst, src map[string]any) {
 }
 
 func fetchEndpointJSON(rawURL, apiKey string) (any, error) {
-	req, err := http.NewRequest("GET", rawURL, nil)
+	return fetchEndpointJSONWithTimeout(rawURL, apiKey, defaultMetadataRequestTimeout)
+}
+
+func fetchEndpointJSONWithTimeout(rawURL, apiKey string, timeout time.Duration) (any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -6129,7 +6136,7 @@ func fetchEndpointJSON(rawURL, apiKey string) (any, error) {
 		return nil, fmt.Errorf("%s returned %s", rawURL, res.Status)
 	}
 	var body any
-	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 4*1024*1024)).Decode(&body); err != nil {
 		return nil, err
 	}
 	return body, nil
@@ -10443,10 +10450,17 @@ var usageExamples = []string{
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --missing-only --submit`,
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --all-missing --submit`,
 	`lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1`,
-	`lmx eval terminal verify ./tb-bundles/smoke --oracle`,
+	`lmx eval terminal import ./terminal-bench-tasks/smoke --out ./tb-bundles --version 2.1`,
+	`lmx eval terminal verify ./tb-bundles/smoke`,
+	`lmx eval terminal verify ./tb-bundles/smoke --trace-dir ./oracle-traces --out oracle-results.json`,
+	`lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com`,
 	`lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com --verify-bundles --json`,
-	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
-	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-batch.json`,
+	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --model Qwen/Qwen3-8B --hardware hardware.json`,
+	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json`,
+	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --base-url http://localhost:8000 --served-model Qwen3-8B --model Qwen/Qwen3-8B --hardware hardware.json --shard 3 --concurrency 2 --trace-dir ./terminal-traces --submit`,
+	`lmx eval terminal run --task-dir ./tb-bundles/smoke --base-url http://localhost:8000 --model Qwen/Qwen3-8B --trace-dir ./terminal-traces --out completed-terminal-run.json`,
+	`lmx eval terminal submit ./completed-terminal-run.json --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-batch.json`,
+	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --api-url https://www.localmaxxing.com`,
 	`lmx eval terminal submit ./completed-terminal-shard --dataset <slug> --shard-index 3 --hf-id Qwen/Qwen3-8B --hardware hardware.json --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-batch.json`,
 	`lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`,
 	`lmx benchmark fixup runs/Model/run.json`,
@@ -10497,6 +10511,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --top-p <f>              Sampling top_p for eval-shard runs (default: 1)
   --quant-format <label>   Quantization container format for eval-shard submit (auto-detected as "gguf" from the model path; override if needed)
   --model-revision <rev>   Model revision for eval-shard submit (default: main)
+  --endpoint-file <path>  Endpoint discovery JSON written by lmx endpoint discover --out
   --base-url <url>         OpenAI-compatible model endpoint; accepts host or host/v1
   --mode <mode>            Benchmark mode: remote endpoint or local host command
   --served-model <name>    Model name served by the OpenAI-compatible endpoint
@@ -10615,13 +10630,94 @@ var commandDescriptions = map[string]string{
 	"eval submit":            "Submit a previously saved run payload (deferred submit).",
 	"eval shard":             "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
 	"eval shard status":      "Print aggregate shard coverage and missing shard indexes for a model.",
-	"eval terminal":          "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
-	"eval terminal inspect":  "Validate all terminal dataset shards and optionally download bundles without executing tasks.",
-	"eval terminal submit":   "Validate a completed terminal checkpoint, batch canonical Terminal-Bench 2.1 into 10 shards, or submit one explicit --shard-index.",
+	"eval terminal":          "Import, inspect, run, verify, and submit Terminal-Bench task bundles.",
+	"eval terminal import":   "Convert one Harbor task directory or a parent of Harbor tasks into local Terminal-Bench bundles; this does not execute tasks.",
+	"eval terminal inspect":  "Check every declared dataset shard and manifest without Docker, model, verifier, or submission activity; optionally download and validate every bundle.",
+	"eval terminal run":      "Execute Terminal-Bench tasks with Docker from a public LocalMaxxing dataset or local bundles. --api-url selects LocalMaxxing; an uncredentialed run may auto-discover exactly one healthy localhost model endpoint, otherwise select one with --base-url or --endpoint-file. The selected endpoint is live-probed, explicit --served-model must match it, credentialed endpoints are never auto-probed, and HuggingFace auto-resolution requires an exact verified loaded filename source.",
+	"eval terminal submit":   "Validate and submit a completed terminal run JSON file or legacy checkpoint directory. Authoritative saved dataset/model/hardware/quantization metadata makes the matching flags optional; conflicting explicit flags fail. --dry-run is entirely offline and never contacts LocalMaxxing, Docker, a model, or a verifier.",
+	"eval terminal verify":   "Execute the bundled reference solution and verifier for one local bundle or bundle directory; no model endpoint is used.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",
 	"auth":                   "Manage LocalMaxxing API authentication.",
 	"server":                 "Build or run local model server commands.",
+}
+
+var commandOptions = map[string][]string{
+	"eval terminal import": {
+		"--out <dir>                 Required destination for converted task bundle directories",
+		"--version <version>         task.json version assigned during conversion (default: 2.1)",
+	},
+	"eval terminal inspect": {
+		"--api-url <url>             Required LocalMaxxing origin that serves the dataset shards",
+		"--api-key <key>             Optional LocalMaxxing API key (or LMX_API_KEY/saved config)",
+		"--verify-bundles            Download, hash-check, safely extract, and validate every bundle",
+		"--json                      Print the readiness summary as JSON",
+		"--out <path>                Write the readiness summary JSON to a file",
+	},
+	"eval terminal run": {
+		"--api-url <url>             LocalMaxxing origin used to acquire public datasets and submit runs",
+		"--api-key <key>             LocalMaxxing API key required only with --submit",
+		"--task-dir <dir>            Run one local bundle or all bundles under a local directory",
+		"--dataset <slug>            Dataset identity for a local-bundle submission",
+		"--shard <index>             Select a public dataset shard",
+		"--questions <n>             Run only the first n tasks from the selected public shard",
+		"--task <id[,id...]>         Run only the named task IDs from the selected public shard",
+		"--endpoint-file <path>      Trusted discovery JSON selecting one endpoint; conflicts with --base-url",
+		"--base-url <url>            Explicit model endpoint; cannot be combined with --endpoint-file",
+		"--served-model <name>       Exact model id to select from the chosen endpoint's live /v1/models",
+		"--model-api-key <key>       Bearer token; requires explicit --base-url or trusted --endpoint-file",
+		"--model <hfId>              Authoritative canonical org/name; auto-resolution needs an exact verified loaded filename",
+		"--model-path <path>         Artifact path fallback; must agree when the live endpoint reports a path",
+		"--quantization <label>      Quantization fallback; must agree with live endpoint artifact metadata",
+		"--quant-format <format>     Quantization container format, such as gguf",
+		"--model-revision <rev>      Submitted model revision (default: main)",
+		"--hardware <path>           Hardware JSON required with --submit",
+		"--agent <name>              Built-in agent backend (terminus-2 is supported)",
+		"--agent-cmd <command>       External agent command receiving LMX_TERMINAL_* variables",
+		"--agent-name <name>         Submission label for an external agent",
+		"--agent-execution <mode>    External agent mode: host, container, or routed-shell",
+		"--container-base-url <url>  Model URL visible from task containers",
+		"--max-turns <n>             Agent turn cap (default: task manifest)",
+		"--agent-timeout <seconds>   Whole-agent timeout (default: at least four hours)",
+		"--command-timeout <seconds> Per-shell-command timeout",
+		"--endpoint-timeout-seconds <n> Model request timeout (default: 600)",
+		"--max-tokens <n>            Model completion cap (default: 16384; retry: 8192)",
+		"--temperature <f>           Model sampling temperature (default: 0)",
+		"--top-p <f>                 Model sampling top-p (default: 1)",
+		"--concurrency <n>           Parallel task workers (default: 1)",
+		"--shell-mode <mode>         Built-in harness shell: persistent or stateless",
+		"--cleanup-images            Remove locally built task images after each task",
+		"--trace-dir <dir>           Save per-task transcripts, verifier output, prompts, and logs",
+		"--out <path>                Write deferred-submit source JSON; submitting it never reruns tasks",
+		"--submit                    Submit the completed run to --api-url after execution",
+		"--notes <text>              Attach submission notes",
+		"--runner-version <version>  Custom runner/version provenance for submission",
+		"--oracle                    Run bundled reference solutions instead of a model (normally use verify)",
+		"--json                      Print the submission receipt as JSON",
+	},
+	"eval terminal submit": {
+		"--dataset <slug>            Dataset identity when the completed artifact does not save one",
+		"--shard-index <n>           Required for isolated/noncanonical checkpoints unless saved; omit for canonical batching",
+		"--hf-id <hfId>              Canonical HuggingFace ID when the completed artifact does not save one",
+		"--hardware <path>           Hardware JSON when the completed artifact does not save hardware",
+		"--quantization <label>      Uses saved metadata by default; an explicit value must match",
+		"--quant-format <format>     Uses saved metadata by default; an explicit value must match",
+		"--model-revision <rev>      Uses saved metadata, otherwise main; an explicit value must match",
+		"--agent-name <name>         Uses saved agent label by default; an explicit value must match",
+		"--runner-version <version>  Uses saved runner label by default; an explicit value must match",
+		"--notes <text>              Attach submission notes",
+		"--api-url <url>             LocalMaxxing origin used only for a real submission",
+		"--api-key <key>             LocalMaxxing API key for a real submission",
+		"--dry-run                   Validate and package entirely offline; make no network request",
+		"--out <path>                Write the validated shard payload batch JSON",
+	},
+	"eval terminal verify": {
+		"--concurrency <n>           Parallel bundle workers (default: 1)",
+		"--agent-timeout <seconds>   Reference-solution timeout (default: max(manifest, 14400))",
+		"--cleanup-images            Remove locally built task images after each task",
+		"--trace-dir <dir>           Save per-task solution transcripts and verifier output",
+		"--out <path>                Write the oracle verification result JSON",
+	},
 }
 
 func commandHelp(args cliArgs) (string, bool) {
@@ -10647,7 +10743,17 @@ func commandHelp(args cliArgs) (string, bool) {
 			b.WriteString(match)
 			b.WriteByte('\n')
 		}
-		b.WriteString("\nRun `lmx --help` for all commands and the full option list.")
+		if options := commandOptions[prefix]; len(options) > 0 {
+			b.WriteString("\nOptions:\n")
+			for _, option := range options {
+				b.WriteString("  ")
+				b.WriteString(option)
+				b.WriteByte('\n')
+			}
+			b.WriteString("\nRun `lmx --help` for all commands.")
+		} else {
+			b.WriteString("\nRun `lmx --help` for all commands and the full option list.")
+		}
 		return b.String(), true
 	}
 	return "", false

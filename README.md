@@ -308,6 +308,44 @@ lmx eval run my-judge-suite \
   --submit
 ```
 
+### Terminal-Bench
+
+```bash
+lmx endpoint discover --out endpoint.json --include-server-metadata
+lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com
+lmx eval terminal run terminal-bench-2-1 \
+  --api-url https://www.localmaxxing.com \
+  --endpoint-file endpoint.json \
+  --model Qwen/Qwen3-8B \
+  --hardware hardware.json \
+  --out completed-terminal-run.json
+lmx eval terminal submit completed-terminal-run.json \
+  --api-url https://www.localmaxxing.com \
+  --dry-run \
+  --out terminal-submit-batch.json
+lmx eval terminal submit completed-terminal-run.json \
+  --api-url https://www.localmaxxing.com \
+  --api-key "$LMX_API_KEY"
+```
+
+`run` executes tasks even without `--submit`; omitting `--submit` keeps the
+completed run local. Its `--out` JSON persists shard, resolved model,
+quantization, hardware, harness, timing, and token metadata and is direct input
+to deferred `submit`, so submission never requires running the tasks again.
+Deferred `submit --dry-run` only validates and packages that saved work offline.
+Legacy completed checkpoint directories are accepted by `submit` as well.
+
+For the built-in terminal agent, `--base-url` and `--endpoint-file` are mutually
+exclusive endpoint selectors. An endpoint file contributes only its one usable
+URL; model, path, and quantization are re-read from the live endpoint. With no
+selector, uncredentialed localhost probing must find one unambiguous match;
+`--model-api-key` instead requires an explicit URL or trusted endpoint file.
+Explicit `--served-model`, `--model-path`, `--quantization`, and canonical
+`--model` values are reconciled with live evidence and conflicts are rejected.
+Loaded-filename model resolution is accepted only when the exact filename is
+verified in one unambiguous HuggingFace source repo. Failed tasks are summarized
+by task, outcome, turns, reason, and their `--out` or `--trace-dir` artifact.
+
 ## Discover Models and Suites
 
 ```bash

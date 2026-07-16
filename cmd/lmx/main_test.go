@@ -2473,3 +2473,59 @@ func TestModelNameFromGGUFFilenameStripsVendorFPQuant(t *testing.T) {
 		}
 	}
 }
+
+func TestTerminalUXCommandLocalHelpShowsOnlyRelevantTerminalOptionsAndExamples(t *testing.T) {
+	tests := []struct {
+		command  []string
+		includes []string
+		excludes []string
+	}{
+		{
+			command:  []string{"eval", "terminal", "import", "--help"},
+			includes: []string{"Convert one Harbor task directory", "lmx eval terminal import", "--out <dir>", "--version <version>"},
+			excludes: []string{"lmx eval terminal run", "--endpoint-file", "--verify-bundles", "--hf-id"},
+		},
+		{
+			command:  []string{"eval", "terminal", "inspect", "--help"},
+			includes: []string{"without Docker, model, verifier, or submission activity", "lmx eval terminal inspect", "--api-url <url>", "--verify-bundles", "--json"},
+			excludes: []string{"lmx eval terminal run", "--base-url", "--endpoint-file", "--hf-id", "--submit"},
+		},
+		{
+			command:  []string{"eval", "terminal", "run", "--help"},
+			includes: []string{"--api-url selects LocalMaxxing", "auto-discover exactly one healthy localhost model endpoint", "otherwise select one with --base-url or --endpoint-file", "credentialed endpoints are never auto-probed", "lmx eval terminal run", "--endpoint-file <path>", "--model-path <path>", "--out <path>", "--submit"},
+			excludes: []string{"lmx eval terminal inspect", "lmx eval terminal submit", "--hf-id <hfId>", "--shard-index <n>", "--verify-bundles"},
+		},
+		{
+			command:  []string{"eval", "terminal", "submit", "--help"},
+			includes: []string{"completed terminal run JSON file or legacy checkpoint directory", "entirely offline", "lmx eval terminal submit", "--hf-id <hfId>", "--shard-index <n>", "--dry-run", "--api-url <url>"},
+			excludes: []string{"lmx eval terminal run", "--base-url", "--endpoint-file", "--task-dir", "--verify-bundles", "--oracle"},
+		},
+		{
+			command:  []string{"eval", "terminal", "verify", "--help"},
+			includes: []string{"reference solution and verifier", "lmx eval terminal verify", "--concurrency <n>", "--trace-dir <dir>", "--out <path>"},
+			excludes: []string{"lmx eval terminal run", "--api-url", "--base-url", "--endpoint-file", "--submit", "--hf-id"},
+		},
+	}
+	for _, tc := range tests {
+		name := strings.Join(tc.command[:3], "_")
+		t.Run(name, func(t *testing.T) {
+			text, ok := commandHelp(parseArgs(tc.command))
+			if !ok {
+				t.Fatalf("commandHelp did not recognize %q", strings.Join(tc.command[:3], " "))
+			}
+			for _, want := range tc.includes {
+				if !strings.Contains(text, want) {
+					t.Fatalf("focused help missing %q:\n%s", want, text)
+				}
+			}
+			for _, unwanted := range tc.excludes {
+				if strings.Contains(text, unwanted) {
+					t.Fatalf("focused help included sibling content %q:\n%s", unwanted, text)
+				}
+			}
+			if !strings.Contains(text, "Run `lmx --help` for all commands.") {
+				t.Fatalf("focused help missing global see-also:\n%s", text)
+			}
+		})
+	}
+}

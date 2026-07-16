@@ -28,14 +28,14 @@ Global/auth/output:
 - `--profile <name>`: load saved defaults from `lmx profile save`.
 - `--json-status`: emit progress events as JSON lines on stderr.
 - `--quiet`: suppress progress events.
-- `--out <path>`: write computed payload/result JSON, or write `SKILL.md` for `lmx skill print`.
+- `--out <path>`: write computed payload/result JSON, or write `SKILL.md` for `lmx skill print`. On `eval terminal run`, this is a monolithic completed-run artifact accepted directly by deferred `eval terminal submit`.
 - `--dir <dir>`: target skills directory for `lmx skill install`; default `.claude/skills`.
-- `--submit`: upload run to LocalMaxxing.
-- `--dry-run`: for benchmark run, write a measurement plan; for submit commands, authenticated API validation without creating a run.
+- `--submit`: upload run to LocalMaxxing. `eval terminal run` still executes when this is omitted; it only keeps the result local.
+- `--dry-run`: for benchmark run, write a measurement plan; for deferred `eval terminal submit`, validate/package the completed artifact entirely offline. It is not a no-execution mode for `eval terminal run`.
 
 Model/eval:
 
-- `--model <hfId>`: HuggingFace model ID.
+- `--model <hfId>`: HuggingFace model ID. Terminal run rejects it when it conflicts with a source repo unambiguously verified from the live loaded filename.
 - `--backend <name>`: lm-eval backend name; default `hf`.
 - `--model-args <args>`: lm-eval `--model_args` value.
 - `--num-fewshot <n>`: lm-eval `--num_fewshot` override.
@@ -66,7 +66,8 @@ Eval shards and Terminal-Bench:
 - `--task-dir <dir>`: Terminal eval bundle directory.
 - `--dataset <slug>`: Terminal eval dataset slug.
 - `--hf-id <hfId>`: canonical HuggingFace model ID for deferred terminal submit.
-- `--shard-index <n>`: explicit shard for an isolated deferred checkpoint; required for noncanonical datasets. Omit only for a complete canonical Terminal-Bench 2.1 checkpoint, which is validated and partitioned into 10 submissions.
+- `--endpoint-file <path>`: JSON written by `lmx endpoint discover --out endpoint.json`; Terminal run requires exactly one `ok:true` endpoint, uses the file only to select its URL, and re-probes live identity metadata. Mutually exclusive with `--base-url`.
+- `--shard-index <n>`: explicit shard for an isolated deferred artifact or legacy checkpoint directory; required for noncanonical datasets. Omit only for a complete canonical Terminal-Bench 2.1 checkpoint, which is validated and partitioned into 10 submissions.
 - `--max-turns <n>`: Terminal eval agent turn cap.
 - `--max-tokens <n>`: Terminal model completion cap; default 16,384 and 8,192 on retry. An explicit value applies to both attempts.
 - `--agent-timeout <sec>`: Terminal eval whole-agent timeout.
@@ -81,6 +82,7 @@ Eval shards and Terminal-Bench:
 - `--cleanup-images`: remove locally built terminal task images after each task.
 - `--shell-mode <mode>`: `persistent` or `stateless`; default `persistent`.
 - `--oracle`: run terminal task `solution/solve.sh` instead of the model agent.
+- Terminal `run --out` persists dataset/shard, canonical `hfId` and model-resolution evidence, model revision, quantization, hardware, harness configuration, timing, and token usage. Deferred submit reuses these authoritative values and rejects conflicting flags rather than rerunning work.
 - `--llama-scorer <path>`: local helper for `llama_cpp_loglikelihood` scoring.
 - `--sandbox-image <name>`: code sandbox image; default `lmx-sandbox`.
 - `--sandbox-runtime <bin>`: container runtime for code execution; default `docker`.
@@ -93,10 +95,10 @@ Eval shards and Terminal-Bench:
 
 Remote benchmark / endpoint:
 
-- `--base-url <url>`: OpenAI-compatible endpoint; accepts host or host plus `/v1`.
+- `--base-url <url>`: explicit OpenAI-compatible endpoint; accepts host or host plus `/v1`. Mutually exclusive with Terminal `--endpoint-file`. With neither selector, uncredentialed Terminal runs auto-probe supported localhost endpoints and require one unambiguous match.
 - `--mode <mode>`: `remote` endpoint or `local` host command.
-- `--served-model <name>`: model name served by endpoint.
-- `--model-api-key <key>`: optional bearer token for remote endpoint benchmarking.
+- `--served-model <name>`: exact live model selector for Terminal run; it must match `/v1/models`.
+- `--model-api-key <key>`: optional endpoint bearer token. For Terminal run it requires explicit `--base-url` or trusted `--endpoint-file`; credentials are never sent during broad auto-probing.
 - `--prompt <text>`: prompt for remote endpoint benchmark.
 - `--max-tokens <n>`: max generated tokens; remote benchmark default 256.
 - `--endpoint-timeout-seconds <n>`: remote endpoint timeout; default 600.
@@ -111,7 +113,7 @@ Local benchmark / server:
 - `--command-timeout-seconds <n>`: local benchmark command timeout; default unlimited.
 - `--host <addr>`: local model server host.
 - `--port <n>`: local model server port.
-- `--model-path <path>`: llama.cpp model path.
+- `--model-path <path>`: llama.cpp model artifact path. Terminal run reconciles an explicit value with the live loaded path and rejects conflicts. Canonical `hfId` auto-resolution is accepted only when the exact loaded filename is verified in one unambiguous HuggingFace source repo.
 - `--depth <n>`: llama-bench `-d` depth; KV sweeps use `--levels`.
 - `--batch-size <n>`: llama-bench batch size.
 - `--micro-batch-size <n>`: llama-bench micro-batch size.
@@ -153,7 +155,7 @@ KV-cache and saved runs:
 Hardware and submission metadata:
 
 - `--hardware <path>`: JSON hardware object required when submitting.
-- `--quantization <label>`: quantization label; free-form but common values are exposed by `lmx context` (`commonSchemas.benchmarkFields.quantization.commonValues`) and include GGUF (`Q4_K_M`, `IQ4_XS`), NVIDIA (`NVFP4`), Unsloth (`Unsloth-Dynamic-Q4_K_M`), bitsandbytes (`bnb-nf4`), AWQ/GPTQ/EXL2/FP8 variants. Auto-detected for some remote benchmark/eval-shard paths when omitted.
+- `--quantization <label>`: explicit quantization assertion; Terminal run reconciles it with the live loaded filename/endpoint metadata and rejects conflicts. Common values are exposed by `lmx context` (`commonSchemas.benchmarkFields.quantization.commonValues`) and include GGUF (`Q4_K_M`, `IQ4_XS`), NVIDIA (`NVFP4`), Unsloth (`Unsloth-Dynamic-Q4_K_M`), bitsandbytes (`bnb-nf4`), AWQ/GPTQ/EXL2/FP8 variants.
 - `--gpu-name <name>`: hardware template GPU name.
 - `--gpu-count <n>`: hardware template GPU count.
 - `--vram-gb <gb>`: hardware template VRAM in GB.
@@ -174,4 +176,5 @@ Hardware and submission metadata:
 - `missing_remote_hardware`: run `lmx hardware --out hardware.json` on the server and pass that file when submitting.
 - `lm-eval` not found: install it with `pip install lm-eval`, or pass `--lm-eval-bin <path>`.
 - Missing API key: run `lmx auth --key bhk_...`, set `LMX_API_KEY`, or pass `--api-key bhk_...`.
+- Terminal failures: the human summary lists task, outcome, turns, reason, and an `--out` result pointer or `--trace-dir` path; `--json-status` emits categorized `terminal_failure_summary` data.
 - Unknown enum or schema mismatch: refresh live metadata with `lmx context --out localmaxxing-agent-context.json`.

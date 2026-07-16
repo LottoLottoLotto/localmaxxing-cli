@@ -337,18 +337,42 @@ Verify a bundle with its oracle solution before scoring a model:
 lmx eval terminal verify ./tb-bundles/adaptive-rejection-sampler --oracle --out oracle.json
 ```
 
-Run local bundles against an OpenAI-compatible endpoint:
+Create a reusable endpoint selection file, then run local bundles without
+submitting:
 
 ```bash
+lmx endpoint discover --out endpoint.json --include-server-metadata
+
 lmx eval terminal run --task-dir ./tb-bundles \
   --api-url https://www.localmaxxing.com \
-  --base-url http://localhost:8000 \
+  --endpoint-file endpoint.json \
   --model Qwen/Qwen3-8B \
   --hardware hardware.json \
   --out terminal-run.json \
-  --trace-dir terminal-traces \
-  --dry-run
+  --trace-dir terminal-traces
 ```
+
+`eval terminal run` always executes the selected tasks. Omitting `--submit`
+means "execute and keep the result locally"; `--dry-run` is not a no-execution
+mode for this command. The JSON written by `--out` is a completed monolithic run
+artifact and can be passed directly to `eval terminal submit` later.
+
+For the built-in agent, `--base-url` and `--endpoint-file` are mutually
+exclusive endpoint selectors. The file must contain exactly one `ok:true`
+endpoint and contributes only that URL; the CLI re-probes its live `/v1/models`
+and optional `/props` state before execution. With neither selector and no
+`--model-api-key`, the CLI probes localhost ports 8080, 8000, 11434, and 30000
+and proceeds only when one endpoint matches unambiguously. Credentials disable
+broad auto-probing: `--model-api-key` requires an explicit `--base-url` or
+trusted `--endpoint-file`.
+
+`--served-model` is an exact live-model selector. Explicit `--model-path` and
+`--quantization` values are assertions reconciled with live endpoint metadata,
+not overrides; conflicts stop the run. A canonical `--model org/name` is also
+rejected if it conflicts with an exact source repo verified from the live loaded
+filename. Automatic canonical-HuggingFace resolution succeeds only when that
+exact filename is verified in one unambiguous candidate repo; otherwise the CLI
+does not guess, and submission requires the correct `--model org/name`.
 
 By default the built-in harness runs every turn in one persistent shell session
 (`docker exec -i <container> bash -l`), so `cd`, `export`, and `source` carry
@@ -380,6 +404,12 @@ inside each task. The CLI writes one subdirectory per `question_id` containing:
 - `agent/` — external-agent logs written via `LMX_TERMINAL_TRACE_DIR`, plus
   `usage.json` when the agent trace exposes model usage, when `--agent-cmd` is
   used.
+
+After execution, failures are grouped into categories such as verifier failure,
+agent timeout, maximum-turn exhaustion, and infrastructure/model errors. The
+human table shows each task, outcome, turns, reason, and its `--out` result
+pointer or `--trace-dir` path; `--json-status` emits the same details in the
+`terminal_failure_summary` event.
 
 Scoring follows harbor canonical verifier semantics: after the agent finishes,
 `tests/` is copied to `/tests` in the task container and the verifier command
@@ -415,24 +445,45 @@ lmx eval terminal inspect terminal-bench-2-1 \
   --json
 ```
 
-Run and submit the inspected public dataset against the separate model origin:
+Run the inspected public dataset against the separate model origin and save the
+completed shard without submitting it:
 
 ```bash
 lmx eval terminal run terminal-bench-2-1 \
   --api-url https://www.localmaxxing.com \
-  --base-url http://localhost:8000 \
+  --endpoint-file endpoint.json \
   --model Qwen/Qwen3-8B \
   --hardware hardware.json \
-  --submit
+  --out completed-terminal-run.json
 ```
 
+The monolithic artifact persists the dataset and selected shard, resolved
+canonical model identity and model-resolution evidence, quantization,
+model revision, hardware, agent/harness configuration, timing, and token usage.
+Validate that exact completed work offline, then submit the same file—no task,
+model call, Docker container, or verifier is run again:
 
-The approved `terminal-bench-2-1` dataset deterministically partitions its 89
-tasks into 10 disjoint shards. Each `eval terminal run` invocation acquires and
-submits one shard; repeat it to build full benchmark coverage. A complete
-89-task checkpoint produced by Harbor or another offline runner can be validated
-and partitioned into the same 10 shard submissions without rerunning tasks or
-contacting a model endpoint:
+```bash
+lmx eval terminal submit completed-terminal-run.json \
+  --api-url https://www.localmaxxing.com \
+  --dry-run \
+  --out terminal-submit-batch.json
+
+lmx eval terminal submit completed-terminal-run.json \
+  --api-url https://www.localmaxxing.com \
+  --api-key "$LMX_API_KEY"
+```
+
+Deferred `submit --dry-run` validates and packages the saved artifact entirely
+offline; unlike a non-submit `run`, it performs no expensive execution and no
+network request. It therefore cannot prove `--api-url` routing or production
+readiness, so use `eval terminal inspect` against that origin first. Saved
+dataset, shard, model, quantization, and hardware metadata are authoritative;
+omit repeated flags, or supply matching values. Conflicts are rejected.
+
+Legacy completed checkpoint directories remain accepted. A canonical full
+89-task Terminal-Bench 2.1 directory is validated and partitioned into the 10
+ordered shard payloads without rerunning tasks:
 
 ```bash
 lmx eval terminal submit ./completed-terminal-run \
@@ -446,21 +497,16 @@ lmx eval terminal submit ./completed-terminal-run \
   --out terminal-submit-batch.json
 ```
 
-The dry-run output is `{ "dataset": "terminal-bench-2-1", "shards": [...] }`
-with 10 ordered payloads carrying explicit `shardIndex` values. The CLI verifies
-the exact canonical 89-task ID set before partitioning. Deferred `--dry-run` is
-entirely offline: it proves the saved checkpoint and payload partition but cannot
-prove `--api-url` routing or production readiness. Inspect the batch, run
-`eval terminal inspect` against that LocalMaxxing origin, then remove `--dry-run`
-and provide `--api-key` (or `LMX_API_KEY`) to submit all 10 payloads sequentially.
-For a checkpoint that already contains one isolated shard, pass `--shard-index
-<n>`; other dataset slugs always require an explicit shard index. Deferred
-submission preserves shard-local and full-checkpoint token usage in `runConfig`
-and never starts Docker, reruns a verifier, or calls the model endpoint.
+For a legacy directory containing one isolated shard, pass `--shard-index <n>`;
+other dataset slugs also require an explicit shard index. Deferred submission
+preserves shard-local and full-checkpoint provenance and token totals in
+`runConfig`.
 
 `--api-url` always selects the LocalMaxxing dataset/submission origin;
-`--base-url` selects the OpenAI-compatible model inference origin. Keep both
-explicit in live-run commands rather than substituting one for the other.
+`--base-url` selects the OpenAI-compatible model inference origin. Keep
+`--api-url` explicit, and select model inference with either `--base-url` or a
+reviewed `--endpoint-file`, never both; never substitute the LocalMaxxing origin
+for the model origin.
 
 
 The built-in `--agent terminus-2` adapter is embedded in release binaries. It
@@ -477,8 +523,7 @@ lmx eval terminal run --task-dir ./tb-bundles \
   --agent-execution routed-shell \
   --model Qwen/Qwen3-8B \
   --hardware hardware.json \
-  --out terminal-run.json \
-  --dry-run
+  --out terminal-run.json
 ```
 
 `--agent-cmd` runs on the host after the task container starts and before the
@@ -649,7 +694,7 @@ Submitted suites may require approval before public runs can target them.
 
 ## 10. Safety Notes
 
-- Always run `--dry-run` before `--submit`.
+- For deferred `eval terminal submit`, use `--dry-run` to validate the completed artifact offline; for `eval terminal run`, omit `--submit` to execute without uploading.
 - Do not put gold answers inside `input`, `choices`, prompt text, or artifact text.
 - Structured fields such as `gold`, `answer`, and `referenceAnswer` are redacted from suite discovery output and eval run artifacts, but arbitrary prose cannot be reliably redacted.
 - Never commit API keys, `.env` files, or raw private eval datasets.
