@@ -10444,9 +10444,10 @@ var usageExamples = []string{
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --all-missing --submit`,
 	`lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1`,
 	`lmx eval terminal verify ./tb-bundles/smoke --oracle`,
-	`lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
-	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-batch.json`,
-	`lmx eval terminal submit ./completed-terminal-shard --dataset <slug> --shard-index 3 --hf-id Qwen/Qwen3-8B --hardware hardware.json --dry-run --out terminal-submit-batch.json`,
+	`lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com --verify-bundles --json`,
+	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
+	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-batch.json`,
+	`lmx eval terminal submit ./completed-terminal-shard --dataset <slug> --shard-index 3 --hf-id Qwen/Qwen3-8B --hardware hardware.json --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-batch.json`,
 	`lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`,
 	`lmx benchmark fixup runs/Model/run.json`,
 	`lmx hardware template --gpu-name "RTX 3090" --gpu-count 2 --vram-gb 24 --cpu "Ryzen 9 9950X" --ram-gb 96 --os Linux`,
@@ -10477,6 +10478,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --artifact-limit <n>     Shard traces to submit (default: 0 = all, for a complete whole-shard bundle; >0 keeps a balanced pass/fail sample)
   --task-dir <dir>        Terminal eval bundle directory (one bundle or parent of bundles)
   --dataset <slug>        Terminal eval dataset slug; required for deferred submit
+  --verify-bundles       Inspect: download and validate every referenced terminal bundle
   --max-turns <n>         Terminal eval agent turn cap (defaults to task manifest)
   --agent-timeout <sec>   Terminal eval whole-agent timeout (default: max(task manifest, 14400 = 4h))
   --agent <name>          Terminal eval built-in agent backend: terminus-2 uses Harbor Terminus-2
@@ -10557,6 +10559,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --unset <fields>         Comma-separated saved-run fields to remove
   --yes                    Confirm saved-run deletion
   --json-status            Emit progress events as JSON lines on stderr
+  --json                   Print a command's machine-readable JSON result
   --quiet                  Suppress progress events
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
   --hardware <path>        JSON hardware object required when submitting
@@ -10567,7 +10570,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --item-count <n>         Optional record/sample count for storage metadata
   --limit <n>              Optional search/list result limit
   --submit                 Upload run to LocalMaxxing
-  --dry-run                For update: print release asset plan; for benchmark run: write a measurement plan; for submit commands: authenticated API validation without creating a run
+  --dry-run                For deferred terminal submit: validate entirely offline; for other commands: validate or print a plan without creating a run
   --release-url <url>      Override release download base for lmx update (default: GitHub latest release)
   --include-server-metadata Probe optional endpoint /props and /hardware metadata during discover
   --gpu-name <name>       Hardware template GPU name
@@ -10613,6 +10616,7 @@ var commandDescriptions = map[string]string{
 	"eval shard":             "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
 	"eval shard status":      "Print aggregate shard coverage and missing shard indexes for a model.",
 	"eval terminal":          "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
+	"eval terminal inspect":  "Validate all terminal dataset shards and optionally download bundles without executing tasks.",
 	"eval terminal submit":   "Validate a completed terminal checkpoint, batch canonical Terminal-Bench 2.1 into 10 shards, or submit one explicit --shard-index.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",

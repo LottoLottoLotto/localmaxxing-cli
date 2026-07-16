@@ -3,13 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -949,27 +954,27 @@ func writeDeferredTerminalSubmitFixture(t *testing.T) (runDir, hardwarePath stri
 	})
 	verifier := "VERIFIER_HEAD_検証\n" + strings.Repeat("界", 4000) + "\nVERIFIER_TAIL_合格"
 	writeTerminalTestJSON(t, filepath.Join(runDir, "pass-task.json"), map[string]any{"results": []any{map[string]any{
-		"question_id": "pass-task",
-		"pass":        true,
-		"scored":      true,
-		"wallTimeMs":  100,
-		"tokenUsage":  map[string]any{"inputTokens": 11, "outputTokens": 7, "cacheReadTokens": 2, "cacheWriteTokens": 3, "totalTokens": 23, "modelCalls": 2},
-		"turns":       2,
-		"question":    "Pass question with café",
-		"prompt":      "Pass prompt",
-		"response":    "SAVED_PASS_RESPONSE_MUST_NOT_REPLACE_OMP",
+		"question_id":    "pass-task",
+		"pass":           true,
+		"scored":         true,
+		"wallTimeMs":     100,
+		"tokenUsage":     map[string]any{"inputTokens": 11, "outputTokens": 7, "cacheReadTokens": 2, "cacheWriteTokens": 3, "totalTokens": 23, "modelCalls": 2},
+		"turns":          2,
+		"question":       "Pass question with café",
+		"prompt":         "Pass prompt",
+		"response":       "SAVED_PASS_RESPONSE_MUST_NOT_REPLACE_OMP",
 		"verifierOutput": verifier,
 	}}})
 	writeTerminalTestJSON(t, filepath.Join(runDir, "fail-task.json"), map[string]any{"results": []any{map[string]any{
-		"question_id":   "fail-task",
-		"pass":          false,
-		"scored":        true,
-		"latencyMs":     200,
-		"tokenUsage":    map[string]any{"input_tokens": 5, "output_tokens": 3, "cache_read_tokens": 4, "cache_write_tokens": 1, "total_tokens": 13, "model_calls": 3},
-		"turns":         1,
-		"question":      "Fail question",
-		"prompt":        "Fail prompt",
-		"response":      "SAVED_FAIL_RESPONSE",
+		"question_id":    "fail-task",
+		"pass":           false,
+		"scored":         true,
+		"latencyMs":      200,
+		"tokenUsage":     map[string]any{"input_tokens": 5, "output_tokens": 3, "cache_read_tokens": 4, "cache_write_tokens": 1, "total_tokens": 13, "model_calls": 3},
+		"turns":          1,
+		"question":       "Fail question",
+		"prompt":         "Fail prompt",
+		"response":       "SAVED_FAIL_RESPONSE",
 		"verifierOutput": "FAIL_VERIFIER_RETAINED",
 	}}})
 
@@ -984,7 +989,7 @@ func writeDeferredTerminalSubmitFixture(t *testing.T) (runDir, hardwarePath stri
 		},
 		map[string]any{
 			"type": "tool_execution_end", "toolName": "bash", "intent": "Inspect résumé safely",
-			"args": map[string]any{"command": "printf 'tool ✓'"},
+			"args":   map[string]any{"command": "printf 'tool ✓'"},
 			"result": map[string]any{"content": []any{map[string]any{"type": "text", "text": "tool output λ"}}},
 		},
 		map[string]any{"type": "future_event", "privateRaw": "RAW_JSON_FIELD_MUST_NOT_APPEAR"},
@@ -1105,6 +1110,347 @@ video-processing
 vulnerable-secret
 winning-avg-corewars
 write-compressor`
+
+func TestInspectTerminalDatasetRequiresExplicitAPIURLBeforeHTTP(t *testing.T) {
+	counter := &terminalInspectRequestCounter{}
+	originalClient := apiHTTPClient
+	apiHTTPClient = &http.Client{Transport: counter}
+	t.Cleanup(func() { apiHTTPClient = originalClient })
+
+	err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
+		"eval", "terminal", "inspect", terminalBench21Dataset,
+		"--json",
+	}))
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "missing_option" || cliErr.Message != "--api-url is required" {
+		t.Fatalf("error = %#v, want missing_option for --api-url", err)
+	}
+	if got := counter.calls.Load(); got != 0 {
+		t.Fatalf("inspect without --api-url made %d HTTP requests, want none", got)
+	}
+}
+
+func TestInspectTerminalDatasetRoutesToConfiguredAPIAndReportsCanonicalReadiness(t *testing.T) {
+	fixture := newTerminalInspectFixture(t, false)
+	fixture.wantAuthorization = "Bearer fixture-key"
+	server := fixture.start(t)
+	defer server.Close()
+
+	var modelCalls atomic.Int32
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelCalls.Add(1)
+		http.Error(w, "inspect must not contact a model endpoint", http.StatusInternalServerError)
+	}))
+	defer modelServer.Close()
+	dockerSentinel := filepath.Join(t.TempDir(), "docker-called")
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	mustWrite(t, dockerPath, "#!/bin/sh\necho called > "+dockerSentinel+"\n")
+	if err := os.Chmod(dockerPath, 0o755); err != nil {
+		t.Fatalf("chmod fake docker: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	output, err := captureTerminalTestStdout(t, func() error {
+		return inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
+			"eval", "terminal", "inspect", terminalBench21Dataset,
+			"--api-url", server.URL,
+			"--api-key", "fixture-key",
+			"--base-url", modelServer.URL,
+			"--json",
+		}))
+	})
+	if err != nil {
+		t.Fatalf("inspect canonical dataset: %v", err)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal([]byte(output), &summary); err != nil {
+		t.Fatalf("decode inspect JSON %q: %v", output, err)
+	}
+	if summary["ready"] != true || summary["dataset"] != terminalBench21Dataset {
+		t.Fatalf("inspect identity = %#v", summary)
+	}
+	for field, want := range map[string]float64{
+		"itemCount": 89, "shardCount": 10, "manifestItems": 89, "uniqueTaskIds": 89,
+	} {
+		if summary[field] != want {
+			t.Fatalf("inspect %s = %#v, want %.0f", field, summary[field], want)
+		}
+	}
+	shards := anySlice(summary["shards"])
+	wantSizes := []int{8, 9, 9, 9, 9, 9, 9, 9, 9, 9}
+	if len(shards) != len(wantSizes) {
+		t.Fatalf("inspect shard summaries = %d, want %d", len(shards), len(wantSizes))
+	}
+	for i, wantSize := range wantSizes {
+		shard := asObject(shards[i])
+		if shard["shardIndex"] != float64(i+1) || shard["itemCount"] != float64(wantSize) {
+			t.Fatalf("inspect shard %d = %#v, want index %d size %d", i+1, shard, i+1, wantSize)
+		}
+	}
+	wantIndexes := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	if !reflect.DeepEqual(fixture.shardRequests, wantIndexes) {
+		t.Fatalf("shard requests = %v, want %v", fixture.shardRequests, wantIndexes)
+	}
+	if !reflect.DeepEqual(fixture.manifestRequests, wantIndexes) {
+		t.Fatalf("manifest requests = %v, want %v", fixture.manifestRequests, wantIndexes)
+	}
+	if fixture.bundleRequests != 0 {
+		t.Fatalf("default inspect downloaded %d bundles, want manifest-only inspection", fixture.bundleRequests)
+	}
+	if fixture.unexpectedRequests != 0 {
+		t.Fatalf("inspect made %d unexpected API/submit requests", fixture.unexpectedRequests)
+	}
+	if got := modelCalls.Load(); got != 0 {
+		t.Fatalf("inspect made %d model requests", got)
+	}
+	if _, err := os.Stat(dockerSentinel); !os.IsNotExist(err) {
+		t.Fatalf("inspect executed Docker: %v", err)
+	}
+}
+
+func TestInspectTerminalDatasetRejectsInvalidCanonicalManifests(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*terminalInspectFixture)
+	}{
+		{
+			name: "duplicate id within shard",
+			mutate: func(f *terminalInspectFixture) {
+				f.shards[1][1]["question_id"] = f.shards[1][0]["question_id"]
+			},
+		},
+		{
+			name: "cross-shard duplicate id",
+			mutate: func(f *terminalInspectFixture) {
+				f.shards[1][0]["question_id"] = f.shards[0][0]["question_id"]
+			},
+		},
+		{
+			name: "missing id",
+			mutate: func(f *terminalInspectFixture) {
+				f.shards[9] = f.shards[9][:len(f.shards[9])-1]
+			},
+		},
+		{
+			name: "extra id",
+			mutate: func(f *terminalInspectFixture) {
+				f.shards[9] = append(f.shards[9], terminalInspectManifestRow("extra-noncanonical-task"))
+			},
+		},
+		{
+			name: "canonical ids in wrong shard sizes",
+			mutate: func(f *terminalInspectFixture) {
+				moved := f.shards[0][len(f.shards[0])-1]
+				f.shards[0] = f.shards[0][:len(f.shards[0])-1]
+				f.shards[1] = append(f.shards[1], moved)
+			},
+		},
+		{
+			name: "wrong declared shard count",
+			mutate: func(f *terminalInspectFixture) {
+				f.datasetShardCount = 9
+			},
+		},
+		{
+			name: "wrong response shard index",
+			mutate: func(f *terminalInspectFixture) {
+				f.reportedShardIndexes[3] = 4
+			},
+		},
+		{
+			name: "wrong response item count",
+			mutate: func(f *terminalInspectFixture) {
+				f.reportedItemCounts[4] = len(f.shards[3]) + 1
+			},
+		},
+		{
+			name: "malformed sha256",
+			mutate: func(f *terminalInspectFixture) {
+				f.shards[2][0]["sha256"] = "not-a-sha256"
+			},
+		},
+		{
+			name: "zero byte size",
+			mutate: func(f *terminalInspectFixture) {
+				f.shards[2][0]["byteSize"] = 0
+			},
+		},
+		{
+			name: "missing bundle key",
+			mutate: func(f *terminalInspectFixture) {
+				f.shards[2][0]["bundle_key"] = ""
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newTerminalInspectFixture(t, false)
+			tc.mutate(fixture)
+			server := fixture.start(t)
+			defer server.Close()
+			err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
+				"eval", "terminal", "inspect", terminalBench21Dataset,
+				"--api-url", server.URL,
+				"--json",
+			}))
+			var cliErr cliError
+			if !errors.As(err, &cliErr) || cliErr.Code != "terminal_inspect_failed" {
+				t.Fatalf("error = %#v, want terminal_inspect_failed", err)
+			}
+			if fixture.bundleRequests != 0 {
+				t.Fatalf("manifest rejection downloaded %d bundles", fixture.bundleRequests)
+			}
+		})
+	}
+}
+
+func TestInspectTerminalDatasetRejectsCountPreservingCrossShardSwap(t *testing.T) {
+	fixture := newTerminalInspectFixture(t, false)
+	shardTwoID := stringValue(fixture.shards[1][0]["question_id"])
+	fixture.shards[1][0], fixture.shards[2][0] = fixture.shards[2][0], fixture.shards[1][0]
+	server := fixture.start(t)
+	defer server.Close()
+
+	err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
+		"eval", "terminal", "inspect", terminalBench21Dataset,
+		"--api-url", server.URL,
+		"--json",
+	}))
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "terminal_inspect_failed" || cliErr.Message != "Terminal-Bench 2.1 task is assigned to a noncanonical shard." {
+		t.Fatalf("error = %#v, want noncanonical shard assignment rejection", err)
+	}
+	details := asObject(cliErr.Details)
+	if details["taskId"] != shardTwoID || details["expectedShardIndex"] != 2 || details["actualShardIndex"] != 3 {
+		t.Fatalf("assignment evidence = %#v, want task %q moved from shard 2 to shard 3", details, shardTwoID)
+	}
+	if fixture.bundleRequests != 0 {
+		t.Fatalf("shard assignment rejection downloaded %d bundles", fixture.bundleRequests)
+	}
+}
+
+func TestInspectTerminalDatasetVerifyBundlesChecksHashAndExtraction(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		fixture := newTerminalInspectFixture(t, true)
+		server := fixture.start(t)
+		defer server.Close()
+		var modelCalls atomic.Int32
+		modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			modelCalls.Add(1)
+			http.Error(w, "bundle inspection must not contact a model endpoint", http.StatusInternalServerError)
+		}))
+		defer modelServer.Close()
+		dockerSentinel := filepath.Join(t.TempDir(), "docker-called")
+		binDir := t.TempDir()
+		dockerPath := filepath.Join(binDir, "docker")
+		mustWrite(t, dockerPath, "#!/bin/sh\necho called > "+dockerSentinel+"\n")
+		if err := os.Chmod(dockerPath, 0o755); err != nil {
+			t.Fatalf("chmod fake docker: %v", err)
+		}
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		output, err := captureTerminalTestStdout(t, func() error {
+			return inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
+				"eval", "terminal", "inspect", terminalBench21Dataset,
+				"--api-url", server.URL,
+				"--base-url", modelServer.URL,
+				"--verify-bundles", "--json",
+			}))
+		})
+		if err != nil {
+			t.Fatalf("verify canonical bundles: %v", err)
+		}
+		var summary map[string]any
+		if err := json.Unmarshal([]byte(output), &summary); err != nil {
+			t.Fatalf("decode verify summary %q: %v", output, err)
+		}
+		if summary["verifiedBundles"] != float64(89) {
+			t.Fatalf("verifiedBundles = %#v, want 89", summary["verifiedBundles"])
+		}
+		if fixture.bundleRequests != 89 {
+			t.Fatalf("bundle downloads = %d, want 89", fixture.bundleRequests)
+		}
+		if fixture.unexpectedRequests != 0 {
+			t.Fatalf("bundle inspection made %d unexpected API/submit requests", fixture.unexpectedRequests)
+		}
+		if got := modelCalls.Load(); got != 0 {
+			t.Fatalf("bundle inspection made %d model requests", got)
+		}
+		if _, err := os.Stat(dockerSentinel); !os.IsNotExist(err) {
+			t.Fatalf("bundle inspection executed Docker: %v", err)
+		}
+	})
+
+	t.Run("hash mismatch", func(t *testing.T) {
+		fixture := newTerminalInspectFixture(t, true)
+		fixture.shards[0][0]["sha256"] = strings.Repeat("0", 64)
+		server := fixture.start(t)
+		defer server.Close()
+		err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
+			"eval", "terminal", "inspect", terminalBench21Dataset,
+			"--api-url", server.URL,
+			"--verify-bundles", "--json",
+		}))
+		var cliErr cliError
+		if !errors.As(err, &cliErr) || cliErr.Code != "bundle_download_failed" {
+			t.Fatalf("error = %#v, want bundle_download_failed", err)
+		}
+	})
+
+	t.Run("byte size mismatch", func(t *testing.T) {
+		fixture := newTerminalInspectFixture(t, true)
+		fixture.shards[0][0]["byteSize"] = fixture.shards[0][0]["byteSize"].(int) + 1
+		server := fixture.start(t)
+		defer server.Close()
+		err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
+			"eval", "terminal", "inspect", terminalBench21Dataset,
+			"--api-url", server.URL,
+			"--verify-bundles", "--json",
+		}))
+		var cliErr cliError
+		if !errors.As(err, &cliErr) || cliErr.Code != "bundle_download_failed" {
+			t.Fatalf("error = %#v, want bundle_download_failed", err)
+		}
+	})
+
+	t.Run("traversal member", func(t *testing.T) {
+		fixture := newTerminalInspectFixture(t, true)
+		id := stringValue(fixture.shards[0][0]["question_id"])
+		key := stringValue(fixture.shards[0][0]["bundle_key"])
+		archive := terminalInspectBundleArchive(t, id, map[string]string{"../escaped": "unsafe"})
+		fixture.setBundle(fixture.shards[0][0], key, archive)
+		server := fixture.start(t)
+		defer server.Close()
+		err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
+			"eval", "terminal", "inspect", terminalBench21Dataset,
+			"--api-url", server.URL,
+			"--verify-bundles", "--json",
+		}))
+		var cliErr cliError
+		if !errors.As(err, &cliErr) || cliErr.Code != "bundle_download_failed" {
+			t.Fatalf("error = %#v, want bundle_download_failed", err)
+		}
+	})
+}
+
+func TestInspectTerminalDatasetRejectsBundleContainingSolution(t *testing.T) {
+	fixture := newTerminalInspectFixture(t, true)
+	id := stringValue(fixture.shards[0][0]["question_id"])
+	key := stringValue(fixture.shards[0][0]["bundle_key"])
+	archive := terminalInspectBundleArchive(t, id, map[string]string{id + "/solution/solve.sh": "#!/bin/sh\nexit 0\n"})
+	fixture.setBundle(fixture.shards[0][0], key, archive)
+	server := fixture.start(t)
+	defer server.Close()
+	err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
+		"eval", "terminal", "inspect", terminalBench21Dataset,
+		"--api-url", server.URL,
+		"--verify-bundles", "--json",
+	}))
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "terminal_inspect_failed" {
+		t.Fatalf("error = %#v, want terminal_inspect_failed for solution archive", err)
+	}
+}
 
 func TestSubmitTerminalEvalCanonicalCheckpointDryRunPartitionsExactTaskSet(t *testing.T) {
 	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
@@ -1269,6 +1615,99 @@ func TestSubmitTerminalEvalCustomDatasetRequiresShardIndex(t *testing.T) {
 	}
 }
 
+func TestSubmitTerminalEvalPostsAllCanonicalShards(t *testing.T) {
+	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
+	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
+	wantSizes := []int{8, 9, 9, 9, 9, 9, 9, 9, 9, 9}
+	seenIDs := make(map[string]int, len(canonicalIDs))
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if r.Method != http.MethodPost {
+			t.Errorf("request %d method = %s, want POST", requestCount, r.Method)
+		}
+		if r.URL.Path != "/api/evals/terminal-bench-2-1/submit" {
+			t.Errorf("request %d path = %q, want canonical submit path", requestCount, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer fixture-key" {
+			t.Errorf("request %d authorization = %q, want bearer fixture key", requestCount, got)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("request %d content type = %q, want application/json", requestCount, got)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode shard request %d: %v", requestCount, err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if requestCount > terminalBench21ShardCount {
+			t.Errorf("received unexpected request %d", requestCount)
+			http.Error(w, "too many requests", http.StatusBadRequest)
+			return
+		}
+		offset := 0
+		for i := range requestCount - 1 {
+			offset += wantSizes[i]
+		}
+		wantIDs := canonicalIDs[offset : offset+wantSizes[requestCount-1]]
+		assertTerminalShardPayload(t, payload, requestCount, wantIDs)
+		for _, id := range wantIDs {
+			seenIDs[id]++
+		}
+		covered := make([]int, requestCount)
+		for i := range covered {
+			covered[i] = i + 1
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"run":       map[string]any{"id": fmt.Sprintf("run-%02d", requestCount), "status": "approved"},
+			"aggregate": map[string]any{"pooledScore": float64(requestCount) / 100, "shardsCovered": covered},
+		})
+	}))
+	defer server.Close()
+
+	output, err := captureTerminalTestStdout(t, func() error {
+		return submitTerminalEval(parseArgs([]string{
+			"eval", "terminal", "submit", runDir,
+			"--dataset", terminalBench21Dataset,
+			"--hf-id", "fixture/model",
+			"--hardware", hardwarePath,
+			"--api-url", server.URL,
+			"--api-key", "fixture-key",
+			"--quiet",
+		}))
+	})
+	if err != nil {
+		t.Fatalf("submit canonical checkpoint: %v", err)
+	}
+	if requestCount != terminalBench21ShardCount {
+		t.Fatalf("submission request count = %d, want %d", requestCount, terminalBench21ShardCount)
+	}
+	if len(seenIDs) != len(canonicalIDs) {
+		t.Fatalf("submitted unique task IDs = %d, want %d", len(seenIDs), len(canonicalIDs))
+	}
+	for _, id := range canonicalIDs {
+		if seenIDs[id] != 1 {
+			t.Fatalf("task %q submitted %d times, want exactly once", id, seenIDs[id])
+		}
+	}
+	for shard := range terminalBench21ShardCount {
+		if want := fmt.Sprintf("run-%02d", shard+1); !strings.Contains(output, want) {
+			t.Fatalf("completion output did not contain parsed receipt %q: %s", want, output)
+		}
+	}
+	for _, want := range []string{
+		"status:approved",
+		"pooledScore:0.1",
+		"coverage:[1 2 3 4 5 6 7 8 9 10]",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("completion output did not contain parsed receipt field %q: %s", want, output)
+		}
+	}
+}
+
 func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *testing.T) {
 	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
 	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
@@ -1276,6 +1715,18 @@ func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *
 	var received [terminalBench21ShardCount]atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := int(requestCount.Add(1)) - 1
+		if r.Method != http.MethodPost {
+			t.Errorf("request %d method = %s, want POST", call+1, r.Method)
+		}
+		if r.URL.Path != "/api/evals/terminal-bench-2-1/submit" {
+			t.Errorf("request %d path = %q, want canonical submit path", call+1, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer fixture-key" {
+			t.Errorf("request %d authorization = %q, want bearer fixture key", call+1, got)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("request %d content type = %q, want application/json", call+1, got)
+		}
 		var payload struct {
 			ShardIndex int `json:"shardIndex"`
 		}
@@ -1286,9 +1737,6 @@ func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *
 		}
 		if call < len(received) {
 			received[call].Store(int32(payload.ShardIndex))
-		}
-		if r.Method != http.MethodPost {
-			t.Errorf("request %d method = %s, want POST", call+1, r.Method)
 		}
 		if payload.ShardIndex == 3 {
 			http.Error(w, "synthetic shard failure", http.StatusServiceUnavailable)
@@ -1327,6 +1775,203 @@ func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *
 	if !reflect.DeepEqual(details["completedShardIndexes"], []int{1, 2}) {
 		t.Fatalf("completed shard evidence = %#v, want [1 2]", details["completedShardIndexes"])
 	}
+}
+
+type terminalInspectRequestCounter struct {
+	calls atomic.Int32
+}
+
+func (c *terminalInspectRequestCounter) RoundTrip(*http.Request) (*http.Response, error) {
+	c.calls.Add(1)
+	return nil, errors.New("unexpected HTTP request")
+}
+
+type terminalInspectFixture struct {
+	datasetItemCount     int
+	datasetShardCount    int
+	shards               [][]map[string]any
+	bundles              map[string][]byte
+	reportedShardIndexes map[int]int
+	reportedItemCounts   map[int]int
+	wantAuthorization    string
+	shardRequests        []int
+	manifestRequests     []int
+	bundleRequests       int
+	unexpectedRequests   int
+}
+
+func newTerminalInspectFixture(t *testing.T, includeBundles bool) *terminalInspectFixture {
+	t.Helper()
+	ids := terminalBench21CanonicalTestTaskIDs(t)
+	fixture := &terminalInspectFixture{
+		datasetItemCount:     len(ids),
+		datasetShardCount:    terminalBench21ShardCount,
+		shards:               make([][]map[string]any, terminalBench21ShardCount),
+		bundles:              make(map[string][]byte, len(ids)),
+		reportedShardIndexes: map[int]int{},
+		reportedItemCounts:   map[int]int{},
+	}
+	for shard := range terminalBench21ShardCount {
+		start := shard * len(ids) / terminalBench21ShardCount
+		end := (shard + 1) * len(ids) / terminalBench21ShardCount
+		fixture.shards[shard] = make([]map[string]any, 0, end-start)
+		for _, id := range ids[start:end] {
+			row := terminalInspectManifestRow(id)
+			if includeBundles {
+				key := stringValue(row["bundle_key"])
+				archive := terminalInspectBundleArchive(t, id, nil)
+				fixture.setBundle(row, key, archive)
+			}
+			fixture.shards[shard] = append(fixture.shards[shard], row)
+		}
+	}
+	return fixture
+}
+
+func terminalInspectManifestRow(id string) map[string]any {
+	return map[string]any{
+		"question_id": id,
+		"bundle_key":  "eval-datasets/terminal-bench-2-1/tasks/" + id + ".tar.gz",
+		"sha256":      strings.Repeat("a", 64),
+		"byteSize":    1,
+	}
+}
+
+func terminalInspectBundleArchive(t *testing.T, id string, extraFiles map[string]string) []byte {
+	t.Helper()
+	taskJSON, err := json.Marshal(map[string]any{
+		"id": id, "version": "2.1", "instruction": "Inspect fixture " + id,
+		"source": "terminal-bench/" + id,
+	})
+	if err != nil {
+		t.Fatalf("marshal task fixture: %v", err)
+	}
+	files := map[string]string{
+		id + "/task.json":              string(taskJSON),
+		id + "/environment/Dockerfile": "FROM scratch\n",
+		id + "/tests/test.sh":          "#!/bin/sh\nexit 0\n",
+	}
+	for name, body := range extraFiles {
+		files[name] = body
+	}
+	return testReleaseTarGz(t, files)
+}
+
+func (f *terminalInspectFixture) setBundle(row map[string]any, key string, archive []byte) {
+	f.bundles[key] = archive
+	sum := sha256.Sum256(archive)
+	row["sha256"] = fmt.Sprintf("%x", sum)
+	row["byteSize"] = len(archive)
+}
+
+func (f *terminalInspectFixture) start(t *testing.T) *httptest.Server {
+	t.Helper()
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		canonicalShardPath := "/api/evals/terminal-bench-2-1/shard"
+		switch {
+		case r.URL.Path == canonicalShardPath:
+			if r.Method != http.MethodGet {
+				t.Errorf("shard method = %s, want GET", r.Method)
+			}
+			f.assertAuthorization(t, r)
+			shardIndex, err := strconv.Atoi(r.URL.Query().Get("shard"))
+			if err != nil || shardIndex < 1 || shardIndex > len(f.shards) {
+				http.Error(w, "invalid shard", http.StatusNotFound)
+				return
+			}
+			f.shardRequests = append(f.shardRequests, shardIndex)
+			reportedIndex := shardIndex
+			if override := f.reportedShardIndexes[shardIndex]; override != 0 {
+				reportedIndex = override
+			}
+			reportedCount := len(f.shards[shardIndex-1])
+			if override, ok := f.reportedItemCounts[shardIndex]; ok {
+				reportedCount = override
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"dataset": map[string]any{
+					"slug": terminalBench21Dataset, "itemCount": f.datasetItemCount, "shardCount": f.datasetShardCount,
+				},
+				"shard": map[string]any{
+					"shardIndex": reportedIndex, "itemCount": reportedCount, "selectedQuestionCount": reportedCount,
+				},
+				"downloadUrl": server.URL + "/manifest/" + strconv.Itoa(shardIndex),
+			})
+		case strings.HasPrefix(r.URL.Path, "/manifest/"):
+			shardIndex, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/manifest/"))
+			if err != nil || shardIndex < 1 || shardIndex > len(f.shards) {
+				http.NotFound(w, r)
+				return
+			}
+			f.manifestRequests = append(f.manifestRequests, shardIndex)
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			encoder := json.NewEncoder(w)
+			for _, row := range f.shards[shardIndex-1] {
+				if err := encoder.Encode(row); err != nil {
+					t.Errorf("encode manifest shard %d: %v", shardIndex, err)
+					return
+				}
+			}
+		case r.URL.Path == "/api/evals/storage/download-url":
+			if r.Method != http.MethodGet {
+				t.Errorf("presign method = %s, want GET", r.Method)
+			}
+			f.assertAuthorization(t, r)
+			key := r.URL.Query().Get("key")
+			if _, ok := f.bundles[key]; !ok {
+				http.Error(w, "unknown bundle", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": server.URL + "/bundle?key=" + url.QueryEscape(key)})
+		case r.URL.Path == "/bundle":
+			key := r.URL.Query().Get("key")
+			archive, ok := f.bundles[key]
+			if !ok {
+				http.Error(w, "unknown bundle", http.StatusNotFound)
+				return
+			}
+			f.bundleRequests++
+			w.Header().Set("Content-Type", "application/gzip")
+			_, _ = w.Write(archive)
+		default:
+			f.unexpectedRequests++
+			http.Error(w, "unexpected inspect request", http.StatusInternalServerError)
+		}
+	}))
+	return server
+}
+
+func (f *terminalInspectFixture) assertAuthorization(t *testing.T, r *http.Request) {
+	t.Helper()
+	if f.wantAuthorization != "" && r.Header.Get("Authorization") != f.wantAuthorization {
+		t.Errorf("authorization = %q, want %q", r.Header.Get("Authorization"), f.wantAuthorization)
+	}
+}
+
+func captureTerminalTestStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	original := os.Stdout
+	os.Stdout = writer
+	defer func() { os.Stdout = original }()
+	callErr := fn()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	output, readErr := io.ReadAll(reader)
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close stdout reader: %v", err)
+	}
+	if readErr != nil {
+		t.Fatalf("read captured stdout: %v", readErr)
+	}
+	return string(output), callErr
 }
 
 func terminalBench21CanonicalTestTaskIDs(t *testing.T) []string {

@@ -341,6 +341,7 @@ Run local bundles against an OpenAI-compatible endpoint:
 
 ```bash
 lmx eval terminal run --task-dir ./tb-bundles \
+  --api-url https://www.localmaxxing.com \
   --base-url http://localhost:8000 \
   --model Qwen/Qwen3-8B \
   --hardware hardware.json \
@@ -402,10 +403,23 @@ import with a `terminal_import_skipped` event; this runner only supports
 single-container Dockerfile or prebuilt-image environments (all of Terminal-
 Bench 2.1 qualifies).
 
-Run and submit an approved public dataset:
+Inspect every declared public shard before starting a live run. By default this
+downloads manifests only; add `--verify-bundles` to download and validate every
+referenced archive without starting Docker, contacting a model or verifier, or
+submitting results:
+
+```bash
+lmx eval terminal inspect terminal-bench-2-1 \
+  --api-url https://www.localmaxxing.com \
+  --verify-bundles \
+  --json
+```
+
+Run and submit the inspected public dataset against the separate model origin:
 
 ```bash
 lmx eval terminal run terminal-bench-2-1 \
+  --api-url https://www.localmaxxing.com \
   --base-url http://localhost:8000 \
   --model Qwen/Qwen3-8B \
   --hardware hardware.json \
@@ -423,6 +437,7 @@ contacting a model endpoint:
 ```bash
 lmx eval terminal submit ./completed-terminal-run \
   --dataset terminal-bench-2-1 \
+  --api-url https://www.localmaxxing.com \
   --hf-id Qwen/Qwen3-8B \
   --hardware hardware.json \
   --quantization Q4_K_M \
@@ -433,13 +448,19 @@ lmx eval terminal submit ./completed-terminal-run \
 
 The dry-run output is `{ "dataset": "terminal-bench-2-1", "shards": [...] }`
 with 10 ordered payloads carrying explicit `shardIndex` values. The CLI verifies
-the exact canonical 89-task ID set before partitioning. Inspect the batch, then
-remove `--dry-run` and provide `--api-key` (or `LMX_API_KEY`) to submit all 10
-payloads sequentially. For a checkpoint that already contains one isolated
-shard, pass `--shard-index <n>`; other dataset slugs always require an explicit
-shard index. Deferred submission preserves shard-local and full-checkpoint token
-usage in `runConfig` and never starts Docker, reruns a verifier, or calls the
-model endpoint.
+the exact canonical 89-task ID set before partitioning. Deferred `--dry-run` is
+entirely offline: it proves the saved checkpoint and payload partition but cannot
+prove `--api-url` routing or production readiness. Inspect the batch, run
+`eval terminal inspect` against that LocalMaxxing origin, then remove `--dry-run`
+and provide `--api-key` (or `LMX_API_KEY`) to submit all 10 payloads sequentially.
+For a checkpoint that already contains one isolated shard, pass `--shard-index
+<n>`; other dataset slugs always require an explicit shard index. Deferred
+submission preserves shard-local and full-checkpoint token usage in `runConfig`
+and never starts Docker, reruns a verifier, or calls the model endpoint.
+
+`--api-url` always selects the LocalMaxxing dataset/submission origin;
+`--base-url` selects the OpenAI-compatible model inference origin. Keep both
+explicit in live-run commands rather than substituting one for the other.
 
 
 The built-in `--agent terminus-2` adapter is embedded in release binaries. It
@@ -450,6 +471,7 @@ Use a preferred external agent harness:
 
 ```bash
 lmx eval terminal run --task-dir ./tb-bundles \
+  --api-url https://www.localmaxxing.com \
   --agent-cmd './my-agent-wrapper.sh' \
   --agent-name my-agent \
   --agent-execution routed-shell \

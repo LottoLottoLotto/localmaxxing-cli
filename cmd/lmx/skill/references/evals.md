@@ -74,18 +74,23 @@ Useful shard flags include `--questions`, `--shard`, `--missing-only`, `--all-mi
 ```bash
 lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1
 lmx eval terminal verify ./tb-bundles/smoke --oracle
-lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit
-lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-payload.json
+lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com --verify-bundles --json
+lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit
+lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-payload.json
 ```
 
 The approved Terminal-Bench 2.1 dataset partitions 89 tasks into 10 disjoint
-shards. A full deferred checkpoint is validated against the exact canonical task
-set and written/submitted as 10 ordered shard payloads; `--shard-index <n>` is
-required for an already-isolated shard or any other dataset. Dry-run performs no
-network calls. Saved shard-local and full-checkpoint token totals remain in
-`runConfig`.
+shards. `inspect` fetches every shard explicitly and validates the manifests
+without Docker, a model, a verifier, or submission; `--verify-bundles` also
+downloads and safely loads all referenced bundles. A full deferred checkpoint is
+validated against the exact canonical task set and written/submitted as 10
+ordered shard payloads; `--shard-index <n>` is required for an already-isolated
+shard or any other dataset. Deferred `--dry-run` performs no network calls, so it
+cannot prove `--api-url` routing; inspect that LocalMaxxing origin before a live
+run. `--api-url` selects LocalMaxxing, while `--base-url` selects model inference.
+Saved shard-local and full-checkpoint token totals remain in `runConfig`.
 
-Useful Terminal-Bench flags include `--task-dir`, `--dataset`, `--hf-id`, `--shard-index`, `--max-turns`, `--agent-timeout`, `--agent`, `--agent-cmd`, `--agent-execution`, `--agent-name`, `--container-base-url`, `--command-timeout`, `--endpoint-timeout-seconds`, `--trace-dir`, `--cleanup-images`, `--shell-mode`, and `--oracle`. `--agent terminus-2` uses the release-binary-embedded Harbor adapter.
+Useful Terminal-Bench flags include `--task-dir`, `--dataset`, `--hf-id`, `--shard-index`, `--verify-bundles`, `--max-turns`, `--agent-timeout`, `--agent`, `--agent-cmd`, `--agent-execution`, `--agent-name`, `--container-base-url`, `--command-timeout`, `--endpoint-timeout-seconds`, `--trace-dir`, `--cleanup-images`, `--shell-mode`, and `--oracle`. `--agent terminus-2` uses the release-binary-embedded Harbor adapter.
 
 
 

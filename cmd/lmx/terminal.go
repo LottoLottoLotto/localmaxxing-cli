@@ -8,9 +8,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
-	_ "embed"
 	"errors"
 	"fmt"
 	"io"
@@ -24,9 +24,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 )
@@ -291,6 +291,8 @@ func handleEvalTerminal(sub string, args cliArgs) error {
 	switch sub {
 	case "import":
 		return runTerminalImport(args)
+	case "inspect":
+		return inspectTerminalDataset(positional(args, 3), args)
 	case "run":
 		return runTerminalEval(args, false)
 	case "submit":
@@ -298,7 +300,7 @@ func handleEvalTerminal(sub string, args cliArgs) error {
 	case "verify":
 		return runTerminalEval(args, true)
 	default:
-		return cliError{"unknown_subcommand", "Unknown eval terminal subcommand.", []string{"Use one of: import, run, submit, verify."}, map[string]any{"subcommand": sub}}
+		return cliError{"unknown_subcommand", "Unknown eval terminal subcommand.", []string{"Use one of: import, inspect, run, submit, verify."}, map[string]any{"subcommand": sub}}
 	}
 }
 
@@ -461,7 +463,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		dataset = opt(args, "dataset")
 	}
 	if !forceOracle && localDir == "" && dataset == "" {
-		return cliError{"missing_option", "eval terminal run requires a dataset slug or --task-dir.", []string{"Run: lmx eval terminal run terminal-bench-2-1 --base-url <url> --model <hfId>.", "For local bundles, run: lmx eval terminal run --task-dir ./bundles --base-url <url> --model <hfId>."}, nil}
+		return cliError{"missing_option", "eval terminal run requires a dataset slug or --task-dir.", []string{"Run: lmx eval terminal run terminal-bench-2-1 --api-url <localmaxxing-origin> --base-url <model-origin> --model <hfId>.", "For local bundles, run: lmx eval terminal run --task-dir ./bundles --api-url <localmaxxing-origin> --base-url <model-origin> --model <hfId>."}, nil}
 	}
 	bundles, cleanup, shardIndex, err := acquireTerminalBundles(args, dataset, localDir)
 	if cleanup != "" {
@@ -612,9 +614,9 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		fmt.Println("Dry run only — nothing submitted.")
 		if dataset != "" {
 			if cfg.agentCommand != "" {
-				fmt.Println("Publish with: lmx eval terminal run " + dataset + " --agent-cmd '<your-agent-command>' --model <hfId> --hardware hardware.json --submit")
+				fmt.Println("Publish with: lmx eval terminal run " + dataset + " --api-url " + apiURL(args) + " --agent-cmd '<your-agent-command>' --model <hfId> --hardware hardware.json --submit")
 			} else {
-				fmt.Println("Publish with: lmx eval terminal run " + dataset + " --base-url " + rawBaseURL + " --model <hfId> --hardware hardware.json --submit")
+				fmt.Println("Publish with: lmx eval terminal run " + dataset + " --api-url " + apiURL(args) + " --base-url " + rawBaseURL + " --model <hfId> --hardware hardware.json --submit")
 			}
 		}
 		if stats.errors == len(results) {
@@ -706,10 +708,10 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 }
 
 const (
-	terminalTracePreviewBytes    = 24 * 1024
-	terminalVerifierPreviewBytes = 7 * 1024
+	terminalTracePreviewBytes     = 24 * 1024
+	terminalVerifierPreviewBytes  = 7 * 1024
 	terminalArtifactResponseBytes = 32 * 1024
-	terminalTraceLineBytes       = 4 * 1024 * 1024
+	terminalTraceLineBytes        = 4 * 1024 * 1024
 )
 
 type terminalCheckpointEntry struct {
@@ -754,9 +756,9 @@ type terminalTracePreviewStats struct {
 const terminalBench21Dataset = "terminal-bench-2-1"
 const terminalBench21ShardCount = 10
 
-// terminalBench21CanonicalTaskIDsText is the exact sorted 89-task set from
-// .terminal-smoke/omp-full-tb21-20260710-localmaxxing-cli/summary.json. Keeping
-// the IDs compiled into the binary makes deferred validation independent of it.
+// terminalBench21CanonicalTaskIDsText is the exact sorted canonical
+// Terminal-Bench 2.1 task set. Keeping the IDs compiled into the binary makes
+// dataset inspection and deferred validation independent of local fixtures.
 const terminalBench21CanonicalTaskIDsText = `adaptive-rejection-sampler
 bn-fit-modify
 break-filter-js-from-html
@@ -849,6 +851,268 @@ write-compressor`
 
 var terminalBench21CanonicalTaskIDs = strings.Fields(terminalBench21CanonicalTaskIDsText)
 
+type terminalInspectionItem struct {
+	questionID string
+	bundleKey  string
+	sha256     string
+	byteSize   int64
+}
+
+var terminalInspectionSHA256 = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+// inspectTerminalDataset validates that every declared shard and manifest is
+// ready to acquire. Bundle verification is opt-in and never executes a task.
+func inspectTerminalDataset(dataset string, args cliArgs) error {
+	dataset = strings.TrimSpace(dataset)
+	if dataset == "" {
+		return cliError{"missing_dataset", "eval terminal inspect requires a dataset slug.", []string{"Run: lmx eval terminal inspect <dataset> --api-url <localmaxxing-origin> [--verify-bundles] [--json]."}, nil}
+	}
+	inspectionOrigin, err := requireOpt(args, "api-url")
+	if err != nil {
+		return err
+	}
+	inspectionOrigin = strings.TrimRight(inspectionOrigin, "/")
+
+	itemCount := 0
+	shardCount := 0
+	seenTasks := make(map[string]int)
+	items := make([]terminalInspectionItem, 0)
+	shards := make([]map[string]any, 0)
+
+	for requestedShard := 1; requestedShard == 1 || requestedShard <= shardCount; requestedShard++ {
+		metaURL := inspectionOrigin + "/api/evals/" + url.PathEscape(dataset) + "/shard?shard=" + strconv.Itoa(requestedShard)
+		value, err := fetchJSON("GET", metaURL, apiKey(args), nil)
+		if err != nil {
+			return terminalInspectionError("Could not fetch a declared terminal dataset shard.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "url": metaURL, "error": err.Error()})
+		}
+		response := asObject(value)
+		datasetMeta := asObject(response["dataset"])
+		shardMeta := asObject(response["shard"])
+		if datasetMeta == nil || shardMeta == nil {
+			return terminalInspectionError("Terminal shard response is missing dataset or shard metadata.", map[string]any{"dataset": dataset, "shardIndex": requestedShard})
+		}
+		if responseSlug := strings.TrimSpace(stringValue(datasetMeta["slug"])); responseSlug != dataset {
+			return terminalInspectionError("Terminal shard response names a different dataset.", map[string]any{"dataset": dataset, "actual": responseSlug, "shardIndex": requestedShard})
+		}
+
+		responseItemCount, ok := terminalInspectionPositiveInt(datasetMeta["itemCount"])
+		if !ok {
+			return terminalInspectionError("Terminal dataset itemCount must be a positive integer.", map[string]any{"dataset": dataset, "itemCount": datasetMeta["itemCount"]})
+		}
+		responseShardCount, ok := terminalInspectionPositiveInt(datasetMeta["shardCount"])
+		if !ok {
+			return terminalInspectionError("Terminal dataset shardCount must be a positive integer.", map[string]any{"dataset": dataset, "shardCount": datasetMeta["shardCount"]})
+		}
+		if requestedShard == 1 {
+			itemCount = responseItemCount
+			shardCount = responseShardCount
+			if dataset == terminalBench21Dataset && (itemCount != len(terminalBench21CanonicalTaskIDs) || shardCount != terminalBench21ShardCount) {
+				return terminalInspectionError("Terminal-Bench 2.1 dataset metadata is not canonical.", map[string]any{"expectedItemCount": len(terminalBench21CanonicalTaskIDs), "actualItemCount": itemCount, "expectedShardCount": terminalBench21ShardCount, "actualShardCount": shardCount})
+			}
+		} else if responseItemCount != itemCount || responseShardCount != shardCount {
+			return terminalInspectionError("Terminal dataset metadata changed between shard responses.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "expectedItemCount": itemCount, "actualItemCount": responseItemCount, "expectedShardCount": shardCount, "actualShardCount": responseShardCount})
+		}
+
+		responseShardIndex, ok := terminalInspectionPositiveInt(shardMeta["shardIndex"])
+		if !ok || responseShardIndex != requestedShard {
+			return terminalInspectionError("Terminal shard response index does not match the requested shard.", map[string]any{"dataset": dataset, "requestedShardIndex": requestedShard, "actualShardIndex": shardMeta["shardIndex"]})
+		}
+		responseShardItems, ok := terminalInspectionPositiveInt(shardMeta["itemCount"])
+		if !ok {
+			return terminalInspectionError("Terminal shard itemCount must be a positive integer.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "itemCount": shardMeta["itemCount"]})
+		}
+		selectedItems, ok := terminalInspectionPositiveInt(shardMeta["selectedQuestionCount"])
+		if !ok || selectedItems != responseShardItems {
+			return terminalInspectionError("Terminal shard selectedQuestionCount does not match itemCount.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "itemCount": responseShardItems, "selectedQuestionCount": shardMeta["selectedQuestionCount"]})
+		}
+
+		downloadURL := strings.TrimSpace(stringValue(response["downloadUrl"]))
+		if downloadURL == "" {
+			return terminalInspectionError("Terminal shard response did not include downloadUrl.", map[string]any{"dataset": dataset, "shardIndex": requestedShard})
+		}
+		manifestRows, err := fetchDatasetItems(downloadURL, "jsonl")
+		if err != nil {
+			return terminalInspectionError("Could not download a terminal shard manifest.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "downloadUrl": downloadURL, "error": err.Error()})
+		}
+		if len(manifestRows) != responseShardItems {
+			return terminalInspectionError("Terminal shard manifest row count does not match shard itemCount.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "itemCount": responseShardItems, "manifestItems": len(manifestRows)})
+		}
+
+		for rowIndex, row := range manifestRows {
+			questionID := strings.TrimSpace(stringValue(row["question_id"]))
+			bundleKey := strings.TrimSpace(stringValue(row["bundle_key"]))
+			hash := strings.TrimSpace(stringValue(row["sha256"]))
+			byteSize, validByteSize := terminalInspectionPositiveInt64(row["byteSize"])
+			if questionID == "" {
+				return terminalInspectionError("Terminal manifest row is missing question_id.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "rowIndex": rowIndex})
+			}
+			if previousShard, exists := seenTasks[questionID]; exists {
+				return terminalInspectionError("Terminal task appears more than once across shard manifests.", map[string]any{"dataset": dataset, "taskId": questionID, "firstShardIndex": previousShard, "duplicateShardIndex": requestedShard})
+			}
+			if bundleKey == "" {
+				return terminalInspectionError("Terminal manifest row is missing bundle_key.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "taskId": questionID})
+			}
+			if !terminalInspectionSHA256.MatchString(hash) {
+				return terminalInspectionError("Terminal manifest row sha256 must contain exactly 64 hexadecimal characters.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "taskId": questionID, "sha256": hash})
+			}
+			if !validByteSize {
+				return terminalInspectionError("Terminal manifest row byteSize must be a positive integer.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "taskId": questionID, "byteSize": row["byteSize"]})
+			}
+			seenTasks[questionID] = requestedShard
+			items = append(items, terminalInspectionItem{questionID: questionID, bundleKey: bundleKey, sha256: hash, byteSize: byteSize})
+		}
+		shards = append(shards, map[string]any{"shardIndex": requestedShard, "itemCount": responseShardItems})
+	}
+
+	if len(items) != itemCount || len(seenTasks) != itemCount {
+		return terminalInspectionError("Terminal manifests do not contain the dataset's declared number of unique tasks.", map[string]any{"dataset": dataset, "itemCount": itemCount, "manifestItems": len(items), "uniqueTaskIds": len(seenTasks)})
+	}
+	if dataset == terminalBench21Dataset {
+		if err := validateTerminalBench21Inspection(seenTasks, shards); err != nil {
+			return err
+		}
+	}
+
+	summary := map[string]any{
+		"ready":         true,
+		"dataset":       dataset,
+		"itemCount":     itemCount,
+		"shardCount":    shardCount,
+		"manifestItems": len(items),
+		"uniqueTaskIds": len(seenTasks),
+		"shards":        shards,
+	}
+	if hasFlag(args, "verify-bundles") {
+		verified, err := verifyTerminalInspectionBundles(args, items)
+		if err != nil {
+			return err
+		}
+		summary["verifiedBundles"] = verified
+	}
+	if hasFlag(args, "json") || hasFlag(args, "print") || opt(args, "out") != "" {
+		return writeOrPrintJSON("terminal_dataset_inspection", args, summary)
+	}
+	printInfo("terminal_dataset_ready", summary)
+	return nil
+}
+
+func terminalInspectionError(message string, details any) error {
+	return cliError{"terminal_inspect_failed", message, []string{"Check the dataset ingestion and LocalMaxxing API response, then retry inspection."}, details}
+}
+
+func terminalInspectionPositiveInt(value any) (int, bool) {
+	n, ok := terminalInspectionPositiveInt64(value)
+	if !ok || int64(int(n)) != n {
+		return 0, false
+	}
+	return int(n), true
+}
+
+func terminalInspectionPositiveInt64(value any) (int64, bool) {
+	var n int64
+	switch typed := value.(type) {
+	case float64:
+		n = int64(typed)
+		if float64(n) != typed {
+			return 0, false
+		}
+	case float32:
+		n = int64(typed)
+		if float32(n) != typed {
+			return 0, false
+		}
+	case int:
+		n = int64(typed)
+	case int64:
+		n = typed
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		n = parsed
+	default:
+		return 0, false
+	}
+	return n, n > 0
+}
+
+func validateTerminalBench21Inspection(seenTasks map[string]int, shards []map[string]any) error {
+	missing := make([]string, 0)
+	extra := make([]string, 0)
+	expected := make(map[string]bool, len(terminalBench21CanonicalTaskIDs))
+	for _, id := range terminalBench21CanonicalTaskIDs {
+		expected[id] = true
+		if _, ok := seenTasks[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	for id := range seenTasks {
+		if !expected[id] {
+			extra = append(extra, id)
+		}
+	}
+	sort.Strings(extra)
+	if len(missing) > 0 || len(extra) > 0 {
+		return terminalInspectionError("Terminal-Bench 2.1 manifests do not match the canonical task set.", map[string]any{"missingTaskIds": missing, "extraTaskIds": extra})
+	}
+	for index, id := range terminalBench21CanonicalTaskIDs {
+		expectedShard := (((index+1)*terminalBench21ShardCount)-1)/len(terminalBench21CanonicalTaskIDs) + 1
+		if actualShard := seenTasks[id]; actualShard != expectedShard {
+			return terminalInspectionError("Terminal-Bench 2.1 task is assigned to a noncanonical shard.", map[string]any{"taskId": id, "expectedShardIndex": expectedShard, "actualShardIndex": actualShard})
+		}
+	}
+	if len(shards) != terminalBench21ShardCount {
+		return terminalInspectionError("Terminal-Bench 2.1 does not contain exactly ten shards.", map[string]any{"expectedShardCount": terminalBench21ShardCount, "actualShardCount": len(shards)})
+	}
+	for i, shard := range shards {
+		expectedSize := ((i + 1) * len(terminalBench21CanonicalTaskIDs) / terminalBench21ShardCount) - (i * len(terminalBench21CanonicalTaskIDs) / terminalBench21ShardCount)
+		if shard["itemCount"] != expectedSize {
+			return terminalInspectionError("Terminal-Bench 2.1 shard size is not canonical.", map[string]any{"shardIndex": i + 1, "expectedItemCount": expectedSize, "actualItemCount": shard["itemCount"]})
+		}
+	}
+	return nil
+}
+
+func verifyTerminalInspectionBundles(args cliArgs, items []terminalInspectionItem) (int, error) {
+	tmp, err := os.MkdirTemp("", "lmx-terminal-inspect-*")
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(tmp)
+
+	for index, item := range items {
+		extractionRoot := filepath.Join(tmp, strconv.Itoa(index+1))
+		bundleDir, err := downloadTerminalBundle(args, extractionRoot, item.questionID, item.bundleKey, item.sha256, item.byteSize)
+		if err != nil {
+			return index, err
+		}
+		if err := rejectTerminalInspectionSolution(extractionRoot, item.questionID); err != nil {
+			return index, err
+		}
+		bundle, err := loadSingleTerminalBundle(bundleDir)
+		if err != nil {
+			return index, err
+		}
+		if bundle.Task.ID != item.questionID {
+			return index, terminalInspectionError("Downloaded terminal bundle task id does not match its manifest row.", map[string]any{"questionId": item.questionID, "bundleTaskId": bundle.Task.ID, "bundleKey": item.bundleKey})
+		}
+	}
+	return len(items), nil
+}
+
+func rejectTerminalInspectionSolution(root, questionID string) error {
+	return filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() && entry.Name() == "solution" {
+			return terminalInspectionError("Public terminal bundle contains a forbidden solution directory.", map[string]any{"taskId": questionID, "path": current})
+		}
+		return nil
+	})
+}
+
 type terminalSubmissionRecord struct {
 	questionID string
 	pass       bool
@@ -864,7 +1128,7 @@ type terminalSubmissionRecord struct {
 func submitTerminalEval(args cliArgs) error {
 	runDir := positional(args, 3)
 	if runDir == "" {
-		return cliError{"missing_option", "eval terminal submit requires a completed run directory.", []string{"Run: lmx eval terminal submit <run-dir> --dataset <slug> --hf-id <org/model> --hardware hardware.json --dry-run."}, nil}
+		return cliError{"missing_option", "eval terminal submit requires a completed run directory.", []string{"Run: lmx eval terminal submit <run-dir> --dataset <slug> --hf-id <org/model> --hardware hardware.json --api-url <localmaxxing-origin> --dry-run."}, nil}
 	}
 	root, err := filepath.Abs(runDir)
 	if err != nil {
@@ -1420,7 +1684,6 @@ func findTerminalOMPTrace(root, taskID string) string {
 	return matches[len(matches)-1]
 }
 
-
 func terminalSavedArtifactResponse(root, recordPath string, record terminalSavedResult) (string, terminalTracePreviewStats, bool, error) {
 	tracePath := findTerminalOMPTrace(root, record.QuestionID)
 	stats := terminalTracePreviewStats{}
@@ -1865,7 +2128,7 @@ func acquireTerminalBundles(args cliArgs, dataset, localDir string) ([]terminalB
 	return bundles, tmp, shardIndex, nil
 }
 
-func downloadTerminalBundle(args cliArgs, tmp, id, key, wantHash string) (string, error) {
+func downloadTerminalBundle(args cliArgs, tmp, id, key, wantHash string, wantByteSize ...int64) (string, error) {
 	value, err := fetchJSON("GET", apiURL(args)+"/api/evals/storage/download-url?key="+url.QueryEscape(key), apiKey(args), nil)
 	if err != nil {
 		return "", cliError{"bundle_download_failed", fmt.Sprintf("Could not presign terminal bundle download: %v", err), []string{"Check that the dataset is approved and the bundle key exists."}, map[string]any{"taskId": id, "bundle_key": key, "error": err.Error()}}
@@ -1882,6 +2145,9 @@ func downloadTerminalBundle(args cliArgs, tmp, id, key, wantHash string) (string
 	data, _ := io.ReadAll(res.Body)
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return "", cliError{"bundle_download_failed", fmt.Sprintf("Terminal bundle download returned %s", res.Status), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key, "body": truncateString(string(data), 4096)}}
+	}
+	if len(wantByteSize) > 0 && wantByteSize[0] != int64(len(data)) {
+		return "", cliError{"bundle_download_failed", "Terminal bundle byte size did not match the manifest.", []string{"Re-ingest the dataset; the manifest and bundle object are inconsistent."}, map[string]any{"taskId": id, "bundle_key": key, "expected": wantByteSize[0], "actual": len(data)}}
 	}
 	if wantHash != "" {
 		sum := sha256.Sum256(data)
