@@ -507,12 +507,12 @@ func TestTerminalShellPersistsState(t *testing.T) {
 	}
 	defer shell.close()
 
-	if _, code, _, restarted := shell.exec("cd /tmp && export FOO=bar", 30*time.Second); code != 0 || restarted {
+	if _, code, _, restarted, err := shell.exec("cd /tmp && export FOO=bar", 30*time.Second); err != nil || code != 0 || restarted {
 		t.Fatalf("setup exec: code=%d restarted=%v", code, restarted)
 	}
-	out, code, _, restarted := shell.exec("pwd && echo $FOO", 30*time.Second)
-	if code != 0 || restarted {
-		t.Fatalf("state exec: code=%d restarted=%v out=%q", code, restarted, out)
+	out, code, _, restarted, err := shell.exec("pwd && echo $FOO", 30*time.Second)
+	if err != nil || code != 0 || restarted {
+		t.Fatalf("state exec: code=%d restarted=%v err=%v out=%q", code, restarted, err, out)
 	}
 	if !strings.Contains(out, "/tmp") || !strings.Contains(out, "bar") {
 		t.Fatalf("state not persisted: out=%q", out)
@@ -521,13 +521,13 @@ func TestTerminalShellPersistsState(t *testing.T) {
 	// Killing the shell (running `exit`) must trigger recovery. The EOF is
 	// observed by whichever exec races the shell death, so accept a restart
 	// flag on either call; the invariant is that the session keeps working.
-	_, _, _, restartedExit := shell.exec("exit", 5*time.Second)
-	out2, code2, _, restartedAlive := shell.exec("echo alive", 30*time.Second)
+	_, _, _, restartedExit, _ := shell.exec("exit", 5*time.Second)
+	out2, code2, _, restartedAlive, err2 := shell.exec("echo alive", 30*time.Second)
 	if !restartedExit && !restartedAlive {
 		t.Fatalf("expected restart after shell death, got neither; out=%q", out2)
 	}
-	if code2 != 0 || !strings.Contains(out2, "alive") {
-		t.Fatalf("post-restart exec: code=%d out=%q", code2, out2)
+	if err2 != nil || code2 != 0 || !strings.Contains(out2, "alive") {
+		t.Fatalf("post-restart exec: code=%d err=%v out=%q", code2, err2, out2)
 	}
 }
 
@@ -548,7 +548,7 @@ func TestRunTerminalAgentLoopSessionContinuesAfterCommandTimeout(t *testing.T) {
 			Analysis: "Exercise a command timeout.",
 			Plan:     "Run a command that exceeds its bound.",
 			Commands: []terminalJSONCommand{
-				{Keystrokes: "sleep 2\n", Duration: 0.1},
+				{Keystrokes: "printf '%s' \"$$\" > /tmp/timed-command-pid; exec sleep 30\n", Duration: 0.1},
 				{Keystrokes: "printf should-not-run > /tmp/skipped\n", Duration: 0.1},
 			},
 		}
@@ -597,6 +597,28 @@ func TestRunTerminalAgentLoopSessionContinuesAfterCommandTimeout(t *testing.T) {
 	}
 	if out, code, _, execErr := runCommand(context.Background(), 30*time.Second, "docker", "exec", name, "sh", "-c", "test ! -e /tmp/skipped"); execErr != nil || code != 0 {
 		t.Fatalf("post-timeout command batch continued unexpectedly: code=%d err=%v out=%q", code, execErr, out)
+	}
+	if out, code, _, execErr := runCommand(context.Background(), 30*time.Second, "docker", "exec", name, "bash", "-lc", `pid=$(cat /tmp/timed-command-pid); test ! -d "/proc/$pid"`); execErr != nil || code != 0 {
+		t.Fatalf("timed-out command survived recovery: code=%d err=%v out=%q", code, execErr, out)
+	}
+}
+
+func TestRunTerminalContainerCommandStopsTimedOutProcess(t *testing.T) {
+	if dockerPreflight() != nil {
+		t.Skip("docker unavailable")
+	}
+	name := "lmx-stateless-timeout-" + randomHex(6)
+	if _, code, _, err := runCommand(context.Background(), 60*time.Second, "docker", "run", "-d", "--rm", "--name", name, "ubuntu:24.04", "sleep", "infinity"); err != nil || code != 0 {
+		t.Skipf("could not start test container (code=%d err=%v)", code, err)
+	}
+	defer runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", name)
+
+	out, code, timedOut, err := runTerminalContainerCommand(context.Background(), name, "", `printf '%s' "$$" > /tmp/timed-command-pid; exec sleep 30`, time.Second)
+	if err != nil || !timedOut || code != 124 {
+		t.Fatalf("timed command: code=%d timedOut=%v err=%v out=%q", code, timedOut, err, out)
+	}
+	if out, code, _, execErr := runCommand(context.Background(), 30*time.Second, "docker", "exec", name, "bash", "-lc", `pid=$(cat /tmp/timed-command-pid); test ! -d "/proc/$pid"`); execErr != nil || code != 0 {
+		t.Fatalf("timed-out stateless command survived: code=%d err=%v out=%q", code, execErr, out)
 	}
 }
 

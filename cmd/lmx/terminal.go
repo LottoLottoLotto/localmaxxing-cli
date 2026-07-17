@@ -4982,12 +4982,11 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 		messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, cmdText)})
 		terminalTraceHeader(&transcript, turn, reasoning, content)
 		transcript.WriteString("## Command\n$ " + cmdText + "\n")
-		execArgs := []string{"exec"}
-		if task.Agent.User != "" {
-			execArgs = append(execArgs, "--user", task.Agent.User)
+		out, code, timedOut, execErr := runTerminalContainerCommand(ctx, containerName, task.Agent.User, cmdText, terminalCommandExecutionTimeout(cmdText, time.Duration(terminalCommandTimeoutSec(cfg))*time.Second, deadline))
+		if execErr != nil {
+			transcript.WriteString(truncateString(out, 8192) + "\n[command cleanup failed]\n")
+			return turn, transcript.String(), usage, cliError{"command_exec_failed", "Could not stop a timed-out shell command in the task container.", []string{"Inspect Docker and the task container process state before retrying."}, map[string]any{"taskId": task.ID, "error": execErr.Error()}}
 		}
-		execArgs = append(execArgs, containerName, "bash", "-lc", cmdText)
-		out, code, timedOut, _ := runCommand(ctx, terminalCommandExecutionTimeout(cmdText, time.Duration(terminalCommandTimeoutSec(cfg))*time.Second, deadline), "docker", execArgs...)
 		if timedOut {
 			out += "\n[command timed out]"
 			code = 124
@@ -5014,10 +5013,65 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 	return turnsCompleted, transcript.String(), usage, terminalAgentLoopExhaustion(deadline)
 }
 
+func terminalContainerCommandWrapper(command, pidfile string) string {
+	return "pidfile=" + shellQuote(pidfile) + "; rm -f \"$pidfile\"; " +
+		"setsid bash -lc " + shellQuote(command) + " & child=$!; " +
+		"printf '%s\\n' \"$child\" > \"$pidfile\"; " +
+		"wait \"$child\"; rc=$?; rm -f \"$pidfile\"; exit \"$rc\""
+}
+
+func terminateTerminalContainerProcessGroup(containerName, pidfile string) error {
+	cleanup := "pidfile=" + shellQuote(pidfile) + "; " +
+		"test -s \"$pidfile\" || exit 0; pid=$(cat \"$pidfile\"); " +
+		"case \"$pid\" in ''|*[!0-9]*) exit 3;; esac; " +
+		"kill -TERM -- -\"$pid\" 2>/dev/null || true; " +
+		"i=0; while kill -0 -- -\"$pid\" 2>/dev/null && [ \"$i\" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; " +
+		"if kill -0 -- -\"$pid\" 2>/dev/null; then kill -KILL -- -\"$pid\" 2>/dev/null || true; fi; " +
+		"i=0; while kill -0 -- -\"$pid\" 2>/dev/null && [ \"$i\" -lt 20 ]; do sleep 0.1; i=$((i+1)); done; " +
+		"alive=0; kill -0 -- -\"$pid\" 2>/dev/null && alive=1; rm -f \"$pidfile\"; exit \"$alive\""
+	out, code, timedOut, err := runCommand(context.Background(), 10*time.Second, "docker", "exec", containerName, "bash", "-lc", cleanup)
+	if err != nil || timedOut || code != 0 {
+		return fmt.Errorf("container process-group cleanup failed (code=%d timedOut=%t): %s", code, timedOut, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+func waitTerminalContainerPIDFile(containerName, pidfile string) error {
+	check := "pidfile=" + shellQuote(pidfile) + "; " +
+		"i=0; while [ ! -s \"$pidfile\" ] && [ \"$i\" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; " +
+		"test -s \"$pidfile\" || exit 2; pid=$(cat \"$pidfile\"); " +
+		"case \"$pid\" in ''|*[!0-9]*) exit 3;; esac"
+	out, code, timedOut, err := runCommand(context.Background(), 10*time.Second, "docker", "exec", containerName, "bash", "-lc", check)
+	if err != nil || timedOut || code != 0 {
+		return fmt.Errorf("container process-group startup failed (code=%d timedOut=%t): %s", code, timedOut, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+func runTerminalContainerCommand(ctx context.Context, containerName, user, command string, timeout time.Duration) (string, int, bool, error) {
+	pidfile := "/tmp/lmx-terminal-command-" + randomHex(12) + ".pid"
+	execArgs := []string{"exec"}
+	if user != "" {
+		execArgs = append(execArgs, "--user", user)
+	}
+	execArgs = append(execArgs, containerName, "bash", "-lc", terminalContainerCommandWrapper(command, pidfile))
+	out, code, timedOut, _ := runCommand(ctx, timeout, "docker", execArgs...)
+	if timedOut || ctx.Err() != nil {
+		if cleanupErr := terminateTerminalContainerProcessGroup(containerName, pidfile); cleanupErr != nil {
+			return out, code, timedOut, cleanupErr
+		}
+	}
+	if ctx.Err() != nil && !timedOut {
+		return out, code, false, ctx.Err()
+	}
+	return out, code, timedOut, nil
+}
+
 type terminalShell struct {
 	containerName string
 	user          string
 	nonce         string
+	pidfile       string
 	cmd           *exec.Cmd
 	stdin         io.WriteCloser
 	reader        *bufio.Reader
@@ -5035,11 +5089,15 @@ func startTerminalShell(containerName, user string) (*terminalShell, error) {
 func (s *terminalShell) start() error {
 	// No context timeout on the shell process itself; per-command timeouts are
 	// enforced in exec(). The shell lives for the whole agent loop.
+	s.pidfile = "/tmp/lmx-terminal-shell-" + s.nonce + ".pid"
 	execArgs := []string{"exec", "-i"}
 	if s.user != "" {
 		execArgs = append(execArgs, "--user", s.user)
 	}
-	execArgs = append(execArgs, s.containerName, "bash", "-l")
+	wrapper := "pidfile=" + shellQuote(s.pidfile) + "; rm -f \"$pidfile\"; " +
+		"setsid bash -l <&0 & child=$!; printf '%s\\n' \"$child\" > \"$pidfile\"; " +
+		"wait \"$child\"; rc=$?; rm -f \"$pidfile\"; exit \"$rc\""
+	execArgs = append(execArgs, s.containerName, "bash", "-lc", wrapper)
 	cmd := exec.Command("docker", execArgs...)
 	configureCommandProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
@@ -5062,26 +5120,41 @@ func (s *terminalShell) start() error {
 	s.stdin = stdin
 	s.pr = pr
 	s.reader = bufio.NewReader(pr)
+	if err := waitTerminalContainerPIDFile(s.containerName, s.pidfile); err != nil {
+		_ = s.close()
+		return err
+	}
 	return nil
 }
 
 func (s *terminalShell) restart() error {
-	s.close()
+	if err := s.close(); err != nil {
+		return err
+	}
 	s.nonce = randomHex(8)
 	return s.start()
 }
 
-func (s *terminalShell) close() {
+func (s *terminalShell) close() error {
+	var cleanupErr error
+	if s.pidfile != "" {
+		cleanupErr = terminateTerminalContainerProcessGroup(s.containerName, s.pidfile)
+		s.pidfile = ""
+	}
 	if s.stdin != nil {
 		s.stdin.Close()
+		s.stdin = nil
 	}
 	if s.cmd != nil {
 		killCommandProcessGroup(s.cmd)
 		_ = s.cmd.Wait()
+		s.cmd = nil
 	}
 	if s.pr != nil {
 		s.pr.Close()
+		s.pr = nil
 	}
+	return cleanupErr
 }
 
 func terminalShellPayload(command, marker string) string {
@@ -5093,12 +5166,12 @@ func terminalShellPayload(command, marker string) string {
 // exec runs one command in the persistent shell. timedOut means the per-command
 // budget elapsed; restarted means the shell was rebuilt (state reset) due to
 // timeout or the shell dying (e.g. the command ran `exit` or crashed bash).
-func (s *terminalShell) exec(command string, timeout time.Duration) (output string, exitCode int, timedOut bool, restarted bool) {
+func (s *terminalShell) exec(command string, timeout time.Duration) (output string, exitCode int, timedOut bool, restarted bool, err error) {
 	marker := "__LMX_END_" + s.nonce + "__"
 	payload := terminalShellPayload(command, marker)
 	if _, err := io.WriteString(s.stdin, payload); err != nil {
-		_ = s.restart()
-		return "[shell write failed; session restarted]", 1, false, true
+		restartErr := s.restart()
+		return "[shell write failed; session restarted]", 1, false, true, restartErr
 	}
 	type readResult struct {
 		out  string
@@ -5127,13 +5200,13 @@ func (s *terminalShell) exec(command string, timeout time.Duration) (output stri
 	select {
 	case r := <-done:
 		if r.eof {
-			_ = s.restart()
-			return r.out + "\n[shell ended; session restarted, state reset]", r.code, false, true
+			restartErr := s.restart()
+			return r.out + "\n[shell ended; session restarted, state reset]", r.code, false, true, restartErr
 		}
-		return r.out, r.code, false, false
+		return r.out, r.code, false, false, nil
 	case <-time.After(timeout):
-		_ = s.restart()
-		return "[command timed out after " + timeout.String() + "; session restarted, state reset]", 124, true, true
+		restartErr := s.restart()
+		return "[command timed out after " + timeout.String() + "; session restarted, state reset]", 124, true, true, restartErr
 	}
 }
 
@@ -5142,7 +5215,7 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 	if err != nil {
 		return 0, "", terminalTokenUsage{}, cliError{"command_exec_failed", "Could not open a persistent shell in the task container.", []string{"Check Docker and that the task image provides /bin/bash.", "Or rerun with --shell-mode stateless."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
 	}
-	defer shell.close()
+	defer func() { _ = shell.close() }()
 
 	messages := []map[string]any{{"role": "user", "content": terminalJSONPrompt(task.Instruction, "")}}
 	maxTurns := terminalAgentMaxTurns(cfg, task)
@@ -5220,7 +5293,11 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 			}
 			transcript.WriteString("## Command\n$ " + cmdText + "\n")
 			executedCommands = append(executedCommands, cmdText)
-			out, code, timedOut, restarted := shell.exec(cmdText, terminalCommandExecutionTimeout(cmdText, cmdTimeout, deadline))
+			out, code, timedOut, restarted, execErr := shell.exec(cmdText, terminalCommandExecutionTimeout(cmdText, cmdTimeout, deadline))
+			if execErr != nil {
+				transcript.WriteString(truncateString(out, 8192) + "\n[command cleanup failed]\n")
+				return turn, transcript.String(), usage, cliError{"command_exec_failed", "Could not stop a shell command in the task container.", []string{"Inspect Docker and the task container process state before retrying."}, map[string]any{"taskId": task.ID, "error": execErr.Error()}}
+			}
 			if timedOut {
 				out += "\n[command timed out]"
 			}
