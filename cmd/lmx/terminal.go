@@ -2772,7 +2772,7 @@ func submitTerminalEval(args cliArgs) error {
 		} else {
 			response, previewStats, usedTrace, err = terminalSavedArtifactResponse(source.root, recordPath, record)
 			if err != nil {
-				return cliError{"trace_read_failed", fmt.Sprintf("Could not package the OMP trace for task %q.", entry.Task), []string{"Check that the selected omp.jsonl is readable, or remove the broken trace to use the bounded saved response fallback."}, map[string]any{"taskId": entry.Task, "error": err.Error()}}
+				return cliError{"trace_read_failed", fmt.Sprintf("Could not package the selected agent trace for task %q.", entry.Task), []string{"Check that the selected trace is readable, or remove the broken trace to use the bounded saved response fallback."}, map[string]any{"taskId": entry.Task, "error": err.Error()}}
 			}
 			if usedTrace {
 				traceCount++
@@ -3790,7 +3790,7 @@ func terminalSavedArtifactResponse(root, recordPath string, record terminalSaved
 		if err != nil {
 			return "", stats, false, err
 		}
-		preview = "# Agent trace\n\nSource: saved task response (no omp.jsonl trace was found).\n\n## Final answer\n\n" + terminalMarkdownCode(boundedTerminalUTF8(savedResponse, terminalTracePreviewBytes-128, "saved response"))
+		preview = "# Agent trace\n\nSource: saved task response.\n\n## Final answer\n\n" + terminalMarkdownCode(boundedTerminalUTF8(savedResponse, terminalTracePreviewBytes-128, "saved response"))
 	}
 	if strings.TrimSpace(record.VerifierOutput) != "" {
 		verifier := boundedTerminalUTF8(record.VerifierOutput, terminalVerifierPreviewBytes, "verifier output")

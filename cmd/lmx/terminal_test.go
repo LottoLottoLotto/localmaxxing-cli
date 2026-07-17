@@ -944,6 +944,12 @@ func TestSubmitTerminalEvalDryRunBuildsCanonicalPayloadWithoutNetworkOrBenchmark
 	if !strings.Contains(failResponse, "SAVED_FAIL_RESPONSE") || !strings.Contains(failResponse, "FAIL_VERIFIER_RETAINED") {
 		t.Fatalf("fallback artifact did not retain saved response and verifier output:\n%s", failResponse)
 	}
+	if !strings.Contains(failResponse, "Source: saved task response.") {
+		t.Fatalf("fallback artifact did not identify its harness-neutral source:\n%s", failResponse)
+	}
+	if strings.Contains(strings.ToLower(failResponse), "omp.jsonl") {
+		t.Fatalf("fallback artifact exposed an irrelevant harness-specific trace filename:\n%s", failResponse)
+	}
 }
 
 func TestSubmitTerminalEvalRejectsInvalidCheckpointRecords(t *testing.T) {
