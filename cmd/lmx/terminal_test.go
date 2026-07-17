@@ -531,6 +531,75 @@ func TestTerminalShellPersistsState(t *testing.T) {
 	}
 }
 
+func TestRunTerminalAgentLoopSessionContinuesAfterCommandTimeout(t *testing.T) {
+	if dockerPreflight() != nil {
+		t.Skip("docker unavailable")
+	}
+	name := "lmx-timeout-recovery-" + randomHex(6)
+	if _, code, _, err := runCommand(context.Background(), 60*time.Second, "docker", "run", "-d", "--rm", "--name", name, "ubuntu:24.04", "sleep", "infinity"); err != nil || code != 0 {
+		t.Skipf("could not start test container (code=%d err=%v)", code, err)
+	}
+	defer runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", name)
+
+	modelCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelCalls++
+		response := terminalJSONResponse{
+			Analysis: "Exercise a command timeout.",
+			Plan:     "Run a command that exceeds its bound.",
+			Commands: []terminalJSONCommand{
+				{Keystrokes: "sleep 2\n", Duration: 0.1},
+				{Keystrokes: "printf should-not-run > /tmp/skipped\n", Duration: 0.1},
+			},
+		}
+		if modelCalls > 1 {
+			response = terminalJSONResponse{
+				Analysis:     "Recover after the bounded command was stopped.",
+				Plan:         "Write durable evidence and finish.",
+				Commands:     []terminalJSONCommand{{Keystrokes: "printf recovered > /tmp/recovered\n", Duration: 0.1}},
+				TaskComplete: true,
+			}
+		}
+		content, err := json.Marshal(response)
+		if err != nil {
+			t.Errorf("encode model response: %v", err)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": string(content)}}},
+		})
+	}))
+	defer server.Close()
+
+	turns, transcript, _, err := runTerminalAgentLoopSession(context.Background(), terminalTask{
+		ID:          "timeout-recovery-test",
+		Instruction: "Recover after a bounded command.",
+		Agent:       terminalAgentConfig{MaxTurns: 3},
+	}, name, server.URL, "fixture-model", terminalConfig{
+		args:              parseArgs([]string{"eval", "terminal", "run", "--quiet"}),
+		commandTimeoutSec: 1,
+		agentTimeoutSec:   20,
+		endpointTimeout:   5 * time.Second,
+		repeatBatchLimit:  3,
+	})
+	if err != nil {
+		t.Fatalf("runTerminalAgentLoopSession: %v\ntranscript:\n%s", err, transcript)
+	}
+	if turns != 2 || modelCalls != 2 {
+		t.Fatalf("turns=%d modelCalls=%d, want two recovery turns", turns, modelCalls)
+	}
+	if !strings.Contains(transcript, "[command timed out]") || !strings.Contains(transcript, "printf recovered") {
+		t.Fatalf("transcript does not show timeout followed by recovery:\n%s", transcript)
+	}
+	out, code, _, execErr := runCommand(context.Background(), 30*time.Second, "docker", "exec", name, "cat", "/tmp/recovered")
+	if execErr != nil || code != 0 || strings.TrimSpace(out) != "recovered" {
+		t.Fatalf("recovery marker: code=%d err=%v out=%q", code, execErr, out)
+	}
+	if out, code, _, execErr := runCommand(context.Background(), 30*time.Second, "docker", "exec", name, "sh", "-c", "test ! -e /tmp/skipped"); execErr != nil || code != 0 {
+		t.Fatalf("post-timeout command batch continued unexpectedly: code=%d err=%v out=%q", code, execErr, out)
+	}
+}
+
 func TestRunTerminalAgentLoopAppliesFiniteAndRetryTokenCaps(t *testing.T) {
 	tests := []struct {
 		name          string

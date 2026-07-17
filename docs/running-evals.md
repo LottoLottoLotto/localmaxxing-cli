@@ -351,7 +351,6 @@ lmx eval terminal run --task-dir ./tb-bundles \
   --out terminal-run.json \
   --checkpoint-dir terminal-run.checkpoint \
   --resume none \
-  --command-timeout-seconds 1800 \
   --repeat-batch-limit 3 \
   --trace-dir terminal-traces
 ```
@@ -415,10 +414,16 @@ is omitted, each task gets `max(task.json agent.timeoutSec, 14400)` seconds.
 Task/agent budget, manifest verifier timeout, shell-command timeout, and model
 HTTP timeout are separate controls. `--command-timeout-seconds` bounds each
 built-in or routed Terminus-2 shell command (legacy `--command-timeout` is still
-accepted) and reports `command_timeout`; it never changes the task verifier
-timeout. `--endpoint-timeout-seconds` bounds only model HTTP requests (default
-600 seconds, with retry reserve). Model completions default to 16,384 tokens and
-8,192 on retry; explicit `--max-tokens` applies to both.
+accepted); it never changes the task verifier timeout. A built-in command timeout
+kills only that command, restarts the persistent shell, skips the rest of that
+command batch, and returns a recovery observation to the agent. Durable container
+files remain available, so the next turn can inspect partial state, resume a
+download, or choose a smaller bounded action. Repeating the same timed-out batch
+is still stopped by the no-progress guard. Routed external agents report
+`command_timeout` when their external harness exits on routed-shell timeout.
+`--endpoint-timeout-seconds` bounds only model HTTP requests (default 600 seconds,
+with retry reserve). Model completions default to 16,384 tokens and 8,192 on
+retry; explicit `--max-tokens` applies to both.
 
 The built-in harness fingerprints normalized command batches and observations.
 After `--repeat-batch-limit - 1` identical or near-identical no-progress batches

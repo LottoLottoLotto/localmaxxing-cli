@@ -10459,7 +10459,7 @@ var usageExamples = []string{
 	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json`,
 	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --base-url http://localhost:8000 --served-model Qwen3-8B --model Qwen/Qwen3-8B --hardware hardware.json --shard 3 --concurrency 2 --trace-dir ./terminal-traces --submit`,
 	`lmx eval terminal run --task-dir ./tb-bundles/smoke --base-url http://localhost:8000 --model Qwen/Qwen3-8B --trace-dir ./terminal-traces --out completed-terminal-run.json`,
-	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json --resume auto --command-timeout-seconds 1800 --repeat-batch-limit 3`,
+	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json --resume auto --repeat-batch-limit 3`,
 	`lmx eval terminal recover ./completed-terminal-run.json.checkpoint --task-id caffe-cifar-10 --container lmx-tb-caffe-recovered --bundle ./tb-bundles/caffe-cifar-10 --result ./recovered-task.json`,
 	`lmx eval terminal submit ./completed-terminal-run.json --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-batch.json`,
 	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --api-url https://www.localmaxxing.com`,

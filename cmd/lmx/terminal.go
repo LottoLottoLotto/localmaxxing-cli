@@ -4998,8 +4998,7 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 		messages = append(messages, map[string]any{"role": "user", "content": observation})
 		printStatus(cfg.args, "terminal_turn", map[string]any{"taskId": task.ID, "turn": turn, "exitCode": code, "commandTimedOut": timedOut, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg), "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)})
 		if timedOut {
-			printStatus(cfg.args, "terminal_command_timeout", map[string]any{"taskId": task.ID, "turn": turn, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg)})
-			return turn, transcript.String(), usage, terminalAgentOutcomeError{code: "command_timeout", text: "a harness-bounded shell command exceeded --command-timeout-seconds"}
+			printStatus(cfg.args, "terminal_command_timeout", map[string]any{"taskId": task.ID, "turn": turn, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg), "recoverable": true})
 		}
 		nudge, exhausted := repeatGuard.observe([]string{cmdText}, observation, cfg.repeatBatchLimit)
 		if nudge {
@@ -5205,6 +5204,7 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 
 		executedCommands := make([]string, 0, len(response.Commands))
 		var observation strings.Builder
+		batchTimedOut := false
 		for i, command := range response.Commands {
 			cmdText, _ := terminalCommandFromKeystrokes(command.Keystrokes)
 			if cmdText == "" {
@@ -5235,8 +5235,9 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 			}
 			printStatus(cfg.args, "terminal_turn", fields)
 			if timedOut {
-				printStatus(cfg.args, "terminal_command_timeout", map[string]any{"taskId": task.ID, "turn": turn, "commandIndex": i + 1, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg)})
-				return turn, transcript.String(), usage, terminalAgentOutcomeError{code: "command_timeout", text: "a harness-bounded shell command exceeded --command-timeout-seconds"}
+				batchTimedOut = true
+				printStatus(cfg.args, "terminal_command_timeout", map[string]any{"taskId": task.ID, "turn": turn, "commandIndex": i + 1, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg), "recoverable": true})
+				break
 			}
 		}
 		terminalState = truncateString(observation.String(), terminalModelObservationLimit)
@@ -5251,7 +5252,7 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 			transcript.WriteString("## Note\nRepeated identical or near-identical command batches persisted after the protocol nudge.\n")
 			return turn, transcript.String(), usage, terminalAgentOutcomeError{code: "agent_protocol_exhausted", text: "agent repeated an identical or near-identical command batch without observable progress"}
 		}
-		if response.TaskComplete {
+		if response.TaskComplete && !batchTimedOut {
 			transcript.WriteString("## Note\nModel marked task complete after command batch.\n")
 			return turn, transcript.String(), usage, nil
 		}

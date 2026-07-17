@@ -76,7 +76,7 @@ lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1
 lmx eval terminal verify ./tb-bundles/smoke --oracle
 lmx endpoint discover --out endpoint.json --include-server-metadata
 lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com --verify-bundles --json
-lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json --out completed-terminal-run.json --resume auto --command-timeout-seconds 1800 --repeat-batch-limit 3
+lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json --out completed-terminal-run.json --resume auto --repeat-batch-limit 3
 lmx eval terminal recover completed-terminal-run.json.checkpoint --task-id caffe-cifar-10 --container lmx-tb-caffe-recovered --bundle ./tb-bundles/caffe-cifar-10 --result recovered-task.json
 lmx eval terminal submit completed-terminal-run.json.checkpoint --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-batch.json
 lmx eval terminal submit completed-terminal-run.json.checkpoint --api-url https://www.localmaxxing.com --api-key "$LMX_API_KEY"
@@ -123,7 +123,8 @@ cannot be overwritten.
 `--api-url` selects LocalMaxxing; `--base-url` selects model inference. Failures
 emit `terminal_failure_summary` rows with task ID, verifier summary, turns/max,
 artifact path, and last-progress timestamp. `--command-timeout-seconds` (legacy
-alias `--command-timeout`) bounds shell commands and reports `command_timeout`;
+alias `--command-timeout`) bounds each shell command. Built-in timeouts kill only
+that command and return a recovery observation on the next agent turn;
 `--endpoint-timeout-seconds` independently bounds model HTTP. Repeated
 no-progress batches receive a nudge and then end as `agent_protocol_exhausted`
 before canonical verification. Use `--trace-dir`, `--cleanup-images`,

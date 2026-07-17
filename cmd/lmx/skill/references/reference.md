@@ -76,7 +76,7 @@ Eval shards and Terminal-Bench:
 - `--agent-execution <m>`: `host`, `container`, or `routed-shell`; default `host`.
 - `--agent-name <name>`: external terminal agent label; default `external-agent`.
 - `--container-base-url <url>`: base URL visible from task containers.
-- `--command-timeout-seconds <sec>`: harness shell-command timeout (default remaining task budget, up to 4h); legacy `--command-timeout` remains accepted. It is distinct from task/verifier and HTTP timeouts; expiry reports `command_timeout` and verification still runs.
+- `--command-timeout-seconds <sec>`: harness shell-command timeout (default remaining task budget, up to 4h); legacy `--command-timeout` remains accepted. It is distinct from task/verifier and HTTP timeouts. A built-in timeout stops only that command, restarts the persistent shell, preserves durable container files, and gives the agent another turn to inspect or resume. Routed external agents may still exit with `command_timeout`.
 - `--endpoint-timeout-seconds <n>`: model HTTP request timeout only; default 600 seconds with retry reserve.
 - `--resume <none|auto|dir>`: initialize a clean private checkpoint (default), resume the default checkpoint, or resume an explicit v3 checkpoint. Dataset/shard, complete manifest and canonical IDs, selected order/bundle digests, model identities/resolution/revision, quantization, hardware hash, runner/harness, and run configuration must match exactly. Incomplete, unscored, and verifier-incomplete wrappers rerun.
 - `--checkpoint-dir <dir>`: private `checkpoint.json` + `summary.json` + per-task wrapper destination. A process lock rejects concurrent writers; wrappers, metadata, and the final summary commit use synced same-directory atomic file transactions.
