@@ -2294,7 +2294,7 @@ func TestTerminalUXEndpointFileReconcilesLiveMetadataAndCompletionIsNonSubmit(t 
 	if endpointCalls.Load() < 2 {
 		t.Fatalf("selected endpoint received %d metadata probes, want live models and props", endpointCalls.Load())
 	}
-	for _, want := range []string{"[localmaxxing] terminal_eval_complete", "Terminal execution completed; results were not submitted.", "Submit later with: lmx eval terminal submit"} {
+	for _, want := range []string{"[localmaxxing] local_execution_results_not_submitted", "local_execution_results_not_submitted: terminal tasks executed and checkpointed; no result was submitted to LocalMaxxing.", "Submit later with: lmx eval terminal submit"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("completion output missing %q:\n%s", want, stdout)
 		}
@@ -2481,7 +2481,7 @@ func TestTerminalUXLegacyCheckpointDirectoryRemainsAccepted(t *testing.T) {
 	}
 }
 
-func TestTerminalUXFailureSummaryClassifiesOutcomesAndArtifactHints(t *testing.T) {
+func TestTerminalUXFailureSummaryClassifiesOutcomesAndIncludesActionableFields(t *testing.T) {
 	bundles := []terminalBundle{
 		{Task: terminalTask{ID: "passed"}},
 		{Task: terminalTask{ID: "model-error"}},
@@ -2492,19 +2492,20 @@ func TestTerminalUXFailureSummaryClassifiesOutcomesAndArtifactHints(t *testing.T
 	}
 	results := []terminalTaskResult{
 		{scored: true, pass: true},
-		{errCode: "model_call_failed", errText: "endpoint returned 503", turns: 1},
-		{errText: "verifier never started", turns: 2},
-		{scored: true, agentOutcomeCode: "agent_timeout", agentOutcomeText: "external agent timed out before verification", turns: 1},
-		{scored: true, agentOutcomeCode: "max_turns_exhausted", agentOutcomeText: "agent exhausted its maximum turns before verifier success", turns: 3},
-		{scored: true, turns: 1},
+		{errCode: "model_call_failed", errText: "endpoint returned 503", turns: 1, lastProgressAt: "2026-07-17T01:01:01Z"},
+		{errText: "verifier never started", turns: 2, lastProgressAt: "2026-07-17T01:02:02Z"},
+		{scored: true, agentOutcomeCode: "agent_timeout", agentOutcomeText: "external agent timed out before verification", turns: 1, lastProgressAt: "2026-07-17T01:03:03Z"},
+		{scored: true, agentOutcomeCode: "max_turns_exhausted", agentOutcomeText: "agent exhausted its maximum turns before verifier success", turns: 3, lastProgressAt: "2026-07-17T01:04:04Z"},
+		{scored: true, turns: 1, verifierOutput: "canonical verifier rejected the task", lastProgressAt: "2026-07-17T01:05:05Z"},
 	}
+	checkpoint := filepath.Join("saved", "atomic-checkpoint")
 	stderr := captureTerminalTestStderr(t, func() {
 		printTerminalFailureSummary(
 			parseArgs([]string{"--json-status"}),
 			bundles,
 			results,
 			terminalConfig{maxTurns: 3},
-			"completed.json",
+			checkpoint,
 		)
 	})
 	line := strings.TrimSpace(stderr)
@@ -2529,12 +2530,21 @@ func TestTerminalUXFailureSummaryClassifiesOutcomesAndArtifactHints(t *testing.T
 	for _, raw := range failures {
 		failure := asObject(raw)
 		byTask[stringValue(failure["taskId"])] = failure
+		for _, field := range []string{"taskId", "outcome", "verifierSummary", "turns", "maxTurns", "artifactPath", "lastProgressAt"} {
+			if _, present := failure[field]; !present {
+				t.Fatalf("failure row missing actionable field %q: %#v", field, failure)
+			}
+		}
 	}
-	if byTask["model-error"]["reason"] != "endpoint returned 503" || byTask["turn-limit"]["outcome"] != "max_turns_exhausted" {
-		t.Fatalf("classified failure rows = %#v", byTask)
+	if byTask["model-error"]["outcome"] != "model_call_failed" || byTask["model-error"]["verifierSummary"] != "endpoint returned 503" {
+		t.Fatalf("model failure row = %#v", byTask["model-error"])
 	}
-	if byTask["verifier-rejected"]["artifactHint"] != "completed.json#results[5]" {
-		t.Fatalf("artifact hint = %#v", byTask["verifier-rejected"])
+	if byTask["turn-limit"]["outcome"] != "max_turns_exhausted" || byTask["turn-limit"]["turns"] != float64(3) || byTask["turn-limit"]["maxTurns"] != float64(3) {
+		t.Fatalf("turn exhaustion row = %#v", byTask["turn-limit"])
+	}
+	wantArtifact := filepath.Join(checkpoint, terminalCheckpointWrapperName("verifier-rejected"))
+	if byTask["verifier-rejected"]["artifactPath"] != wantArtifact || byTask["verifier-rejected"]["lastProgressAt"] != "2026-07-17T01:05:05Z" {
+		t.Fatalf("verifier failure recovery fields = %#v, want artifact %q", byTask["verifier-rejected"], wantArtifact)
 	}
 	if _, included := byTask["passed"]; included {
 		t.Fatalf("successful task appeared in failure summary: %#v", byTask["passed"])

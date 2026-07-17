@@ -10459,6 +10459,8 @@ var usageExamples = []string{
 	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json`,
 	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --base-url http://localhost:8000 --served-model Qwen3-8B --model Qwen/Qwen3-8B --hardware hardware.json --shard 3 --concurrency 2 --trace-dir ./terminal-traces --submit`,
 	`lmx eval terminal run --task-dir ./tb-bundles/smoke --base-url http://localhost:8000 --model Qwen/Qwen3-8B --trace-dir ./terminal-traces --out completed-terminal-run.json`,
+	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json --resume auto --command-timeout-seconds 1800 --repeat-batch-limit 3`,
+	`lmx eval terminal recover ./completed-terminal-run.json.checkpoint --task-id caffe-cifar-10 --container lmx-tb-caffe-recovered --bundle ./tb-bundles/caffe-cifar-10 --result ./recovered-task.json`,
 	`lmx eval terminal submit ./completed-terminal-run.json --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-batch.json`,
 	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --api-url https://www.localmaxxing.com`,
 	`lmx eval terminal submit ./completed-terminal-shard --dataset <slug> --shard-index 3 --hf-id Qwen/Qwen3-8B --hardware hardware.json --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-batch.json`,
@@ -10500,8 +10502,11 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --agent-execution <m>   External agent execution: host (default), container, or routed-shell
   --agent-name <name>     Label for external terminal agent submissions (default: external-agent)
   --container-base-url <url> Base URL visible from task containers for container-native agents
-  --command-timeout <sec> Terminal eval per-shell-command timeout (default: remaining task budget, up to 4h)
-  --endpoint-timeout-seconds <n> Terminal model request timeout (default: 600; first attempt reserves retry time)
+  --command-timeout-seconds <n> Terminal harness shell-command timeout; distinct from task verifier and model endpoint timeouts (legacy alias: --command-timeout)
+  --endpoint-timeout-seconds <n> Terminal model HTTP request timeout (default: 600; first attempt reserves retry time)
+  --resume <mode|dir>     Terminal run resume policy: none (default), auto, or an explicit v3 checkpoint directory
+  --checkpoint-dir <dir>  Private locked checkpoint directory using synced same-directory atomic file commits; default is <out>.checkpoint or .lmx-terminal-checkpoints/<dataset-shard>
+  --repeat-batch-limit <n> Stop after repeated no-progress command batches (default/minimum: 3)
   --trace-dir <dir>       Save per-terminal-task traces locally: transcript.md, verifier.txt, prompt.txt, result.json, and external agent logs
   --cleanup-images        Remove locally built terminal task images after each task
   --shell-mode <mode>     Terminal eval built-in harness shell: persistent (default, one shared shell) or stateless (fresh shell per command)
@@ -10630,12 +10635,13 @@ var commandDescriptions = map[string]string{
 	"eval submit":            "Submit a previously saved run payload (deferred submit).",
 	"eval shard":             "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
 	"eval shard status":      "Print aggregate shard coverage and missing shard indexes for a model.",
-	"eval terminal":          "Import, inspect, run, verify, and submit Terminal-Bench task bundles.",
+	"eval terminal":          "Import, inspect, recover, run, verify, and submit Terminal-Bench task bundles.",
 	"eval terminal import":   "Convert one Harbor task directory or a parent of Harbor tasks into local Terminal-Bench bundles; this does not execute tasks.",
 	"eval terminal inspect":  "Check every declared dataset shard and manifest without Docker, model, verifier, or submission activity; optionally download and validate every bundle.",
-	"eval terminal run":      "Execute Terminal-Bench tasks with Docker from a public LocalMaxxing dataset or local bundles. --api-url selects LocalMaxxing; an uncredentialed run may auto-discover exactly one healthy localhost model endpoint, otherwise select one with --base-url or --endpoint-file. The selected endpoint is live-probed, explicit --served-model must match it, credentialed endpoints are never auto-probed, and HuggingFace auto-resolution requires an exact verified loaded filename source.",
-	"eval terminal submit":   "Validate and submit a completed terminal run JSON file or legacy checkpoint directory. Authoritative saved dataset/model/hardware/quantization metadata makes the matching flags optional; conflicting explicit flags fail. --dry-run is entirely offline and never contacts LocalMaxxing, Docker, a model, or a verifier.",
-	"eval terminal verify":   "Execute the bundled reference solution and verifier for one local bundle or bundle directory; no model endpoint is used.",
+	"eval terminal recover":  "Safely rerun the canonical verifier against an existing container holding the recovered task state, then atomically import the derived score into only the matching missing v3 checkpoint task. Bundle identity and immutable provenance are validated before Docker executes.",
+	"eval terminal run":      "Execute Terminal-Bench tasks with Docker and atomically checkpoint after every verifier attempt. --resume accepts none, auto, or an explicit matching v3 checkpoint; immutable manifest/model/hardware/runner/task-order conflicts fail before task execution. --api-url is LocalMaxxing, while --base-url/--endpoint-file selects model inference.",
+	"eval terminal submit":   "Validate and submit a completed terminal run JSON file or legacy/v3 checkpoint directory. --dry-run emits offline_submit_validation_no_execution and never contacts LocalMaxxing, Docker, a model, or a verifier.",
+	"eval terminal verify":   "Execute the bundled reference solution and verifier for local bundles with the same atomic checkpoint/recovery behavior; no model endpoint is used.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",
 	"auth":                   "Manage LocalMaxxing API authentication.",
@@ -10653,6 +10659,12 @@ var commandOptions = map[string][]string{
 		"--verify-bundles            Download, hash-check, safely extract, and validate every bundle",
 		"--json                      Print the readiness summary as JSON",
 		"--out <path>                Write the readiness summary JSON to a file",
+	},
+	"eval terminal recover": {
+		"--task-id <id>             Missing checkpoint task to recover",
+		"--container <name>         Existing container holding the recovered task state",
+		"--bundle <dir>             Exact canonical bundle used to rerun the verifier",
+		"--result <path>            Optional incomplete one-task wrapper supplying telemetry only",
 	},
 	"eval terminal run": {
 		"--api-url <url>             LocalMaxxing origin used to acquire public datasets and submit runs",
@@ -10679,7 +10691,10 @@ var commandOptions = map[string][]string{
 		"--container-base-url <url>  Model URL visible from task containers",
 		"--max-turns <n>             Agent turn cap (default: task manifest)",
 		"--agent-timeout <seconds>   Whole-agent timeout (default: at least four hours)",
-		"--command-timeout <seconds> Per-shell-command timeout",
+		"--command-timeout-seconds <n> Harness shell-command timeout; legacy --command-timeout is accepted",
+		"--resume <none|auto|dir>     Resume only an exact immutable-provenance v3 checkpoint (default: none)",
+		"--checkpoint-dir <dir>       Atomic summary.json/checkpoint.json/per-task wrapper destination",
+		"--repeat-batch-limit <n>     Nudge then stop repeated no-progress command batches (default: 3)",
 		"--endpoint-timeout-seconds <n> Model request timeout (default: 600)",
 		"--max-tokens <n>            Model completion cap (default: 16384; retry: 8192)",
 		"--temperature <f>           Model sampling temperature (default: 0)",
@@ -10714,6 +10729,8 @@ var commandOptions = map[string][]string{
 	"eval terminal verify": {
 		"--concurrency <n>           Parallel bundle workers (default: 1)",
 		"--agent-timeout <seconds>   Reference-solution timeout (default: max(manifest, 14400))",
+		"--resume <none|auto|dir>     Resume only a matching v3 checkpoint",
+		"--checkpoint-dir <dir>       Atomic checkpoint directory",
 		"--cleanup-images            Remove locally built task images after each task",
 		"--trace-dir <dir>           Save per-task solution transcripts and verifier output",
 		"--out <path>                Write the oracle verification result JSON",

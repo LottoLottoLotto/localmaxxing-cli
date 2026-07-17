@@ -62,6 +62,7 @@ class RoutedEnvironment:
     trace_dir: Path
     workdir: str
     default_user: str | None
+    command_timeout_sec: float
 
     def __post_init__(self) -> None:
         self.session_id = os.environ.get("LMX_TERMINAL_TASK_ID", "lmx-terminus2")
@@ -87,23 +88,39 @@ class RoutedEnvironment:
         timeout_sec: float | None = None,
         **_: Any,
     ) -> ExecResult:
+        effective_timeout = self.command_timeout_sec
+        if timeout_sec is not None and timeout_sec > 0:
+            effective_timeout = min(effective_timeout, timeout_sec)
         full_command = command
         if env:
             exports = " ".join(f"{shlex.quote(k)}={shlex.quote(v)}" for k, v in env.items())
             full_command = f"export {exports}; {command}"
+        token = os.urandom(12).hex()
+        pidfile = f"/tmp/lmx-terminal-command-{token}.pid"
+        wrapped_command = (
+            f"pidfile={shlex.quote(pidfile)}; rm -f \"$pidfile\"; "
+            f"setsid bash -lc {shlex.quote(full_command)} & child=$!; "
+            "printf '%s\\n' \"$child\" > \"$pidfile\"; "
+            "wait \"$child\"; rc=$?; rm -f \"$pidfile\"; exit \"$rc\""
+        )
         proc = await asyncio.create_subprocess_exec(
             *self._docker_args(user=user, cwd=cwd),
-            full_command,
+            wrapped_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout)
         except asyncio.TimeoutError:
+            terminated, termination_detail = await self._terminate_container_group(pidfile)
             proc.kill()
             stdout_b, stderr_b = await proc.communicate()
-            stderr = stderr_b.decode(errors="replace") + f"\n[timeout after {timeout_sec}s]"
+            stderr = stderr_b.decode(errors="replace") + f"\n[command_timeout after {effective_timeout}s]"
+            if termination_detail:
+                stderr += "\n" + termination_detail
             self._log_exec(command, cwd, user, 124, stdout_b.decode(errors="replace"), stderr)
+            if not terminated:
+                raise RuntimeError("timed-out command process group could not be terminated inside the task container")
             return ExecResult(stdout=stdout_b.decode(errors="replace"), stderr=stderr, return_code=124)
 
         stdout = stdout_b.decode(errors="replace")
@@ -111,6 +128,31 @@ class RoutedEnvironment:
         return_code = int(proc.returncode or 0)
         self._log_exec(command, cwd, user, return_code, stdout, stderr)
         return ExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
+
+    async def _terminate_container_group(self, pidfile: str) -> tuple[bool, str]:
+        cleanup = (
+            f"pidfile={shlex.quote(pidfile)}; "
+            "test -s \"$pidfile\" || exit 2; pid=$(cat \"$pidfile\"); "
+            "case \"$pid\" in ''|*[!0-9]*) exit 3;; esac; "
+            "kill -TERM -- -\"$pid\" 2>/dev/null || true; "
+            "i=0; while kill -0 -- -\"$pid\" 2>/dev/null && [ \"$i\" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; "
+            "if kill -0 -- -\"$pid\" 2>/dev/null; then kill -KILL -- -\"$pid\" 2>/dev/null || true; fi; "
+            "i=0; while kill -0 -- -\"$pid\" 2>/dev/null && [ \"$i\" -lt 20 ]; do sleep 0.1; i=$((i+1)); done; "
+            "alive=0; kill -0 -- -\"$pid\" 2>/dev/null && alive=1; rm -f \"$pidfile\"; exit \"$alive\""
+        )
+        killer = await asyncio.create_subprocess_exec(
+            "docker", "exec", self.container, "bash", "-lc", cleanup,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(killer.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            killer.kill()
+            await killer.communicate()
+            return False, "[command_timeout cleanup itself timed out]"
+        detail = (stdout_b + stderr_b).decode(errors="replace").strip()
+        return killer.returncode == 0, detail
 
     def _log_exec(self, command: str, cwd: str | None, user: str | int | None, return_code: int, stdout: str, stderr: str) -> None:
         event = {
@@ -208,12 +250,14 @@ async def main() -> int:
     temperature_raw = os.environ.get("LMX_TERMINUS2_TEMPERATURE")
     temperature = float(temperature_raw) if temperature_raw not in (None, "") else None
     default_user = os.environ.get("LMX_TERMINAL_AGENT_USER") or None
+    command_timeout_sec = float(os.environ.get("LMX_TERMINAL_COMMAND_TIMEOUT_SECONDS") or "14400")
 
     env = RoutedEnvironment(
         container=os.environ["LMX_TERMINAL_CONTAINER"],
         trace_dir=trace_dir,
         workdir=os.environ.get("LMX_TERMINAL_WORKDIR", "/app"),
         default_user=default_user,
+        command_timeout_sec=command_timeout_sec,
     )
     context = AgentContext()
     agent = Terminus2(

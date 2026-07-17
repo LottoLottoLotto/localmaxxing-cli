@@ -28,10 +28,10 @@ Global/auth/output:
 - `--profile <name>`: load saved defaults from `lmx profile save`.
 - `--json-status`: emit progress events as JSON lines on stderr.
 - `--quiet`: suppress progress events.
-- `--out <path>`: write computed payload/result JSON, or write `SKILL.md` for `lmx skill print`. On `eval terminal run`, this is a monolithic completed-run artifact accepted directly by deferred `eval terminal submit`.
+- `--out <path>`: write computed payload/result JSON. Terminal run also writes an atomic sibling `<out>.checkpoint` unless `--checkpoint-dir` selects another directory.
 - `--dir <dir>`: target skills directory for `lmx skill install`; default `.claude/skills`.
-- `--submit`: upload run to LocalMaxxing. `eval terminal run` still executes when this is omitted; it only keeps the result local.
-- `--dry-run`: for benchmark run, write a measurement plan; for deferred `eval terminal submit`, validate/package the completed artifact entirely offline. It is not a no-execution mode for `eval terminal run`.
+- `--submit`: upload a completed run. Terminal `run` without it emits `local_execution_results_not_submitted`; execution still occurred.
+- `--dry-run`: deferred Terminal `submit` emits `offline_submit_validation_no_execution` and only validates/packages saved work. It is never a no-execution mode for Terminal `run`.
 
 Model/eval:
 
@@ -76,13 +76,17 @@ Eval shards and Terminal-Bench:
 - `--agent-execution <m>`: `host`, `container`, or `routed-shell`; default `host`.
 - `--agent-name <name>`: external terminal agent label; default `external-agent`.
 - `--container-base-url <url>`: base URL visible from task containers.
-- `--command-timeout <sec>`: terminal per-shell-command timeout; default is the remaining task budget, up to 4h.
-- `--endpoint-timeout-seconds <n>`: Terminal model request timeout; default 600 seconds. The first attempt reserves part of the remaining task budget for retry.
-- `--trace-dir <dir>`: save per-task `transcript.md`, `verifier.txt`, `prompt.txt`, `instruction.txt`, `result.json` with `wallTimeMs`/`tokenUsage`, and external agent logs.
+- `--command-timeout-seconds <sec>`: harness shell-command timeout (default remaining task budget, up to 4h); legacy `--command-timeout` remains accepted. It is distinct from task/verifier and HTTP timeouts; expiry reports `command_timeout` and verification still runs.
+- `--endpoint-timeout-seconds <n>`: model HTTP request timeout only; default 600 seconds with retry reserve.
+- `--resume <none|auto|dir>`: initialize a clean private checkpoint (default), resume the default checkpoint, or resume an explicit v3 checkpoint. Dataset/shard, complete manifest and canonical IDs, selected order/bundle digests, model identities/resolution/revision, quantization, hardware hash, runner/harness, and run configuration must match exactly. Incomplete, unscored, and verifier-incomplete wrappers rerun.
+- `--checkpoint-dir <dir>`: private `checkpoint.json` + `summary.json` + per-task wrapper destination. A process lock rejects concurrent writers; wrappers, metadata, and the final summary commit use synced same-directory atomic file transactions.
+- `--repeat-batch-limit <n>`: no-progress identical/near-identical batch limit (default 3); the harness nudges before `agent_protocol_exhausted`.
+- `--trace-dir <dir>`: save per-task transcript, verifier output, prompt/instruction, result, and external agent logs.
 - `--cleanup-images`: remove locally built terminal task images after each task.
 - `--shell-mode <mode>`: `persistent` or `stateless`; default `persistent`.
 - `--oracle`: run terminal task `solution/solve.sh` instead of the model agent.
-- Terminal `run --out` persists dataset/shard, canonical `hfId` and model-resolution evidence, model revision, quantization, hardware, harness configuration, timing, and token usage. Deferred submit reuses these authoritative values and rejects conflicting flags rather than rerunning work.
+- `eval terminal recover <checkpoint> --task-id <id> --container <name> --bundle <dir> [--result <wrapper>]`: validate exact v3 provenance and bundle identity, rerun the canonical verifier against the existing container, and atomically persist only its fresh reward-derived score. Optional result input is incomplete-task telemetry only and never score evidence; completed tasks cannot be overwritten.
+- Terminal v3 artifacts retain complete secret-free provenance in checkpoint metadata, every nested summary entry, every task wrapper, monolithic output, and deferred submission. Partial checkpoints advertise only the exact resume command; submit is advertised only when complete. Legacy checkpoint submit remains supported; legacy resume/recover does not.
 - `--llama-scorer <path>`: local helper for `llama_cpp_loglikelihood` scoring.
 - `--sandbox-image <name>`: code sandbox image; default `lmx-sandbox`.
 - `--sandbox-runtime <bin>`: container runtime for code execution; default `docker`.

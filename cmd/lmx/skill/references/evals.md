@@ -76,19 +76,21 @@ lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1
 lmx eval terminal verify ./tb-bundles/smoke --oracle
 lmx endpoint discover --out endpoint.json --include-server-metadata
 lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com --verify-bundles --json
-lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json --out completed-terminal-run.json
-lmx eval terminal submit completed-terminal-run.json --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-batch.json
-lmx eval terminal submit completed-terminal-run.json --api-url https://www.localmaxxing.com --api-key "$LMX_API_KEY"
+lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json --out completed-terminal-run.json --resume auto --command-timeout-seconds 1800 --repeat-batch-limit 3
+lmx eval terminal recover completed-terminal-run.json.checkpoint --task-id caffe-cifar-10 --container lmx-tb-caffe-recovered --bundle ./tb-bundles/caffe-cifar-10 --result recovered-task.json
+lmx eval terminal submit completed-terminal-run.json.checkpoint --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-batch.json
+lmx eval terminal submit completed-terminal-run.json.checkpoint --api-url https://www.localmaxxing.com --api-key "$LMX_API_KEY"
 ```
 
-`run` executes tasks; omitting `--submit` keeps the run local, while its `--out`
-JSON is a complete monolithic artifact accepted directly by deferred `submit`.
-Do not execute the tasks again merely to upload them. Deferred `submit --dry-run`
-validates and packages the saved work entirely offline, so it cannot prove
-`--api-url` routing; use `inspect` for that. `submit` also accepts legacy
-completed checkpoint directories. An isolated/noncanonical directory requires
-`--shard-index <n>`; a full canonical 89-task Terminal-Bench 2.1 directory is
-partitioned into 10 payloads automatically.
+`run` executes non-resumed tasks. Without `--submit` it emits
+`local_execution_results_not_submitted`; deferred `submit --dry-run` emits
+`offline_submit_validation_no_execution` and performs no task, Docker, model,
+verifier, or network execution. A private v3 checkpoint uses same-directory
+file transactions: task wrappers are synced and renamed first, checkpoint
+metadata is atomic, and ordered `summary.json` is the final task-set commit.
+The directory/parent are synced, a process lock rejects concurrent writers, and
+`--resume none` safely initializes a clean checkpoint before the first task.
+Legacy checkpoint directories remain supported for submit, never strict resume.
 
 For the built-in agent, `--base-url` and `--endpoint-file` are mutually exclusive
 endpoint selectors. The file supplies only its one `ok:true` URL; model, path,
@@ -101,17 +103,28 @@ Loaded-filename HF resolution succeeds only when the exact filename is verified
 in one unambiguous source repo; it never guesses. The run artifact saves
 dataset/shard, model and resolution evidence, quantization, hardware, harness,
 timing, and token metadata; deferred submit reuses matching saved values.
-`--api-url` selects LocalMaxxing; `--base-url` selects model inference.
+`--resume none|auto|<dir>` accepts a task only when complete manifest/task order,
+bundle digests/versions, declared/canonical/served model identity, quantization,
+hardware hash, runner/harness fingerprint, and run configuration match exactly.
+Only complete parsed canonical verifier rewards resume; incomplete, unscored,
+or verifier-incomplete wrappers rerun. Partial task events contain the exact
+`resumeCommand` and no submit command; the submit command appears only when the
+checkpoint is complete.
 
-Failures print a task/outcome/turn/reason table with an `--out` result pointer or
-`--trace-dir` path; `--json-status` emits the same categorized
-`terminal_failure_summary`. Useful flags include `--task-dir`, `--dataset`,
-`--endpoint-file`, `--base-url`, `--served-model`, `--model-path`, `--hf-id`,
-`--shard-index`, `--verify-bundles`, `--max-turns`, `--agent-timeout`, `--agent`,
-`--agent-cmd`, `--agent-execution`, `--agent-name`, `--container-base-url`,
-`--command-timeout`, `--endpoint-timeout-seconds`, `--trace-dir`,
-`--cleanup-images`, `--shell-mode`, and `--oracle`. `--agent terminus-2` uses the
-release-binary-embedded Harbor adapter.
+`recover <checkpoint> --task-id <id> --container <name> --bundle <dir>
+[--result <wrapper>]` validates exact v3 provenance, task membership, and the
+bundle's deterministic hash/version/task/verifier identity before invoking
+Docker. It reruns the canonical verifier against the existing container and
+persists only the score derived from the fresh canonical reward. Optional
+`--result` input is incomplete-task telemetry only; self-authored pass, scored,
+canonical, evidence, and digest claims never establish a score. Completed tasks
+cannot be overwritten.
 
-
-
+`--api-url` selects LocalMaxxing; `--base-url` selects model inference. Failures
+emit `terminal_failure_summary` rows with task ID, verifier summary, turns/max,
+artifact path, and last-progress timestamp. `--command-timeout-seconds` (legacy
+alias `--command-timeout`) bounds shell commands and reports `command_timeout`;
+`--endpoint-timeout-seconds` independently bounds model HTTP. Repeated
+no-progress batches receive a nudge and then end as `agent_protocol_exhausted`
+before canonical verification. Use `--trace-dir`, `--cleanup-images`,
+`--shell-mode`, and `--oracle` as needed.

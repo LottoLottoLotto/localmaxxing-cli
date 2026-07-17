@@ -349,13 +349,19 @@ lmx eval terminal run --task-dir ./tb-bundles \
   --model Qwen/Qwen3-8B \
   --hardware hardware.json \
   --out terminal-run.json \
+  --checkpoint-dir terminal-run.checkpoint \
+  --resume none \
+  --command-timeout-seconds 1800 \
+  --repeat-batch-limit 3 \
   --trace-dir terminal-traces
 ```
 
-`eval terminal run` always executes the selected tasks. Omitting `--submit`
-means "execute and keep the result locally"; `--dry-run` is not a no-execution
-mode for this command. The JSON written by `--out` is a completed monolithic run
-artifact and can be passed directly to `eval terminal submit` later.
+`eval terminal run` always executes tasks that are not safely resumed. Omitting
+`--submit` emits `local_execution_results_not_submitted`: execution happened,
+results were checkpointed, and nothing was submitted. `--dry-run` is not a
+no-execution mode for `run`. By contrast, deferred `submit --dry-run` emits
+`offline_submit_validation_no_execution` and executes no task, Docker, model,
+verifier, or network submission.
 
 For the built-in agent, `--base-url` and `--endpoint-file` are mutually
 exclusive endpoint selectors. The file must contain exactly one `ok:true`
@@ -380,16 +386,44 @@ across turns (`protocol: "react-shell"`). Pass `--shell-mode stateless` to run
 each command in a fresh `docker exec` with no shared state (`protocol:
 "react-bash"`).
 
+Every verifier attempt commits into one private checkpoint directory containing
+`checkpoint.json`, ordered `summary.json`, and one safe JSON task wrapper per
+attempted verifier. A process lock rejects concurrent writers. Each wrapper is
+written, synced, and renamed in that same directory first; checkpoint metadata
+is written atomically, and `summary.json` is the last atomic task-set commit.
+The directory and parent are synced. `--resume none` clears and initializes this
+private checkpoint before any task starts instead of rotating whole directories.
+
+After a persisted or resumed task the CLI prints dataset, shard, task index/ID,
+checkpoint path, and last-progress time. While any task is incomplete, it prints
+the exact `lmx eval terminal run ... --resume <checkpoint>` command and never a
+submit command. A deferred-submit command appears only after all selected tasks
+have complete canonical verifier scores.
+
+`--resume` accepts `none` (default), `auto` (the default checkpoint path), or an
+explicit directory. V3 resume is intentionally strict: dataset, shard, complete
+canonical manifest identity/hash/version and task IDs, selected task ordering
+and bundle digests, declared/canonical/served model identities and resolution,
+model revision, quantization, hardware object/hash, agent/harness configuration,
+runner label, and harness fingerprint must all match. A mismatch fails before
+task execution. Only wrappers with a completed verifier and a parsed canonical
+reward resume; interrupted, unscored, timed-out, or unparseable verifier attempts
+remain diagnostic artifacts but are rerun. Legacy directories remain submit-only.
+
 Terminal runs use Harbor-like long task budgets by default. If `--agent-timeout`
-is omitted, each task gets `max(task.json agent.timeoutSec, 14400)` seconds
-(four hours), so imported Terminal-Bench manifests with 15–60 minute limits do
-not prematurely stop local long-running models. Built-in model requests default
-to a 10-minute per-request timeout, and the first attempt reserves part of the
-remaining task budget for one retry. Terminal model completions are capped at
-16,384 tokens by default and 8,192 tokens on retry; pass `--max-tokens` to set
-an explicit cap for both attempts. Per-shell-command execution remains bounded
-by the remaining task budget; override with `--endpoint-timeout-seconds` or
-`--command-timeout` when needed.
+is omitted, each task gets `max(task.json agent.timeoutSec, 14400)` seconds.
+Task/agent budget, manifest verifier timeout, shell-command timeout, and model
+HTTP timeout are separate controls. `--command-timeout-seconds` bounds each
+built-in or routed Terminus-2 shell command (legacy `--command-timeout` is still
+accepted) and reports `command_timeout`; it never changes the task verifier
+timeout. `--endpoint-timeout-seconds` bounds only model HTTP requests (default
+600 seconds, with retry reserve). Model completions default to 16,384 tokens and
+8,192 on retry; explicit `--max-tokens` applies to both.
+
+The built-in harness fingerprints normalized command batches and observations.
+After `--repeat-batch-limit - 1` identical or near-identical no-progress batches
+it emits a concise protocol nudge; persistence after that ends the agent as
+`agent_protocol_exhausted` and still proceeds to the canonical verifier.
 
 Use `--trace-dir <dir>` when you want a local, browsable copy of what happened
 inside each task. The CLI writes one subdirectory per `question_id` containing:
@@ -405,24 +439,24 @@ inside each task. The CLI writes one subdirectory per `question_id` containing:
   `usage.json` when the agent trace exposes model usage, when `--agent-cmd` is
   used.
 
-After execution, failures are grouped into categories such as verifier failure,
-agent timeout, maximum-turn exhaustion, and infrastructure/model errors. The
-human table shows each task, outcome, turns, reason, and its `--out` result
-pointer or `--trace-dir` path; `--json-status` emits the same details in the
-`terminal_failure_summary` event.
+After execution, `terminal_failure_summary` contains actionable rows with task
+ID, outcome, concise verifier summary, `turns`/`maxTurns`, exact artifact path,
+and `lastProgressAt`. The human table prints the same data. Outcomes distinguish
+`command_timeout`, `agent_protocol_exhausted`, agent/task timeout, max-turn
+exhaustion, verifier failure, and infrastructure/model errors.
 
-Scoring follows harbor canonical verifier semantics: after the agent finishes,
-`tests/` is copied to `/tests` in the task container and the verifier command
-(default `bash /tests/test.sh`) runs in a non-login shell. The reward file is
-the sole pass signal — `/logs/verifier/reward.json` (`{"reward": <num>}`) takes
-precedence over `/logs/verifier/reward.txt` (bare float), and a task passes
-when `reward >= 1.0`. The verifier's exit code is ignored once a reward was
-written; a verifier timeout or a missing/unparseable reward file scores the
-task as failed (it is still submitted, matching harbor's fail-on-error
-accounting). Agent timeouts do not abort the trial either: the task is
-verified with whatever state the agent left behind, so partial work completed
-before the deadline still counts. Oracle runs (`verify --oracle`) mirror
-harbor's OracleAgent — `solution/` is copied to `/solution` and `solve.sh`
+Scoring follows Harbor canonical verifier semantics: after the agent finishes,
+`tests/` is copied to `/tests` and the verifier command runs in a non-login
+shell with its own manifest timeout. `/logs/verifier/reward.json` (`{"reward":
+<num>}`) takes precedence over `reward.txt` (bare float), and `reward >= 1.0`
+passes. The checkpoint separately records `verifierAttempted`,
+`verifierCompleted`, and `rewardParsed`. A completed parse is a canonical scored
+result; copy failures, timeouts, and missing/unparseable rewards are diagnostic
+attempts that are checkpointed but not resumed or submitted as canonical scores.
+Agent outcomes do not prevent verification: partial work left by
+`command_timeout`, task timeout, repetition exhaustion, or max-turn exhaustion
+is still verified.
+Oracle runs mirror Harbor's OracleAgent — `solution/` is copied to `/solution` and `solve.sh`
 runs as root with `DEBIAN_FRONTEND=noninteractive` plus the task's
 `[solution].env`, bounded by the agent timeout, and verification proceeds even
 when `solve.sh` exits non-zero. Task env values support harbor `${VAR}` /
@@ -454,8 +488,16 @@ lmx eval terminal run terminal-bench-2-1 \
   --endpoint-file endpoint.json \
   --model Qwen/Qwen3-8B \
   --hardware hardware.json \
-  --out completed-terminal-run.json
+  --out completed-terminal-run.json \
+  --resume auto \
+  --command-timeout-seconds 1800
 ```
+
+The default checkpoint for that command is
+`completed-terminal-run.json.checkpoint`. Public acquisition validates the full
+unfiltered canonical shard manifest—including ordered task assignment, bundle
+key, SHA-256, byte size, bundle task ID/version/source—before applying
+`--questions` or `--task`, downloading, or executing anything.
 
 The monolithic artifact persists the dataset and selected shard, resolved
 canonical model identity and model-resolution evidence, quantization,
@@ -474,12 +516,36 @@ lmx eval terminal submit completed-terminal-run.json \
   --api-key "$LMX_API_KEY"
 ```
 
-Deferred `submit --dry-run` validates and packages the saved artifact entirely
-offline; unlike a non-submit `run`, it performs no expensive execution and no
-network request. It therefore cannot prove `--api-url` routing or production
-readiness, so use `eval terminal inspect` against that origin first. Saved
-dataset, shard, model, quantization, and hardware metadata are authoritative;
-omit repeated flags, or supply matching values. Conflicts are rejected.
+To recover an incomplete task whose repaired state still exists in a named
+container, rerun the canonical verifier and atomically persist its fresh score:
+
+```bash
+lmx eval terminal recover completed-terminal-run.json.checkpoint \
+  --task-id caffe-cifar-10 \
+  --container lmx-tb-caffe-recovered \
+  --bundle ./tb-bundles/caffe-cifar-10 \
+  --result recovered-task.json
+```
+
+`--result` is optional and may supply bounded telemetry only from an incomplete
+one-task wrapper; its pass/scored/verifier fields are never trusted. Recovery
+requires an exact v3 checkpoint, task membership, the unmodified bundle's
+deterministic identity/hash/version/task ID, and matching nested provenance. It
+rejects traversal, symlink, special-file, trailing-JSON, concurrent-writer, and
+completed-task overwrite inputs before verifier execution. It then copies the
+bundle's canonical tests into the existing container, runs the bundle's exact
+verifier command, parses its canonical reward file, and derives pass/fail only
+from that fresh verifier run. The scored wrapper and summary are persisted before
+`terminal_checkpoint_recovered` is emitted. Recovery invokes Docker and the
+verifier, but never invokes a model or LocalMaxxing submission endpoint.
+
+Deferred `submit --dry-run` emits
+`offline_submit_validation_no_execution`, validates and packages the saved
+artifact entirely offline, and performs no execution or network request. It
+therefore cannot prove `--api-url` routing or production readiness; use
+`eval terminal inspect` first. Saved dataset, shard, manifest, task order, model,
+quantization, hardware, agent, and runner provenance is authoritative; explicit
+conflicts are rejected.
 
 Legacy completed checkpoint directories remain accepted. A canonical full
 89-task Terminal-Bench 2.1 directory is validated and partitioned into the 10

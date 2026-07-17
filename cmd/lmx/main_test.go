@@ -2491,13 +2491,18 @@ func TestTerminalUXCommandLocalHelpShowsOnlyRelevantTerminalOptionsAndExamples(t
 			excludes: []string{"lmx eval terminal run", "--base-url", "--endpoint-file", "--hf-id", "--submit"},
 		},
 		{
+			command:  []string{"eval", "terminal", "recover", "--help"},
+			includes: []string{"rerun", "canonical", "verifier", "existing container", "lmx eval terminal recover", "--task-id <id>", "--container <name>", "--bundle <dir>", "--result <path>"},
+			excludes: []string{"--evidence", "without Docker", "no Docker, model, verifier", "--api-url", "--base-url", "--submit", "--dry-run"},
+		},
+		{
 			command:  []string{"eval", "terminal", "run", "--help"},
-			includes: []string{"--api-url selects LocalMaxxing", "auto-discover exactly one healthy localhost model endpoint", "otherwise select one with --base-url or --endpoint-file", "credentialed endpoints are never auto-probed", "lmx eval terminal run", "--endpoint-file <path>", "--model-path <path>", "--out <path>", "--submit"},
+			includes: []string{"--api-url is LocalMaxxing", "--base-url/--endpoint-file selects model inference", "lmx eval terminal run", "--endpoint-file <path>", "--model-path <path>", "--out <path>", "--submit"},
 			excludes: []string{"lmx eval terminal inspect", "lmx eval terminal submit", "--hf-id <hfId>", "--shard-index <n>", "--verify-bundles"},
 		},
 		{
 			command:  []string{"eval", "terminal", "submit", "--help"},
-			includes: []string{"completed terminal run JSON file or legacy checkpoint directory", "entirely offline", "lmx eval terminal submit", "--hf-id <hfId>", "--shard-index <n>", "--dry-run", "--api-url <url>"},
+			includes: []string{"completed terminal run JSON file or legacy/v3 checkpoint directory", "offline_submit_validation_no_execution", "never contacts LocalMaxxing, Docker, a model, or a verifier", "lmx eval terminal submit", "--hf-id <hfId>", "--shard-index <n>", "--dry-run", "--api-url <url>"},
 			excludes: []string{"lmx eval terminal run", "--base-url", "--endpoint-file", "--task-dir", "--verify-bundles", "--oracle"},
 		},
 		{
