@@ -627,7 +627,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	}
 
 	hfID := declaredModel
-	if declaredModel != "" && (submit || (dryRun && dataset != "")) {
+	if declaredModel != "" && (rawBaseURL != "" || submit || (dryRun && dataset != "")) {
 		submitArgs := argsWithTerminalBaseURL(args, rawBaseURL)
 		hfID, modelResolution, err = resolveEvalModelID(submitArgs, declaredModel)
 		if err != nil {

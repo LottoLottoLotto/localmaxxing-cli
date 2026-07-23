@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -676,6 +677,49 @@ func TestRemoteModelResolutionSearchesByLoadedFilenameWhenAliasNonCanonical(t *t
 	}
 	if resolution["sourceRepo"] != "unsloth/gemma-4-31B-it-GGUF" || resolution["status"] != "source_repo_detected" {
 		t.Fatalf("source repo resolution = %#v", resolution)
+	}
+}
+
+func TestRemoteModelResolutionFallsBackToLoadedFilenameWhenAliasSearchIsEmpty(t *testing.T) {
+	const (
+		filename = "Qwopus3.6-27B-Coder-MTP-Q5_K_M.gguf"
+		hfID     = "Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF"
+	)
+	var searchQueries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/models/search":
+			query := r.URL.Query().Get("q")
+			searchQueries = append(searchQueries, query)
+			if query == "Qwopus3.6-27B-Coder-MTP" {
+				fmt.Fprint(w, `{"models":[{"hfId":"`+hfID+`"}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"models":[]}`)
+		case "/api/models/" + hfID:
+			fmt.Fprint(w, `{"siblings":[{"rfilename":"`+filename+`"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	resolution := remoteModelResolution(
+		cliArgs{opts: map[string]string{"api-url": server.URL, "hf-api-url": server.URL}, flags: map[string]bool{"quiet": true}},
+		"qwopus-27b",
+		"v1_models",
+		"Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF",
+		"/models/"+filename,
+	)
+
+	if !reflect.DeepEqual(searchQueries, []string{"qwopus-27b", "Qwopus3.6-27B-Coder-MTP"}) {
+		t.Fatalf("search queries = %#v, want alias then filename-derived fallback", searchQueries)
+	}
+	if resolution["searchQuery"] != "Qwopus3.6-27B-Coder-MTP" || resolution["searchQuerySource"] != "loaded_filename" {
+		t.Fatalf("fallback query metadata = %#v", resolution)
+	}
+	if resolution["sourceRepo"] != hfID || resolution["sourceRepoMatch"] != "exact_filename" || resolution["status"] != "source_repo_detected" {
+		t.Fatalf("source repository resolution = %#v", resolution)
 	}
 }
 

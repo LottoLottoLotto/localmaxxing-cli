@@ -161,6 +161,53 @@ func TestRunTerminalEvalEmptyTaskDirIsBundleInvalid(t *testing.T) {
 	}
 }
 
+func TestRunTerminalEvalRejectsDetectedModelConflictBeforeLocalRun(t *testing.T) {
+	const (
+		declared = "Jackrong/Qwopus3.6-27B-v2-MTP-GGUF"
+		detected = "Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF"
+		filename = "Qwopus3.6-27B-Coder-MTP-Q5_K_M.gguf"
+	)
+	var searchQueries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			io.WriteString(w, `{"data":[{"id":"qwopus-27b"}]}`)
+		case "/props":
+			io.WriteString(w, `{"model_path":"/models/`+filename+`"}`)
+		case "/api/models/search":
+			query := r.URL.Query().Get("q")
+			searchQueries = append(searchQueries, query)
+			if query == "Qwopus3.6-27B-Coder-MTP" {
+				io.WriteString(w, `{"models":[{"hfId":"`+detected+`"}]}`)
+			} else {
+				io.WriteString(w, `{"models":[]}`)
+			}
+		case "/api/models/" + detected:
+			io.WriteString(w, `{"siblings":[{"rfilename":"`+filename+`"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := runTerminalEval(parseArgs([]string{
+		"eval", "terminal", "run",
+		"--task-dir", t.TempDir(),
+		"--base-url", server.URL,
+		"--api-url", server.URL,
+		"--hf-api-url", server.URL,
+		"--model", declared,
+		"--dry-run",
+	}), false)
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "model_identity_conflict" {
+		t.Fatalf("terminal eval error = %#v, want model_identity_conflict", err)
+	}
+	if want := []string{"qwopus-27b", "Qwopus3.6-27B-Coder-MTP"}; !reflect.DeepEqual(searchQueries, want) {
+		t.Fatalf("model search queries = %#v, want %#v", searchQueries, want)
+	}
+}
+
 func TestParseReward(t *testing.T) {
 	cases := []struct {
 		json, txt string

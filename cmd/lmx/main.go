@@ -1956,7 +1956,7 @@ func handleModelResolveRemote(args cliArgs) error {
 			filename = filepath.Base(mp)
 		}
 	}
-	query, querySource := remoteModelSearchQuery(model, filename)
+	query, querySource, candidates, searchErr := searchRemoteModelCandidates(args, model, filename, 5)
 	result := map[string]any{"baseUrl": baseURL, "servedModel": model, "searchQuery": query, "searchQuerySource": querySource}
 	if filename != "" {
 		result["loadedFilename"] = filename
@@ -1964,12 +1964,10 @@ func handleModelResolveRemote(args cliArgs) error {
 	if quantRes != nil && quantRes["trusted"] != nil {
 		result["quantization"] = quantRes["trusted"]
 	}
-	value, err := searchModels(args, query, 5)
-	if err != nil {
-		result["searchError"] = err.Error()
+	if searchErr != nil {
+		result["searchError"] = searchErr.Error()
 		return writeOrPrintJSON("model_resolution", args, result)
 	}
-	candidates := modelCandidates(value, 5)
 	result["candidates"] = candidates
 	if filename != "" {
 		if match, err := sourceRepoFromFilename(args, candidates, filename); err == nil && match != "" {
@@ -6022,21 +6020,19 @@ func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, m
 		resolution["declaredBaseModel"] = hfID
 		resolution["loadedFilename"] = filepath.Base(modelPath)
 	}
-	query, querySource := remoteModelSearchQuery(servedModel, stringValue(resolution["loadedFilename"]))
+	query, querySource, candidates, err := searchRemoteModelCandidates(args, servedModel, stringValue(resolution["loadedFilename"]), 5)
 	resolution["searchQuery"] = query
 	resolution["searchQuerySource"] = querySource
 	if querySource == "loaded_filename" {
-		printStatus(args, "remote_model_query_from_filename", map[string]any{"servedModel": servedModel, "query": query, "hint": "Served model alias looks generic; searching by the loaded GGUF filename instead."})
+		printStatus(args, "remote_model_query_from_filename", map[string]any{"servedModel": servedModel, "query": query, "hint": "Searching by the loaded GGUF filename because the served model alias returned no candidates."})
 	}
 	queryCommand := "lmx model search " + shellQuote(query)
-	value, err := searchModels(args, query, 5)
 	if err != nil {
 		resolution["searchError"] = err.Error()
 		resolution["searchCommand"] = queryCommand
 		printStatus(args, "hf_id_search_unavailable", map[string]any{"query": query, "next": queryCommand})
 		return resolution
 	}
-	candidates := modelCandidates(value, 5)
 	resolution["candidates"] = candidates
 	resolution["searchCommand"] = queryCommand
 	if len(candidates) == 0 {
@@ -6185,6 +6181,31 @@ func remoteModelSearchQuery(servedModel, loadedFilename string) (string, string)
 		}
 	}
 	return servedModel, "served_model"
+}
+
+func searchRemoteModelCandidates(args cliArgs, servedModel, loadedFilename string, limit int) (string, string, []any, error) {
+	query, source := remoteModelSearchQuery(servedModel, loadedFilename)
+	value, err := searchModels(args, query, limit)
+	if err != nil {
+		return query, source, nil, err
+	}
+	candidates := modelCandidates(value, limit)
+	if len(candidates) > 0 || source == "loaded_filename" {
+		return query, source, candidates, nil
+	}
+	derived := modelNameFromGGUFFilename(loadedFilename)
+	if derived == "" || strings.EqualFold(derived, query) {
+		return query, source, candidates, nil
+	}
+	value, err = searchModels(args, derived, limit)
+	if err != nil {
+		return derived, "loaded_filename", nil, err
+	}
+	fallbackCandidates := modelCandidates(value, limit)
+	if len(fallbackCandidates) == 0 {
+		return query, source, candidates, nil
+	}
+	return derived, "loaded_filename", fallbackCandidates, nil
 }
 
 var genericModelAliases = map[string]bool{"default": true, "model": true, "local": true, "local-model": true, "localmodel": true, "gguf": true, "unknown": true, "custom": true}
@@ -7364,6 +7385,10 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 	}
 	doc := suiteDoc(suite)
 	runner := stringValue(suite["runner"])
+	hfID, modelResolution, err := resolveEvalModelID(args, firstNonEmpty(opt(args, "model"), "<required-before-submit>"))
+	if err != nil {
+		return err
+	}
 	var result map[string]any
 	if strings.EqualFold(runner, "LM_EVAL_HARNESS") {
 		resultsPath := opt(args, "results")
@@ -7376,10 +7401,6 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 	} else {
 		err = cliError{"suite_runner_mismatch", "Suite runner must be CUSTOM or LM_EVAL_HARNESS.", nil, runner}
 	}
-	if err != nil {
-		return err
-	}
-	hfID, modelResolution, err := resolveEvalModelID(args, firstNonEmpty(opt(args, "model"), "<required-before-submit>"))
 	if err != nil {
 		return err
 	}
