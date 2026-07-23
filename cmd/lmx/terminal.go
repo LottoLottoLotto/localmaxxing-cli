@@ -629,7 +629,10 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	hfID := declaredModel
 	if declaredModel != "" && (submit || (dryRun && dataset != "")) {
 		submitArgs := argsWithTerminalBaseURL(args, rawBaseURL)
-		hfID, modelResolution = resolveEvalModelID(submitArgs, declaredModel)
+		hfID, modelResolution, err = resolveEvalModelID(submitArgs, declaredModel)
+		if err != nil {
+			return err
+		}
 	}
 	var coverageBefore map[string]any
 	if dataset != "" && localDir == "" && (submit || dryRun) && opt(args, "shard") == "" {

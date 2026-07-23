@@ -1082,7 +1082,7 @@ func handleProfile(action, name string, args cliArgs) error {
 			return errors.New("profile save requires a profile name")
 		}
 		profileOpts := map[string]any{}
-		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len", "output-len", "num-prompts", "tensor-parallel", "context-length", "gpu-layers", "depth", "context-depth", "batch-size", "micro-batch-size", "ubatch-size", "repetitions", "runs", "benchmark-format", "bench-format", "output-format", "cache-type-k", "cache-type-v", "extra-server-args", "extra-bench-args"} {
+		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "prefill-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len", "output-len", "num-prompts", "tensor-parallel", "context-length", "gpu-layers", "depth", "context-depth", "batch-size", "micro-batch-size", "ubatch-size", "repetitions", "runs", "benchmark-format", "bench-format", "output-format", "cache-type-k", "cache-type-v", "extra-server-args", "extra-bench-args"} {
 			if value := opt(args, key); value != "" {
 				profileOpts[key] = value
 			}
@@ -4706,7 +4706,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		Extra:           metrics,
 	}
 	payload := builder.ToMap()
-	setNumericFlagFields(payload, args, map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "prompt-tokens": "promptTokens", "prefill-tokens": "promptTokens", "output-tokens": "outputTokens", "num-prompts": "numPrompts"})
+	setNumericFlagFields(payload, args, map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "prompt-tokens": "promptTokens", "prefill-tokens": "prefillTokens", "depth": "prefillTokens", "output-tokens": "outputTokens", "num-prompts": "numPrompts"})
 	if raw := opt(args, "gpu-power-watts"); raw != "" {
 		watts, err := parseGpuPowerWatts(raw)
 		if err != nil {
@@ -5285,7 +5285,7 @@ func localBenchmarkCommand(engineName string, args cliArgs) string {
 		return ""
 	}
 	cmd := []string{shellQuote(resolvedExecutable(firstNonEmpty(opt(args, "benchmark-bin"), "llama-bench"))), "-m", shellQuote(opt(args, "model-path"))}
-	if value := firstNonEmpty(opt(args, "prompt-tokens"), opt(args, "prefill-tokens"), "512"); value != "" {
+	if value := firstNonEmpty(opt(args, "prompt-tokens"), "512"); value != "" {
 		cmd = append(cmd, "-p", shellQuote(value))
 	}
 	if value := firstNonEmpty(opt(args, "output-tokens"), "128"); value != "" {
@@ -5325,7 +5325,7 @@ func localBenchmarkEngineFlags(engineName, commandSnippet string) map[string]any
 
 func appendLlamaBenchArgs(cmd *[]string, args cliArgs, includeDepth bool) {
 	if includeDepth {
-		appendShellArg(cmd, "-d", firstNonEmpty(opt(args, "depth"), opt(args, "context-depth")))
+		appendShellArg(cmd, "-d", firstNonEmpty(opt(args, "depth"), opt(args, "prefill-tokens"), opt(args, "context-depth")))
 	}
 	appendShellArg(cmd, "-b", opt(args, "batch-size"))
 	appendShellArg(cmd, "-ub", firstNonEmpty(opt(args, "micro-batch-size"), opt(args, "ubatch-size")))
@@ -5354,7 +5354,7 @@ func applyCommandTokenHints(payload map[string]any) {
 		return
 	}
 	if numberField(payload, "promptTokens") == 0 {
-		if value := commandFlagNumber(command, "-p", "--prompt-tokens", "--prefill-tokens", "--input-len", "--random-input-len"); value > 0 {
+		if value := commandFlagNumber(command, "-p", "--prompt-tokens", "--input-len", "--random-input-len"); value > 0 {
 			payload["promptTokens"] = value
 		}
 	}
@@ -5363,8 +5363,13 @@ func applyCommandTokenHints(payload map[string]any) {
 			payload["outputTokens"] = value
 		}
 	}
+	if numberField(payload, "prefillTokens") == 0 {
+		if value := commandFlagNumber(command, "-d", "--depth", "--prefill-tokens", "--context-depth"); value > 0 {
+			payload["prefillTokens"] = value
+		}
+	}
 	if numberField(payload, "contextLength") == 0 {
-		if value := commandFlagNumber(command, "-c", "-d", "--context-length", "--context-depth", "--max-model-len"); value > 0 {
+		if value := commandFlagNumber(command, "-c", "--context-length", "--max-model-len"); value > 0 {
 			payload["contextLength"] = value
 		}
 	}
@@ -6068,11 +6073,12 @@ func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, m
 	return resolution
 }
 
-func resolveEvalModelID(args cliArgs, declared string) (string, map[string]any) {
+func resolveEvalModelID(args cliArgs, declared string) (string, map[string]any, error) {
 	declared = strings.TrimSpace(declared)
 	if declared == "" || declared == "<required-before-submit>" {
-		return declared, nil
+		return declared, nil, nil
 	}
+	explicitRepo := explicitHFRepoID(declared)
 	baseURL := opt(args, "base-url")
 	if baseURL != "" {
 		servedModel, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), declared))
@@ -6086,9 +6092,26 @@ func resolveEvalModelID(args cliArgs, declared string) (string, map[string]any) 
 				modelPath = firstNonEmpty(stringValue(info["filename"]), stringValue(info["model_path"]), stringValue(info["path"]))
 			}
 			resolution := remoteModelResolution(args, servedModel, "v1_models", declared, modelPath)
+			if explicitRepo {
+				if sourceRepo := stringValue(resolution["sourceRepo"]); sourceRepo != "" && !strings.EqualFold(sourceRepo, declared) {
+					return "", resolution, cliError{
+						"model_identity_conflict",
+						"The endpoint's loaded model file belongs to a different HuggingFace repository than the explicit --model value.",
+						[]string{"Verify the endpoint weights and --model value.", "Restart the endpoint with the intended weights or rerun with the repository that owns the loaded file."},
+						map[string]any{"declared": declared, "detected": sourceRepo, "servedModel": servedModel, "loadedFilename": stringValue(resolution["loadedFilename"])},
+					}
+				}
+				resolution["identityPolicy"] = "explicit_repository_preserved"
+				resolution["effectiveHfId"] = declared
+				if suggested := resolvedHFIDFromModelResolution(resolution); suggested != "" && !strings.EqualFold(suggested, declared) {
+					resolution["suggestedHfId"] = suggested
+				}
+				printStatus(args, "eval_hf_id_preserved", map[string]any{"declared": declared, "effective": declared, "servedModel": servedModel, "policy": "explicit_repository_preserved"})
+				return declared, resolution, nil
+			}
 			if resolved := resolvedHFIDFromModelResolution(resolution); resolved != "" {
 				printStatus(args, "eval_hf_id_resolved", map[string]any{"declared": declared, "resolved": resolved, "servedModel": servedModel})
-				return resolved, resolution
+				return resolved, resolution, nil
 			}
 			if modelPath != "" {
 				if sourceRepo, err := sourceRepoFromFilename(args, nil, filepath.Base(modelPath)); err == nil && sourceRepo != "" {
@@ -6102,19 +6125,19 @@ func resolveEvalModelID(args cliArgs, declared string) (string, map[string]any) 
 						"status":            "source_repo_detected",
 					}
 					printStatus(args, "eval_hf_id_resolved", map[string]any{"declared": declared, "resolved": sourceRepo, "servedModel": servedModel, "filename": filepath.Base(modelPath)})
-					return sourceRepo, resolution
+					return sourceRepo, resolution, nil
 				}
 			}
 			if resolution != nil {
-				return declared, resolution
+				return declared, resolution, nil
 			}
 		} else {
 			printStatus(args, "eval_model_detection_unavailable", map[string]any{"baseUrl": baseURL, "reason": err.Error()})
 		}
 	}
-	// If the user passed an endpoint alias (no org/name), search LocalMaxxing's
-	// model index and use the first candidate, matching benchmark UX.
-	if !strings.Contains(declared, "/") || genericModelAliases[strings.ToLower(declared)] {
+	// Only endpoint aliases may be replaced by a search candidate. A canonical
+	// org/repo supplied by the user is authoritative.
+	if !explicitRepo && (!strings.Contains(declared, "/") || genericModelAliases[strings.ToLower(declared)]) {
 		query, _ := normalizedModelSearchQuery(declared)
 		value, err := searchModels(args, query, 5)
 		if err == nil {
@@ -6124,12 +6147,17 @@ func resolveEvalModelID(args cliArgs, declared string) (string, map[string]any) 
 				if resolved != "" {
 					resolution := map[string]any{"hfId": declared, "servedModel": declared, "searchQuery": query, "status": "search_candidate", "candidates": candidates}
 					printStatus(args, "eval_hf_id_resolved", map[string]any{"declared": declared, "resolved": resolved, "query": query})
-					return resolved, resolution
+					return resolved, resolution, nil
 				}
 			}
 		}
 	}
-	return declared, nil
+	return declared, nil, nil
+}
+
+func explicitHFRepoID(value string) bool {
+	parts := strings.Split(strings.TrimSpace(value), "/")
+	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
 func resolvedHFIDFromModelResolution(resolution map[string]any) string {
@@ -7007,8 +7035,8 @@ func parseLlamaBenchJSONMetrics(value any) map[string]float64 {
 		nPrompt, _ := anyNumber(row["n_prompt"])
 		nGen, _ := anyNumber(row["n_gen"])
 		nDepth, _ := anyNumber(row["n_depth"])
-		if nDepth > 0 && metrics["contextTokens"] == 0 {
-			metrics["contextTokens"] = nDepth
+		if nDepth > 0 && metrics["prefillTokens"] == 0 {
+			metrics["prefillTokens"] = nDepth
 		}
 		if nPrompt > 0 && nGen == 0 {
 			if metrics["tokSPrefill"] == 0 {
@@ -7180,9 +7208,9 @@ func parseLlamaBenchTable(text string) map[string]float64 {
 			if match == nil {
 				continue
 			}
-			if depthMatch := depthPattern.FindStringSubmatch(cell); len(depthMatch) >= 2 && metrics["contextTokens"] == 0 {
+			if depthMatch := depthPattern.FindStringSubmatch(cell); len(depthMatch) >= 2 && metrics["prefillTokens"] == 0 {
 				if depth, err := strconv.ParseFloat(depthMatch[1], 64); err == nil {
-					metrics["contextTokens"] = depth
+					metrics["prefillTokens"] = depth
 				}
 			}
 			var value float64
@@ -7351,7 +7379,10 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	hfID, modelResolution := resolveEvalModelID(args, firstNonEmpty(opt(args, "model"), "<required-before-submit>"))
+	hfID, modelResolution, err := resolveEvalModelID(args, firstNonEmpty(opt(args, "model"), "<required-before-submit>"))
+	if err != nil {
+		return err
+	}
 	runConfig := map[string]any{"aggregatePreview": result["aggregate"]}
 	if modelResolution != nil {
 		runConfig["modelResolution"] = modelResolution
@@ -7509,7 +7540,10 @@ func handleEvalSubmit(runFile string, args cliArgs) error {
 	if hfID := stringValue(payload["hfId"]); hfID == "" || hfID == "<required-before-submit>" {
 		return cliError{"missing_model", "Run payload has no hfId; pass --model <HuggingFace model id>", []string{"Pass --model here, or re-run eval run with --model."}, nil}
 	}
-	resolvedHFID, modelResolution := resolveEvalModelID(args, stringValue(payload["hfId"]))
+	resolvedHFID, modelResolution, err := resolveEvalModelID(args, stringValue(payload["hfId"]))
+	if err != nil {
+		return err
+	}
 	payload["hfId"] = resolvedHFID
 	if modelResolution != nil {
 		runConfig := asObject(payload["runConfig"])
@@ -7899,6 +7933,10 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		servedModelInfo = info
 	}
 	callModel := firstNonEmpty(servedModel, declaredModel, "local")
+	hfID, modelResolution, err := resolveEvalModelID(args, declaredModel)
+	if err != nil {
+		return err
+	}
 
 	// Pull the quantization from the endpoint exactly like `benchmark run`:
 	// filename-derived (llama.cpp /props model_path) > /v1/models metadata >
@@ -7981,7 +8019,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	}
 
 	if submit {
-		hfIDForCoverage := opt(args, "model")
+		hfIDForCoverage := hfID
 		if hfIDForCoverage != "" {
 			coverageValue, covErr := fetchEvalShardCoverage(dataset, hfIDForCoverage, resolvedQuant, resolvedQuantFormat, args)
 			if covErr != nil {
@@ -8062,6 +8100,11 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		avgLatency = stats.totalLatencyMs / int64(len(results))
 	}
 	summary := map[string]any{"dataset": dataset, "shardIndex": shardIndex, "questions": count, "correct": stats.correct, "scored": stats.scored, "errors": stats.errors, "accuracyPct": roundMetric(accuracy * 100), "avgLatencyMs": avgLatency, "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "scoring": scoring}
+	summary["declaredModel"] = declaredModel
+	summary["effectiveModel"] = hfID
+	if modelResolution != nil {
+		summary["modelResolution"] = modelResolution
+	}
 	for mk, mv := range codeMetrics {
 		summary[mk] = mv
 	}
@@ -8166,7 +8209,8 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	if len(submitResults) == 0 {
 		return cliError{"no_scored_questions", "Every question failed to score, so there is nothing to submit.", []string{"Check that the endpoint is reachable and returns completions.", "Inspect failures with --out results.json."}, nil}
 	}
-	hfID, modelResolution := resolveEvalModelID(args, declaredModel)
+	// hfID and modelResolution were fixed before inference so dry-run, coverage,
+	// and submission all use the same identity.
 	runConfig := map[string]any{"accuracy": accuracy, "questionsRun": count, "errors": stats.errors, "avgLatencyMs": avgLatency, "answerExtraction": firstNonEmpty(cfg.extraction, "auto"), "artifactCount": len(submitArtifacts), "scoring": scoring}
 	if scoring == "loglikelihood" {
 		runConfig["answerExtraction"] = "none"
@@ -8494,6 +8538,45 @@ func buildCodeProgram(item map[string]any, solution string) string {
 	return b.String()
 }
 
+func sandboxRuntimeArgs(args cliArgs) []string {
+	runtimeArgs := strings.Fields(firstNonEmpty(opt(args, "sandbox-runtime"), "docker"))
+	if len(runtimeArgs) == 0 {
+		runtimeArgs = []string{"docker"}
+	}
+	if hasFlag(args, "sandbox-use-sudo") && runtimeArgs[0] != "sudo" {
+		runtimeArgs = append([]string{"sudo"}, runtimeArgs...)
+	}
+	return runtimeArgs
+}
+
+func preflightSandbox(args cliArgs) error {
+	if opt(args, "sandbox-cmd") != "" {
+		return nil
+	}
+	runtimeArgs := sandboxRuntimeArgs(args)
+	if _, err := exec.LookPath(runtimeArgs[0]); err != nil {
+		return cliError{
+			"sandbox_unavailable",
+			fmt.Sprintf("Sandbox runtime %q was not found before model inference.", runtimeArgs[0]),
+			[]string{"Install the container runtime or select one with --sandbox-runtime.", "Override the sandbox launcher with --sandbox-cmd."},
+			err.Error(),
+		}
+	}
+	image := firstNonEmpty(opt(args, "sandbox-image"), "lmx-sandbox")
+	inspectArgs := append(append([]string{}, runtimeArgs[1:]...), "image", "inspect", image)
+	output, err := exec.Command(runtimeArgs[0], inspectArgs...).CombinedOutput()
+	if err != nil {
+		return cliError{
+			"sandbox_unavailable",
+			fmt.Sprintf("Sandbox image %q is not ready; model inference was not started.", image),
+			sandboxFailureHints(string(output)),
+			map[string]any{"runtime": strings.Join(runtimeArgs, " "), "image": image, "error": err.Error()},
+		}
+	}
+	printStatus(args, "eval_shard_sandbox_ready", map[string]any{"runtime": strings.Join(runtimeArgs, " "), "image": image})
+	return nil
+}
+
 // sandboxCommand builds the process that runs the code sandbox. By default it
 // launches the hardened Docker image over stdin/stdout; --sandbox-cmd overrides
 // it entirely (e.g. podman, or `python3 sandbox/run_sandbox.py` without Docker).
@@ -8501,13 +8584,7 @@ func sandboxCommand(args cliArgs) (*exec.Cmd, string) {
 	if custom := opt(args, "sandbox-cmd"); custom != "" {
 		return exec.Command("sh", "-c", custom), custom
 	}
-	runtime := strings.Fields(firstNonEmpty(opt(args, "sandbox-runtime"), "docker"))
-	if len(runtime) == 0 {
-		runtime = []string{"docker"}
-	}
-	if hasFlag(args, "sandbox-use-sudo") && runtime[0] != "sudo" {
-		runtime = append([]string{"sudo"}, runtime...)
-	}
+	runtime := sandboxRuntimeArgs(args)
 	image := firstNonEmpty(opt(args, "sandbox-image"), "lmx-sandbox")
 	argv := append([]string{}, runtime...)
 	argv = append(argv,
@@ -8630,6 +8707,9 @@ func codePrompt(cfg runShardConfig, item map[string]any) string {
 // endpoint, grade each by running solution+tests in the sandbox, then record the
 // submitted greedy/first-sample pass@1 plus a pass@k estimate over all samples.
 func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[string]any, cfg runShardConfig) ([]shardItemResult, shardStats, map[string]any, error) {
+	if err := preflightSandbox(args); err != nil {
+		return nil, shardStats{}, nil, err
+	}
 	n := cfg.nSamples
 	if n < 1 {
 		n = 1
@@ -8864,6 +8944,9 @@ func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[strin
 // input-prediction passes if f(generated_input) == observed_output, and
 // output-prediction passes if generated_output == f(function_input).
 func runEvalShardCruxExec(args cliArgs, baseURL, model string, items []map[string]any, cfg runShardConfig) ([]shardItemResult, shardStats, map[string]any, error) {
+	if err := preflightSandbox(args); err != nil {
+		return nil, shardStats{}, nil, err
+	}
 	if cfg.concurrency < 1 {
 		cfg.concurrency = 1
 	}
@@ -10947,7 +11030,9 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --n-samples <n>           Samples per question for code evals (default: 1 greedy; >1 enables pass@k sampling)
   --k <n>                   k for pass@k over --n-samples (default: 1)
   --few-shot <n>            Few-shot examples for MBPP-family code evals (default: 3 for mbpp*, 0 otherwise)
-  --depth <n>              llama-bench -d depth for benchmark run; KV sweeps use --levels
+  --prompt-tokens <n>       llama-bench -p prompt tokens; submitted as promptTokens
+  --prefill-tokens <n>      llama-bench -d cached depth; submitted as prefillTokens (alias: --depth)
+  --depth <n>               llama-bench -d cached depth; submitted as prefillTokens; KV sweeps use --levels
   --batch-size <n>         llama-bench -b batch size
   --micro-batch-size <n>   llama-bench -ub micro-batch size
   --repetitions <n>        llama-bench -r repetitions

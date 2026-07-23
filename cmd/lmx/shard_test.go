@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -561,6 +562,59 @@ func TestHandleEvalShardStatusReadsCoverage(t *testing.T) {
 	}
 }
 
+func TestHandleEvalShardDryRunReportsPreservedExplicitIdentity(t *testing.T) {
+	const declared = "google/gemma-4-26B-A4B-it"
+	const candidate = "Jiunsong/supergemma4-26b-uncensored-gguf-v2"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/evals/gsm8k/shard":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"shard":       map[string]any{"shardIndex": 1, "itemCount": 1},
+				"sampling":    map[string]any{"recommendations": map[string]any{"margin05": 1}},
+				"downloadUrl": "http://" + r.Host + "/blob",
+			})
+		case "/blob":
+			_, _ = w.Write([]byte("{\"question_id\":\"gsm8k:1\",\"input\":\"5 + 5?\",\"gold\":\"10\"}\n"))
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"gemma4-26b"}]}`))
+		case "/api/models/search":
+			_, _ = w.Write([]byte(`{"models":[{"hfId":"` + candidate + `"}]}`))
+		case "/v1/chat/completions":
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "The final answer is 10."}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	out := filepath.Join(t.TempDir(), "dry-run.json")
+	args := cliArgs{
+		opts: map[string]string{
+			"api-url":   srv.URL,
+			"base-url":  srv.URL,
+			"model":     declared,
+			"questions": "1",
+			"out":       out,
+		},
+		flags: map[string]bool{"quiet": true},
+	}
+	if err := handleEvalShard("gsm8k", args); err != nil {
+		t.Fatalf("handleEvalShard dry-run: %v", err)
+	}
+	saved, err := readJSON(out)
+	if err != nil {
+		t.Fatalf("read dry-run output: %v", err)
+	}
+	summary := asObject(asObject(saved)["summary"])
+	resolution := asObject(summary["modelResolution"])
+	if summary["declaredModel"] != declared || summary["effectiveModel"] != declared {
+		t.Fatalf("dry-run identity summary = %#v", summary)
+	}
+	if resolution["identityPolicy"] != "explicit_repository_preserved" || resolution["suggestedHfId"] != candidate {
+		t.Fatalf("dry-run model resolution = %#v", resolution)
+	}
+}
+
 // shardArtifactRows returns 4 passing (gold 10) + 2 failing rows for the fixed
 // reply "The final answer is 10."
 func shardArtifactRows() []map[string]any {
@@ -772,6 +826,37 @@ func TestSandboxFailureHintsPythonOperationNotPermitted(t *testing.T) {
 	hints := strings.Join(sandboxFailureHints("exec /usr/local/bin/python3: operation not permitted"), "\n")
 	if !strings.Contains(hints, "--sandbox-relaxed-security") {
 		t.Fatalf("missing relaxed-security hint:\n%s", hints)
+	}
+}
+
+func TestRunEvalShardCodeExecPreflightsSandboxBeforeInference(t *testing.T) {
+	modelCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelCalls++
+		http.Error(w, "model must not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	args := cliArgs{
+		opts:  map[string]string{"sandbox-runtime": "definitely-missing-lmx-sandbox-runtime"},
+		flags: map[string]bool{"quiet": true},
+	}
+	items := []map[string]any{{
+		"question_id": "humaneval:T1",
+		"input":       "def add(a, b):\n",
+		"entry_point": "add",
+		"test":        "def check(candidate):\n    assert candidate(1, 2) == 3\n",
+	}}
+	_, _, _, err := runEvalShardCodeExec(args, srv.URL, "model", items, runShardConfig{scoring: "code_execution", concurrency: 1})
+	if err == nil {
+		t.Fatal("runEvalShardCodeExec succeeded without a sandbox runtime")
+	}
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "sandbox_unavailable" {
+		t.Fatalf("runEvalShardCodeExec error = %#v, want sandbox_unavailable", err)
+	}
+	if modelCalls != 0 {
+		t.Fatalf("model endpoint called %d times before sandbox preflight", modelCalls)
 	}
 }
 

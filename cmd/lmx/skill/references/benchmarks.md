@@ -42,20 +42,24 @@ Optional cost/power metadata for submissions:
 Use local mode when running `llama-bench` on the host that owns the model/hardware. With `--model-path`, `lmx` generates:
 
 ```bash
-llama-bench -m <model-path> -p <prompt-tokens|512> -n <output-tokens|128>
+llama-bench -m <model-path> -p <prompt-tokens|512> -n <output-tokens|128> [-d <prefill-tokens>]
 ```
 
 Useful flags:
 
 - `--threads <n>`
 - `--gpu-layers <n>`
-- `--depth <n>`
+- `--depth <n>` / `--prefill-tokens <n>`: llama-bench `-d`; submitted as `prefillTokens`
 - `--batch-size <n>`
 - `--micro-batch-size <n>`
 - `--repetitions <n>`
 - `--cache-type-k <type>` / `--cache-type-v <type>`
 - `--flash-attn` / `--no-flash-attn`
 - `--benchmark-format <fmt>`
+
+`promptTokens` is the fresh prompt size (`-p`/`n_prompt`). `prefillTokens` is
+the cached depth present before generation (`-d`/`n_depth`); the CLI keeps these
+fields separate in saved and submitted benchmark payloads.
 
 Use `--command "..."` for custom local engines or exact commands.
 

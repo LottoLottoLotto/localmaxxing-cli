@@ -263,6 +263,11 @@ Build the sandbox image once:
 docker build -t lmx-sandbox sandbox
 ```
 
+Before sending any model requests, the CLI verifies that the configured runtime
+is executable, can inspect the configured image, and can access the container
+daemon. A failed preflight exits with `sandbox_unavailable`, so a missing image
+or Docker permission error cannot discard hours of model generation.
+
 The default container command is:
 
 ```bash

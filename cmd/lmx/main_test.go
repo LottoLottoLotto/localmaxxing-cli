@@ -554,10 +554,13 @@ func TestResolveEvalModelIDSuppressesCandidateNoiseForExactExplicitSourceRepo(t 
 		os.Stderr = stderr
 		_ = statusFile.Close()
 	})
-	resolved, resolution := resolveEvalModelID(cliArgs{
+	resolved, resolution, resolveErr := resolveEvalModelID(cliArgs{
 		opts:  map[string]string{"base-url": server.URL, "api-url": server.URL, "hf-api-url": server.URL},
 		flags: map[string]bool{"json-status": true},
 	}, hfID)
+	if resolveErr != nil {
+		t.Fatalf("resolveEvalModelID returned error: %v", resolveErr)
+	}
 	os.Stderr = stderr
 	if err := statusFile.Close(); err != nil {
 		t.Fatalf("close status capture: %v", err)
@@ -576,6 +579,69 @@ func TestResolveEvalModelIDSuppressesCandidateNoiseForExactExplicitSourceRepo(t 
 	statusOutput := string(statusData)
 	if strings.Contains(statusOutput, `"event":"remote_model_alias"`) || strings.Contains(statusOutput, `"event":"hf_id_candidates_found"`) {
 		t.Fatalf("exact explicit repository emitted candidate noise:\n%s", statusOutput)
+	}
+}
+
+func TestResolveEvalModelIDPreservesExplicitRepoAgainstFuzzyCandidate(t *testing.T) {
+	const declared = "google/gemma-4-26B-A4B-it"
+	const candidate = "Jiunsong/supergemma4-26b-uncensored-gguf-v2"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[{"id":"gemma4-26b"}]}`)
+		case "/api/models/search":
+			fmt.Fprint(w, `{"models":[{"hfId":"`+candidate+`"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	resolved, resolution, err := resolveEvalModelID(cliArgs{
+		opts:  map[string]string{"base-url": server.URL, "api-url": server.URL},
+		flags: map[string]bool{"quiet": true},
+	}, declared)
+	if err != nil {
+		t.Fatalf("resolveEvalModelID returned error: %v", err)
+	}
+	if resolved != declared {
+		t.Fatalf("resolved hfId = %q, want explicit repository %q", resolved, declared)
+	}
+	if resolution["identityPolicy"] != "explicit_repository_preserved" || resolution["suggestedHfId"] != candidate || resolution["effectiveHfId"] != declared {
+		t.Fatalf("explicit repository resolution metadata = %#v", resolution)
+	}
+}
+
+func TestResolveEvalModelIDRejectsExactFilenameConflict(t *testing.T) {
+	const declared = "google/gemma-4-26B-A4B-it"
+	const detected = "Jiunsong/supergemma4-26b-uncensored-gguf-v2"
+	const filename = "supergemma4-26b-uncensored-Q4_K_M.gguf"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[{"id":"gemma4-26b"}]}`)
+		case "/props":
+			fmt.Fprint(w, `{"model_path":"/models/`+filename+`"}`)
+		case "/api/models/search":
+			fmt.Fprint(w, `{"models":[{"hfId":"`+detected+`"}]}`)
+		case "/api/models/" + detected:
+			fmt.Fprint(w, `{"siblings":[{"rfilename":"`+filename+`"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	resolved, resolution, err := resolveEvalModelID(cliArgs{
+		opts:  map[string]string{"base-url": server.URL, "api-url": server.URL, "hf-api-url": server.URL},
+		flags: map[string]bool{"quiet": true},
+	}, declared)
+	if err == nil {
+		t.Fatalf("resolveEvalModelID resolved %q with metadata %#v, want identity conflict", resolved, resolution)
+	}
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "model_identity_conflict" {
+		t.Fatalf("resolveEvalModelID error = %#v, want model_identity_conflict", err)
 	}
 }
 
@@ -1629,11 +1695,33 @@ func TestParseLlamaBenchJSONDepthMetrics(t *testing.T) {
   {"n_prompt":512,"n_gen":0,"n_depth":10000,"avg_ts":6425.91},
   {"n_prompt":0,"n_gen":128,"n_depth":10000,"avg_ts":116.71}
 ]`)
-	if metrics["contextTokens"] != 10000 || metrics["promptTokens"] != 512 || metrics["outputTokens"] != 128 {
+	if metrics["prefillTokens"] != 10000 || metrics["promptTokens"] != 512 || metrics["outputTokens"] != 128 {
 		t.Fatalf("token metrics = %#v", metrics)
 	}
 	if metrics["tokSPrefill"] != 6425.91 || metrics["tokSOut"] != 116.71 {
 		t.Fatalf("throughput metrics = %#v", metrics)
+	}
+}
+
+func TestBenchmarkPrefillTokensReachSubmitPayload(t *testing.T) {
+	payload, err := benchmarkPayloadFromFlags("vllm", cliArgs{
+		opts: map[string]string{
+			"mode":           "remote",
+			"hf-id":          "Qwen/Qwen3-8B",
+			"quantization":   "fp16",
+			"hardware":       writeBenchmarkHardwareForTest(t),
+			"tok-s-out":      "42",
+			"prompt-tokens":  "512",
+			"prefill-tokens": "10000",
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	submit := toBenchmarkSubmit(payload)
+	if submit["promptTokens"] != float64(512) || submit["prefillTokens"] != float64(10000) {
+		t.Fatalf("submit token fields = prompt:%#v prefill:%#v", submit["promptTokens"], submit["prefillTokens"])
 	}
 }
 

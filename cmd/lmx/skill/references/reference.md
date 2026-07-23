@@ -130,7 +130,8 @@ Local benchmark / server:
 - `--host <addr>`: local model server host.
 - `--port <n>`: local model server port.
 - `--model-path <path>`: llama.cpp model path.
-- `--depth <n>`: llama-bench `-d` depth; KV sweeps use `--levels`.
+- `--prompt-tokens <n>`: llama-bench `-p` fresh prompt tokens, submitted as `promptTokens`.
+- `--depth <n>` / `--prefill-tokens <n>`: llama-bench `-d` cached depth, submitted as `prefillTokens`; KV sweeps use `--levels`.
 - `--batch-size <n>`: llama-bench batch size.
 - `--micro-batch-size <n>`: llama-bench micro-batch size.
 - `--repetitions <n>`: llama-bench repetitions.
