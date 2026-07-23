@@ -254,7 +254,7 @@ func prepareEvalTrainingData(args cliArgs) error {
 	if err := writeJSONAtomic(manifestPath, manifest); err != nil {
 		return err
 	}
-	printInfo("eval_training_data_written", map[string]any{
+	printInfo(args, "eval_training_data_written", map[string]any{
 		"manifest":        manifestPath,
 		"sft":             sftPath,
 		"failures":        failuresPath,
@@ -608,7 +608,7 @@ func runEvalRLTrainer(args cliArgs) error {
 	}
 	planArgv := []string{pythonBin, "<embedded:train_eval_grpo.py>", "--manifest", manifestPath, "--output-dir", outputDir, "--resume", resume}
 	if !hasFlag(args, "execute") {
-		printJSON(map[string]any{
+		printJSON(args, map[string]any{
 			"argv":           planArgv,
 			"execute":        false,
 			"manifest":       manifestPath,

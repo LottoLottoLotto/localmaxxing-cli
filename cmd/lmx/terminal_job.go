@@ -195,12 +195,12 @@ func startDetachedTerminalEval(args cliArgs) error {
 	if hasFlag(args, "json-status") {
 		printStatus(args, "terminal_eval_detached", fields)
 		if hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose") {
-			printJSON(fields)
+			printJSON(args, fields)
 		}
 	} else if hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose") {
-		printJSON(fields)
+		printJSON(args, fields)
 	} else {
-		printInfo("terminal_eval_detached", fields)
+		printInfo(args, "terminal_eval_detached", fields)
 	}
 	return nil
 }

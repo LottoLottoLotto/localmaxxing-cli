@@ -25,7 +25,7 @@ curl -fsSLO "$base/checksums.txt"
 sha256sum --check --ignore-missing checksums.txt   # macOS: shasum -a 256 --check --ignore-missing checksums.txt
 tar -xzf lmx-linux-amd64.tar.gz
 sudo mv lmx /usr/local/bin/
-lmx --help
+lmx --version
 ```
 
 Every release includes `checksums.txt` with SHA-256 hashes keyed by asset basename, so `--check --ignore-missing` succeeds even when you downloaded a single asset.
@@ -70,15 +70,17 @@ Create an API key from your [LocalMaxxing dashboard](https://localmaxxing.com), 
 export LMX_API_KEY=bhk_...
 ```
 
-or save it locally:
+or save it locally without putting the secret in process arguments:
 
 ```bash
-lmx auth --key bhk_...
+printf '%s\n' "$LMX_API_KEY" | lmx auth --key-stdin
 lmx auth
 lmx auth --logout
 ```
 
-Saved config lives under `~/.config/localmaxxing`. You can also pass `--api-key bhk_...` to any command directly.
+Saved config lives under `~/.config/localmaxxing`. `LMX_API_KEY` is preferred
+for agents and automation. Passing `--api-key` or `lmx auth --key` can expose
+the secret through shell history, process inspection, and agent traces.
 
 ## Agent Skill
 
@@ -92,6 +94,15 @@ lmx skill install --dir ~/.claude/skills
 ```
 
 `lmx skill install` writes the skill tree to `<dir>/localmaxxing-cli/`. It works with any harness that discovers `skills/<name>/SKILL.md`, including Claude `.claude/skills` and GitHub `.github/skills`.
+
+Agent-oriented discovery and machine output:
+
+```bash
+lmx version --json
+lmx commands --json
+lmx context list
+lmx context get hardwareOptions.hardwareCostComponentNames --compact
+```
 
 ## Hardware Metadata
 

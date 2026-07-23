@@ -51,9 +51,12 @@ var goldFieldNames = map[string]bool{
 }
 
 type cliArgs struct {
-	positional []string
-	opts       map[string]string
-	flags      map[string]bool
+	positional   []string
+	opts         map[string]string
+	flags        map[string]bool
+	provided     map[string]bool
+	jsonPrinted  *bool
+	jsonFallback *any
 }
 
 type cliError struct {
@@ -178,6 +181,9 @@ func runCLI(argv []string) int {
 	if err != nil {
 		printError(args, err)
 	}
+	if err == nil && hasFlag(args, "json") && args.jsonPrinted != nil && !*args.jsonPrinted && args.jsonFallback != nil && *args.jsonFallback != nil {
+		printJSON(args, *args.jsonFallback)
+	}
 	if hasFlag(args, "detached-child") {
 		finalizeDetachedTerminalChild(args, err)
 	}
@@ -204,6 +210,12 @@ func run(argv []string) error {
 }
 
 func runWithArgs(args cliArgs) error {
+	if err := validateOptionNames(args); err != nil {
+		return err
+	}
+	if hasFlag(args, "version") && positional(args, 0) == "" {
+		return handleVersion(args)
+	}
 	if err := applyProfile(&args); err != nil {
 		return err
 	}
@@ -212,6 +224,17 @@ func runWithArgs(args cliArgs) error {
 	if cmd == "" {
 		usage()
 		return nil
+	}
+	if cmd == "help" {
+		if hasFlag(args, "all") {
+			usageAll()
+		} else {
+			usage()
+		}
+		return nil
+	}
+	if wantsHelp(args) && hasFlag(args, "json") {
+		return handleCommands(args)
 	}
 	if wantsHelp(args) {
 		if knownTopLevel(cmd) {
@@ -224,11 +247,15 @@ func runWithArgs(args cliArgs) error {
 		return nil
 	}
 	if !knownTopLevel(cmd) {
-		usage()
-		return errors.New("unknown command")
+		hints := []string{"Run lmx --help to list command groups."}
+		return cliError{"unknown_command", "Unknown command: " + cmd, hints, map[string]any{"command": cmd}}
 	}
 
 	switch cmd {
+	case "version":
+		return handleVersion(args)
+	case "commands":
+		return handleCommands(args)
 	case "update", "upgrade":
 		return handleUpdate(args)
 	case "auth":
@@ -286,13 +313,12 @@ func runWithArgs(args cliArgs) error {
 		}
 	}
 
-	usage()
-	return errors.New("unknown command")
+	return cliError{"unknown_command", "Unknown command path: " + strings.Join(args.positional, " "), []string{"Run lmx " + cmd + " --help to list supported subcommands."}, map[string]any{"command": strings.Join(args.positional, " ")}}
 }
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "benchmark", "bench", "auth", "hardware", "setups", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill", "update", "upgrade":
+	case "eval", "benchmark", "bench", "auth", "hardware", "setups", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill", "update", "upgrade", "version", "commands":
 		return true
 	default:
 		return false
@@ -306,7 +332,8 @@ func isBooleanOption(key string) bool {
 		"include-server-metadata", "enable-prefix-caching", "flash-attn", "no-flash-attn",
 		"no-stream", "missing-only", "all-missing", "cleanup-images", "oracle",
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
-		"sandbox-use-sudo", "sandbox-relaxed-security":
+		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
+		"save-run", "key-stdin":
 		return true
 	default:
 		return false
@@ -314,7 +341,9 @@ func isBooleanOption(key string) bool {
 }
 
 func parseArgs(argv []string) cliArgs {
-	args := cliArgs{opts: map[string]string{}, flags: map[string]bool{}}
+	printed := false
+	var fallback any
+	args := cliArgs{opts: map[string]string{}, flags: map[string]bool{}, provided: map[string]bool{}, jsonPrinted: &printed, jsonFallback: &fallback}
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
 		if !strings.HasPrefix(arg, "--") {
@@ -322,6 +351,7 @@ func parseArgs(argv []string) cliArgs {
 			continue
 		}
 		key := strings.TrimPrefix(arg, "--")
+		args.provided[strings.SplitN(key, "=", 2)[0]] = true
 		if eq := strings.Index(key, "="); eq >= 0 {
 			args.opts[key[:eq]] = key[eq+1:]
 			continue
@@ -338,6 +368,10 @@ func parseArgs(argv []string) cliArgs {
 		i++
 	}
 	return args
+}
+
+func humanOutput(args cliArgs) bool {
+	return !hasFlag(args, "quiet") && !hasFlag(args, "json") && !hasFlag(args, "json-status")
 }
 
 func positional(args cliArgs, index int) string {
@@ -604,19 +638,21 @@ func writeJSON(path string, value any) error {
 
 func writeOrPrintJSON(title string, args cliArgs, value any) error {
 	out := opt(args, "out")
+	compact := hasFlag(args, "compact")
 	if out == "" {
-		data, _ := json.MarshalIndent(value, "", "  ")
+		var data []byte
+		if compact {
+			data, _ = json.Marshal(value)
+		} else {
+			data, _ = json.MarshalIndent(value, "", "  ")
+		}
 		fmt.Println(string(data))
 		return nil
 	}
-	if err := writeJSON(out, value); err != nil {
+	if err := writeJSONOutput(out, value, compact); err != nil {
 		return err
 	}
-	if hasFlag(args, "json-status") {
-		printStatus(args, title+"_written", map[string]any{"path": out})
-	} else {
-		printInfo(title+"_written", map[string]any{"path": out})
-	}
+	printStatus(args, title+"_written", map[string]any{"path": out})
 	return nil
 }
 
@@ -634,14 +670,14 @@ func handleUpdate(args cliArgs) error {
 		return cliError{"update_executable_unknown", "Could not resolve the running lmx executable.", []string{"Run the release install command from the README manually."}, err.Error()}
 	}
 	if hasFlag(args, "dry-run") {
-		printInfo("update_plan", map[string]any{"asset": asset, "checksums": checksum, "target": exe})
+		printInfo(args, "update_plan", map[string]any{"asset": asset, "checksums": checksum, "target": exe})
 		return nil
 	}
 	if err := updateFromRelease(asset, checksum, exe); err != nil {
 		return err
 	}
-	printInfo("updated", map[string]any{"target": exe, "asset": asset})
-	if !hasFlag(args, "quiet") {
+	printInfo(args, "updated", map[string]any{"target": exe, "asset": asset})
+	if humanOutput(args) {
 		fmt.Printf("Updated lmx from %s\n", asset)
 	}
 	return nil
@@ -865,7 +901,7 @@ func handleAuth(args cliArgs) error {
 		if err := saveConfig(map[string]any{}); err != nil {
 			return err
 		}
-		printInfo("auth_cleared", map[string]any{"path": configFile()})
+		printInfo(args, "auth_cleared", map[string]any{"path": configFile()})
 		return nil
 	case "keys":
 		return handleAuthKeys(positional(args, 2), positional(args, 3), args)
@@ -876,14 +912,24 @@ func handleAuth(args cliArgs) error {
 		if err := saveConfig(map[string]any{}); err != nil {
 			return err
 		}
-		printInfo("auth_cleared", map[string]any{"path": configFile()})
+		printInfo(args, "auth_cleared", map[string]any{"path": configFile()})
 		return nil
+	}
+	if hasFlag(args, "key-stdin") {
+		if key != "" {
+			return cliError{"conflicting_options", "--key-stdin cannot be combined with --key or --api-key.", nil, nil}
+		}
+		stdinKey, err := readKeyFromStdin(os.Stdin)
+		if err != nil {
+			return err
+		}
+		key = stdinKey
 	}
 	if key != "" {
 		if err := saveConfig(map[string]any{"apiKey": key, "authProvider": "manual", "authSavedAt": time.Now().UTC().Format(time.RFC3339)}); err != nil {
 			return err
 		}
-		printInfo("auth_saved", map[string]any{"path": configFile(), "key": redactKey(key)})
+		printInfo(args, "auth_saved", map[string]any{"path": configFile(), "key": redactKey(key)})
 		return nil
 	}
 	cfg := loadConfig()
@@ -895,10 +941,10 @@ func handleAuth(args cliArgs) error {
 		key = stored
 	}
 	if key == "" {
-		printInfo("auth_missing", map[string]any{"next": "Run lmx auth login, lmx auth --key bhk_..., or set LMX_API_KEY."})
+		printInfo(args, "auth_missing", map[string]any{"next": "Run lmx auth login, lmx auth --key bhk_..., or set LMX_API_KEY."})
 		return nil
 	}
-	printInfo("auth_status", map[string]any{"source": source, "key": redactKey(key), "provider": cfg["authProvider"]})
+	printInfo(args, "auth_status", map[string]any{"source": source, "key": redactKey(key), "provider": cfg["authProvider"]})
 	return nil
 }
 
@@ -919,8 +965,7 @@ func handleAuthLogin(args cliArgs) error {
 		return cliError{"auth_device_code_invalid", "Device authorization response did not include deviceCode and userCode.", nil, parsed}
 	}
 
-	fmt.Printf("Open: %s\n", verificationURI)
-	fmt.Printf("Enter code: %s\n", userCode)
+	printStatus(args, "auth_device_code", map[string]any{"verificationUri": verificationURI, "userCode": userCode})
 	if !hasFlag(args, "no-browser") {
 		openBrowser(verificationURI)
 	}
@@ -941,7 +986,9 @@ func handleAuthLogin(args cliArgs) error {
 		token, err := fetchJSON("POST", base+"/api/auth/device/token", "", map[string]any{"deviceCode": deviceCode})
 		if err != nil {
 			if code := authResponseError(err); code == "authorization_pending" {
-				fmt.Print(".")
+				if humanOutput(args) {
+					fmt.Print(".")
+				}
 			} else if code == "expired_token" {
 				return cliError{"auth_device_expired", "Device authorization expired before approval.", []string{"Run lmx auth login to request a new code."}, nil}
 			} else if code == "key_limit_exceeded" {
@@ -961,11 +1008,15 @@ func handleAuthLogin(args cliArgs) error {
 				if err := saveConfig(cfg); err != nil {
 					return err
 				}
-				fmt.Println()
-				printInfo("auth_saved", map[string]any{"path": configFile(), "key": redactKey(key)})
+				if humanOutput(args) {
+					fmt.Println()
+				}
+				printInfo(args, "auth_saved", map[string]any{"path": configFile(), "key": redactKey(key)})
 				return nil
 			case "authorization_pending":
-				fmt.Print(".")
+				if humanOutput(args) {
+					fmt.Print(".")
+				}
 			case "expired_token":
 				return cliError{"auth_device_expired", "Device authorization expired before approval.", []string{"Run lmx auth login to request a new code."}, nil}
 			case "key_limit_exceeded":
@@ -1102,10 +1153,12 @@ func handleProfile(action, name string, args cliArgs) error {
 		if err := writeJSON(profileFile(name), payload); err != nil {
 			return err
 		}
-		printInfo("profile_saved", map[string]any{"profile": name, "path": profileFile(name)})
-		fmt.Println("Use it with:")
-		fmt.Println("  lmx benchmark run <engine> --profile " + name)
-		fmt.Println("  lmx server run <engine> --profile " + name)
+		printInfo(args, "profile_saved", map[string]any{"profile": name, "path": profileFile(name)})
+		if humanOutput(args) {
+			fmt.Println("Use it with:")
+			fmt.Println("  lmx benchmark run <engine> --profile " + name)
+			fmt.Println("  lmx server run <engine> --profile " + name)
+		}
 		return nil
 	case "list":
 		entries, err := os.ReadDir(profilesDir())
@@ -1136,7 +1189,7 @@ func handleProfile(action, name string, args cliArgs) error {
 		if err := os.Remove(profileFile(name)); err != nil {
 			return err
 		}
-		printInfo("profile_deleted", map[string]any{"profile": name})
+		printInfo(args, "profile_deleted", map[string]any{"profile": name})
 		return nil
 	default:
 		return errors.New("Unknown profile command. Use save, list, show, or delete.")
@@ -1174,13 +1227,14 @@ func handleHardware(action string, args cliArgs) error {
 			fields["gpuCount"] = gpuCount
 			fields["note"] = "Multiple GPUs detected; verify the benchmark runtime used the intended GPU count before submitting."
 		}
-		printInfo("hardware_written", fields)
-		fmt.Println("Use it with:")
-		fmt.Println("  lmx benchmark run <engine> --hardware " + out)
+		printInfo(args, "hardware_written", fields)
+		if humanOutput(args) {
+			fmt.Println("Use it with:")
+			fmt.Println("  lmx benchmark run <engine> --hardware " + out)
+		}
 		return nil
 	}
-	data, _ := json.MarshalIndent(hardware, "", "  ")
-	fmt.Println(string(data))
+	printJSON(args, hardware)
 	return nil
 }
 
@@ -1262,11 +1316,10 @@ func handleHardwareTemplate(args cliArgs) error {
 		if err := writeJSON(out, hw); err != nil {
 			return err
 		}
-		printInfo("hardware_template_written", map[string]any{"path": out, "pathAbsolute": absPathOr(out)})
+		printInfo(args, "hardware_template_written", map[string]any{"path": out, "pathAbsolute": absPathOr(out)})
 		return nil
 	}
-	data, _ := json.MarshalIndent(hw, "", "  ")
-	fmt.Println(string(data))
+	printJSON(args, hw)
 	return nil
 }
 
@@ -1286,7 +1339,11 @@ func handleSetups(action string, args cliArgs) error {
 	switch action {
 	case "list":
 		if len(setups) == 0 {
-			printInfo("no_setups", map[string]any{"next": "Save a setup from a benchmark submission or the dashboard."})
+			printInfo(args, "no_setups", map[string]any{"next": "Save a setup from a benchmark submission or the dashboard."})
+			return nil
+		}
+		if hasFlag(args, "json") {
+			printJSON(args, map[string]any{"setups": setups})
 			return nil
 		}
 		for _, setup := range setups {
@@ -1529,7 +1586,7 @@ func handleServer(action, target string, args cliArgs) error {
 	if hasFlag(args, "dry-run") || opt(args, "out") != "" {
 		return writeOrPrintJSON("server_plan", args, payload)
 	}
-	printInfo("server_command_start", map[string]any{"engine": engineName, "command": commandSnippet})
+	printInfo(args, "server_command_start", map[string]any{"engine": engineName, "command": commandSnippet})
 	return runLongCommand(commandSnippet)
 }
 
@@ -1905,7 +1962,11 @@ func handleContext(args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	return writeOrPrintJSON("context", args, value)
+	projected, err := projectContext(value, args)
+	if err != nil {
+		return err
+	}
+	return writeOrPrintJSON("context", args, projected)
 }
 
 func handleModel(action, target string, args cliArgs) error {
@@ -2025,7 +2086,7 @@ func handleSuite(action, target string, args cliArgs) error {
 		}
 		obj := asObject(payload)
 		suiteDoc := asObject(obj["suiteDoc"])
-		printInfo("suite_valid", map[string]any{"slug": obj["slug"], "runner": obj["runner"], "scoringMethod": suiteDoc["scoringMethod"], "submit": "lmx eval suite submit " + target + " --api-key bhk_..."})
+		printInfo(args, "suite_valid", map[string]any{"slug": obj["slug"], "runner": obj["runner"], "scoringMethod": suiteDoc["scoringMethod"], "submit": "lmx eval suite submit " + target + " --api-key bhk_..."})
 		return nil
 	case "submit":
 		if target == "" {
@@ -2046,8 +2107,8 @@ func handleSuite(action, target string, args cliArgs) error {
 		if err != nil {
 			return err
 		}
-		printJSON(value)
-		printInfo("suite_submitted", map[string]any{"slug": asObject(payload)["slug"], "status": "PENDING", "next": "Wait for admin approval before running public submissions."})
+		printJSON(args, value)
+		printInfo(args, "suite_submitted", map[string]any{"slug": asObject(payload)["slug"], "status": "PENDING", "next": "Wait for admin approval before running public submissions."})
 		return nil
 	case "init":
 		return handleSuiteInit(args)
@@ -2120,10 +2181,12 @@ func handleSuiteInit(args cliArgs) error {
 	if err := writeJSON(out, payload); err != nil {
 		return err
 	}
-	printInfo("suite_template_written", map[string]any{"path": out, "slug": slug, "runner": runner, "scoringMethod": stringValue(suiteDoc(payload)["scoringMethod"]), "tasks": len(evalTasks(suiteDoc(payload)))})
-	fmt.Println("Edit the suite, then run:")
-	fmt.Println("  lmx eval suite validate " + out)
-	fmt.Println("  lmx eval suite submit " + out + " --api-key bhk_...")
+	printInfo(args, "suite_template_written", map[string]any{"path": out, "slug": slug, "runner": runner, "scoringMethod": stringValue(suiteDoc(payload)["scoringMethod"]), "tasks": len(evalTasks(suiteDoc(payload)))})
+	if humanOutput(args) {
+		fmt.Println("Edit the suite, then run:")
+		fmt.Println("  lmx eval suite validate " + out)
+		fmt.Println("  lmx eval suite submit " + out + " --api-key bhk_...")
+	}
 	return nil
 }
 
@@ -2368,7 +2431,7 @@ func handleStorage(action, target string, args cliArgs, forcedKind string) error
 		if err := os.WriteFile(out, data, 0o644); err != nil {
 			return err
 		}
-		printInfo("storage_downloaded", map[string]any{"path": out, "key": target})
+		printInfo(args, "storage_downloaded", map[string]any{"path": out, "key": target})
 		return nil
 	default:
 		return errors.New("Unknown storage command. Use upload or download.")
@@ -2392,7 +2455,7 @@ func defaultContentType(format string) string {
 
 func handleBenchmark(action, target string, args cliArgs) error {
 	if action == "validate-local" || action == "local-validate" {
-		return validateBenchmarkFileLocally(target)
+		return validateBenchmarkFileLocally(target, args)
 	}
 	if action == "validate" {
 		action = "dry-run"
@@ -2411,30 +2474,49 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		if err != nil {
 			return err
 		}
-		runPath := benchmarkRunPathInDir(payload, firstNonEmpty(opt(args, "runs-dir"), "runs"))
-		out := firstNonEmpty(opt(args, "out"), runPath)
+		dryRunOnly := hasFlag(args, "dry-run") && !hasFlag(args, "submit")
+		persistRun := !dryRunOnly || hasFlag(args, "save-run")
+		runPath := ""
+		if persistRun {
+			runPath = benchmarkRunPathInDir(payload, firstNonEmpty(opt(args, "runs-dir"), "runs"))
+		}
+		out := opt(args, "out")
+		if out == "" && persistRun {
+			out = runPath
+		}
 		feedback := benchmarkAgentFeedback(payload, out, args, hasFlag(args, "dry-run"), hasFlag(args, "submit"))
-		if absOut, err := filepath.Abs(out); err == nil {
-			feedback["outputPathAbsolute"] = absOut
+		feedback["runPersisted"] = persistRun
+		if out != "" {
+			if absOut, err := filepath.Abs(out); err == nil {
+				feedback["outputPathAbsolute"] = absOut
+			}
 		}
-		feedback["savedRunPathRelative"] = runPath
-		if absRun, err := filepath.Abs(runPath); err == nil {
-			feedback["savedRunPathAbsolute"] = absRun
-		}
-		if out != runPath {
-			feedback["savedRunPath"] = runPath
+		if persistRun {
+			feedback["savedRunPathRelative"] = runPath
+			if absRun, err := filepath.Abs(runPath); err == nil {
+				feedback["savedRunPathAbsolute"] = absRun
+			}
+			if out != runPath {
+				feedback["savedRunPath"] = runPath
+			}
 		}
 		payload["agentFeedback"] = feedback
 		if err := writeBenchmarkPayloadFiles(payload, out, runPath); err != nil {
 			return err
 		}
-		printInfo("benchmark_payload_file_written", map[string]any{"path": out, "pathAbsolute": absPathOr(out), "engine": payload["engineName"]})
-		if out != runPath {
-			printInfo("benchmark_run_saved", map[string]any{"path": runPath, "pathAbsolute": absPathOr(runPath), "engine": payload["engineName"]})
+		if out != "" {
+			printStatus(args, "benchmark_payload_file_written", map[string]any{"path": out, "pathAbsolute": absPathOr(out), "engine": payload["engineName"]})
+		} else {
+			printJSON(args, payload)
+		}
+		if runPath != "" && out != runPath {
+			printStatus(args, "benchmark_run_saved", map[string]any{"path": runPath, "pathAbsolute": absPathOr(runPath), "engine": payload["engineName"]})
 		}
 		printStatus(args, "benchmark_payload_status", feedback)
-		if hasFlag(args, "dry-run") && !hasFlag(args, "submit") {
-			fmt.Println(stringValue(feedback["message"]))
+		if dryRunOnly {
+			if !hasFlag(args, "json") && !hasFlag(args, "quiet") && out != "" {
+				fmt.Println(stringValue(feedback["message"]))
+			}
 			return nil
 		}
 		if hasFlag(args, "submit") {
@@ -2448,8 +2530,10 @@ func handleBenchmark(action, target string, args cliArgs) error {
 			apiPayload := toBenchmarkSubmit(payload)
 			return submitPayload(endpoint, hasFlag(args, "dry-run"), "benchmark", args, apiPayload)
 		}
-		fmt.Println(stringValue(feedback["message"]))
-		printBenchmarkNextSteps(feedback, out)
+		if humanOutput(args) {
+			fmt.Println(stringValue(feedback["message"]))
+			printBenchmarkNextSteps(feedback, out)
+		}
 		return nil
 	}
 	if action == "add-hardware" || action == "attach-hardware" {
@@ -2486,13 +2570,15 @@ func handleBenchmark(action, target string, args cliArgs) error {
 }
 
 func writeBenchmarkPayloadFiles(payload map[string]any, out, runPath string) error {
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		return err
+	if out != "" {
+		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+			return err
+		}
+		if err := writeJSON(out, payload); err != nil {
+			return err
+		}
 	}
-	if err := writeJSON(out, payload); err != nil {
-		return err
-	}
-	if out == runPath {
+	if runPath == "" || out == runPath {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(runPath), 0o755); err != nil {
@@ -2501,7 +2587,7 @@ func writeBenchmarkPayloadFiles(payload map[string]any, out, runPath string) err
 	return writeJSON(runPath, payload)
 }
 
-func validateBenchmarkFileLocally(path string) error {
+func validateBenchmarkFileLocally(path string, args cliArgs) error {
 	if path == "" {
 		return errors.New("benchmark validate-local requires a benchmark JSON path")
 	}
@@ -2517,7 +2603,7 @@ func validateBenchmarkFileLocally(path string) error {
 	if err := validateBenchmarkSubmitPayload(asObject(value)); err != nil {
 		return err
 	}
-	printInfo("benchmark_local_valid", map[string]any{"path": path, "status": "valid", "note": "Local validation only; API dry-run still requires --api-key or LMX_API_KEY."})
+	printInfo(args, "benchmark_local_valid", map[string]any{"path": path, "status": "valid", "note": "Local validation only; API dry-run still requires --api-key or LMX_API_KEY."})
 	return nil
 }
 
@@ -2597,7 +2683,7 @@ func listBenchmarkRuns(args cliArgs) error {
 	if len(runs) > limit {
 		runs = runs[:limit]
 	}
-	printJSON(map[string]any{"runsDir": root, "count": len(runs), "runs": runs})
+	printJSON(args, map[string]any{"runsDir": root, "count": len(runs), "runs": runs})
 	return nil
 }
 
@@ -2633,7 +2719,7 @@ func exportBenchmarkRuns(target string, args cliArgs) error {
 			if err := os.WriteFile(out, []byte(text), 0o644); err != nil {
 				return err
 			}
-			printInfo("benchmark_run_export_written", map[string]any{"path": out, "format": "csv", "rows": len(rows)})
+			printInfo(args, "benchmark_run_export_written", map[string]any{"path": out, "format": "csv", "rows": len(rows)})
 			return nil
 		}
 		fmt.Print(text)
@@ -2908,7 +2994,7 @@ func writeOrPrintBenchmarkRunShow(args cliArgs, path string, value any) error {
 		format = "table"
 	}
 	if format == "json" {
-		printJSON(value)
+		printJSON(args, value)
 		return nil
 	}
 	if format != "table" {
@@ -2923,7 +3009,7 @@ func writeOrPrintBenchmarkRunShow(args cliArgs, path string, value any) error {
 		if err := os.WriteFile(out, []byte(text), 0o644); err != nil {
 			return err
 		}
-		printInfo("benchmark_run_show_written", map[string]any{"path": out, "format": "table"})
+		printInfo(args, "benchmark_run_show_written", map[string]any{"path": out, "format": "table"})
 		return nil
 	}
 	fmt.Print(text)
@@ -3017,7 +3103,7 @@ func writeOrPrintBenchmarkRunCompare(args cliArgs, result map[string]any) error 
 		if err := os.WriteFile(out, []byte(text), 0o644); err != nil {
 			return err
 		}
-		printInfo("benchmark_run_compare_written", map[string]any{"path": out, "format": "table"})
+		printInfo(args, "benchmark_run_compare_written", map[string]any{"path": out, "format": "table"})
 		return nil
 	}
 	fmt.Print(text)
@@ -3687,9 +3773,9 @@ func editBenchmarkRun(path string, args cliArgs) error {
 	if err := writeJSON(path, value); err != nil {
 		return err
 	}
-	printInfo("benchmark_run_edited", map[string]any{"path": path})
+	printInfo(args, "benchmark_run_edited", map[string]any{"path": path})
 	if hasFlag(args, "print") || hasFlag(args, "json") {
-		printJSON(value)
+		printJSON(args, value)
 	}
 	return nil
 }
@@ -3726,8 +3812,10 @@ func addHardwareToRun(target string, args cliArgs) error {
 	if err := writeJSON(path, value); err != nil {
 		return err
 	}
-	printInfo("benchmark_hardware_attached", map[string]any{"path": path, "pathAbsolute": absPathOr(path), "gpuName": hardware["gpuName"], "vramGb": hardware["vramGb"], "benchmarkStatus": feedback["benchmarkStatus"], "submissionStatus": feedback["submissionStatus"]})
-	printBenchmarkNextSteps(feedback, path)
+	printInfo(args, "benchmark_hardware_attached", map[string]any{"path": path, "pathAbsolute": absPathOr(path), "gpuName": hardware["gpuName"], "vramGb": hardware["vramGb"], "benchmarkStatus": feedback["benchmarkStatus"], "submissionStatus": feedback["submissionStatus"]})
+	if humanOutput(args) {
+		printBenchmarkNextSteps(feedback, path)
+	}
 	return nil
 }
 
@@ -3780,7 +3868,7 @@ func deleteBenchmarkRun(path string, args cliArgs) error {
 	if err := os.Remove(path); err != nil {
 		return err
 	}
-	printInfo("benchmark_run_deleted", map[string]any{"path": path})
+	printInfo(args, "benchmark_run_deleted", map[string]any{"path": path})
 	return nil
 }
 
@@ -3798,7 +3886,7 @@ func rerunBenchmarkRun(path string, args cliArgs) error {
 }
 
 func benchmarkArgsFromPayload(payload map[string]any, overrides cliArgs) cliArgs {
-	args := cliArgs{opts: map[string]string{}, flags: map[string]bool{}}
+	args := cliArgs{opts: map[string]string{}, flags: map[string]bool{}, jsonPrinted: overrides.jsonPrinted, jsonFallback: overrides.jsonFallback}
 	for key, value := range map[string]any{
 		"mode":           payload["benchmarkMode"],
 		"hf-id":          payload["hfId"],
@@ -7327,8 +7415,8 @@ func handleExecute(suiteSlug string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	printJSON(value)
-	printInfo("execute_submitted", map[string]any{"suite": suiteSlug, "endpoint": "/api/evals/execute", "autoSubmit": payload["autoSubmit"]})
+	printJSON(args, value)
+	printInfo(args, "execute_submitted", map[string]any{"suite": suiteSlug, "endpoint": "/api/evals/execute", "autoSubmit": payload["autoSubmit"]})
 	return nil
 }
 
@@ -7364,7 +7452,7 @@ func handleLmEval(suiteSlug string, args cliArgs) error {
 		cmdArgs = append(cmdArgs, "--num_fewshot", fewshot)
 	}
 	cmdArgs = append(cmdArgs, "--output_path", resultsPath)
-	printInfo("lm_eval_start", map[string]any{"suite": suiteSlug, "command": command, "backend": backend, "modelArgs": modelArgs, "tasks": tasks, "output": resultsPath})
+	printInfo(args, "lm_eval_start", map[string]any{"suite": suiteSlug, "command": command, "backend": backend, "modelArgs": modelArgs, "tasks": tasks, "output": resultsPath})
 	cmd := exec.Command(command, cmdArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -7395,7 +7483,7 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 		if resultsPath == "" {
 			return cliError{"missing_results", "LM-Eval suites require --results <lm-eval-output.json>.", []string{"Run lmx eval lm-eval <suiteSlug> to produce results, or pass an existing lm-eval output JSON with --results."}, nil}
 		}
-		result, err = loadLmEvalRunResult(resultsPath, suite)
+		result, err = loadLmEvalRunResult(resultsPath, suite, args)
 	} else if strings.EqualFold(runner, "CUSTOM") {
 		result, err = runCustomLocalEval(suite, args)
 	} else {
@@ -7430,7 +7518,7 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 	if err := writeJSON(out, payload); err != nil {
 		return err
 	}
-	printInfo("run_payload_written", map[string]any{"path": out, "suite": suiteSlug, "tasks": len(asObject(payload["results"])), "aggregatePreview": result["aggregate"]})
+	printInfo(args, "run_payload_written", map[string]any{"path": out, "suite": suiteSlug, "tasks": len(asObject(payload["results"])), "aggregatePreview": result["aggregate"]})
 	if hasFlag(args, "submit") || hasFlag(args, "dry-run") {
 		if opt(args, "hardware") == "" {
 			return cliError{"missing_hardware", "--hardware is required for submit/dry-run", []string{"Create a hardware JSON file matching /api/agent-context hardwareSchemas.", "Pass --hardware hardware.json."}, nil}
@@ -7531,12 +7619,14 @@ func handleEvalPull(suiteSlug string, args cliArgs) error {
 	if err := writeJSON(filepath.Join(outDir, "manifest.json"), manifest); err != nil {
 		return err
 	}
-	printInfo("eval_pulled", map[string]any{"suite": slug, "outDir": outDir, "tasks": len(resolvedTasks), "items": totalItems, "containsLabels": true})
-	fmt.Println("Gold labels are included in the .jsonl files and suite.json — do not publish them.")
-	fmt.Println("Run fully offline (no site connection or API key needed):")
-	fmt.Println("  lmx eval run " + slug + " --suite-file " + filepath.Join(outDir, "suite.json") + " --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --out run.json")
-	fmt.Println("Submit the saved run later, once the site is reachable:")
-	fmt.Println("  lmx eval submit run.json --model <hfId> --hardware hardware.json --api-key bhk_...")
+	printInfo(args, "eval_pulled", map[string]any{"suite": slug, "outDir": outDir, "tasks": len(resolvedTasks), "items": totalItems, "containsLabels": true})
+	if humanOutput(args) {
+		fmt.Println("Gold labels are included in the .jsonl files and suite.json — do not publish them.")
+		fmt.Println("Run fully offline (no site connection or API key needed):")
+		fmt.Println("  lmx eval run " + slug + " --suite-file " + filepath.Join(outDir, "suite.json") + " --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --out run.json")
+		fmt.Println("Submit the saved run later, once the site is reachable:")
+		fmt.Println("  lmx eval submit run.json --model <hfId> --hardware hardware.json --api-key bhk_...")
+	}
 	return nil
 }
 
@@ -7871,7 +7961,7 @@ func handleEvalShardStatus(dataset string, args cliArgs) error {
 	if hasFlag(args, "json") || hasFlag(args, "print") || opt(args, "out") != "" {
 		return writeOrPrintJSON("eval_shard_status", args, map[string]any{"status": fields, "raw": value})
 	}
-	printInfo("eval_shard_status", fields)
+	printInfo(args, "eval_shard_status", fields)
 	return nil
 }
 
@@ -8052,7 +8142,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 				shardCount, covered, missing := shardCoverageDetails(coverageValue)
 				if hasFlag(args, "all-missing") && opt(args, "shard") == "" {
 					if len(missing) == 0 {
-						printInfo("eval_shard_all_missing_complete", map[string]any{"dataset": dataset, "model": hfIDForCoverage, "shardCount": shardCount, "coveredShards": sortedIntsFromSet(covered)})
+						printInfo(args, "eval_shard_all_missing_complete", map[string]any{"dataset": dataset, "model": hfIDForCoverage, "shardCount": shardCount, "coveredShards": sortedIntsFromSet(covered)})
 						return nil
 					}
 					for _, nextShard := range missing {
@@ -8083,7 +8173,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		}
 	}
 
-	printInfo("eval_shard_start", map[string]any{"dataset": dataset, "shard": shardIndex, "questions": count, "model": callModel, "baseUrl": baseURL, "concurrency": concurrency, "scoring": scoring})
+	printInfo(args, "eval_shard_start", map[string]any{"dataset": dataset, "shard": shardIndex, "questions": count, "model": callModel, "baseUrl": baseURL, "concurrency": concurrency, "scoring": scoring})
 
 	var results []shardItemResult
 	var stats shardStats
@@ -8099,7 +8189,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 			return err
 		}
 		if len(codeMetrics) > 0 {
-			printInfo("eval_shard_passk", codeMetrics)
+			printInfo(args, "eval_shard_passk", codeMetrics)
 		}
 	} else if scoring == "cruxeval_execution" {
 		results, stats, codeMetrics, err = runEvalShardCruxExec(args, baseURL, callModel, items, cfg)
@@ -8107,7 +8197,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 			return err
 		}
 		if len(codeMetrics) > 0 {
-			printInfo("eval_shard_execution", codeMetrics)
+			printInfo(args, "eval_shard_execution", codeMetrics)
 		}
 	} else {
 		results, stats = runEvalShard(args, baseURL, callModel, items, cfg)
@@ -8206,9 +8296,11 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	}
 
 	if !submit {
-		printInfo("eval_shard_dry_run", summary)
-		fmt.Println("Dry run only — nothing submitted.")
-		fmt.Println("Publish with: lmx eval shard " + dataset + " --base-url " + rawBaseURL + " --model <hfId> --hardware hardware.json --submit")
+		printInfo(args, "eval_shard_dry_run", summary)
+		if humanOutput(args) {
+			fmt.Println("Dry run only — nothing submitted.")
+			fmt.Println("Publish with: lmx eval shard " + dataset + " --base-url " + rawBaseURL + " --model <hfId> --hardware hardware.json --submit")
+		}
 		return nil
 	}
 
@@ -8271,7 +8363,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		return err
 	}
 	if hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose") {
-		printJSON(value)
+		printJSON(args, value)
 	}
 	fields := map[string]any{"dataset": dataset, "shardIndex": shardIndex, "submitted": len(submitResults), "accuracyPct": summary["accuracyPct"]}
 	if obj := asObject(value); obj != nil {
@@ -8287,7 +8379,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 			fields["status"] = run["status"]
 		}
 	}
-	printInfo("eval_shard_submitted", fields)
+	printInfo(args, "eval_shard_submitted", fields)
 	return nil
 }
 
@@ -9675,7 +9767,7 @@ func downloadURLFromValue(value any) string {
 	return firstNonEmpty(stringValue(obj["downloadUrl"]), stringValue(obj["url"]), stringValue(obj["signedUrl"]), downloadURLFromValue(obj["downloadUrls"]))
 }
 
-func loadLmEvalRunResult(path string, suite map[string]any) (map[string]any, error) {
+func loadLmEvalRunResult(path string, suite map[string]any, args cliArgs) (map[string]any, error) {
 	raw, err := readJSON(path)
 	if err != nil {
 		return nil, err
@@ -9684,7 +9776,7 @@ func loadLmEvalRunResult(path string, suite map[string]any) (map[string]any, err
 	scoring := firstNonEmpty(stringValue(doc["scoringMethod"]), "exact_match")
 	scores := map[string]any{}
 	flatScores := map[string]float64{}
-	printInfo("lm_eval_parse_start", map[string]any{"suite": suite["slug"], "tasks": len(evalTasks(doc)), "scoringMethod": scoring, "results": path})
+	printInfo(args, "lm_eval_parse_start", map[string]any{"suite": suite["slug"], "tasks": len(evalTasks(doc)), "scoringMethod": scoring, "results": path})
 	for _, task := range evalTasks(doc) {
 		key := stringValue(task["key"])
 		result := lmEvalResultForTask(raw, key)
@@ -9694,7 +9786,7 @@ func loadLmEvalRunResult(path string, suite map[string]any) (map[string]any, err
 		}
 		scores[key] = map[string]any{"score": score, "nShots": firstNonZero(int(numberField(task, "nShots")), atoiDefault(inferredEvalFewShot(doc), 0))}
 		flatScores[key] = score
-		printInfo("lm_eval_task_score", map[string]any{"task": key, "score": score})
+		printInfo(args, "lm_eval_task_score", map[string]any{"task": key, "score": score})
 	}
 	return map[string]any{"scores": scores, "artifacts": []any{}, "aggregate": computeEvalAggregate(doc, flatScores)}, nil
 }
@@ -9810,7 +9902,7 @@ func runCustomLocalEval(suite map[string]any, args cliArgs) (map[string]any, err
 	if scoring == "llm_judge" && (judgeBaseURL == "" || judgeModel == "") {
 		return nil, cliError{"judge_config_missing", "llm_judge suites require --judge-base-url and --judge-model, or suiteDoc.judge defaults", []string{"Pass --judge-base-url and --judge-model.", "If the judge requires auth, pass --judge-api-key or set EVAL_JUDGE_API_KEY."}, nil}
 	}
-	printInfo("custom_eval_start", map[string]any{"suite": suite["slug"], "tasks": len(evalTasks(doc)), "model": model, "baseUrl": baseURL, "scoringMethod": scoring})
+	printInfo(args, "custom_eval_start", map[string]any{"suite": suite["slug"], "tasks": len(evalTasks(doc)), "model": model, "baseUrl": baseURL, "scoringMethod": scoring})
 	scores := map[string]any{}
 	flatScores := map[string]float64{}
 	artifacts := []any{}
@@ -9867,7 +9959,7 @@ func runCustomLocalEval(suite map[string]any, args cliArgs) (map[string]any, err
 			scores[stringValue(task["key"])] = map[string]any{"score": score, "nSamples": counted, "nShots": numberField(task, "nShots")}
 			flatScores[stringValue(task["key"])] = score
 		}
-		printInfo("task_complete", map[string]any{"task": task["key"], "samples": counted, "failures": failures, "score": flatScores[stringValue(task["key"])]})
+		printInfo(args, "task_complete", map[string]any{"task": task["key"], "samples": counted, "failures": failures, "score": flatScores[stringValue(task["key"])]})
 	}
 	return map[string]any{"scores": scores, "artifacts": artifacts, "aggregate": computeEvalAggregate(doc, flatScores)}, nil
 }
@@ -10612,7 +10704,7 @@ func submitPayload(endpoint string, dryRun bool, label string, args cliArgs, pay
 	}
 	printFullResponse := label != "run" || hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose")
 	if printFullResponse {
-		printJSON(value)
+		printJSON(args, value)
 	}
 	status := label + "_submitted"
 	if dryRun {
@@ -10625,8 +10717,8 @@ func submitPayload(endpoint string, dryRun bool, label string, args cliArgs, pay
 	if receipt := receiptURL(value); receipt != "" {
 		fields["url"] = receipt
 	}
-	printInfo(status, fields)
-	if dryRun {
+	printInfo(args, status, fields)
+	if dryRun && humanOutput(args) {
 		fmt.Println("Dry-run passed. Submit with:")
 		if label == "benchmark" {
 			fmt.Println("  lmx benchmark submit <payload.json>")
@@ -10786,12 +10878,33 @@ func toJSON(value any) string {
 	return string(data)
 }
 
-func printJSON(value any) {
+func printJSON(args cliArgs, value any) {
 	data, _ := json.MarshalIndent(value, "", "  ")
 	fmt.Println(string(data))
+	if args.jsonPrinted != nil {
+		*args.jsonPrinted = true
+	}
 }
 
-func printInfo(title string, fields map[string]any) {
+func printInfo(args cliArgs, title string, fields map[string]any) {
+	payload := map[string]any{"event": title}
+	for key, value := range fields {
+		if value != nil && fmt.Sprint(value) != "" {
+			payload[key] = value
+		}
+	}
+	if hasFlag(args, "json-status") {
+		printStatus(args, title, fields)
+	}
+	if hasFlag(args, "json") {
+		if args.jsonFallback != nil {
+			*args.jsonFallback = payload
+		}
+		return
+	}
+	if hasFlag(args, "quiet") || hasFlag(args, "json-status") {
+		return
+	}
 	fmt.Println("[localmaxxing] " + title)
 	for key, value := range fields {
 		if value == nil || fmt.Sprint(value) == "" {
@@ -10818,6 +10931,9 @@ func printStatus(args cliArgs, event string, fields map[string]any) {
 	if hasFlag(args, "json-status") {
 		data, _ := json.Marshal(payload)
 		fmt.Fprintln(os.Stderr, string(data))
+		return
+	}
+	if hasFlag(args, "json") {
 		return
 	}
 	fmt.Fprintln(os.Stderr, "[localmaxxing] "+event)
@@ -10860,7 +10976,7 @@ func printError(args cliArgs, err error) {
 	statusOutputMu.Lock()
 	defer statusOutputMu.Unlock()
 	_ = appendTerminalStatusLog(opt(args, "status-log"), payload)
-	if hasFlag(args, "json-status") {
+	if hasFlag(args, "json-status") || hasFlag(args, "json") {
 		data, _ := json.Marshal(payload)
 		fmt.Fprintln(os.Stderr, string(data))
 		return
@@ -10885,9 +11001,13 @@ func printError(args cliArgs, err error) {
 }
 
 var usageExamples = []string{
+	`lmx version --json`,
+	`lmx commands --json`,
 	`lmx update`,
 	`lmx context --out localmaxxing-agent-context.json`,
-	`lmx auth --key bhk_...`,
+	`lmx context list`,
+	`lmx context get hardwareOptions.hardwareCostComponentNames --compact`,
+	`lmx auth --key-stdin`,
 	`lmx auth login`,
 	`lmx auth logout`,
 	`lmx auth keys list`,
@@ -11087,8 +11207,12 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --patch <path>           Merge JSON object file into a saved benchmark run
   --unset <fields>         Comma-separated saved-run fields to remove
   --yes                    Confirm saved-run deletion
-  --json-status            Machine mode: emit JSONL progress/errors on stderr; terminal stdout is empty unless --json requests one final JSON document
-  --quiet                  Suppress progress events
+  --json                   Emit a final JSON result on stdout
+  --json-status            Emit JSONL progress/errors on stderr
+  --quiet                  Suppress progress and human status output
+  --compact                Emit one-line JSON instead of indented JSON
+  --section <path>         Select one dotted path from lmx context
+  --key-stdin              Read and persist an API key from stdin
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
   --hardware <path>        JSON hardware object required when submitting
   --quantization <label>   Quantization label (auto-detected from the endpoint for remote benchmark and eval-shard runs when omitted)
@@ -11099,6 +11223,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --limit <n>              Optional search/list result limit
   --submit                 Upload run to LocalMaxxing
   --dry-run                Preflight without execution/submission; terminal run validates its manifest without Docker/model calls, other commands print or validate plans
+  --save-run               Persist a benchmark dry-run in managed run history
   --release-url <url>      Override release download base for lmx update (default: GitHub latest release)
   --include-server-metadata Probe optional endpoint /props and /hardware metadata during discover
   --gpu-name <name>       Hardware template GPU name
@@ -11115,6 +11240,9 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --out <path>             Write computed payload/result JSON`
 
 var commandDescriptions = map[string]string{
+	"version":                "Print CLI build version and platform metadata.",
+	"commands":               "Print the machine-readable command and option schema.",
+	"context":                "Fetch complete or selected live agent context.",
 	"update":                 "Download the newest LocalMaxxing CLI release and replace the current binary.",
 	"upgrade":                "Alias for update.",
 	"endpoint discover":      "Discover an OpenAI-compatible endpoint and benchmark command hints.",
@@ -11184,13 +11312,44 @@ func commandHelp(args cliArgs) (string, bool) {
 			b.WriteString(match)
 			b.WriteByte('\n')
 		}
-		b.WriteString("\nRun `lmx --help` for all commands and the full option list.")
+		b.WriteString("\nRun `lmx help --all` for the exhaustive command and option list.")
 		return b.String(), true
 	}
 	return "", false
 }
 
 func usage() {
+	fmt.Println(`LocalMaxxing CLI
+
+Usage:
+  lmx <command> [options]
+
+Command groups:
+  auth        Authentication and API keys
+  benchmark   Run, validate, manage, and submit benchmarks
+  context     Fetch live agent schemas and enums
+  engines     Detect local inference engines
+  eval        Run and submit quality evaluations
+  hardware    Detect, validate, and template hardware
+  model       Search and resolve model IDs
+  profile     Manage reusable defaults
+  server      Build or run model server commands
+  setups      Pull saved hardware setups
+  skill       Print or install the embedded agent skill
+  update      Update the installed release
+
+Agent and discovery commands:
+  lmx version [--json]
+  lmx commands --json
+  lmx context list [--compact]
+  lmx context get <dotted.path> [--compact]
+  lmx skill install --dir <skills-dir>
+
+Run ` + "`lmx <command> --help`" + ` for scoped help.
+Run ` + "`lmx help --all`" + ` for every example and option.`)
+}
+
+func usageAll() {
 	fmt.Println("LocalMaxxing CLI\n\nUsage:")
 	for _, ex := range usageExamples {
 		fmt.Println("  " + ex)

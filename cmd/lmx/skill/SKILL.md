@@ -15,12 +15,16 @@ Install `lmx` from a release tarball, or build from source:
 go build -o lmx ./cmd/lmx
 ```
 
-Authenticate with an API key (prefix `bhk_`) or environment variable:
+Authenticate with an API key (prefix `bhk_`). Prefer the environment so the
+secret does not enter shell history or process arguments:
 
 ```bash
-lmx auth --key bhk_...
 export LMX_API_KEY=bhk_...
+printf '%s\n' "$LMX_API_KEY" | lmx auth --key-stdin  # persist without argv exposure
 ```
+
+Only use `--api-key` or `lmx auth --key ...` when command-line secret exposure
+is acceptable. Never include an API key in agent traces, generated plans, or logs.
 
 Saved config lives under `~/.config/localmaxxing`. Generate hardware metadata before submitting:
 
@@ -37,7 +41,7 @@ lmx hardware --out hardware.json
 
 ## Canonical benchmark workflow
 
-1. Run with `--dry-run` to write a measurement plan.
+1. Run with `--dry-run --out plan.json` to write a measurement plan without adding managed run history.
 2. Run again without `--dry-run` to measure.
 3. Validate with `lmx benchmark dry-run <file>` (authenticated API validation, no write).
 4. Submit with `lmx benchmark submit <file>`.
@@ -76,11 +80,14 @@ Control output length with `--max-tokens` (default 256) and sampling with `--tem
 
 ## Agent-friendly flags
 
-- `--json-status`: emit JSON progress events on stderr.
-- `--quiet`: suppress progress events and human status text.
+- `--json`: request a final JSON result on stdout.
+- `--json-status`: emit JSONL progress and errors on stderr.
+- `--quiet`: suppress progress events and human status text, but not a requested final JSON result.
 - `--out <path>`: write output payloads/files.
-- `--dry-run`: write plans or validate without submitting, depending on command.
-- `lmx context --out ...`: fetch live enum values and schemas from the site.
+- `--dry-run`: plan or validate without submitting. Benchmark dry-runs do not add managed run history unless `--save-run` is passed.
+- `lmx commands --json`: inspect the versioned machine-readable command schema.
+- `lmx context list`: list live context sections.
+- `lmx context get <dotted.path> --compact`: fetch only the needed live enum or schema.
 - `lmx <command> --help`: show examples and relevant flags for a command.
 - Long Terminal-Bench jobs: preflight first, then launch with a unique `--run-dir ... --detach`; poll with `lmx eval terminal status <run-dir> --json`, consume `logs <run-dir> [--follow]` as JSONL, and cancel with `cancel <run-dir>`. Resume by repeating the exact run identity with the same directory and `--resume auto`; see `references/evals.md`.
 

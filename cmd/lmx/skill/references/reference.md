@@ -23,15 +23,20 @@ Raw HTTP API docs are available from the site through `GET /api/agent-context` a
 Global/auth/output:
 
 - `--api-url <url>`: LocalMaxxing origin; default `https://www.localmaxxing.com`.
-- `--api-key <key>`: API key; defaults to `LMX_API_KEY`, then saved config.
+- `LMX_API_KEY`: preferred authentication for agents; avoids command-line secret exposure.
+- `--api-key <key>`: API key argument; defaults to `LMX_API_KEY`, then saved config. Avoid it in agent traces and shell history.
+- `lmx auth --key-stdin`: persist one newline-terminated key read from stdin.
 - `--no-browser`: do not open the device-login browser automatically.
 - `--profile <name>`: load saved defaults from `lmx profile save`.
-- `--json-status`: machine mode with progress/errors as JSONL on stderr. Terminal-run human prose is suppressed; stdout is empty unless `--json` requests one final JSON document.
-- `--quiet`: suppress progress events.
+- `--json`: request a final JSON result on stdout.
+- `--json-status`: machine mode with progress/errors as JSONL on stderr.
+- `--quiet`: suppress progress and human status output.
+- `--compact`: emit one-line JSON for context and other JSON-producing commands.
 - `--out <path>`: write computed payload/result JSON, or write `SKILL.md` for `lmx skill print`.
 - `--dir <dir>`: target skills directory for `lmx skill install`; default `.claude/skills`.
 - `--submit`: upload run to LocalMaxxing.
-- `--dry-run`: for benchmark run, write a measurement plan; for submit commands, authenticated API validation without creating a run.
+- `--dry-run`: plan or validate without submission. Benchmark dry-runs do not create managed run history unless `--save-run` is passed.
+- `--save-run`: explicitly add a benchmark dry-run to managed run history.
 
 Model/eval:
 
@@ -192,5 +197,5 @@ Hardware and submission metadata:
 - `benchmark_metric_missing`: pass `--tok-s-out` and at least one secondary metric, or run a benchmark path that measures them.
 - `missing_remote_hardware`: run `lmx hardware --out hardware.json` on the server and pass that file when submitting.
 - `lm-eval` not found: install it with `pip install lm-eval`, or pass `--lm-eval-bin <path>`.
-- Missing API key: run `lmx auth --key bhk_...`, set `LMX_API_KEY`, or pass `--api-key bhk_...`.
-- Unknown enum or schema mismatch: refresh live metadata with `lmx context --out localmaxxing-agent-context.json`.
+- Missing API key: set `LMX_API_KEY` or pipe it to `lmx auth --key-stdin`. Use `--api-key` only when command-line exposure is acceptable.
+- Unknown enum or schema mismatch: run `lmx context list`, then fetch only the required path with `lmx context get <path> --compact`.

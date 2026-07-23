@@ -37,12 +37,16 @@ func printSkill(args cliArgs) error {
 			return err
 		}
 		printStatus(args, "skill_written", map[string]any{"path": out, "bytes": len(data)})
-		if !hasFlag(args, "quiet") {
+		if humanOutput(args) {
 			fmt.Printf("Wrote %s SKILL.md to %s\n", skillName, out)
 		}
 		return nil
 	}
-	fmt.Print(string(data))
+	if hasFlag(args, "json") {
+		printJSON(args, map[string]any{"name": skillName, "content": string(data)})
+	} else {
+		fmt.Print(string(data))
+	}
 	return nil
 }
 
@@ -76,7 +80,7 @@ func installSkill(args cliArgs) error {
 		return err
 	}
 	printStatus(args, "skill_installed", map[string]any{"dir": root, "files": count})
-	if !hasFlag(args, "quiet") {
+	if humanOutput(args) {
 		fmt.Printf("Installed %s skill (%d files) to %s\n", skillName, count, root)
 		fmt.Printf("Point your agent's skills directory at %s, or pass --dir to target ~/.claude/skills, .github/skills, etc.\n", filepath.Dir(root))
 	}

@@ -345,7 +345,7 @@ func runTerminalImport(args cliArgs) error {
 	if imported == 0 {
 		return cliError{"task_import_failed", "Every harbor task was skipped.", []string{"docker-compose task environments are not supported; import tasks that use environment/Dockerfile or [environment].docker_image."}, map[string]any{"src": src, "skipped": skipped}}
 	}
-	printInfo("terminal_import_complete", map[string]any{"src": src, "out": out, "tasks": imported, "skipped": skipped, "version": version})
+	printInfo(args, "terminal_import_complete", map[string]any{"src": src, "out": out, "tasks": imported, "skipped": skipped, "version": version})
 	return nil
 }
 
@@ -769,18 +769,20 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		if hasFlag(args, "json-status") {
 			printStatus(args, "terminal_eval_completed", completeFields)
 		} else {
-			printInfo("terminal_eval_complete", summary)
-			fmt.Println("Local run complete — nothing submitted.")
-			if dataset != "" {
-				if cfg.agentCommand != "" {
-					fmt.Println("Publish with: lmx eval terminal run " + dataset + " --agent-cmd '<your-agent-command>' --model <hfId> --hardware hardware.json --submit")
-				} else {
-					fmt.Println("Publish with: lmx eval terminal run " + dataset + " --base-url " + rawBaseURL + " --model <hfId> --hardware hardware.json --submit")
+			printInfo(args, "terminal_eval_complete", summary)
+			if humanOutput(args) {
+				fmt.Println("Local run complete — nothing submitted.")
+				if dataset != "" {
+					if cfg.agentCommand != "" {
+						fmt.Println("Publish with: lmx eval terminal run " + dataset + " --agent-cmd '<your-agent-command>' --model <hfId> --hardware hardware.json --submit")
+					} else {
+						fmt.Println("Publish with: lmx eval terminal run " + dataset + " --base-url " + rawBaseURL + " --model <hfId> --hardware hardware.json --submit")
+					}
 				}
 			}
 		}
 		if hasFlag(args, "json-status") && (hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose")) {
-			printJSON(resultDocument)
+			printJSON(args, resultDocument)
 		}
 		if stats.errors == len(results) {
 			code := dominantTerminalErrorCode(errorCodes)
@@ -862,7 +864,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		return err
 	}
 	if !hasFlag(args, "json-status") && (hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose")) {
-		printJSON(value)
+		printJSON(args, value)
 	}
 	obj := asObject(value)
 	submission := map[string]any{"shardIndex": shardIndex, "submitted": len(submitResults), "run": obj["run"], "aggregate": obj["aggregate"]}
@@ -903,10 +905,10 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if hasFlag(args, "json-status") {
 		printStatus(args, "terminal_eval_submitted", fields)
 		if hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose") {
-			printJSON(resultDocument)
+			printJSON(args, resultDocument)
 		}
 	} else {
-		printInfo("terminal_eval_submitted", fields)
+		printInfo(args, "terminal_eval_submitted", fields)
 	}
 	return nil
 }
@@ -1680,8 +1682,10 @@ func submitTerminalEval(args cliArgs) error {
 		fields["payloadOut"] = out
 	}
 	if hasFlag(args, "dry-run") {
-		printInfo("terminal_submit_dry_run", fields)
-		fmt.Println("Dry run only — payload batch validated locally; no network request was made.")
+		printInfo(args, "terminal_submit_dry_run", fields)
+		if humanOutput(args) {
+			fmt.Println("Dry run only — payload batch validated locally; no network request was made.")
+		}
 		return nil
 	}
 	key := apiKey(args)
@@ -1716,7 +1720,7 @@ func submitTerminalEval(args cliArgs) error {
 	fields["completedShardIndexes"] = completed
 	fields["runIds"] = runIDs
 	fields["shardReceipts"] = receipts
-	printInfo("terminal_submit_complete", fields)
+	printInfo(args, "terminal_submit_complete", fields)
 	return nil
 }
 

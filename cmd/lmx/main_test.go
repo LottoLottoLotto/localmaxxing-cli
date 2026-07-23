@@ -1525,7 +1525,7 @@ func TestBenchmarkRunRerunUsesSavedCommand(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write saved run: %v", err)
 	}
-	if err := rerunBenchmarkRun(saved, cliArgs{opts: map[string]string{}, flags: map[string]bool{"dry-run": true, "quiet": true}}); err != nil {
+	if err := rerunBenchmarkRun(saved, cliArgs{opts: map[string]string{}, flags: map[string]bool{"dry-run": true, "save-run": true, "quiet": true}}); err != nil {
 		t.Fatalf("rerunBenchmarkRun returned error: %v", err)
 	}
 	entries, err := os.ReadDir(filepath.Join(tmp, "runs", "Qwen-Qwen3-8B"))
@@ -1572,7 +1572,7 @@ func TestBenchmarkRunRerunHonorsRunsDir(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write saved run: %v", err)
 	}
-	if err := rerunBenchmarkRun(saved, cliArgs{opts: map[string]string{"runs-dir": customRuns}, flags: map[string]bool{"dry-run": true, "quiet": true}}); err != nil {
+	if err := rerunBenchmarkRun(saved, cliArgs{opts: map[string]string{"runs-dir": customRuns}, flags: map[string]bool{"dry-run": true, "save-run": true, "quiet": true}}); err != nil {
 		t.Fatalf("rerunBenchmarkRun returned error: %v", err)
 	}
 	entries, err := os.ReadDir(filepath.Join(customRuns, "Qwen-Qwen3-8B"))
@@ -2510,7 +2510,7 @@ func TestCommandHelpFocusesSubcommand(t *testing.T) {
 	if strings.Contains(text, "lmx eval suite") {
 		t.Fatalf("focused help included eval suite: %s", text)
 	}
-	if !strings.Contains(text, "Run `lmx --help`") {
+	if !strings.Contains(text, "Run `lmx help --all`") {
 		t.Fatalf("focused help missing see-also: %s", text)
 	}
 }
