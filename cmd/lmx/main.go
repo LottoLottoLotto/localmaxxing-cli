@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -27,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf16"
 )
@@ -34,12 +37,13 @@ import (
 const defaultAPIURL = "https://www.localmaxxing.com"
 const defaultHFAPIURL = "https://huggingface.co"
 const defaultEndpointTimeout = 10 * time.Minute
-const defaultMetadataRequestTimeout = 30 * time.Second
 const remoteKVCacheColdMethodology = "Single streaming request with inline filler padded to target context size; measures cold prefill + decode at that context depth."
 const remoteKVCacheReuseMethodology = "Two-step remote cache-reuse probe: pre-warm target context, then time a streaming request with the same prefix plus probe; measures cached-prefix decode at that context depth."
 const remoteKVCacheFallbackWarning = "Remote OpenAI-compatible endpoints do not provide a portable persistent KV-cache session API; this sweep resends the full prefix at each depth and can only verify cache reuse when backend-specific cache metrics are exposed. Results may fall back to cold depth TPS instead of retained KV-cache TPS."
 
 var apiHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+var statusOutputMu sync.Mutex
 
 var goldFieldNames = map[string]bool{
 	"gold": true, "answer": true, "referenceAnswer": true, "expectedAnswer": true,
@@ -75,12 +79,124 @@ type detectedEngine struct {
 
 func (e cliError) Error() string { return e.Message }
 
-func main() {
-	args := parseArgs(os.Args[1:])
-	if err := runWithArgs(args); err != nil {
+const (
+	dockerRegroupArgsEnv = "LMX_DOCKER_REGROUP_ARGS"
+	dockerRegroupExeEnv  = "LMX_DOCKER_REGROUP_EXE"
+	dockerRegroupChild   = "--docker-regroup-child"
+)
+
+func terminalDockerCommand(argv []string) bool {
+	for i := 0; i+2 < len(argv); i++ {
+		if argv[i] == "eval" && argv[i+1] == "terminal" && (argv[i+2] == "run" || argv[i+2] == "oracle") {
+			return true
+		}
+	}
+	return false
+}
+
+func terminalDockerRegroupChildArgs(argv []string) ([]string, error) {
+	if len(argv) != 1 || argv[0] != dockerRegroupChild {
+		return argv, nil
+	}
+	encoded := os.Getenv(dockerRegroupArgsEnv)
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decode Docker regroup arguments: %w", err)
+	}
+	var restored []string
+	if err := json.Unmarshal(data, &restored); err != nil {
+		return nil, fmt.Errorf("decode Docker regroup arguments: %w", err)
+	}
+	_ = os.Unsetenv(dockerRegroupArgsEnv)
+	_ = os.Unsetenv(dockerRegroupExeEnv)
+	return restored, nil
+}
+
+func terminalDockerGroupRefreshNeeded(argv []string) bool {
+	if runtime.GOOS != "linux" || !terminalDockerCommand(argv) || os.Getenv(dockerRegroupArgsEnv) != "" {
+		return false
+	}
+	group, err := user.LookupGroup("docker")
+	if err != nil {
+		return false
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil {
+		return false
+	}
+	if os.Getegid() == gid {
+		return false
+	}
+	groups, err := os.Getgroups()
+	if err == nil {
+		for _, current := range groups {
+			if current == gid {
+				return false
+			}
+		}
+	}
+	currentUser, err := user.Current()
+	if err != nil {
+		return false
+	}
+	output, err := exec.Command("id", "-G", currentUser.Username).Output()
+	if err != nil {
+		return false
+	}
+	for _, listed := range strings.Fields(string(output)) {
+		if listed == group.Gid {
+			return true
+		}
+	}
+	return false
+}
+
+func execTerminalWithRefreshedDockerGroup(argv []string) error {
+	data, err := json.Marshal(argv)
+	if err != nil {
+		return err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	newgrp, err := exec.LookPath("newgrp")
+	if err != nil {
+		return err
+	}
+	environment := append(os.Environ(),
+		dockerRegroupArgsEnv+"="+base64.RawURLEncoding.EncodeToString(data),
+		dockerRegroupExeEnv+"="+executable,
+	)
+	command := "exec \"$" + dockerRegroupExeEnv + "\" " + dockerRegroupChild
+	return syscall.Exec(newgrp, []string{"newgrp", "docker", "-c", command}, environment)
+}
+
+func runCLI(argv []string) int {
+	args := parseArgs(argv)
+	err := runWithArgs(args)
+	if err != nil {
 		printError(args, err)
+	}
+	if hasFlag(args, "detached-child") {
+		finalizeDetachedTerminalChild(args, err)
+	}
+	if err != nil {
+		return 1
+	}
+	return 0
+}
+
+func main() {
+	argv, err := terminalDockerRegroupChildArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if terminalDockerGroupRefreshNeeded(argv) {
+		_ = execTerminalWithRefreshedDockerGroup(argv)
+	}
+	os.Exit(runCLI(argv))
 }
 
 func run(argv []string) error {
@@ -163,6 +279,8 @@ func runWithArgs(args cliArgs) error {
 				return handleEvalShardStatus(positional(args, 3), args)
 			}
 			return handleEvalShard(positional(args, 2), args)
+		case "train":
+			return handleEvalTrain(positional(args, 2), args)
 		case "terminal":
 			return handleEvalTerminal(positional(args, 2), args)
 		}
@@ -181,6 +299,20 @@ func knownTopLevel(cmd string) bool {
 	}
 }
 
+func isBooleanOption(key string) bool {
+	switch key {
+	case "help", "json-status", "dry-run", "quiet", "logout", "no-browser", "default",
+		"submit", "print", "json", "verbose", "yes", "force", "rerun",
+		"include-server-metadata", "enable-prefix-caching", "flash-attn", "no-flash-attn",
+		"no-stream", "missing-only", "all-missing", "cleanup-images", "oracle",
+		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
+		"sandbox-use-sudo", "sandbox-relaxed-security":
+		return true
+	default:
+		return false
+	}
+}
+
 func parseArgs(argv []string) cliArgs {
 	args := cliArgs{opts: map[string]string{}, flags: map[string]bool{}}
 	for i := 0; i < len(argv); i++ {
@@ -192,6 +324,10 @@ func parseArgs(argv []string) cliArgs {
 		key := strings.TrimPrefix(arg, "--")
 		if eq := strings.Index(key, "="); eq >= 0 {
 			args.opts[key[:eq]] = key[eq+1:]
+			continue
+		}
+		if isBooleanOption(key) {
+			args.flags[key] = true
 			continue
 		}
 		if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
@@ -350,6 +486,10 @@ func apiKey(args cliArgs) string {
 }
 
 func fetchJSON(method, rawURL, key string, body any) (any, error) {
+	return fetchJSONContext(context.Background(), method, rawURL, key, body)
+}
+
+func fetchJSONContext(ctx context.Context, method, rawURL, key string, body any) (any, error) {
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -358,7 +498,7 @@ func fetchJSON(method, rawURL, key string, body any) (any, error) {
 		}
 		reader = bytes.NewReader(data)
 	}
-	req, err := http.NewRequest(method, rawURL, reader)
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -472,7 +612,11 @@ func writeOrPrintJSON(title string, args cliArgs, value any) error {
 	if err := writeJSON(out, value); err != nil {
 		return err
 	}
-	printInfo(title+"_written", map[string]any{"path": out})
+	if hasFlag(args, "json-status") {
+		printStatus(args, title+"_written", map[string]any{"path": out})
+	} else {
+		printInfo(title+"_written", map[string]any{"path": out})
+	}
 	return nil
 }
 
@@ -2395,8 +2539,7 @@ func handleBenchmarkRuns(action, target string, args cliArgs) error {
 		if err != nil {
 			return err
 		}
-		printJSON(value)
-		return nil
+		return writeOrPrintBenchmarkRunShow(args, path, value)
 	case "edit", "patch":
 		path, err := resolveBenchmarkRunPath(target, args)
 		if err != nil {
@@ -2515,14 +2658,14 @@ func compareBenchmarkRuns(target, other string, args cliArgs) error {
 			return err
 		}
 		result := compareTwoBenchmarkRuns(left, right, args)
-		return writeOrPrintJSON("benchmark_run_compare", args, result)
+		return writeOrPrintBenchmarkRunCompare(args, result)
 	}
 	records, err := benchmarkRunRecords(target, args)
 	if err != nil {
 		return err
 	}
 	result := compareBenchmarkRunGroups(records, args)
-	return writeOrPrintJSON("benchmark_run_compare", args, result)
+	return writeOrPrintBenchmarkRunCompare(args, result)
 }
 
 func benchmarkRunRecords(target string, args cliArgs) ([]benchmarkRunRecord, error) {
@@ -2760,6 +2903,244 @@ func metricComparison(name string, value float64, baselineName string, baselineV
 		comparison["better"] = metricBetter(value, baselineValue, metric)
 	}
 	return comparison
+}
+func writeOrPrintBenchmarkRunShow(args cliArgs, path string, value any) error {
+	format := strings.ToLower(firstNonEmpty(opt(args, "format"), "json"))
+	if format == "ascii" {
+		format = "table"
+	}
+	if format == "json" {
+		printJSON(value)
+		return nil
+	}
+	if format != "table" {
+		return cliError{"invalid_option", "--format for benchmark runs show must be table, ascii, or json", []string{"Use --format table for an ASCII table or --format json for machine-readable output."}, nil}
+	}
+	record, err := benchmarkRunRecordFromPath(path)
+	if err != nil {
+		return err
+	}
+	text := benchmarkRunTable(record)
+	if out := opt(args, "out"); out != "" {
+		if err := os.WriteFile(out, []byte(text), 0o644); err != nil {
+			return err
+		}
+		printInfo("benchmark_run_show_written", map[string]any{"path": out, "format": "table"})
+		return nil
+	}
+	fmt.Print(text)
+	return nil
+}
+
+func benchmarkRunTable(record benchmarkRunRecord) string {
+	rows := [][]string{
+		{"path", record.Path},
+		{"updatedAt", record.UpdatedAt.UTC().Format(time.RFC3339)},
+	}
+	flattenTableFields("", record.Payload, &rows)
+	return asciiTable([]string{"Field", "Value"}, rows)
+}
+
+func flattenTableFields(prefix string, value any, rows *[][]string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if len(typed) == 0 {
+			*rows = append(*rows, []string{prefix, "{}"})
+			return
+		}
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			name := key
+			if prefix != "" {
+				name = prefix + "." + key
+			}
+			flattenTableFields(name, typed[key], rows)
+		}
+	case []any:
+		if len(typed) == 0 {
+			*rows = append(*rows, []string{prefix, "[]"})
+			return
+		}
+		for i, item := range typed {
+			flattenTableFields(fmt.Sprintf("%s[%d]", prefix, i), item, rows)
+		}
+	default:
+		*rows = append(*rows, []string{prefix, tableValueString(value)})
+	}
+}
+
+func tableValueString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return typed
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(typed), 'f', -1, 32)
+	case int:
+		return strconv.Itoa(typed)
+	case int64:
+		return strconv.FormatInt(typed, 10)
+	case json.Number:
+		return typed.String()
+	default:
+		data, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Sprint(typed)
+		}
+		return string(data)
+	}
+}
+
+func writeOrPrintBenchmarkRunCompare(args cliArgs, result map[string]any) error {
+	format := strings.ToLower(firstNonEmpty(opt(args, "format"), "table"))
+	if format == "ascii" {
+		format = "table"
+	}
+	if format == "json" {
+		return writeOrPrintJSON("benchmark_run_compare", args, result)
+	}
+	if format != "table" {
+		return cliError{"invalid_option", "--format for benchmark runs compare must be table, ascii, or json", []string{"Use --format table for an ASCII table or --format json for machine-readable output."}, nil}
+	}
+	text := benchmarkRunCompareTable(result)
+	if out := opt(args, "out"); out != "" {
+		if err := os.WriteFile(out, []byte(text), 0o644); err != nil {
+			return err
+		}
+		printInfo("benchmark_run_compare_written", map[string]any{"path": out, "format": "table"})
+		return nil
+	}
+	fmt.Print(text)
+	return nil
+}
+
+func benchmarkRunCompareTable(result map[string]any) string {
+	comparisons := anySlice(result["comparisons"])
+	if asObject(result["candidate"]) != nil {
+		rows := [][]string{}
+		for _, item := range comparisons {
+			comparison := asObject(item)
+			rows = append(rows, []string{
+				stringValue(comparison["metric"]),
+				formatTableNumber(numberField(comparison, "baselineValue")),
+				formatTableNumber(numberField(comparison, "value")),
+				formatSignedTableNumber(numberField(comparison, "delta")),
+				formatSignedPercent(numberField(comparison, "percent")),
+				formatBetter(comparison["better"]),
+			})
+		}
+		return asciiTable([]string{"Metric", "Baseline", "Candidate", "Delta", "Delta %", "Better"}, rows)
+	}
+	rows := [][]string{}
+	for _, item := range comparisons {
+		comparison := asObject(item)
+		rows = append(rows, []string{
+			stringValue(comparison["name"]),
+			stringValue(comparison["metric"]),
+			formatTableNumber(numberField(comparison, "baselineValue")),
+			formatTableNumber(numberField(comparison, "value")),
+			formatSignedTableNumber(numberField(comparison, "delta")),
+			formatSignedPercent(numberField(comparison, "percent")),
+			formatBetter(comparison["better"]),
+		})
+	}
+	return asciiTable([]string{"Group", "Metric", "Baseline", "Value", "Delta", "Delta %", "Better"}, rows)
+}
+
+func asciiTable(headers []string, rows [][]string) string {
+	widths := make([]int, len(headers))
+	for i, header := range headers {
+		widths[i] = len(header)
+	}
+	for _, row := range rows {
+		for i := 0; i < len(headers) && i < len(row); i++ {
+			if len(row[i]) > widths[i] {
+				widths[i] = len(row[i])
+			}
+		}
+	}
+	var b strings.Builder
+	writeRule := func() {
+		b.WriteByte('+')
+		for _, width := range widths {
+			b.WriteString(strings.Repeat("-", width+2))
+			b.WriteByte('+')
+		}
+		b.WriteByte('\n')
+	}
+	writeRow := func(row []string) {
+		b.WriteByte('|')
+		for i := range headers {
+			cell := ""
+			if i < len(row) {
+				cell = row[i]
+			}
+			b.WriteByte(' ')
+			b.WriteString(cell)
+			b.WriteString(strings.Repeat(" ", widths[i]-len(cell)+1))
+			b.WriteByte('|')
+		}
+		b.WriteByte('\n')
+	}
+	writeRule()
+	writeRow(headers)
+	writeRule()
+	for _, row := range rows {
+		writeRow(row)
+	}
+	writeRule()
+	return b.String()
+}
+
+func formatTableNumber(value float64) string {
+	if value == 0 {
+		return "-"
+	}
+	return strconv.FormatFloat(roundMetric(value), 'f', -1, 64)
+}
+
+func formatSignedTableNumber(value float64) string {
+	if value == 0 {
+		return "-"
+	}
+	text := formatTableNumber(math.Abs(value))
+	if value > 0 {
+		return "+" + text
+	}
+	return "-" + text
+}
+
+func formatSignedPercent(value float64) string {
+	if value == 0 {
+		return "-"
+	}
+	text := strconv.FormatFloat(roundMetric(math.Abs(value)), 'f', -1, 64) + "%"
+	if value > 0 {
+		return "+" + text
+	}
+	return "-" + text
+}
+
+func formatBetter(value any) string {
+	if better, ok := value.(bool); ok {
+		if better {
+			return "yes"
+		}
+		return "no"
+	}
+	return "-"
 }
 
 func benchmarkRunExportRows(records []benchmarkRunRecord, fields []string) []map[string]any {
@@ -5636,9 +6017,6 @@ func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, m
 		resolution["declaredBaseModel"] = hfID
 		resolution["loadedFilename"] = filepath.Base(modelPath)
 	}
-	if status == "alias" {
-		printStatus(args, "remote_model_alias", map[string]any{"hfId": hfID, "servedModel": servedModel, "hint": "Endpoint model names are often server aliases; verify --hf-id only if the underlying model is different."})
-	}
 	query, querySource := remoteModelSearchQuery(servedModel, stringValue(resolution["loadedFilename"]))
 	resolution["searchQuery"] = query
 	resolution["searchQuerySource"] = querySource
@@ -5657,7 +6035,9 @@ func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, m
 	resolution["candidates"] = candidates
 	resolution["searchCommand"] = queryCommand
 	if len(candidates) == 0 {
-		printStatus(args, "hf_id_candidates_empty", map[string]any{"query": query, "next": queryCommand})
+		if modelPath == "" {
+			printStatus(args, "hf_id_candidates_empty", map[string]any{"query": query, "next": queryCommand})
+		}
 		return resolution
 	}
 	fields := map[string]any{"query": query, "count": len(candidates), "next": "If the exact GGUF repo matters, rerun with that --hf-id."}
@@ -5677,6 +6057,12 @@ func remoteModelResolution(args cliArgs, servedModel, servedModelSource, hfID, m
 			fields["sourceRepo"] = match
 			fields["sourceRepoMatch"] = "exact_filename"
 		}
+	}
+	if sourceRepo := stringValue(resolution["sourceRepo"]); sourceRepo != "" && strings.EqualFold(sourceRepo, hfID) {
+		return resolution
+	}
+	if status == "alias" {
+		printStatus(args, "remote_model_alias", map[string]any{"hfId": hfID, "servedModel": servedModel, "hint": "Endpoint model names are often server aliases; verify --hf-id only if the underlying model is different."})
 	}
 	printStatus(args, "hf_id_candidates_found", fields)
 	return resolution
@@ -5987,11 +6373,15 @@ func modelCandidates(value any, limit int) []any {
 }
 
 func remoteQuantizationResolution(args cliArgs, baseURL, apiKey, cliQuantization string, servedModelInfo map[string]any) map[string]any {
+	return remoteQuantizationResolutionContext(context.Background(), args, baseURL, apiKey, cliQuantization, servedModelInfo)
+}
+
+func remoteQuantizationResolutionContext(ctx context.Context, args cliArgs, baseURL, apiKey, cliQuantization string, servedModelInfo map[string]any) map[string]any {
 	resolution := map[string]any{"cli": cliQuantization}
 	if quant := quantizationFromModelInfo(servedModelInfo); quant != "" {
 		resolution["v1Models"] = quant
 	}
-	if props, err := fetchEndpointJSON(baseURL+"/props", apiKey); err == nil {
+	if props, err := fetchEndpointJSONContext(ctx, baseURL+"/props", apiKey); err == nil {
 		if obj := asObject(props); obj != nil {
 			modelPath := stringValue(obj["model_path"])
 			if modelPath != "" {
@@ -6114,20 +6504,18 @@ func copyKnownMetaFields(dst, src map[string]any) {
 }
 
 func fetchEndpointJSON(rawURL, apiKey string) (any, error) {
-	return fetchEndpointJSONWithTimeout(rawURL, apiKey, defaultMetadataRequestTimeout)
+	return fetchEndpointJSONContext(context.Background(), rawURL, apiKey)
 }
 
-func fetchEndpointJSONWithTimeout(rawURL, apiKey string, timeout time.Duration) (any, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+func fetchEndpointJSONContext(ctx context.Context, rawURL, apiKey string) (any, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := apiHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -6136,7 +6524,7 @@ func fetchEndpointJSONWithTimeout(rawURL, apiKey string, timeout time.Duration) 
 		return nil, fmt.Errorf("%s returned %s", rawURL, res.Status)
 	}
 	var body any
-	if err := json.NewDecoder(io.LimitReader(res.Body, 4*1024*1024)).Decode(&body); err != nil {
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		return nil, err
 	}
 	return body, nil
@@ -6311,6 +6699,9 @@ func tokenCount(args cliArgs, hfID, revision, text string, known int, kind strin
 
 //go:embed token_count.py
 var tokenCountScript string
+
+//go:embed train_eval_grpo.py
+var trainEvalGRPOScript []byte
 
 func pythonTokenCount(model, revision, text string) (int, error) {
 	response, err := runPythonTokenHelper(map[string]any{"model": model, "revision": revision, "text": text})
@@ -10307,20 +10698,20 @@ func printInfo(title string, fields map[string]any) {
 }
 
 func printStatus(args cliArgs, event string, fields map[string]any) {
-	if fields == nil {
-		fields = map[string]any{}
+	payload := map[string]any{"event": event, "time": time.Now().UTC().Format(time.RFC3339)}
+	for key, value := range fields {
+		if value == nil || fmt.Sprint(value) == "" {
+			continue
+		}
+		payload[key] = value
 	}
+	statusOutputMu.Lock()
+	defer statusOutputMu.Unlock()
+	_ = appendTerminalStatusLog(opt(args, "status-log"), payload)
 	if hasFlag(args, "quiet") {
 		return
 	}
 	if hasFlag(args, "json-status") {
-		payload := map[string]any{"event": event, "time": time.Now().UTC().Format(time.RFC3339)}
-		for key, value := range fields {
-			if value == nil || fmt.Sprint(value) == "" {
-				continue
-			}
-			payload[key] = value
-		}
 		data, _ := json.Marshal(payload)
 		fmt.Fprintln(os.Stderr, string(data))
 		return
@@ -10349,45 +10740,44 @@ func metricStatusFields(metrics map[string]float64) map[string]any {
 
 func printError(args cliArgs, err error) {
 	var ce cliError
+	code, message := "unexpected_error", err.Error()
+	var hints []string
+	var details any
 	if errors.As(err, &ce) {
-		if hasFlag(args, "json-status") {
-			payload := map[string]any{"event": "error", "time": time.Now().UTC().Format(time.RFC3339), "code": ce.Code, "message": ce.Message}
-			if len(ce.Hints) > 0 {
-				payload["hints"] = ce.Hints
-			}
-			if ce.Details != nil {
-				payload["details"] = ce.Details
-			}
-			data, _ := json.Marshal(payload)
-			fmt.Fprintln(os.Stderr, string(data))
-			return
-		}
-		fmt.Fprintln(os.Stderr, "[localmaxxing:error] "+ce.Code)
-		fmt.Fprintln(os.Stderr, ce.Message)
-		if len(ce.Hints) > 0 {
-			fmt.Fprintln(os.Stderr, "Fix:")
-			for _, hint := range ce.Hints {
-				fmt.Fprintln(os.Stderr, "- "+hint)
-			}
-		}
-		if ce.Details != nil {
-			fmt.Fprintln(os.Stderr, "Details:")
-			if text, ok := ce.Details.(string); ok {
-				fmt.Fprintln(os.Stderr, text)
-			} else {
-				data, _ := json.MarshalIndent(ce.Details, "", "  ")
-				fmt.Fprintln(os.Stderr, string(data))
-			}
-		}
-		return
+		code, message, hints, details = ce.Code, ce.Message, ce.Hints, ce.Details
 	}
+	payload := map[string]any{"event": "error", "time": time.Now().UTC().Format(time.RFC3339), "code": code, "message": message}
+	if len(hints) > 0 {
+		payload["hints"] = hints
+	}
+	if details != nil {
+		payload["details"] = details
+	}
+	statusOutputMu.Lock()
+	defer statusOutputMu.Unlock()
+	_ = appendTerminalStatusLog(opt(args, "status-log"), payload)
 	if hasFlag(args, "json-status") {
-		data, _ := json.Marshal(map[string]any{"event": "error", "time": time.Now().UTC().Format(time.RFC3339), "code": "unexpected_error", "message": err.Error()})
+		data, _ := json.Marshal(payload)
 		fmt.Fprintln(os.Stderr, string(data))
 		return
 	}
-	fmt.Fprintln(os.Stderr, "[localmaxxing:error] unexpected_error")
-	fmt.Fprintln(os.Stderr, err.Error())
+	fmt.Fprintln(os.Stderr, "[localmaxxing:error] "+code)
+	fmt.Fprintln(os.Stderr, message)
+	if len(hints) > 0 {
+		fmt.Fprintln(os.Stderr, "Fix:")
+		for _, hint := range hints {
+			fmt.Fprintln(os.Stderr, "- "+hint)
+		}
+	}
+	if details != nil {
+		fmt.Fprintln(os.Stderr, "Details:")
+		if text, ok := details.(string); ok {
+			fmt.Fprintln(os.Stderr, text)
+		} else {
+			data, _ := json.MarshalIndent(details, "", "  ")
+			fmt.Fprintln(os.Stderr, string(data))
+		}
+	}
 }
 
 var usageExamples = []string{
@@ -10418,14 +10808,14 @@ var usageExamples = []string{
 	`lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run`,
 	`lmx benchmark run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --model-path model.gguf --dry-run`,
 	`lmx benchmark runs list`,
-	`lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json`,
+	`lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json --format table`,
 	`lmx benchmark runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'`,
 	`lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run`,
 	`lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json --api-key bhk_...`,
 	`lmx benchmark runs delete runs/Qwen-Qwen3-8B/run.json --yes`,
 	`lmx benchmark runs stats --group-by quantization --metric tokSOut`,
-	`lmx benchmark runs compare --by hardware --model Qwen/Qwen3-8B`,
-	`lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs`,
+	`lmx benchmark runs compare --by hardware --model Qwen/Qwen3-8B --format table`,
+	`lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs --format table`,
 	`lmx benchmark runs export --format csv --out runs.csv`,
 	`lmx kvcache run llama.cpp --hf-id Qwen/Qwen3-8B --model-path model.gguf --levels 10000,20000,30000,40000`,
 	`lmx kvcache run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --levels 10000,20000,30000,40000`,
@@ -10450,20 +10840,19 @@ var usageExamples = []string{
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --missing-only --submit`,
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --all-missing --submit`,
 	`lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1`,
-	`lmx eval terminal import ./terminal-bench-tasks/smoke --out ./tb-bundles --version 2.1`,
-	`lmx eval terminal verify ./tb-bundles/smoke`,
-	`lmx eval terminal verify ./tb-bundles/smoke --trace-dir ./oracle-traces --out oracle-results.json`,
-	`lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com`,
-	`lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com --verify-bundles --json`,
-	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --model Qwen/Qwen3-8B --hardware hardware.json`,
-	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json`,
-	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --base-url http://localhost:8000 --served-model Qwen3-8B --model Qwen/Qwen3-8B --hardware hardware.json --shard 3 --concurrency 2 --trace-dir ./terminal-traces --submit`,
-	`lmx eval terminal run --task-dir ./tb-bundles/smoke --base-url http://localhost:8000 --model Qwen/Qwen3-8B --trace-dir ./terminal-traces --out completed-terminal-run.json`,
-	`lmx eval terminal run terminal-bench-2-1 --api-url https://www.localmaxxing.com --endpoint-file endpoint.json --model Qwen/Qwen3-8B --hardware hardware.json --resume auto --repeat-batch-limit 3`,
-	`lmx eval terminal recover ./completed-terminal-run.json.checkpoint --task-id caffe-cifar-10 --container lmx-tb-caffe-recovered --bundle ./tb-bundles/caffe-cifar-10 --result ./recovered-task.json`,
-	`lmx eval terminal submit ./completed-terminal-run.json --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-batch.json`,
-	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --api-url https://www.localmaxxing.com`,
-	`lmx eval terminal submit ./completed-terminal-shard --dataset <slug> --shard-index 3 --hf-id Qwen/Qwen3-8B --hardware hardware.json --api-url https://www.localmaxxing.com --dry-run --out terminal-submit-batch.json`,
+	`lmx eval terminal verify ./tb-bundles/smoke --oracle`,
+	`lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --run-dir ./runs/tb21-qwen --resume auto --json-status --json --submit`,
+	`lmx eval terminal status ./runs/tb21-qwen --json`,
+	`lmx eval terminal logs ./runs/tb21-qwen --follow`,
+	`lmx eval terminal cancel ./runs/tb21-qwen`,
+	`lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --run-dir ./runs/tb21-qwen --resume auto --json-status --submit --detach`,
+	`lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit --dry-run --out terminal-preflight.json`,
+	`lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-batch.json`,
+	`lmx eval terminal submit ./completed-terminal-shard --dataset <slug> --shard-index 3 --hf-id Qwen/Qwen3-8B --hardware hardware.json --dry-run --out terminal-submit-batch.json`,
+	`lmx eval train prepare ./completed-terminal-run --out ./training-data --base-model Qwen/Qwen3-Coder-30B-A3B-Instruct --allow-benchmark-training`,
+	`lmx eval train run ./training-data/manifest.json --trainer-cmd "python3 python/localmaxxing_helpers/train_eval_sft.py --backend unsloth --dataset {dataset} --model {base_model} --output {output} --lora-dropout 0"`,
+	`lmx eval train rl prepare ./tb-bundles --out ./rl-training --base-model Qwen/Qwen3-Coder-30B-A3B-Instruct --environment-factory my_package.environments:make_environment --allow-benchmark-training`,
+	`lmx eval train rl run ./rl-training/manifest.json --resume auto`,
 	`lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`,
 	`lmx benchmark fixup runs/Model/run.json`,
 	`lmx hardware template --gpu-name "RTX 3090" --gpu-count 2 --vram-gb 24 --cpu "Ryzen 9 9950X" --ram-gb 96 --os Linux`,
@@ -10477,13 +10866,11 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --profile <name>         Load saved defaults from lmx profile save
   --model <hfId>           HuggingFace model ID
   --hf-id <hfId>           Canonical HuggingFace model ID for deferred terminal submit
-  --shard-index <n>       Deferred terminal submit shard; required for isolated/noncanonical checkpoints
   --backend <name>         lm-eval backend name for eval lm-eval (default: hf)
-  --model-args <args>      lm-eval --model_args value
   --num-fewshot <n>        lm-eval --num_fewshot override
   --lm-eval-bin <path>     lm-eval executable (default: lm_eval)
   --questions <n>          Eval-shard questions to run (default: 95%/±5% CI recommendation)
-  --shard <index>          Pin a specific eval-shard index instead of the least-run one
+  --shard <index>          Pin a shard; terminal runs otherwise choose the first missing model/quantization/harness shard
   --missing-only          With --submit, skip a covered default shard and run the first missing shard
   --all-missing           With --submit, submit every currently missing shard in ascending order
   --rerun, --force        Allow submitting a shard already covered for the current aggregate key
@@ -10493,36 +10880,52 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --concurrency <n>        Eval-shard parallel requests (default: 1)
   --artifact-limit <n>     Shard traces to submit (default: 0 = all, for a complete whole-shard bundle; >0 keeps a balanced pass/fail sample)
   --task-dir <dir>        Terminal eval bundle directory (one bundle or parent of bundles)
+  --run-dir <dir>         Durable terminal run checkpoint; writes run.json, atomic per-task results, traces, and final result.json
+  --detach                Launch a terminal run as a durable background worker; requires --run-dir and cannot be combined with --dry-run
+  --follow                Continue streaming terminal events until the persisted job reaches a terminal state
   --dataset <slug>        Terminal eval dataset slug; required for deferred submit
-  --verify-bundles       Inspect: download and validate every referenced terminal bundle
-  --max-turns <n>         Terminal eval agent turn cap (defaults to task manifest)
-  --agent-timeout <sec>   Terminal eval whole-agent timeout (default: max(task manifest, 14400 = 4h))
+  --shard-index <n>       Deferred terminal submit shard; required for isolated/noncanonical checkpoints
+  --max-turns <n>         Requested turn cap; built-in/Terminus enforce it, arbitrary --agent-cmd only receives the env value and is not enforced (default: task manifest, then 50)
+  --max-tokens <n>        Terminal model completion cap (default: 16384; retry: 8192)
+  --agent-timeout <sec>   Terminal whole-agent timeout (default: task manifest, then 900 seconds)
   --agent <name>          Terminal eval built-in agent backend: terminus-2 uses Harbor Terminus-2
   --agent-cmd <cmd>       Terminal eval external agent command; gets LMX_TERMINAL_* env vars
   --agent-execution <m>   External agent execution: host (default), container, or routed-shell
   --agent-name <name>     Label for external terminal agent submissions (default: external-agent)
   --container-base-url <url> Base URL visible from task containers for container-native agents
-  --command-timeout-seconds <n> Terminal harness shell-command timeout; distinct from task verifier and model endpoint timeouts (legacy alias: --command-timeout)
-  --endpoint-timeout-seconds <n> Terminal model HTTP request timeout (default: 600; first attempt reserves retry time)
-  --resume <mode|dir>     Terminal run resume policy: none (default), auto, or an explicit v3 checkpoint directory
-  --checkpoint-dir <dir>  Private locked checkpoint directory using synced same-directory atomic file commits; default is <out>.checkpoint or .lmx-terminal-checkpoints/<dataset-shard>
-  --repeat-batch-limit <n> Stop after repeated no-progress command batches (default/minimum: 3)
+  --command-timeout <sec> Terminal per-shell-command timeout (default: 300 seconds, capped by remaining agent time)
+  --endpoint-timeout-seconds <n> Terminal model request timeout (default: 600; first attempt reserves retry time)
   --trace-dir <dir>       Save per-terminal-task traces locally: transcript.md, verifier.txt, prompt.txt, result.json, and external agent logs
   --cleanup-images        Remove locally built terminal task images after each task
   --shell-mode <mode>     Terminal eval built-in harness shell: persistent (default, one shared shell) or stateless (fresh shell per command)
   --oracle                Run terminal task solution/solve.sh instead of the model agent
+  --base-model <hfId>      Loadable HuggingFace base checkpoint for eval-derived adapter training
+  --max-message-bytes <n>  Maximum retained bytes per training message (default: 65536)
+  --allow-benchmark-training
+                           Acknowledge that training on eval tasks contaminates scores on those tasks
+  --trainer-cmd <command>  Explicit local trainer command; supports {dataset}, {manifest}, {output}, {base_model}
+  --execute                Execute --trainer-cmd; eval train run only prints the expanded plan by default
+  --environment-factory <module:callable>
+                           Trusted online GRPO environment factory imported only by the Python trainer
+  --environment-config <json-file>
+                           JSON object file passed to the online environment factory (default: {})
+  --grpo-config <json-file>
+                           JSON object file of validated conservative GRPO overrides
+  --output-dir <dir>       Override the RL trainer output directory
+  --resume <selector>      Terminal/RL resume selector: auto or none (terminal default with --run-dir: auto; RL also accepts an explicit checkpoint directory)
+  --python-bin <path>      Python executable for the embedded RL trainer (default: python3)
+  --execute                Execute the embedded RL trainer; RL run only prints an argv plan by default
   --scoring <mode>          Eval-shard scoring: exact_match, loglikelihood, llama_cpp_loglikelihood, code_execution, cruxeval_execution (dataset defaults are canonical)
   --temperature <f>        Sampling temperature for eval-shard runs (default: 0)
   --top-p <f>              Sampling top_p for eval-shard runs (default: 1)
   --quant-format <label>   Quantization container format for eval-shard submit (auto-detected as "gguf" from the model path; override if needed)
   --model-revision <rev>   Model revision for eval-shard submit (default: main)
-  --endpoint-file <path>  Endpoint discovery JSON written by lmx endpoint discover --out
   --base-url <url>         OpenAI-compatible model endpoint; accepts host or host/v1
   --mode <mode>            Benchmark mode: remote endpoint or local host command
   --served-model <name>    Model name served by the OpenAI-compatible endpoint
   --model-api-key <key>    Optional bearer token for remote endpoint benchmarking
   --prompt <text>          Prompt for remote endpoint benchmark
-  --max-tokens <n>        Terminal model completion cap (default: 16384; retry: 8192)
+  --max-tokens <n>         Max generated tokens (eval shard default: 0 = no cap, let the model finish)
   --endpoint-timeout-seconds <n> Timeout for remote endpoint benchmark (default: 600)
   --warmup <n>             Untimed warmup requests before remote endpoint measurement (default: 1)
   --iterations <n>         Timed remote endpoint measurement iterations; median is reported (default: 3)
@@ -10578,19 +10981,18 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --patch <path>           Merge JSON object file into a saved benchmark run
   --unset <fields>         Comma-separated saved-run fields to remove
   --yes                    Confirm saved-run deletion
-  --json-status            Emit progress events as JSON lines on stderr
-  --json                   Print a command's machine-readable JSON result
+  --json-status            Machine mode: emit JSONL progress/errors on stderr; terminal stdout is empty unless --json requests one final JSON document
   --quiet                  Suppress progress events
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
   --hardware <path>        JSON hardware object required when submitting
   --quantization <label>   Quantization label (auto-detected from the endpoint for remote benchmark and eval-shard runs when omitted)
   --results <path>         Existing lm-eval output JSON for run upload
   --kind <kind>            Storage upload kind, usually artifact or dataset
-  --format <format>        Storage file format, e.g. json, jsonl, parquet, zip
+  --format <format>        Output/storage format; run show/compare support table/ascii/json, export supports json/csv, storage supports json/jsonl/parquet/zip
   --item-count <n>         Optional record/sample count for storage metadata
   --limit <n>              Optional search/list result limit
   --submit                 Upload run to LocalMaxxing
-  --dry-run                For deferred terminal submit: validate entirely offline; for other commands: validate or print a plan without creating a run
+  --dry-run                Preflight without execution/submission; terminal run validates its manifest without Docker/model calls, other commands print or validate plans
   --release-url <url>      Override release download base for lmx update (default: GitHub latest release)
   --include-server-metadata Probe optional endpoint /props and /hardware metadata during discover
   --gpu-name <name>       Hardware template GPU name
@@ -10613,7 +11015,7 @@ var commandDescriptions = map[string]string{
 	"endpoint":               "Discover OpenAI-compatible model endpoints.",
 	"benchmark":              "Create, manage, validate, and submit benchmark runs.",
 	"benchmark run":          "Measure a model or write a benchmark measurement plan.",
-	"benchmark runs":         "List and edit saved benchmark run files.",
+	"benchmark runs":         "List, edit, compare, and export saved benchmark run files.",
 	"benchmark add-hardware": "Attach server hardware metadata to a saved run.",
 	"benchmark fixup":        "Inspect a saved run and print remediation commands.",
 	"hardware":               "Detect, validate, or template hardware metadata.",
@@ -10635,106 +11037,22 @@ var commandDescriptions = map[string]string{
 	"eval submit":            "Submit a previously saved run payload (deferred submit).",
 	"eval shard":             "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
 	"eval shard status":      "Print aggregate shard coverage and missing shard indexes for a model.",
-	"eval terminal":          "Import, inspect, recover, run, verify, and submit Terminal-Bench task bundles.",
-	"eval terminal import":   "Convert one Harbor task directory or a parent of Harbor tasks into local Terminal-Bench bundles; this does not execute tasks.",
-	"eval terminal inspect":  "Check every declared dataset shard and manifest without Docker, model, verifier, or submission activity; optionally download and validate every bundle.",
-	"eval terminal recover":  "Safely rerun the canonical verifier against an existing container holding the recovered task state, then atomically import the derived score into only the matching missing v3 checkpoint task. Bundle identity and immutable provenance are validated before Docker executes.",
-	"eval terminal run":      "Execute Terminal-Bench tasks with Docker and atomically checkpoint after every verifier attempt. --resume accepts none, auto, or an explicit matching v3 checkpoint; immutable manifest/model/hardware/runner/task-order conflicts fail before task execution. --api-url is LocalMaxxing, while --base-url/--endpoint-file selects model inference.",
-	"eval terminal submit":   "Validate and submit a completed terminal run JSON file or legacy/v3 checkpoint directory. --dry-run emits offline_submit_validation_no_execution and never contacts LocalMaxxing, Docker, a model, or a verifier.",
-	"eval terminal verify":   "Execute the bundled reference solution and verifier for local bundles with the same atomic checkpoint/recovery behavior; no model endpoint is used.",
+	"eval terminal":          "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
+	"eval terminal run":      "Preflight, run, resume, or detach a Terminal-Bench task selection.",
+	"eval terminal status":   "Read a durable terminal run snapshot, including worker and task progress.",
+	"eval terminal logs":     "Replay canonical terminal JSONL events; --follow waits through job completion.",
+	"eval terminal cancel":   "Request cooperative cancellation; --force terminates the detached worker immediately.",
+	"eval terminal submit":   "Validate a completed terminal checkpoint, batch canonical Terminal-Bench 2.1 into 10 shards, or submit one explicit --shard-index.",
+	"eval train":             "Prepare verifier-filtered training data from eval results or run an explicit local trainer.",
+	"eval train prepare":     "Export passing OMP trajectories as conversational SFT JSONL and failures as diagnostics.",
+	"eval train run":         "Expand and optionally execute an explicit local training command from a prepared manifest.",
+	"eval train rl":          "Prepare prompt-only online GRPO data or plan and execute the embedded TRL trainer.",
+	"eval train rl prepare":  "Prepare imported terminal task prompts and a trusted environment-factory manifest for online GRPO.",
+	"eval train rl run":      "Validate an online GRPO manifest and plan or execute its embedded Python trainer.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",
 	"auth":                   "Manage LocalMaxxing API authentication.",
 	"server":                 "Build or run local model server commands.",
-}
-
-var commandOptions = map[string][]string{
-	"eval terminal import": {
-		"--out <dir>                 Required destination for converted task bundle directories",
-		"--version <version>         task.json version assigned during conversion (default: 2.1)",
-	},
-	"eval terminal inspect": {
-		"--api-url <url>             Required LocalMaxxing origin that serves the dataset shards",
-		"--api-key <key>             Optional LocalMaxxing API key (or LMX_API_KEY/saved config)",
-		"--verify-bundles            Download, hash-check, safely extract, and validate every bundle",
-		"--json                      Print the readiness summary as JSON",
-		"--out <path>                Write the readiness summary JSON to a file",
-	},
-	"eval terminal recover": {
-		"--task-id <id>             Missing checkpoint task to recover",
-		"--container <name>         Existing container holding the recovered task state",
-		"--bundle <dir>             Exact canonical bundle used to rerun the verifier",
-		"--result <path>            Optional incomplete one-task wrapper supplying telemetry only",
-	},
-	"eval terminal run": {
-		"--api-url <url>             LocalMaxxing origin used to acquire public datasets and submit runs",
-		"--api-key <key>             LocalMaxxing API key required only with --submit",
-		"--task-dir <dir>            Run one local bundle or all bundles under a local directory",
-		"--dataset <slug>            Dataset identity for a local-bundle submission",
-		"--shard <index>             Select a public dataset shard",
-		"--questions <n>             Run only the first n tasks from the selected public shard",
-		"--task <id[,id...]>         Run only the named task IDs from the selected public shard",
-		"--endpoint-file <path>      Trusted discovery JSON selecting one endpoint; conflicts with --base-url",
-		"--base-url <url>            Explicit model endpoint; cannot be combined with --endpoint-file",
-		"--served-model <name>       Exact model id to select from the chosen endpoint's live /v1/models",
-		"--model-api-key <key>       Bearer token; requires explicit --base-url or trusted --endpoint-file",
-		"--model <hfId>              Authoritative canonical org/name; auto-resolution needs an exact verified loaded filename",
-		"--model-path <path>         Artifact path fallback; must agree when the live endpoint reports a path",
-		"--quantization <label>      Quantization fallback; must agree with live endpoint artifact metadata",
-		"--quant-format <format>     Quantization container format, such as gguf",
-		"--model-revision <rev>      Submitted model revision (default: main)",
-		"--hardware <path>           Hardware JSON required with --submit",
-		"--agent <name>              Built-in agent backend (terminus-2 is supported)",
-		"--agent-cmd <command>       External agent command receiving LMX_TERMINAL_* variables",
-		"--agent-name <name>         Submission label for an external agent",
-		"--agent-execution <mode>    External agent mode: host, container, or routed-shell",
-		"--container-base-url <url>  Model URL visible from task containers",
-		"--max-turns <n>             Agent turn cap (default: task manifest)",
-		"--agent-timeout <seconds>   Whole-agent timeout (default: at least four hours)",
-		"--command-timeout-seconds <n> Harness shell-command timeout; legacy --command-timeout is accepted",
-		"--resume <none|auto|dir>     Resume only an exact immutable-provenance v3 checkpoint (default: none)",
-		"--checkpoint-dir <dir>       Atomic summary.json/checkpoint.json/per-task wrapper destination",
-		"--repeat-batch-limit <n>     Nudge then stop repeated no-progress command batches (default: 3)",
-		"--endpoint-timeout-seconds <n> Model request timeout (default: 600)",
-		"--max-tokens <n>            Model completion cap (default: 16384; retry: 8192)",
-		"--temperature <f>           Model sampling temperature (default: 0)",
-		"--top-p <f>                 Model sampling top-p (default: 1)",
-		"--concurrency <n>           Parallel task workers (default: 1)",
-		"--shell-mode <mode>         Built-in harness shell: persistent or stateless",
-		"--cleanup-images            Remove locally built task images after each task",
-		"--trace-dir <dir>           Save per-task transcripts, verifier output, prompts, and logs",
-		"--out <path>                Write deferred-submit source JSON; submitting it never reruns tasks",
-		"--submit                    Submit the completed run to --api-url after execution",
-		"--notes <text>              Attach submission notes",
-		"--runner-version <version>  Custom runner/version provenance for submission",
-		"--oracle                    Run bundled reference solutions instead of a model (normally use verify)",
-		"--json                      Print the submission receipt as JSON",
-	},
-	"eval terminal submit": {
-		"--dataset <slug>            Dataset identity when the completed artifact does not save one",
-		"--shard-index <n>           Required for isolated/noncanonical checkpoints unless saved; omit for canonical batching",
-		"--hf-id <hfId>              Canonical HuggingFace ID when the completed artifact does not save one",
-		"--hardware <path>           Hardware JSON when the completed artifact does not save hardware",
-		"--quantization <label>      Uses saved metadata by default; an explicit value must match",
-		"--quant-format <format>     Uses saved metadata by default; an explicit value must match",
-		"--model-revision <rev>      Uses saved metadata, otherwise main; an explicit value must match",
-		"--agent-name <name>         Uses saved agent label by default; an explicit value must match",
-		"--runner-version <version>  Uses saved runner label by default; an explicit value must match",
-		"--notes <text>              Attach submission notes",
-		"--api-url <url>             LocalMaxxing origin used only for a real submission",
-		"--api-key <key>             LocalMaxxing API key for a real submission",
-		"--dry-run                   Validate and package entirely offline; make no network request",
-		"--out <path>                Write the validated shard payload batch JSON",
-	},
-	"eval terminal verify": {
-		"--concurrency <n>           Parallel bundle workers (default: 1)",
-		"--agent-timeout <seconds>   Reference-solution timeout (default: max(manifest, 14400))",
-		"--resume <none|auto|dir>     Resume only a matching v3 checkpoint",
-		"--checkpoint-dir <dir>       Atomic checkpoint directory",
-		"--cleanup-images            Remove locally built task images after each task",
-		"--trace-dir <dir>           Save per-task solution transcripts and verifier output",
-		"--out <path>                Write the oracle verification result JSON",
-	},
 }
 
 func commandHelp(args cliArgs) (string, bool) {
@@ -10760,17 +11078,7 @@ func commandHelp(args cliArgs) (string, bool) {
 			b.WriteString(match)
 			b.WriteByte('\n')
 		}
-		if options := commandOptions[prefix]; len(options) > 0 {
-			b.WriteString("\nOptions:\n")
-			for _, option := range options {
-				b.WriteString("  ")
-				b.WriteString(option)
-				b.WriteByte('\n')
-			}
-			b.WriteString("\nRun `lmx --help` for all commands.")
-		} else {
-			b.WriteString("\nRun `lmx --help` for all commands and the full option list.")
-		}
+		b.WriteString("\nRun `lmx --help` for all commands and the full option list.")
 		return b.String(), true
 	}
 	return "", false

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,36 @@ import (
 	"testing"
 	"time"
 )
+
+func TestTerminalDockerCommandAndRegroupChildArguments(t *testing.T) {
+	if !terminalDockerCommand([]string{"eval", "terminal", "run", "terminal-bench-2-1"}) {
+		t.Fatal("terminal run should require Docker")
+	}
+	if !terminalDockerCommand([]string{"--json", "eval", "terminal", "oracle", "--task-dir", "task"}) {
+		t.Fatal("terminal oracle should require Docker")
+	}
+	if terminalDockerCommand([]string{"eval", "terminal", "status", "run-dir"}) {
+		t.Fatal("terminal status should not require Docker")
+	}
+
+	want := []string{"eval", "terminal", "run", "terminal-bench-2-1", "--model", "name with spaces"}
+	data, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(dockerRegroupArgsEnv, base64.RawURLEncoding.EncodeToString(data))
+	t.Setenv(dockerRegroupExeEnv, "/tmp/lmx")
+	got, err := terminalDockerRegroupChildArgs([]string{dockerRegroupChild})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("restored arguments = %#v, want %#v", got, want)
+	}
+	if os.Getenv(dockerRegroupArgsEnv) != "" || os.Getenv(dockerRegroupExeEnv) != "" {
+		t.Fatal("regroup child environment was not cleared")
+	}
+}
 
 func TestReleaseAssetName(t *testing.T) {
 	tests := []struct {
@@ -446,6 +477,105 @@ func TestRemoteModelResolutionTreatsServedModelAsAlias(t *testing.T) {
 	}
 	if resolution["declaredBaseModel"] != "google/gemma-4-31B-it" || resolution["loadedFilename"] != "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf" {
 		t.Fatalf("model metadata = %#v", resolution)
+	}
+}
+
+func TestRemoteModelResolutionSuppressesEmptySearchNoiseForDeclaredGGUF(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/models/search" {
+			fmt.Fprint(w, `{"models":[]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	statusFile, err := os.Create(filepath.Join(t.TempDir(), "status.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr := os.Stderr
+	os.Stderr = statusFile
+	t.Cleanup(func() {
+		os.Stderr = stderr
+		_ = statusFile.Close()
+	})
+	resolution := remoteModelResolution(
+		cliArgs{opts: map[string]string{"api-url": server.URL}, flags: map[string]bool{"json-status": true}},
+		"qwopus-27b",
+		"v1_models",
+		"Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF",
+		"/models/Qwopus3.6-27B-Coder-MTP-Q5_K_M.gguf",
+	)
+	os.Stderr = stderr
+	if err := statusFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	statusData, err := os.ReadFile(statusFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidates := anySlice(resolution["candidates"]); len(candidates) != 0 {
+		t.Fatalf("candidates = %#v, want none", candidates)
+	}
+	if strings.Contains(string(statusData), `"event":"hf_id_candidates_empty"`) {
+		t.Fatalf("declared GGUF emitted empty candidate warning:\n%s", statusData)
+	}
+}
+
+func TestResolveEvalModelIDSuppressesCandidateNoiseForExactExplicitSourceRepo(t *testing.T) {
+	const (
+		hfID     = "unsloth/gemma-4-31B-it-GGUF"
+		filename = "gemma-4-31B-it-UD-Q4_K_XL.gguf"
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[{"id":"gemma-4-31b-it"}]}`)
+		case "/props":
+			fmt.Fprint(w, `{"model_path":"/models/`+filename+`"}`)
+		case "/api/models/search":
+			fmt.Fprint(w, `{"models":[{"hfId":"`+hfID+`"}]}`)
+		case "/api/models/" + hfID:
+			fmt.Fprint(w, `{"siblings":[{"rfilename":"`+filename+`"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	statusFile, err := os.Create(filepath.Join(t.TempDir(), "status.jsonl"))
+	if err != nil {
+		t.Fatalf("create status capture: %v", err)
+	}
+	stderr := os.Stderr
+	os.Stderr = statusFile
+	t.Cleanup(func() {
+		os.Stderr = stderr
+		_ = statusFile.Close()
+	})
+	resolved, resolution := resolveEvalModelID(cliArgs{
+		opts:  map[string]string{"base-url": server.URL, "api-url": server.URL, "hf-api-url": server.URL},
+		flags: map[string]bool{"json-status": true},
+	}, hfID)
+	os.Stderr = stderr
+	if err := statusFile.Close(); err != nil {
+		t.Fatalf("close status capture: %v", err)
+	}
+	statusData, err := os.ReadFile(statusFile.Name())
+	if err != nil {
+		t.Fatalf("read status capture: %v", err)
+	}
+
+	if resolved != hfID {
+		t.Fatalf("resolved hfId = %q, want explicit exact repository %q", resolved, hfID)
+	}
+	if resolution["sourceRepo"] != hfID || resolution["sourceRepoMatch"] != "exact_filename" || resolution["status"] != "source_repo_detected" || resolution["loadedFilename"] != filename {
+		t.Fatalf("exact repository resolution metadata = %#v", resolution)
+	}
+	statusOutput := string(statusData)
+	if strings.Contains(statusOutput, `"event":"remote_model_alias"`) || strings.Contains(statusOutput, `"event":"hf_id_candidates_found"`) {
+		t.Fatalf("exact explicit repository emitted candidate noise:\n%s", statusOutput)
 	}
 }
 
@@ -1165,6 +1295,29 @@ func TestBenchmarkRunExportCSVIncludesHardwareLabel(t *testing.T) {
 	}
 }
 
+func TestBenchmarkRunTableIncludesFlattenedFields(t *testing.T) {
+	record := benchmarkRunRecord{
+		Path:      "run.json",
+		UpdatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		Payload: map[string]any{
+			"hfId":    "Qwen/Qwen3-8B",
+			"tokSOut": 42.5,
+			"hardware": map[string]any{
+				"gpuName": "NVIDIA RTX 4090",
+				"gpus": []any{
+					map[string]any{"gpuName": "NVIDIA RTX 4090", "vramGb": 24.0},
+				},
+			},
+		},
+	}
+	table := benchmarkRunTable(record)
+	for _, want := range []string{"| Field", "| path", "| updatedAt", "| hfId", "| tokSOut", "| hardware.gpuName", "| hardware.gpus[0].vramGb", "| 42.5", "| 24"} {
+		if !strings.Contains(table, want) {
+			t.Fatalf("run table missing %q:\n%s", want, table)
+		}
+	}
+}
+
 func TestCompareTwoBenchmarkRunsReportsPercent(t *testing.T) {
 	left := benchmarkRunRecord{Path: "base.json", UpdatedAt: time.Now(), Payload: map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "vllm", "quantization": "fp16", "tokSOut": 100.0, "ttftMs": 50.0}}
 	right := benchmarkRunRecord{Path: "candidate.json", UpdatedAt: time.Now(), Payload: map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "vllm", "quantization": "fp16", "tokSOut": 125.0, "ttftMs": 25.0}}
@@ -1180,6 +1333,18 @@ func TestCompareTwoBenchmarkRunsReportsPercent(t *testing.T) {
 	}
 	if latency["percent"] != 50.0 || latency["better"] != true {
 		t.Fatalf("latency comparison = %#v", latency)
+	}
+}
+func TestBenchmarkRunCompareTableShowsDeltas(t *testing.T) {
+	left := benchmarkRunRecord{Path: "base.json", UpdatedAt: time.Now(), Payload: map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "vllm", "quantization": "fp16", "tokSOut": 100.0, "ttftMs": 50.0}}
+	right := benchmarkRunRecord{Path: "candidate.json", UpdatedAt: time.Now(), Payload: map[string]any{"hfId": "Qwen/Qwen3-8B", "engineName": "vllm", "quantization": "fp16", "tokSOut": 125.0, "ttftMs": 25.0}}
+	result := compareTwoBenchmarkRuns(left, right, cliArgs{opts: map[string]string{"metrics": "tokSOut,ttftMs"}, flags: map[string]bool{}})
+
+	table := benchmarkRunCompareTable(result)
+	for _, want := range []string{"| Metric", "| tokSOut", "| ttftMs", "| 100", "| 125", "| +25", "| +50%", "| yes"} {
+		if !strings.Contains(table, want) {
+			t.Fatalf("compare table missing %q:\n%s", want, table)
+		}
 	}
 }
 
@@ -2471,66 +2636,5 @@ func TestModelNameFromGGUFFilenameStripsVendorFPQuant(t *testing.T) {
 		if got := modelNameFromGGUFFilename(in); got != want {
 			t.Errorf("modelNameFromGGUFFilename(%q) = %q, want %q", in, got, want)
 		}
-	}
-}
-
-func TestTerminalUXCommandLocalHelpShowsOnlyRelevantTerminalOptionsAndExamples(t *testing.T) {
-	tests := []struct {
-		command  []string
-		includes []string
-		excludes []string
-	}{
-		{
-			command:  []string{"eval", "terminal", "import", "--help"},
-			includes: []string{"Convert one Harbor task directory", "lmx eval terminal import", "--out <dir>", "--version <version>"},
-			excludes: []string{"lmx eval terminal run", "--endpoint-file", "--verify-bundles", "--hf-id"},
-		},
-		{
-			command:  []string{"eval", "terminal", "inspect", "--help"},
-			includes: []string{"without Docker, model, verifier, or submission activity", "lmx eval terminal inspect", "--api-url <url>", "--verify-bundles", "--json"},
-			excludes: []string{"lmx eval terminal run", "--base-url", "--endpoint-file", "--hf-id", "--submit"},
-		},
-		{
-			command:  []string{"eval", "terminal", "recover", "--help"},
-			includes: []string{"rerun", "canonical", "verifier", "existing container", "lmx eval terminal recover", "--task-id <id>", "--container <name>", "--bundle <dir>", "--result <path>"},
-			excludes: []string{"--evidence", "without Docker", "no Docker, model, verifier", "--api-url", "--base-url", "--submit", "--dry-run"},
-		},
-		{
-			command:  []string{"eval", "terminal", "run", "--help"},
-			includes: []string{"--api-url is LocalMaxxing", "--base-url/--endpoint-file selects model inference", "lmx eval terminal run", "--endpoint-file <path>", "--model-path <path>", "--out <path>", "--submit"},
-			excludes: []string{"lmx eval terminal inspect", "lmx eval terminal submit", "--hf-id <hfId>", "--shard-index <n>", "--verify-bundles"},
-		},
-		{
-			command:  []string{"eval", "terminal", "submit", "--help"},
-			includes: []string{"completed terminal run JSON file or legacy/v3 checkpoint directory", "offline_submit_validation_no_execution", "never contacts LocalMaxxing, Docker, a model, or a verifier", "lmx eval terminal submit", "--hf-id <hfId>", "--shard-index <n>", "--dry-run", "--api-url <url>"},
-			excludes: []string{"lmx eval terminal run", "--base-url", "--endpoint-file", "--task-dir", "--verify-bundles", "--oracle"},
-		},
-		{
-			command:  []string{"eval", "terminal", "verify", "--help"},
-			includes: []string{"reference solution and verifier", "lmx eval terminal verify", "--concurrency <n>", "--trace-dir <dir>", "--out <path>"},
-			excludes: []string{"lmx eval terminal run", "--api-url", "--base-url", "--endpoint-file", "--submit", "--hf-id"},
-		},
-	}
-	for _, tc := range tests {
-		name := strings.Join(tc.command[:3], "_")
-		t.Run(name, func(t *testing.T) {
-			text, ok := commandHelp(parseArgs(tc.command))
-			if !ok {
-				t.Fatalf("commandHelp did not recognize %q", strings.Join(tc.command[:3], " "))
-			}
-			for _, want := range tc.includes {
-				if !strings.Contains(text, want) {
-					t.Fatalf("focused help missing %q:\n%s", want, text)
-				}
-			}
-			for _, unwanted := range tc.excludes {
-				if strings.Contains(text, unwanted) {
-					t.Fatalf("focused help included sibling content %q:\n%s", unwanted, text)
-				}
-			}
-			if !strings.Contains(text, "Run `lmx --help` for all commands.") {
-				t.Fatalf("focused help missing global see-also:\n%s", text)
-			}
-		})
 	}
 }

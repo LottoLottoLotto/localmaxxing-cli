@@ -69,14 +69,14 @@ Saved run commands:
 
 ```bash
 lmx benchmark runs list
-lmx benchmark runs show runs/Model/run.json
+lmx benchmark runs show runs/Model/run.json --format table
 lmx benchmark runs edit runs/Model/run.json --set-json '{"tokSOut":120}'
 lmx benchmark runs rerun runs/Model/run.json --dry-run
 lmx benchmark runs submit runs/Model/run.json --api-key bhk_...
 lmx benchmark runs delete runs/Model/run.json --yes
 lmx benchmark runs stats --group-by quantization --metric tokSOut
-lmx benchmark runs compare --by hardware --model Qwen/Qwen3-8B
-lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs
+lmx benchmark runs compare --by hardware --model Qwen/Qwen3-8B --format table
+lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs --format table
 lmx benchmark runs export --format csv --out runs.csv
 ```
 

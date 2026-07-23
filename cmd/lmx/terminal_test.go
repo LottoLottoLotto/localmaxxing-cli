@@ -1,20 +1,22 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
-	"strconv"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -331,6 +333,89 @@ func TestWriteTerminalTaskTrace(t *testing.T) {
 	}
 }
 
+func TestTerminalMaxTurnsEnforcementReportsHarnessResponsibility(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  terminalConfig
+		want string
+	}{
+		{name: "oracle", cfg: terminalConfig{oracle: true, agentCommand: "ignored"}, want: "not-applicable"},
+		{name: "bundled Terminus adapter", cfg: terminalConfig{args: parseArgs([]string{"eval", "terminal", "run", "--agent", "terminus-2"}), agentCommand: "embedded-adapter"}, want: "bundled-adapter"},
+		{name: "arbitrary external command", cfg: terminalConfig{agentCommand: "custom-agent"}, want: "not-enforced"},
+		{name: "built-in loop", cfg: terminalConfig{}, want: "cli-agent-loop"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := terminalMaxTurnsEnforcement(test.cfg); got != test.want {
+				t.Fatalf("terminalMaxTurnsEnforcement() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestTerminalLimitSourceDistinguishesCLIManifestAndOmission(t *testing.T) {
+	tests := []struct {
+		name               string
+		explicit, manifest int
+		want               string
+	}{
+		{name: "CLI override", explicit: 7, manifest: 11, want: "cli"},
+		{name: "task manifest", manifest: 11, want: "task-manifest"},
+		{name: "omitted", want: "fallback"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := terminalLimitSource(test.explicit, test.manifest); got != test.want {
+				t.Fatalf("terminalLimitSource(%d, %d) = %q, want %q", test.explicit, test.manifest, got, test.want)
+			}
+		})
+	}
+}
+
+func TestTerminalCheckpointKeepsExternalTurnsNullAndLoadsLegacyNumericTurns(t *testing.T) {
+	runDir := t.TempDir()
+	store := &terminalLiveCheckpointStore{
+		root: runDir,
+		state: terminalLiveCheckpoint{
+			Version: terminalLiveCheckpointVersion,
+			State:   "running",
+			TaskIDs: []string{"external-turns"},
+		},
+	}
+	task := terminalTask{ID: "external-turns", Instruction: "exercise external turn provenance"}
+	if err := store.persistTask(task, terminalTaskResult{scored: true, turns: 99, turnsUnreported: true}); err != nil {
+		t.Fatalf("persist external turn checkpoint: %v", err)
+	}
+	data, err := os.ReadFile(terminalLiveResultPath(runDir, task.ID))
+	if err != nil {
+		t.Fatalf("read external turn checkpoint: %v", err)
+	}
+	var encoded map[string]any
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		t.Fatalf("decode external turn checkpoint: %v", err)
+	}
+	turns, present := encoded["turns"]
+	if !present || turns != nil {
+		t.Fatalf("external checkpoint turns = %#v (present %v), want explicit null", turns, present)
+	}
+
+	scored := true
+	legacyTurns := 4
+	writeTerminalTestJSON(t, terminalLiveResultPath(runDir, task.ID), terminalSavedResult{
+		QuestionID: task.ID,
+		Scored:     &scored,
+		Turns:      &legacyTurns,
+		Response:   "legacy numeric checkpoint",
+	})
+	loaded, ok, err := loadTerminalLiveResult(runDir, task.ID)
+	if err != nil {
+		t.Fatalf("load legacy numeric turn checkpoint: %v", err)
+	}
+	if !ok || loaded.turns != legacyTurns || loaded.turnsUnreported || loaded.transcript != "legacy numeric checkpoint" {
+		t.Fatalf("legacy numeric checkpoint = %+v (found %v), want reported %d turns", loaded, ok, legacyTurns)
+	}
+}
+
 func TestExternalAgentTokenUsageParsesOMPTrace(t *testing.T) {
 	traceRoot := t.TempDir()
 	traceFile := filepath.Join(traceRoot, "omp.jsonl")
@@ -432,37 +517,76 @@ func errorsAsCli(err error, target *cliError) bool {
 	return false
 }
 
-func TestTerminalTimeoutDefaults(t *testing.T) {
-	shortTask := terminalTask{Agent: terminalAgentConfig{TimeoutSec: 900}}
-	longTask := terminalTask{Agent: terminalAgentConfig{TimeoutSec: defaultTerminalTaskTimeoutSec + 60}}
+func TestTerminalManifestDefaultsAreAuthoritative(t *testing.T) {
+	manifestTask := terminalTask{Agent: terminalAgentConfig{TimeoutSec: 1200, MaxTurns: 37}}
+	if got := terminalAgentTimeoutSec(terminalConfig{}, manifestTask); got != 1200 {
+		t.Fatalf("manifest timeout = %d, want 1200", got)
+	}
+	if got := terminalAgentMaxTurns(terminalConfig{}, manifestTask); got != 37 {
+		t.Fatalf("manifest max turns = %d, want 37", got)
+	}
 
-	if got := terminalAgentTimeoutSec(terminalConfig{}, shortTask); got != defaultTerminalTaskTimeoutSec {
-		t.Fatalf("short manifest timeout = %d, want %d", got, defaultTerminalTaskTimeoutSec)
+	omitted := terminalTask{}
+	if got := terminalAgentTimeoutSec(terminalConfig{}, omitted); got != 4*60*60 {
+		t.Fatalf("omitted manifest timeout = %d, want %d", got, 4*60*60)
 	}
-	if got := terminalAgentTimeoutSec(terminalConfig{}, longTask); got != defaultTerminalTaskTimeoutSec+60 {
-		t.Fatalf("long manifest timeout = %d, want %d", got, defaultTerminalTaskTimeoutSec+60)
+	if got := terminalAgentMaxTurns(terminalConfig{}, omitted); got != 200 {
+		t.Fatalf("omitted manifest max turns = %d, want 200", got)
 	}
-	if got := terminalAgentTimeoutSec(terminalConfig{agentTimeoutSec: 42}, shortTask); got != 42 {
+
+	if got := terminalAgentTimeoutSec(terminalConfig{agentTimeoutSec: 42}, manifestTask); got != 42 {
 		t.Fatalf("explicit agent timeout = %d, want 42", got)
 	}
-	if got := terminalCommandTimeoutSec(terminalConfig{}); got != defaultTerminalCommandTimeoutSec {
-		t.Fatalf("default command timeout = %d, want %d", got, defaultTerminalCommandTimeoutSec)
+	if got := terminalAgentMaxTurns(terminalConfig{maxTurns: 7}, manifestTask); got != 7 {
+		t.Fatalf("explicit max turns = %d, want 7", got)
+	}
+}
+
+func TestTerminalCommandTimeoutDefaultsToThirtyMinutesAndRemainingBudget(t *testing.T) {
+	if got := terminalCommandTimeoutSec(terminalConfig{}); got != 30*60 {
+		t.Fatalf("default command timeout = %d, want %d", got, 30*60)
 	}
 	if got := terminalCommandTimeoutSec(terminalConfig{commandTimeoutSec: 30}); got != 30 {
 		t.Fatalf("explicit command timeout = %d, want 30", got)
 	}
-	if got := terminalEndpointTimeout(terminalConfig{}); got != defaultTerminalEndpointTimeout {
-		t.Fatalf("default endpoint timeout = %v, want %v", got, defaultTerminalEndpointTimeout)
+
+	requested := time.Duration(terminalCommandTimeoutSec(terminalConfig{})) * time.Second
+	longDeadline := time.Now().Add(time.Hour)
+	if got := terminalCommandExecutionTimeout("sleep infinity", requested, longDeadline); got > 30*time.Minute || got < 29*time.Minute+59*time.Second {
+		t.Fatalf("default command execution timeout = %v, want about 30m", got)
 	}
-	cmdDeadline := time.Now().Add(time.Hour)
-	if got := terminalCommandExecutionTimeout("echo ok", 30*time.Minute, cmdDeadline); got > 30*time.Minute || got < 29*time.Minute {
-		t.Fatalf("normal command timeout = %v, want about 30m", got)
+	shortDeadline := time.Now().Add(2 * time.Minute)
+	if got := terminalCommandExecutionTimeout("sleep infinity", requested, shortDeadline); got > 2*time.Minute || got < time.Minute+59*time.Second {
+		t.Fatalf("remaining-budget command timeout = %v, want about 2m", got)
 	}
-	if got := terminalCommandExecutionTimeout("apt-get update && apt-get install -y git", 30*time.Minute, cmdDeadline); got > 30*time.Minute || got < 29*time.Minute {
-		t.Fatalf("setup command timeout = %v, want about 30m", got)
+}
+
+func TestTerminalChangedFingerprintFields(t *testing.T) {
+	got := terminalChangedFingerprintFields(
+		map[string]string{"baseUrl": "same", "shellMode": "old"},
+		map[string]string{"baseUrl": "same", "shellMode": "new", "maxTurns": "added"},
+	)
+	if !slicesEqual(got, []string{"maxTurns", "shellMode"}) {
+		t.Fatalf("changed fields = %#v, want maxTurns and shellMode", got)
 	}
-	if got := terminalCommandExecutionTimeout("timeout 120 7z x /app/secrets.7z -o/app", 30*time.Minute, cmdDeadline); got > 30*time.Minute || got < 29*time.Minute {
-		t.Fatalf("explicit timeout command timeout = %v, want about 30m", got)
+}
+
+func TestTerminalStagnationTrackerWarnsThenStopsAndResetsOnProgress(t *testing.T) {
+	var tracker terminalStagnationTracker
+	for repeat := 1; repeat <= 6; repeat++ {
+		warn, stop := tracker.observe("printf same", "same\n[exit=0]")
+		if warn != (repeat == 3) {
+			t.Fatalf("repeat %d warning = %v, want %v", repeat, warn, repeat == 3)
+		}
+		if stop != (repeat >= 6) {
+			t.Fatalf("repeat %d stop = %v, want %v", repeat, stop, repeat >= 6)
+		}
+	}
+	if warn, stop := tracker.observe("printf changed", "changed\n[exit=0]"); warn || stop {
+		t.Fatalf("changed interaction should reset stagnation: warn=%v stop=%v", warn, stop)
+	}
+	if tracker.repeats != 1 {
+		t.Fatalf("changed interaction repeats = %d, want 1", tracker.repeats)
 	}
 }
 
@@ -507,12 +631,12 @@ func TestTerminalShellPersistsState(t *testing.T) {
 	}
 	defer shell.close()
 
-	if _, code, _, restarted, err := shell.exec("cd /tmp && export FOO=bar", 30*time.Second); err != nil || code != 0 || restarted {
+	if _, code, _, restarted := shell.exec("cd /tmp && export FOO=bar", 30*time.Second); code != 0 || restarted {
 		t.Fatalf("setup exec: code=%d restarted=%v", code, restarted)
 	}
-	out, code, _, restarted, err := shell.exec("pwd && echo $FOO", 30*time.Second)
-	if err != nil || code != 0 || restarted {
-		t.Fatalf("state exec: code=%d restarted=%v err=%v out=%q", code, restarted, err, out)
+	out, code, _, restarted := shell.exec("pwd && echo $FOO", 30*time.Second)
+	if code != 0 || restarted {
+		t.Fatalf("state exec: code=%d restarted=%v out=%q", code, restarted, out)
 	}
 	if !strings.Contains(out, "/tmp") || !strings.Contains(out, "bar") {
 		t.Fatalf("state not persisted: out=%q", out)
@@ -521,104 +645,13 @@ func TestTerminalShellPersistsState(t *testing.T) {
 	// Killing the shell (running `exit`) must trigger recovery. The EOF is
 	// observed by whichever exec races the shell death, so accept a restart
 	// flag on either call; the invariant is that the session keeps working.
-	_, _, _, restartedExit, _ := shell.exec("exit", 5*time.Second)
-	out2, code2, _, restartedAlive, err2 := shell.exec("echo alive", 30*time.Second)
+	_, _, _, restartedExit := shell.exec("exit", 5*time.Second)
+	out2, code2, _, restartedAlive := shell.exec("echo alive", 30*time.Second)
 	if !restartedExit && !restartedAlive {
 		t.Fatalf("expected restart after shell death, got neither; out=%q", out2)
 	}
-	if err2 != nil || code2 != 0 || !strings.Contains(out2, "alive") {
-		t.Fatalf("post-restart exec: code=%d err=%v out=%q", code2, err2, out2)
-	}
-}
-
-func TestRunTerminalAgentLoopSessionContinuesAfterCommandTimeout(t *testing.T) {
-	if dockerPreflight() != nil {
-		t.Skip("docker unavailable")
-	}
-	name := "lmx-timeout-recovery-" + randomHex(6)
-	if _, code, _, err := runCommand(context.Background(), 60*time.Second, "docker", "run", "-d", "--rm", "--name", name, "ubuntu:24.04", "sleep", "infinity"); err != nil || code != 0 {
-		t.Skipf("could not start test container (code=%d err=%v)", code, err)
-	}
-	defer runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", name)
-
-	modelCalls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		modelCalls++
-		response := terminalJSONResponse{
-			Analysis: "Exercise a command timeout.",
-			Plan:     "Run a command that exceeds its bound.",
-			Commands: []terminalJSONCommand{
-				{Keystrokes: "printf '%s' \"$$\" > /tmp/timed-command-pid; exec sleep 30\n", Duration: 0.1},
-				{Keystrokes: "printf should-not-run > /tmp/skipped\n", Duration: 0.1},
-			},
-		}
-		if modelCalls > 1 {
-			response = terminalJSONResponse{
-				Analysis:     "Recover after the bounded command was stopped.",
-				Plan:         "Write durable evidence and finish.",
-				Commands:     []terminalJSONCommand{{Keystrokes: "printf recovered > /tmp/recovered\n", Duration: 0.1}},
-				TaskComplete: true,
-			}
-		}
-		content, err := json.Marshal(response)
-		if err != nil {
-			t.Errorf("encode model response: %v", err)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"choices": []any{map[string]any{"message": map[string]any{"content": string(content)}}},
-		})
-	}))
-	defer server.Close()
-
-	turns, transcript, _, err := runTerminalAgentLoopSession(context.Background(), terminalTask{
-		ID:          "timeout-recovery-test",
-		Instruction: "Recover after a bounded command.",
-		Agent:       terminalAgentConfig{MaxTurns: 3},
-	}, name, server.URL, "fixture-model", terminalConfig{
-		args:              parseArgs([]string{"eval", "terminal", "run", "--quiet"}),
-		commandTimeoutSec: 1,
-		agentTimeoutSec:   20,
-		endpointTimeout:   5 * time.Second,
-		repeatBatchLimit:  3,
-	})
-	if err != nil {
-		t.Fatalf("runTerminalAgentLoopSession: %v\ntranscript:\n%s", err, transcript)
-	}
-	if turns != 2 || modelCalls != 2 {
-		t.Fatalf("turns=%d modelCalls=%d, want two recovery turns", turns, modelCalls)
-	}
-	if !strings.Contains(transcript, "[command timed out]") || !strings.Contains(transcript, "printf recovered") {
-		t.Fatalf("transcript does not show timeout followed by recovery:\n%s", transcript)
-	}
-	out, code, _, execErr := runCommand(context.Background(), 30*time.Second, "docker", "exec", name, "cat", "/tmp/recovered")
-	if execErr != nil || code != 0 || strings.TrimSpace(out) != "recovered" {
-		t.Fatalf("recovery marker: code=%d err=%v out=%q", code, execErr, out)
-	}
-	if out, code, _, execErr := runCommand(context.Background(), 30*time.Second, "docker", "exec", name, "sh", "-c", "test ! -e /tmp/skipped"); execErr != nil || code != 0 {
-		t.Fatalf("post-timeout command batch continued unexpectedly: code=%d err=%v out=%q", code, execErr, out)
-	}
-	if out, code, _, execErr := runCommand(context.Background(), 30*time.Second, "docker", "exec", name, "bash", "-lc", `pid=$(cat /tmp/timed-command-pid); test ! -d "/proc/$pid"`); execErr != nil || code != 0 {
-		t.Fatalf("timed-out command survived recovery: code=%d err=%v out=%q", code, execErr, out)
-	}
-}
-
-func TestRunTerminalContainerCommandStopsTimedOutProcess(t *testing.T) {
-	if dockerPreflight() != nil {
-		t.Skip("docker unavailable")
-	}
-	name := "lmx-stateless-timeout-" + randomHex(6)
-	if _, code, _, err := runCommand(context.Background(), 60*time.Second, "docker", "run", "-d", "--rm", "--name", name, "ubuntu:24.04", "sleep", "infinity"); err != nil || code != 0 {
-		t.Skipf("could not start test container (code=%d err=%v)", code, err)
-	}
-	defer runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", name)
-
-	out, code, timedOut, err := runTerminalContainerCommand(context.Background(), name, "", `printf '%s' "$$" > /tmp/timed-command-pid; exec sleep 30`, time.Second)
-	if err != nil || !timedOut || code != 124 {
-		t.Fatalf("timed command: code=%d timedOut=%v err=%v out=%q", code, timedOut, err, out)
-	}
-	if out, code, _, execErr := runCommand(context.Background(), 30*time.Second, "docker", "exec", name, "bash", "-lc", `pid=$(cat /tmp/timed-command-pid); test ! -d "/proc/$pid"`); execErr != nil || code != 0 {
-		t.Fatalf("timed-out stateless command survived: code=%d err=%v out=%q", code, execErr, out)
+	if code2 != 0 || !strings.Contains(out2, "alive") {
+		t.Fatalf("post-restart exec: code=%d out=%q", code2, out2)
 	}
 }
 
@@ -720,6 +753,183 @@ func TestTerminalModelCallFailureDistinguishesAgentTimeout(t *testing.T) {
 	}
 }
 
+func TestCallTerminalModelWithHeartbeatEmitsInFlightStatusAndReturnsResult(t *testing.T) {
+	stderr := os.Stderr
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr capture: %v", err)
+	}
+	os.Stderr = writer
+	restoreStderr := func() {
+		os.Stderr = stderr
+		_ = writer.Close()
+		_ = reader.Close()
+	}
+	defer restoreStderr()
+
+	type callResult struct {
+		content   string
+		reasoning string
+		usage     terminalTokenUsage
+		err       error
+	}
+	releaseCall := make(chan struct{})
+	resultCh := make(chan callResult, 1)
+	wantUsage := terminalTokenUsage{inputTokens: 3, outputTokens: 2, totalTokens: 5, modelCalls: 1}
+	go func() {
+		content, reasoning, usage, err := callTerminalModelWithHeartbeat(
+			terminalConfig{args: parseArgs([]string{"eval", "terminal", "run", "--json-status"}), modelHeartbeatInterval: 2 * time.Millisecond},
+			"heartbeat-task", 4, "retry", time.Now().Add(5*time.Second),
+			func() (string, string, terminalTokenUsage, error) {
+				<-releaseCall
+				return "call-content", "call-reasoning", wantUsage, nil
+			},
+		)
+		resultCh <- callResult{content: content, reasoning: reasoning, usage: usage, err: err}
+	}()
+
+	type decodedStatus struct {
+		value map[string]any
+		err   error
+	}
+	statusCh := make(chan decodedStatus, 1)
+	go func() {
+		var status map[string]any
+		err := json.NewDecoder(reader).Decode(&status)
+		statusCh <- decodedStatus{value: status, err: err}
+	}()
+
+	var decoded decodedStatus
+	select {
+	case decoded = <-statusCh:
+		close(releaseCall)
+	case <-time.After(2 * time.Second):
+		close(releaseCall)
+		<-resultCh
+		t.Fatal("timed out waiting for in-flight terminal model heartbeat")
+	}
+	result := <-resultCh
+	restoreStderr()
+
+	if decoded.err != nil {
+		t.Fatalf("decode heartbeat status: %v", decoded.err)
+	}
+	status := decoded.value
+	if status["event"] != "terminal_model_call_heartbeat" || status["taskId"] != "heartbeat-task" || status["turn"] != float64(4) || status["attempt"] != "retry" {
+		t.Fatalf("heartbeat identity = %#v", status)
+	}
+	elapsed, elapsedOK := status["elapsedSec"].(float64)
+	remaining, remainingOK := status["agentTimeRemainingSec"].(float64)
+	if !elapsedOK || elapsed < 0 || elapsed > 1 || !remainingOK || remaining <= 0 || remaining > 5 {
+		t.Fatalf("heartbeat timing = elapsed %#v remaining %#v, want live bounded agent timing", status["elapsedSec"], status["agentTimeRemainingSec"])
+	}
+	if result.err != nil || result.content != "call-content" || result.reasoning != "call-reasoning" || !reflect.DeepEqual(result.usage, wantUsage) {
+		t.Fatalf("completed model call = %+v, want the delayed call result and usage", result)
+	}
+}
+
+func TestRunExternalTerminalAgentHeartbeatOrdersSchemaAndStopsOnCancellation(t *testing.T) {
+	originalStderr := os.Stderr
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create external heartbeat capture: %v", err)
+	}
+	os.Stderr = writer
+	restoreStderr := func() {
+		os.Stderr = originalStderr
+		_ = writer.Close()
+		_ = reader.Close()
+	}
+	defer restoreStderr()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type decodedEvents struct {
+		values []map[string]any
+		err    error
+	}
+	eventsCh := make(chan decodedEvents, 1)
+	go func() {
+		decoder := json.NewDecoder(reader)
+		events := []map[string]any{}
+		for {
+			var event map[string]any
+			if err := decoder.Decode(&event); err != nil {
+				if errors.Is(err, io.EOF) {
+					err = nil
+				}
+				eventsCh <- decodedEvents{values: events, err: err}
+				return
+			}
+			events = append(events, event)
+			if event["event"] == "terminal_external_agent_heartbeat" {
+				cancel()
+			}
+		}
+	}()
+
+	transcript, _, runErr := runExternalTerminalAgent(
+		ctx,
+		terminalTask{ID: "external-heartbeat", Instruction: "wait for cancellation"},
+		t.TempDir(),
+		"unused-container",
+		"",
+		"fixture-model",
+		terminalConfig{
+			args:                           parseArgs([]string{"eval", "terminal", "run", "--json-status"}),
+			agentCommand:                   "while :; do :; done",
+			agentExecution:                 "routed-shell",
+			agentTimeoutSec:                1,
+			externalAgentHeartbeatInterval: time.Millisecond,
+			traceRoot:                      t.TempDir(),
+		},
+	)
+	os.Stderr = originalStderr
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close external heartbeat writer: %v", err)
+	}
+	decoded := <-eventsCh
+	_ = reader.Close()
+	if decoded.err != nil {
+		t.Fatalf("decode external heartbeat events: %v", decoded.err)
+	}
+	if ctx.Err() != context.Canceled || runErr == nil {
+		t.Fatalf("external cancellation = context %v error %v, want cancelled command failure", ctx.Err(), runErr)
+	}
+	if !strings.Contains(transcript, "[exit=130]") {
+		t.Fatalf("cancelled external transcript = %q, want exit 130", transcript)
+	}
+	events := decoded.values
+	if len(events) < 3 {
+		t.Fatalf("external lifecycle events = %#v, want start, heartbeat, and done", events)
+	}
+	if events[0]["event"] != "terminal_external_agent_started" {
+		t.Fatalf("first external lifecycle event = %#v, want started", events[0])
+	}
+	if events[len(events)-1]["event"] != "terminal_external_agent_done" {
+		t.Fatalf("last external lifecycle event = %#v, want done", events[len(events)-1])
+	}
+	heartbeats := 0
+	for _, event := range events[1 : len(events)-1] {
+		if event["event"] != "terminal_external_agent_heartbeat" {
+			t.Fatalf("event between external start and done = %#v, want heartbeat only", event)
+		}
+		heartbeats++
+		elapsed, elapsedOK := event["elapsedSec"].(float64)
+		remaining, remainingOK := event["agentTimeRemainingSec"].(float64)
+		if event["taskId"] != "external-heartbeat" || event["execution"] != "routed-shell" || !elapsedOK || elapsed < 0 || elapsed > 1 || !remainingOK || remaining < 0 || remaining > 1 {
+			t.Fatalf("external heartbeat schema = %#v, want bounded timing and task/execution identity", event)
+		}
+	}
+	if heartbeats == 0 {
+		t.Fatal("external agent emitted no heartbeat before cancellation")
+	}
+	done := events[len(events)-1]
+	if done["taskId"] != "external-heartbeat" || done["execution"] != "routed-shell" || done["exitCode"] != float64(130) || done["timedOut"] != false {
+		t.Fatalf("external done event = %#v, want cancelled exit without timeout", done)
+	}
+}
+
 func TestRunTerminalTaskPersistsTraceForEarlyBuiltInAgentError(t *testing.T) {
 	binDir := t.TempDir()
 	dockerPath := filepath.Join(binDir, "docker")
@@ -774,6 +984,1625 @@ func TestRunTerminalTaskPersistsTraceForEarlyBuiltInAgentError(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunTerminalTaskAgentTimeoutStillRunsVerifierAndScores(t *testing.T) {
+	dockerLog := installFakeTerminalDocker(t, "")
+	bundleDir := t.TempDir()
+	mustMkdir(t, filepath.Join(bundleDir, "tests"))
+	mustWrite(t, filepath.Join(bundleDir, "tests", "test.sh"), "fixture verifier")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(1500 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "too late"}}}})
+	}))
+	defer server.Close()
+
+	task := terminalTask{
+		ID:          "agent-timeout-scored",
+		Instruction: "Let the model request consume its agent budget.",
+		Image:       terminalImage{Prebuilt: "fake:image"},
+		Agent:       terminalAgentConfig{MaxTurns: 1},
+		Verifier: terminalVerifierConfig{
+			Command:    "fixture-verifier",
+			RewardFile: "/logs/verifier/reward.txt",
+		},
+	}
+	result := runTerminalTask(context.Background(), task, bundleDir, server.URL, "fixture-model", terminalConfig{
+		args:            parseArgs([]string{"eval", "terminal", "run", "--quiet"}),
+		shellMode:       "stateless",
+		agentTimeoutSec: 1,
+		endpointTimeout: 10 * time.Second,
+	})
+	if !result.scored || !result.pass {
+		t.Fatalf("timed-out agent result = %+v, want verifier-scored pass", result)
+	}
+	commands, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatalf("read fake Docker log: %v", err)
+	}
+	if !strings.Contains(string(commands), "fixture-verifier") {
+		t.Fatalf("verifier was not invoked after agent timeout; Docker calls:\n%s", commands)
+	}
+}
+
+func TestRunTerminalEvalRejectsIncompleteShardBeforeSubmit(t *testing.T) {
+	installFakeTerminalDocker(t, "bad-task")
+	bundleRoot := t.TempDir()
+	writeTerminalRuntimeBundle(t, bundleRoot, "good-task")
+	writeTerminalRuntimeBundle(t, bundleRoot, "bad-task")
+	hardwarePath := filepath.Join(t.TempDir(), "hardware.json")
+	writeTerminalTestJSON(t, hardwarePath, map[string]any{"hwClass": "CPU_ONLY", "cpu": "Fixture CPU", "ramGb": 8})
+
+	var submitCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "served-model"}}})
+		case "/v1/chat/completions":
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "TASK_COMPLETE"}}}})
+		case "/api/evals/terminal-fixture/submit":
+			submitCalls.Add(1)
+			t.Fatal("incomplete shard reached submission endpoint")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := runTerminalEval(parseArgs([]string{
+		"eval", "terminal", "run",
+		"--task-dir", bundleRoot,
+		"--dataset", "terminal-fixture",
+		"--shard", "1",
+		"--base-url", server.URL,
+		"--served-model", "served-model",
+		"--model", "fixture/model",
+		"--quantization", "Q4_K_M",
+		"--quant-format", "gguf",
+		"--hardware", hardwarePath,
+		"--api-url", server.URL,
+		"--api-key", "fixture-key",
+		"--submit", "--quiet",
+	}), false)
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "incomplete_shard" {
+		t.Fatalf("error = %#v, want incomplete_shard", err)
+	}
+	if got := submitCalls.Load(); got != 0 {
+		t.Fatalf("submission calls = %d, want zero", got)
+	}
+	details := asObject(cliErr.Details)
+	if details["tasks"] != 2 || details["scored"] != 1 {
+		t.Fatalf("incomplete shard evidence = %#v, want tasks=2 scored=1", details)
+	}
+}
+
+func TestRunTerminalEvalSelectsFirstModelCoverageMissingShard(t *testing.T) {
+	archive := terminalTestBundleArchive(t, "coverage-task")
+	hardwarePath := filepath.Join(t.TempDir(), "hardware.json")
+	writeTerminalTestJSON(t, hardwarePath, map[string]any{"hwClass": "CPU_ONLY", "cpu": "Fixture CPU", "ramGb": 8})
+	var coverageCalls atomic.Int32
+	var requestedShards []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/evals/terminal-fixture/coverage":
+			coverageCalls.Add(1)
+			query := r.URL.Query()
+			if query.Get("hfId") != "fixture/model" || query.Get("quantization") != "Q4_K_M" || query.Get("quantFormat") != "gguf" {
+				t.Errorf("coverage identity query = %q, want model/quantization/format scoped", r.URL.RawQuery)
+			}
+			if query.Get("harnessKey") == "" {
+				t.Errorf("coverage query omitted harnessKey: %q", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"dataset":  map[string]any{"slug": "terminal-fixture", "shardCount": 3},
+				"coverage": map[string]any{"shardsCovered": []any{1, 3}},
+			})
+		case "/api/evals/terminal-fixture/shard":
+			requestedShards = append(requestedShards, r.URL.Query().Get("shard"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"shard":       map[string]any{"shardIndex": numberFromString(r.URL.Query().Get("shard")), "itemCount": 1},
+				"downloadUrl": terminalFixtureServerURL(r) + "/manifest",
+			})
+		case "/manifest":
+			_ = json.NewEncoder(w).Encode(map[string]any{"question_id": "coverage-task", "bundle_key": "fixtures/coverage-task.tar.gz"})
+		case "/api/evals/storage/download-url":
+			_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": terminalFixtureServerURL(r) + "/bundle"})
+		case "/bundle":
+			_, _ = w.Write(archive)
+		case "/v1/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "served-model"}}})
+		case "/v1/chat/completions":
+			http.Error(w, "model task execution forbidden during preflight", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	baseArgs := []string{
+		"eval", "terminal", "run", "terminal-fixture",
+		"--api-url", server.URL,
+		"--api-key", "fixture-key",
+		"--base-url", server.URL,
+		"--model", "fixture/model",
+		"--quantization", "Q4_K_M",
+		"--quant-format", "gguf",
+		"--hardware", hardwarePath,
+		"--submit", "--dry-run", "--quiet",
+	}
+	firstArgs := append(append([]string(nil), baseArgs...), "--out", filepath.Join(t.TempDir(), "missing-preflight.json"))
+	if err := runTerminalEval(parseArgs(firstArgs), false); err != nil {
+		t.Fatalf("preflight uncovered shard: %v", err)
+	}
+
+	explicitArgs := append(append([]string(nil), baseArgs...), "--shard", "3", "--out", filepath.Join(t.TempDir(), "explicit-preflight.json"))
+	if err := runTerminalEval(parseArgs(explicitArgs), false); err != nil {
+		t.Fatalf("preflight explicit shard: %v", err)
+	}
+	if got := coverageCalls.Load(); got != 1 {
+		t.Fatalf("coverage calls = %d, want one (explicit shard must bypass coverage)", got)
+	}
+	if !reflect.DeepEqual(requestedShards, []string{"2", "3"}) {
+		t.Fatalf("shard requests = %q, want [2 3]", requestedShards)
+	}
+}
+
+func TestRunTerminalEvalOutIncludesSubmissionReceiptAndEffectiveLimits(t *testing.T) {
+	installFakeTerminalDocker(t, "")
+	archive := terminalTestBundleArchive(t, "receipt-task")
+	hardwarePath := filepath.Join(t.TempDir(), "hardware.json")
+	writeTerminalTestJSON(t, hardwarePath, map[string]any{"hwClass": "CPU_ONLY", "cpu": "Fixture CPU", "ramGb": 8})
+	outPath := filepath.Join(t.TempDir(), "terminal-result.json")
+
+	var submitted map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/evals/terminal-fixture/shard":
+			_ = json.NewEncoder(w).Encode(map[string]any{"shard": map[string]any{"shardIndex": 2, "itemCount": 1}, "downloadUrl": terminalFixtureServerURL(r) + "/manifest"})
+		case "/manifest":
+			_ = json.NewEncoder(w).Encode(map[string]any{"question_id": "receipt-task", "bundle_key": "fixtures/receipt-task.tar.gz"})
+		case "/api/evals/storage/download-url":
+			_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": terminalFixtureServerURL(r) + "/bundle"})
+		case "/bundle":
+			_, _ = w.Write(archive)
+		case "/v1/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "served-model"}}})
+		case "/v1/chat/completions":
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "TASK_COMPLETE"}}}})
+		case "/api/evals/terminal-fixture/submit":
+			if err := json.NewDecoder(r.Body).Decode(&submitted); err != nil {
+				t.Errorf("decode terminal submission: %v", err)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"run":       map[string]any{"id": "run-receipt", "status": "APPROVED"},
+				"aggregate": map[string]any{"pooledScore": 1.0, "ciLower": 0.25, "ciUpper": 1.0, "shardsCovered": []any{2}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := runTerminalEval(parseArgs([]string{
+		"eval", "terminal", "run", "terminal-fixture",
+		"--shard", "2",
+		"--api-url", server.URL,
+		"--api-key", "fixture-key",
+		"--base-url", server.URL,
+		"--served-model", "served-model",
+		"--model", "fixture/model",
+		"--quantization", "Q4_K_M",
+		"--quant-format", "gguf",
+		"--hardware", hardwarePath,
+		"--agent-timeout", "7",
+		"--out", outPath,
+		"--submit", "--quiet",
+	}), false)
+	if err != nil {
+		t.Fatalf("run terminal submit: %v", err)
+	}
+	saved := readTerminalSubmitBatch(t, outPath)
+	summary := asObject(saved["summary"])
+	if len(anySlice(saved["results"])) != 1 || summary["scored"] != float64(1) {
+		t.Fatalf("saved run body was not preserved: %#v", saved)
+	}
+	if summary["shardIndex"] != float64(2) || summary["runId"] != "run-receipt" || summary["status"] != "APPROVED" {
+		t.Fatalf("summary submission identity = %#v, want shard/run/status receipt", summary)
+	}
+	if summary["pooledScore"] != float64(1) || summary["ciLower"] != float64(0.25) || summary["ciUpper"] != float64(1) || !reflect.DeepEqual(anySlice(summary["coverage"]), []any{float64(2)}) {
+		t.Fatalf("summary aggregate receipt = %#v, want pooled score/CI/coverage", summary)
+	}
+	receipt := asObject(saved["submission"])
+	if receipt["shardIndex"] != float64(2) || receipt["submitted"] != float64(1) {
+		t.Fatalf("submission receipt counts = %#v, want shard 2 submitted 1", receipt)
+	}
+	if !reflect.DeepEqual(asObject(receipt["run"]), map[string]any{"id": "run-receipt", "status": "APPROVED"}) {
+		t.Fatalf("submission run receipt = %#v", receipt["run"])
+	}
+	aggregate := asObject(receipt["aggregate"])
+	if aggregate["pooledScore"] != float64(1) || !reflect.DeepEqual(anySlice(aggregate["shardsCovered"]), []any{float64(2)}) {
+		t.Fatalf("submission aggregate receipt = %#v", aggregate)
+	}
+	runConfig := asObject(submitted["runConfig"])
+	if runConfig["maxTurns"] != float64(1) {
+		t.Fatalf("effective maxTurns = %#v, want manifest limit 1", runConfig["maxTurns"])
+	}
+	if runConfig["maxTurnsPolicy"] != "per-task-manifest-or-fallback" || runConfig["agentTimeoutPolicy"] != "cli-override" {
+		t.Fatalf("limit policies = (%#v, %#v), want manifest/fallback max-turn policy and CLI timeout policy", runConfig["maxTurnsPolicy"], runConfig["agentTimeoutPolicy"])
+	}
+	if runConfig["maxTurnsEnforcement"] != "cli-agent-loop" {
+		t.Fatalf("run maxTurnsEnforcement = %#v, want cli-agent-loop", runConfig["maxTurnsEnforcement"])
+	}
+	commandTimeoutSec, ok := runConfig["commandTimeoutSec"].(float64)
+	if !ok || commandTimeoutSec <= 0 {
+		t.Fatalf("effective commandTimeoutSec = %#v, want a nonzero fallback limit", runConfig["commandTimeoutSec"])
+	}
+	taskLimits := anySlice(runConfig["taskLimits"])
+	if len(taskLimits) != 1 {
+		t.Fatalf("taskLimits = %#v, want one receipt-task entry", runConfig["taskLimits"])
+	}
+	limit := asObject(taskLimits[0])
+	if limit["taskId"] != "receipt-task" || limit["maxTurns"] != float64(1) || limit["maxTurnsSource"] != "task-manifest" {
+		t.Fatalf("manifest task limit metadata = %#v", limit)
+	}
+	if limit["maxTurnsEnforcement"] != "cli-agent-loop" {
+		t.Fatalf("task maxTurnsEnforcement = %#v, want cli-agent-loop", limit["maxTurnsEnforcement"])
+	}
+	if limit["agentTimeoutSec"] != float64(7) || limit["agentTimeoutSource"] != "cli" {
+		t.Fatalf("CLI task limit metadata = %#v", limit)
+	}
+	if limit["commandTimeoutSec"] != commandTimeoutSec || limit["commandTimeoutSource"] != "fallback" {
+		t.Fatalf("fallback task limit metadata = %#v, want commandTimeoutSec=%v from fallback", limit, commandTimeoutSec)
+	}
+}
+
+func TestRunTerminalEvalExplicitDryRunPreflightsWithoutDockerOrModel(t *testing.T) {
+	dockerLog := installFakeTerminalDocker(t, "")
+	bundleRoot := t.TempDir()
+	writeTerminalRuntimeBundle(t, bundleRoot, "dry-run-task")
+	outPath := filepath.Join(t.TempDir(), "preflight.json")
+	var modelCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "served-model"}}})
+		case "/v1/chat/completions":
+			modelCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "TASK_COMPLETE"}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := runTerminalEval(parseArgs([]string{
+		"eval", "terminal", "run",
+		"--task-dir", bundleRoot,
+		"--base-url", server.URL,
+		"--model", "fixture/model",
+		"--out", outPath,
+		"--dry-run", "--quiet",
+	}), false)
+	if err != nil {
+		t.Fatalf("terminal explicit dry-run: %v", err)
+	}
+	if got := modelCalls.Load(); got != 0 {
+		t.Fatalf("model calls = %d, want zero", got)
+	}
+	if data, err := os.ReadFile(dockerLog); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read fake Docker log: %v", err)
+	} else if len(data) != 0 {
+		t.Fatalf("explicit dry-run invoked Docker:\n%s", data)
+	}
+	plan := readTerminalSubmitBatch(t, outPath)
+	if plan["dryRun"] != true || plan["tasks"] != float64(1) {
+		t.Fatalf("preflight plan = %#v, want dryRun=true tasks=1", plan)
+	}
+}
+
+func TestStartDetachedTerminalEvalCreatesProcessRecordAndSeparatesWorkerStreams(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv(terminalJobTestHelperEnv, "detached-output")
+
+	stdout, stderr, err := captureTerminalStreams(t, func() error {
+		return startDetachedTerminalEval(parseArgs([]string{
+			"eval", "terminal", "run",
+			"--run-dir", runDir,
+			"--detach", "--json-status", "--quiet",
+		}))
+	})
+	if err != nil {
+		t.Fatalf("start detached terminal worker: %v", err)
+	}
+	if stdout != "" || stderr != "" {
+		t.Fatalf("quiet detached launcher output = stdout %q stderr %q, want both empty", stdout, stderr)
+	}
+
+	workerStdout := waitForTerminalFileContent(t, terminalStdoutPath(runDir), "detached worker stdout")
+	workerStderr := waitForTerminalFileContent(t, terminalStderrPath(runDir), "detached worker event")
+	workerEvents, err := os.ReadFile(terminalEventsPath(runDir))
+	if err != nil {
+		t.Fatalf("read detached event log: %v", err)
+	}
+	if bytes.Contains(workerStdout, []byte("detached worker event")) {
+		t.Fatalf("worker stderr leaked into stdout file: %q", workerStdout)
+	}
+	if bytes.Contains(workerStderr, []byte("detached worker stdout")) {
+		t.Fatalf("worker stdout leaked into stderr file: %q", workerStderr)
+	}
+	if bytes.Contains(workerEvents, []byte("detached worker event")) {
+		t.Fatalf("raw worker stderr corrupted the event log: %q", workerEvents)
+	}
+	for index, line := range strings.Split(strings.TrimSpace(string(workerEvents)), "\n") {
+		if line == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("detached event log line %d is not JSON: %v\n%s", index+1, err, line)
+		}
+	}
+
+	record, err := loadTerminalProcessRecord(runDir)
+	if err != nil {
+		t.Fatalf("load detached process record: %v", err)
+	}
+	root, err := filepath.Abs(runDir)
+	if err != nil {
+		t.Fatalf("resolve run directory: %v", err)
+	}
+	if record.PID <= 0 || record.State != "running" || record.RunDir != root {
+		t.Fatalf("detached process record = %+v, want positive PID and running state for %s", record, root)
+	}
+	if record.EventsPath != terminalEventsPath(root) || record.StdoutPath != terminalStdoutPath(root) || record.StderrPath != terminalStderrPath(root) {
+		t.Fatalf("detached output paths = events %q stdout %q stderr %q, want canonical files under %s", record.EventsPath, record.StdoutPath, record.StderrPath, root)
+	}
+}
+
+func TestTerminalLogsWithholdsTrailingNonNewlineFragment(t *testing.T) {
+	runDir := t.TempDir()
+	mustWrite(t, terminalEventsPath(runDir), "{\"event\":\"complete\"}\n{\"event\":\"partial\"")
+
+	stdout, stderr, err := captureTerminalStreams(t, func() error {
+		return handleEvalTerminal("logs", parseArgs([]string{"eval", "terminal", "logs", runDir}))
+	})
+	if err != nil {
+		t.Fatalf("read terminal logs: %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("terminal logs wrote stderr: %q", stderr)
+	}
+	if stdout != "{\"event\":\"complete\"}\n" {
+		t.Fatalf("terminal logs output = %q, want only the complete JSONL record", stdout)
+	}
+}
+
+func TestTerminalStatusReportsCheckpointProgressAndActiveTask(t *testing.T) {
+	runDir := t.TempDir()
+	mustMkdir(t, filepath.Join(runDir, "results"))
+	writeTerminalTestJSON(t, filepath.Join(runDir, "run.json"), terminalLiveCheckpoint{
+		Version:        terminalLiveCheckpointVersion,
+		State:          "running",
+		Dataset:        "fixture-dataset",
+		ShardIndex:     2,
+		TaskIDs:        []string{"task-passed", "task-unscored", "task-running"},
+		CompletedTasks: []string{"task-passed", "task-unscored"},
+		ActiveTasks: []terminalLiveActiveTask{
+			{TaskID: "task-running", Index: 2, StartedAt: "2026-07-19T12:00:00Z"},
+		},
+		CreatedAt: "2026-07-19T11:59:00Z",
+		UpdatedAt: "2026-07-19T12:00:00Z",
+	})
+	scored, unscored := true, false
+	writeTerminalTestJSON(t, terminalLiveResultPath(runDir, "task-passed"), terminalSavedResult{
+		QuestionID: "task-passed", Pass: true, Scored: &scored,
+	})
+	writeTerminalTestJSON(t, terminalLiveResultPath(runDir, "task-unscored"), terminalSavedResult{
+		QuestionID: "task-unscored", Scored: &unscored, ErrorCode: "verifier_failed",
+	})
+
+	stdout, stderr, err := captureTerminalStreams(t, func() error {
+		return handleEvalTerminal("status", parseArgs([]string{"eval", "terminal", "status", runDir, "--json"}))
+	})
+	if err != nil {
+		t.Fatalf("read terminal status: %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("terminal status wrote stderr: %q", stderr)
+	}
+	var status map[string]any
+	if err := json.Unmarshal([]byte(stdout), &status); err != nil {
+		t.Fatalf("decode terminal status JSON: %v\n%s", err, stdout)
+	}
+	for field, want := range map[string]any{
+		"state": "running", "dataset": "fixture-dataset", "shardIndex": float64(2),
+		"tasksTotal": float64(3), "tasksPersisted": float64(2), "tasksScored": float64(1),
+		"tasksPassed": float64(1), "tasksUnscored": float64(1),
+	} {
+		if got := status[field]; got != want {
+			t.Errorf("status[%q] = %#v, want %#v", field, got, want)
+		}
+	}
+	active, ok := status["activeTasks"].([]any)
+	if !ok || len(active) != 1 || stringValue(asObject(active[0])["taskId"]) != "task-running" || numberField(asObject(active[0]), "index") != 2 {
+		t.Fatalf("activeTasks = %#v, want task-running at index 2", status["activeTasks"])
+	}
+	root, err := filepath.Abs(runDir)
+	if err != nil {
+		t.Fatalf("resolve run directory: %v", err)
+	}
+	if status["eventsPath"] != terminalEventsPath(root) {
+		t.Fatalf("eventsPath = %#v, want %q", status["eventsPath"], terminalEventsPath(root))
+	}
+}
+
+func TestTerminalStatusSeparatesCanonicalActivityFromCheckpointUpdate(t *testing.T) {
+	runDir := t.TempDir()
+	checkpointUpdatedAt := "2026-07-19T12:00:00Z"
+	lastCompleteActivityAt := "2026-07-19T12:03:04.567Z"
+	writeTerminalTestJSON(t, filepath.Join(runDir, "run.json"), terminalLiveCheckpoint{
+		Version:   terminalLiveCheckpointVersion,
+		State:     "running",
+		Dataset:   "fixture-dataset",
+		CreatedAt: "2026-07-19T11:59:00Z",
+		UpdatedAt: checkpointUpdatedAt,
+	})
+	mustWrite(t, terminalEventsPath(runDir),
+		"{\"event\":\"terminal_task_started\",\"time\":\"2026-07-19T12:01:00Z\"}\n"+
+			"{\"event\":\"terminal_external_agent_heartbeat\",\"time\":\""+lastCompleteActivityAt+"\"}\n"+
+			"{\"event\":\"terminal_external_agent_heartbeat\",\"time\":\"2026-07-19T12:05:00Z\"")
+
+	stdout, stderr, err := captureTerminalStreams(t, func() error {
+		return handleEvalTerminal("status", parseArgs([]string{"eval", "terminal", "status", runDir, "--json"}))
+	})
+	if err != nil {
+		t.Fatalf("read terminal activity status: %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("terminal activity status wrote stderr: %q", stderr)
+	}
+	var status map[string]any
+	if err := json.Unmarshal([]byte(stdout), &status); err != nil {
+		t.Fatalf("decode terminal activity status: %v\n%s", err, stdout)
+	}
+	if status["updatedAt"] != checkpointUpdatedAt {
+		t.Fatalf("status updatedAt = %#v, want checkpoint transition %q", status["updatedAt"], checkpointUpdatedAt)
+	}
+	if status["lastActivityAt"] != lastCompleteActivityAt {
+		t.Fatalf("status lastActivityAt = %#v, want newest complete canonical event %q", status["lastActivityAt"], lastCompleteActivityAt)
+	}
+}
+
+func TestTerminalCancelDurablyRecordsRequestBeforeSignallingRecordedWorker(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("cooperative signal receipt and robust process identity are exercised on Linux")
+	}
+	runDir := t.TempDir()
+	root, err := filepath.Abs(runDir)
+	if err != nil {
+		t.Fatalf("resolve run directory: %v", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test executable: %v", err)
+	}
+	helperDir := t.TempDir()
+	readyPath := filepath.Join(helperDir, "ready")
+	signalledPath := filepath.Join(helperDir, "signalled")
+	observedPath := filepath.Join(helperDir, "observed-events")
+	cmd := exec.Command(executable, "-test.run=^$")
+	cmd.Env = append(os.Environ(),
+		terminalJobTestHelperEnv+"=wait-for-termination",
+		"LMX_TEST_TERMINAL_READY="+readyPath,
+		"LMX_TEST_TERMINAL_SIGNALLED="+signalledPath,
+		"LMX_TEST_TERMINAL_EVENTS="+terminalEventsPath(root),
+		"LMX_TEST_TERMINAL_OBSERVED="+observedPath,
+	)
+	configureDetachedCommand(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start controlled detached worker: %v", err)
+	}
+	identity, err := captureProcessIdentity(cmd.Process.Pid)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("capture controlled worker identity: %v", err)
+	}
+	waitDone := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = cmd.Wait()
+		close(waitDone)
+	}()
+	defer func() {
+		if processMatchesIdentity(cmd.Process.Pid, identity) {
+			_ = signalDetachedProcess(cmd.Process.Pid, true)
+		}
+		select {
+		case <-waitDone:
+		case <-time.After(5 * time.Second):
+			t.Errorf("controlled detached worker did not exit during cleanup")
+		}
+	}()
+	waitForTerminalFileContent(t, readyPath, "ready")
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := writeTerminalJSONAtomic(terminalProcessPath(root), terminalProcessRecord{
+		Version: terminalProcessRecordVersion, PID: cmd.Process.Pid, Identity: identity, State: "running", RunDir: root,
+		EventsPath: terminalEventsPath(root), StdoutPath: terminalStdoutPath(root), StderrPath: terminalStderrPath(root), StartedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("write controlled process record: %v", err)
+	}
+
+	stdout, stderr, err := captureTerminalStreams(t, func() error {
+		return handleEvalTerminal("cancel", parseArgs([]string{"eval", "terminal", "cancel", runDir, "--json"}))
+	})
+	if err != nil {
+		t.Fatalf("cancel controlled detached worker: %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("terminal cancel wrote stderr: %q", stderr)
+	}
+	var response map[string]any
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		t.Fatalf("decode terminal cancel response: %v\n%s", err, stdout)
+	}
+	if response["state"] != "cancel_requested" || response["force"] != false || response["pid"] != float64(cmd.Process.Pid) {
+		t.Fatalf("terminal cancel response = %#v, want cooperative request for PID %d", response, cmd.Process.Pid)
+	}
+	observed := waitForTerminalFileContent(t, observedPath, "terminal_cancel_requested")
+	events := decodeTerminalStatusLines(t, string(observed))
+	cancelEvent := events[len(events)-1]
+	if cancelEvent["event"] != "terminal_cancel_requested" || cancelEvent["pid"] != float64(cmd.Process.Pid) || cancelEvent["force"] != false {
+		t.Fatalf("event visible to worker when signal arrived = %#v, want durable cooperative cancel request", cancelEvent)
+	}
+	waitForTerminalFileContent(t, signalledPath, "terminated")
+	select {
+	case <-waitDone:
+		if waitErr != nil {
+			t.Fatalf("controlled detached worker exit: %v", waitErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("controlled detached worker did not exit after cancellation")
+	}
+	record, err := loadTerminalProcessRecord(root)
+	if err != nil {
+		t.Fatalf("reload cancelled process record: %v", err)
+	}
+	if record.State != "cancel_requested" || record.PID != cmd.Process.Pid || record.Identity != identity {
+		t.Fatalf("cancelled process record = %+v, want cancel_requested for controlled process identity", record)
+	}
+}
+
+func TestTerminalCancelRejectsMismatchedProcessIdentityWithoutSignalling(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("robust process identity is exercised on Linux")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test executable: %v", err)
+	}
+	helperDir := t.TempDir()
+	readyPath := filepath.Join(helperDir, "ready")
+	signalledPath := filepath.Join(helperDir, "signalled")
+	cmd := exec.Command(executable, "-test.run=^$")
+	cmd.Env = append(os.Environ(),
+		terminalJobTestHelperEnv+"=wait-for-termination",
+		"LMX_TEST_TERMINAL_READY="+readyPath,
+		"LMX_TEST_TERMINAL_SIGNALLED="+signalledPath,
+	)
+	configureDetachedCommand(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start controlled detached worker: %v", err)
+	}
+	identity, err := captureProcessIdentity(cmd.Process.Pid)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("capture controlled worker identity: %v", err)
+	}
+	waitDone := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(waitDone)
+	}()
+	defer func() {
+		if processMatchesIdentity(cmd.Process.Pid, identity) {
+			_ = signalDetachedProcess(cmd.Process.Pid, true)
+		}
+		select {
+		case <-waitDone:
+		case <-time.After(5 * time.Second):
+			t.Errorf("controlled detached worker did not exit during cleanup")
+		}
+	}()
+	waitForTerminalFileContent(t, readyPath, "ready")
+	mismatched := identity + ":reused"
+	if err := signalTerminalProcess(terminalProcessRecord{PID: cmd.Process.Pid, Identity: mismatched}, false); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("signal mismatched process identity error = %v, want os.ErrProcessDone", err)
+	}
+
+	runDir := t.TempDir()
+	root, err := filepath.Abs(runDir)
+	if err != nil {
+		t.Fatalf("resolve run directory: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	before := terminalProcessRecord{
+		Version: terminalProcessRecordVersion, PID: cmd.Process.Pid, Identity: mismatched, State: "running", RunDir: root,
+		EventsPath: terminalEventsPath(root), StdoutPath: terminalStdoutPath(root), StderrPath: terminalStderrPath(root), StartedAt: now, UpdatedAt: now,
+	}
+	if err := writeTerminalJSONAtomic(terminalProcessPath(root), before); err != nil {
+		t.Fatalf("write mismatched process record: %v", err)
+	}
+	stdout, stderr, err := captureTerminalStreams(t, func() error {
+		return handleEvalTerminal("cancel", parseArgs([]string{"eval", "terminal", "cancel", runDir, "--json"}))
+	})
+	if err != nil {
+		t.Fatalf("reject mismatched terminal process identity: %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("mismatched terminal cancel wrote stderr: %q", stderr)
+	}
+	var response map[string]any
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		t.Fatalf("decode mismatched cancel response: %v\n%s", err, stdout)
+	}
+	if response["alreadyStopped"] != true || response["processRunning"] != false {
+		t.Fatalf("mismatched cancel response = %#v, want already-stopped without a live matching process", response)
+	}
+	after, err := loadTerminalProcessRecord(root)
+	if err != nil {
+		t.Fatalf("reload mismatched process record: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("mismatched cancel changed process record:\nafter  %+v\nbefore %+v", after, before)
+	}
+	if _, err := os.Stat(terminalEventsPath(root)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mismatched cancel created an event log: %v", err)
+	}
+	if !processMatchesIdentity(cmd.Process.Pid, identity) {
+		t.Fatal("mismatched cancel stopped the live process with the different identity")
+	}
+	if _, err := os.Stat(signalledPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mismatched cancel reached the helper signal handler: %v", err)
+	}
+}
+
+func TestRunTerminalEvalRunDirPersistsStatusEventsWhileQuiet(t *testing.T) {
+	installFakeTerminalDocker(t, "")
+	bundleRoot := t.TempDir()
+	writeTerminalRuntimeBundle(t, bundleRoot, "logged-task")
+	runDir := t.TempDir()
+	server, _ := newTerminalExecutionFixtureServer(t)
+
+	stdout, stderr, err := captureTerminalStreams(t, func() error {
+		return runTerminalEval(parseArgs([]string{
+			"eval", "terminal", "run",
+			"--task-dir", bundleRoot,
+			"--base-url", server.URL,
+			"--served-model", "fixture-model",
+			"--model", "fixture/model",
+			"--shell-mode", "stateless",
+			"--run-dir", runDir,
+			"--json-status", "--quiet",
+		}), false)
+	})
+	if err != nil {
+		t.Fatalf("terminal run with durable status log: %v", err)
+	}
+	if stdout != "" || stderr != "" {
+		t.Fatalf("quiet machine run output = stdout %q stderr %q, want both empty", stdout, stderr)
+	}
+	data, err := os.ReadFile(terminalEventsPath(runDir))
+	if err != nil {
+		t.Fatalf("read durable terminal event log: %v", err)
+	}
+	events := decodeTerminalStatusLines(t, string(data))
+	wantOrder := []string{"terminal_eval_start", "terminal_task_started", "terminal_task_done", "terminal_eval_completed"}
+	next := 0
+	for _, event := range events {
+		if next < len(wantOrder) && stringValue(event["event"]) == wantOrder[next] {
+			if wantOrder[next] == "terminal_task_started" && event["taskId"] != "logged-task" {
+				t.Fatalf("persisted task-start event = %#v, want logged-task", event)
+			}
+			if wantOrder[next] == "terminal_task_done" && (event["taskId"] != "logged-task" || event["scored"] != true || event["pass"] != true) {
+				t.Fatalf("persisted task completion = %#v, want scored passing logged-task", event)
+			}
+			next++
+		}
+	}
+	if next != len(wantOrder) {
+		t.Fatalf("durable event order = %#v, want ordered lifecycle %v", events, wantOrder)
+	}
+	completion := events[len(events)-1]
+	if completion["event"] != "terminal_eval_completed" || completion["tasks"] != float64(1) || completion["scored"] != float64(1) {
+		t.Fatalf("final durable event = %#v, want one-task scored completion", completion)
+	}
+}
+
+func TestRunTerminalBundlesCheckpointFailureWithPendingTasksReturns(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "run.json"), 0o755); err != nil {
+		t.Fatalf("create checkpoint write blocker: %v", err)
+	}
+	checkpoint := &terminalLiveCheckpointStore{
+		root: root,
+		state: terminalLiveCheckpoint{
+			Version: terminalLiveCheckpointVersion,
+			State:   "running",
+			TaskIDs: []string{"pending-one", "pending-two", "pending-three"},
+		},
+	}
+	bundles := []terminalBundle{
+		{Task: terminalTask{ID: "pending-one"}},
+		{Task: terminalTask{ID: "pending-two"}},
+		{Task: terminalTask{ID: "pending-three"}},
+	}
+	args := parseArgs([]string{"eval", "terminal", "run", "--run-dir", root, "--quiet"})
+	result := make(chan error, 1)
+	go func() {
+		_, err := runTerminalBundles(context.Background(), args, bundles, "", "", terminalConfig{args: args}, 1, nil, checkpoint)
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		var cliErr cliError
+		if !errorsAsCli(err, &cliErr) || cliErr.Code != "checkpoint_write_failed" {
+			t.Fatalf("checkpoint failure = %#v, want checkpoint_write_failed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runTerminalBundles deadlocked after the first checkpoint failure with tasks still pending")
+	}
+}
+
+func TestTerminalManifestAndBundleDownloadsCancelBlockedRequests(t *testing.T) {
+	tests := []struct {
+		name       string
+		blockedURL string
+		run        func(context.Context, cliArgs, string) error
+	}{
+		{
+			name:       "manifest download",
+			blockedURL: "/blocked-manifest",
+			run: func(ctx context.Context, args cliArgs, _ string) error {
+				_, _, err := fetchTerminalManifestItems(ctx, args, "fixture-dataset")
+				return err
+			},
+		},
+		{
+			name:       "bundle download",
+			blockedURL: "/blocked-bundle",
+			run: func(ctx context.Context, args cliArgs, tmp string) error {
+				_, err := downloadTerminalBundle(ctx, args, tmp, "fixture-task", "bundles/fixture.tar.gz", "")
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requestStarted := make(chan struct{}, 1)
+			releaseHandler := make(chan struct{})
+			serverURL := ""
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/shard"):
+					_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": serverURL + test.blockedURL})
+				case r.URL.Path == "/api/evals/storage/download-url":
+					_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": serverURL + test.blockedURL})
+				case r.URL.Path == test.blockedURL:
+					select {
+					case requestStarted <- struct{}{}:
+					default:
+					}
+					select {
+					case <-r.Context().Done():
+					case <-releaseHandler:
+					}
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			serverURL = server.URL
+			t.Cleanup(func() {
+				close(releaseHandler)
+				server.Close()
+			})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
+			args := parseArgs([]string{"eval", "terminal", "run", "--api-url", server.URL})
+			tmp := t.TempDir()
+			go func() {
+				result <- test.run(ctx, args, tmp)
+			}()
+			select {
+			case <-requestStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("%s never reached the blocked HTTP request", test.name)
+			}
+			cancel()
+			select {
+			case err := <-result:
+				var cliErr cliError
+				if !errorsAsCli(err, &cliErr) || cliErr.Code != "terminal_cancelled" {
+					t.Fatalf("%s cancellation error = %#v, want terminal_cancelled", test.name, err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("%s did not return promptly after cancellation", test.name)
+			}
+		})
+	}
+}
+
+func TestOpenTerminalLiveCheckpointRebuildsStaleProgressFromDurableResults(t *testing.T) {
+	runDir := t.TempDir()
+	args := parseArgs([]string{
+		"eval", "terminal", "run",
+		"--run-dir", runDir,
+		"--resume", "auto",
+		"--api-url", "http://fixture.invalid",
+	})
+	bundles := []terminalBundle{
+		{Task: terminalTask{ID: "scored-task", Instruction: "scored fixture"}},
+		{Task: terminalTask{ID: "unscored-task", Instruction: "unscored fixture"}},
+	}
+	cfg := terminalConfig{args: args, shellMode: "stateless", maxTurns: 1}
+	hardware := map[string]any{"gpu": "fixture"}
+	store, _, err := openTerminalLiveCheckpoint(args, "fixture-dataset", 1, bundles, "http://model.invalid", "fixture-model", "fixture/model", "", "", hardware, cfg)
+	if err != nil {
+		t.Fatalf("create terminal checkpoint: %v", err)
+	}
+	stale := store.state
+	store.close()
+	stale.CompletedTasks = []string{"ghost-task", "unscored-task"}
+	stale.ActiveTasks = []terminalLiveActiveTask{{TaskID: "ghost-active", Index: 99, StartedAt: "2026-07-19T12:00:00Z"}}
+	writeTerminalTestJSON(t, filepath.Join(runDir, "run.json"), stale)
+	scored, unscored := true, false
+	writeTerminalTestJSON(t, terminalLiveResultPath(runDir, "scored-task"), terminalSavedResult{
+		QuestionID: "scored-task", Scored: &scored, Pass: true, Response: "durable scored response",
+	})
+	writeTerminalTestJSON(t, terminalLiveResultPath(runDir, "unscored-task"), terminalSavedResult{
+		QuestionID: "unscored-task", Scored: &unscored, ErrorCode: "verifier_failed",
+	})
+
+	resumedStore, resumed, err := openTerminalLiveCheckpoint(args, "fixture-dataset", 1, bundles, "http://model.invalid", "fixture-model", "fixture/model", "", "", hardware, cfg)
+	if err != nil {
+		t.Fatalf("resume terminal checkpoint: %v", err)
+	}
+	defer resumedStore.close()
+	if result, ok := resumed["scored-task"]; !ok || !result.scored || !result.pass || result.transcript != "durable scored response" {
+		t.Fatalf("resumed scored result = %+v (found %v), want durable passing result", result, ok)
+	}
+	if _, ok := resumed["unscored-task"]; ok {
+		t.Fatal("unscored durable result was incorrectly marked reusable")
+	}
+	runData, err := os.ReadFile(filepath.Join(runDir, "run.json"))
+	if err != nil {
+		t.Fatalf("read rebuilt run checkpoint: %v", err)
+	}
+	var rebuilt terminalLiveCheckpoint
+	if err := json.Unmarshal(runData, &rebuilt); err != nil {
+		t.Fatalf("decode rebuilt run checkpoint: %v", err)
+	}
+	if !reflect.DeepEqual(rebuilt.CompletedTasks, []string{"scored-task", "unscored-task"}) {
+		t.Fatalf("rebuilt completed tasks = %v, want exactly the durable task result files", rebuilt.CompletedTasks)
+	}
+	if len(rebuilt.ActiveTasks) != 0 {
+		t.Fatalf("rebuilt active tasks = %+v, want stale in-flight work cleared", rebuilt.ActiveTasks)
+	}
+}
+
+func TestRunTerminalTaskRemovesContainerBeforeCleaningBuiltImage(t *testing.T) {
+	dockerLog := installFakeTerminalDocker(t, "")
+	bundleDir := t.TempDir()
+	mustMkdir(t, filepath.Join(bundleDir, "tests"))
+	mustWrite(t, filepath.Join(bundleDir, "Dockerfile"), "FROM scratch\n")
+	mustWrite(t, filepath.Join(bundleDir, "tests", "test.sh"), "fixture verifier")
+	server, _ := newTerminalExecutionFixtureServer(t)
+	task := terminalTask{
+		ID:          "cleanup-order",
+		Instruction: "Complete the cleanup-order fixture",
+		Image:       terminalImage{Dockerfile: "Dockerfile", Context: "."},
+		Agent:       terminalAgentConfig{MaxTurns: 1},
+		Verifier: terminalVerifierConfig{
+			Command:    "fixture-verifier",
+			RewardFile: "/logs/verifier/reward.txt",
+		},
+	}
+	result := runTerminalTask(context.Background(), task, bundleDir, server.URL, "fixture-model", terminalConfig{
+		args:            parseArgs([]string{"eval", "terminal", "run", "--quiet"}),
+		shellMode:       "stateless",
+		cleanupImages:   true,
+		agentTimeoutSec: 10,
+		endpointTimeout: time.Second,
+	})
+	if !result.scored || !result.pass {
+		t.Fatalf("cleanup-order task result = %+v, want scored pass", result)
+	}
+	data, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatalf("read fake Docker log: %v", err)
+	}
+	removeIndex, imageRemoveIndex := -1, -1
+	commands := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for index, command := range commands {
+		if strings.HasPrefix(command, "rm -f lmx-tb-cleanup-order-") {
+			removeIndex = index
+		}
+		if strings.HasPrefix(command, "rmi lmx-tb-cleanup-order-") {
+			imageRemoveIndex = index
+		}
+	}
+	if removeIndex < 0 || imageRemoveIndex < 0 || removeIndex >= imageRemoveIndex {
+		t.Fatalf("Docker cleanup order = %v, want container rm before built image rmi", commands)
+	}
+}
+
+func TestRunTerminalEvalPersistsScoredTaskBeforeFinalizationAndResumesWithoutExecution(t *testing.T) {
+	dockerLog := installFakeTerminalDocker(t, "")
+	bundleRoot := t.TempDir()
+	writeTerminalRuntimeBundle(t, bundleRoot, "durable-scored-task")
+	runDir := t.TempDir()
+	server, modelCalls := newTerminalExecutionFixtureServer(t)
+
+	// Force aggregate finalization to fail after the per-task result has been
+	// checkpointed, which models interruption between task completion and the
+	// final result document becoming durable.
+	blockingResultPath := filepath.Join(runDir, "result.json")
+	if err := os.Mkdir(blockingResultPath, 0o755); err != nil {
+		t.Fatalf("create finalization blocker: %v", err)
+	}
+	args := []string{
+		"eval", "terminal", "run",
+		"--task-dir", bundleRoot,
+		"--base-url", server.URL,
+		"--served-model", "fixture-model",
+		"--model", "fixture/model",
+		"--shell-mode", "stateless",
+		"--run-dir", runDir,
+		"--resume", "auto",
+		"--json-status", "--quiet",
+	}
+	if err := runTerminalEval(parseArgs(args), false); err == nil {
+		t.Fatal("first run unexpectedly finalized despite result.json blocker")
+	}
+
+	savedPath := terminalLiveResultPath(runDir, "durable-scored-task")
+	savedData, err := os.ReadFile(savedPath)
+	if err != nil {
+		t.Fatalf("read task checkpoint after interrupted finalization: %v", err)
+	}
+	var saved terminalSavedResult
+	if err := json.Unmarshal(savedData, &saved); err != nil {
+		t.Fatalf("decode task checkpoint after interrupted finalization: %v", err)
+	}
+	if saved.QuestionID != "durable-scored-task" || saved.Scored == nil || !*saved.Scored || !saved.Pass || !strings.Contains(saved.Response, "TASK_COMPLETE") {
+		t.Fatalf("durable task checkpoint = %+v, want complete scored task result", saved)
+	}
+	var interrupted terminalLiveCheckpoint
+	runData, err := os.ReadFile(filepath.Join(runDir, "run.json"))
+	if err != nil {
+		t.Fatalf("read interrupted run checkpoint: %v", err)
+	}
+	if err := json.Unmarshal(runData, &interrupted); err != nil {
+		t.Fatalf("decode interrupted run checkpoint: %v", err)
+	}
+	if interrupted.State != "running" || !reflect.DeepEqual(interrupted.CompletedTasks, []string{"durable-scored-task"}) {
+		t.Fatalf("interrupted run state = %+v, want running with durable completed task", interrupted)
+	}
+	dockerBeforeResume, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatalf("read Docker log before resume: %v", err)
+	}
+	modelCallsBeforeResume := modelCalls.Load()
+
+	if err := os.Remove(blockingResultPath); err != nil {
+		t.Fatalf("remove finalization blocker: %v", err)
+	}
+	if err := runTerminalEval(parseArgs(args), false); err != nil {
+		t.Fatalf("resume interrupted terminal run: %v", err)
+	}
+	if got := modelCalls.Load(); got != modelCallsBeforeResume {
+		t.Fatalf("model calls after scored resume = %d, want unchanged %d", got, modelCallsBeforeResume)
+	}
+	dockerAfterResume, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatalf("read Docker log after resume: %v", err)
+	}
+	appendedDocker := strings.TrimSpace(strings.TrimPrefix(string(dockerAfterResume), string(dockerBeforeResume)))
+	if !strings.HasPrefix(appendedDocker, "ps -aq --filter label=localmaxxing.run=") || strings.Contains(appendedDocker, "\n") {
+		t.Fatalf("scored resume should only verify cleanup, appended Docker commands:\n%s", appendedDocker)
+	}
+	final := readTerminalSubmitBatch(t, blockingResultPath)
+	if summary := asObject(final["summary"]); summary["scored"] != float64(1) || summary["correct"] != float64(1) {
+		t.Fatalf("resumed final summary = %#v, want one scored passing task", summary)
+	}
+}
+
+func TestRunTerminalEvalResumeRerunsUnscoredTaskResult(t *testing.T) {
+	dockerLog := installFakeTerminalDocker(t, "retry-unscored-task")
+	bundleRoot := t.TempDir()
+	writeTerminalRuntimeBundle(t, bundleRoot, "retry-unscored-task")
+	runDir := t.TempDir()
+	server, modelCalls := newTerminalExecutionFixtureServer(t)
+	args := []string{
+		"eval", "terminal", "run",
+		"--task-dir", bundleRoot,
+		"--base-url", server.URL,
+		"--served-model", "fixture-model",
+		"--model", "fixture/model",
+		"--shell-mode", "stateless",
+		"--run-dir", runDir,
+		"--resume", "auto",
+		"--json-status", "--quiet",
+	}
+	if err := runTerminalEval(parseArgs(args), false); err == nil {
+		t.Fatal("first run with verifier failure unexpectedly succeeded")
+	}
+	first, ok, err := loadTerminalLiveResult(runDir, "retry-unscored-task")
+	if err != nil {
+		t.Fatalf("load unscored task checkpoint: %v", err)
+	}
+	if !ok || first.scored {
+		t.Fatalf("first checkpoint = %+v (found %v), want persisted unscored result", first, ok)
+	}
+	dockerBeforeRetry, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatalf("read Docker log before retry: %v", err)
+	}
+	modelCallsBeforeRetry := modelCalls.Load()
+
+	t.Setenv("LMX_TEST_FAIL_VERIFIER_TASK", "")
+	if err := runTerminalEval(parseArgs(args), false); err != nil {
+		t.Fatalf("resume with repaired verifier: %v", err)
+	}
+	if got := modelCalls.Load(); got != modelCallsBeforeRetry+1 {
+		t.Fatalf("model calls after unscored resume = %d, want exactly one rerun after %d calls", got, modelCallsBeforeRetry)
+	}
+	dockerAfterRetry, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatalf("read Docker log after retry: %v", err)
+	}
+	if !bytes.HasPrefix(dockerAfterRetry, dockerBeforeRetry) {
+		t.Fatalf("resume rewrote the Docker log; before:\n%s\nafter:\n%s", dockerBeforeRetry, dockerAfterRetry)
+	}
+	root, err := filepath.Abs(runDir)
+	if err != nil {
+		t.Fatalf("resolve resumed run directory: %v", err)
+	}
+	sum := sha256.Sum256([]byte(root))
+	wantCleanup := "ps -aq --filter label=localmaxxing.run=" + hex.EncodeToString(sum[:])[:12]
+	cleanupCalls := 0
+	for _, command := range strings.Split(strings.TrimSpace(string(dockerAfterRetry[len(dockerBeforeRetry):])), "\n") {
+		if command == wantCleanup {
+			cleanupCalls++
+		}
+	}
+	if cleanupCalls != 2 {
+		t.Fatalf("resume cleanup calls = %d, want start and completion checks %q in appended Docker commands:\n%s", cleanupCalls, wantCleanup, dockerAfterRetry[len(dockerBeforeRetry):])
+	}
+	if bytes.Equal(dockerAfterRetry, dockerBeforeRetry) {
+		t.Fatal("unscored resume did not execute the task again")
+	}
+	retried, ok, err := loadTerminalLiveResult(runDir, "retry-unscored-task")
+	if err != nil {
+		t.Fatalf("load retried task checkpoint: %v", err)
+	}
+	if !ok || !retried.scored || !retried.pass {
+		t.Fatalf("retried checkpoint = %+v (found %v), want scored passing replacement", retried, ok)
+	}
+}
+
+func TestRunTerminalEvalResumeRerunsExternalFailureButReusesScoredVerifierFailure(t *testing.T) {
+	installFakeTerminalDocker(t, "")
+	t.Setenv("LMX_TEST_VERIFIER_REWARD", "0")
+	bundleRoot := t.TempDir()
+	writeTerminalRuntimeBundle(t, bundleRoot, "external-failure")
+	writeTerminalRuntimeBundle(t, bundleRoot, "scored-verifier-failure")
+	runDir := t.TempDir()
+	agentLog := filepath.Join(t.TempDir(), "agent.log")
+	failureMarker := filepath.Join(t.TempDir(), "external-failed-once")
+	agentCommand := "printf '%s\\n' \"$LMX_TERMINAL_TASK_ID\" >> " + shellQuote(agentLog) + "; " +
+		"if [ \"$LMX_TERMINAL_TASK_ID\" = external-failure ] && [ ! -e " + shellQuote(failureMarker) + " ]; then " +
+		"touch " + shellQuote(failureMarker) + "; exit 17; fi"
+	args := parseArgs([]string{
+		"eval", "terminal", "run",
+		"--task-dir", bundleRoot,
+		"--agent-cmd", agentCommand,
+		"--run-dir", runDir,
+		"--resume", "auto",
+		"--quiet",
+	})
+
+	if err := runTerminalEval(args, false); err != nil {
+		t.Fatalf("initial mixed external run: %v", err)
+	}
+	external, ok, err := loadTerminalLiveResult(runDir, "external-failure")
+	if err != nil {
+		t.Fatalf("load external failure: %v", err)
+	}
+	if !ok || external.scored || external.errCode != "command_exec_failed" {
+		t.Fatalf("external failure checkpoint = %+v (found %v), want unscored command_exec_failed", external, ok)
+	}
+	verifier, ok, err := loadTerminalLiveResult(runDir, "scored-verifier-failure")
+	if err != nil {
+		t.Fatalf("load scored verifier failure: %v", err)
+	}
+	if !ok || !verifier.scored || verifier.pass || verifier.errCode != "" {
+		t.Fatalf("verifier failure checkpoint = %+v (found %v), want scored benchmark failure", verifier, ok)
+	}
+	firstExecutions := readTerminalAgentExecutions(t, agentLog)
+	if firstExecutions["external-failure"] != 1 || firstExecutions["scored-verifier-failure"] != 1 {
+		t.Fatalf("initial external executions = %#v, want each task once", firstExecutions)
+	}
+
+	if err := runTerminalEval(args, false); err != nil {
+		t.Fatalf("resume mixed external run: %v", err)
+	}
+	resumedExecutions := readTerminalAgentExecutions(t, agentLog)
+	if resumedExecutions["external-failure"] != 2 {
+		t.Fatalf("external failure executions after resume = %#v, want failed task rerun once", resumedExecutions)
+	}
+	if resumedExecutions["scored-verifier-failure"] != 1 {
+		t.Fatalf("scored verifier failure executions after resume = %#v, want scored task reused", resumedExecutions)
+	}
+	external, ok, err = loadTerminalLiveResult(runDir, "external-failure")
+	if err != nil {
+		t.Fatalf("load rerun external task: %v", err)
+	}
+	if !ok || !external.scored || external.pass || external.errCode != "" {
+		t.Fatalf("rerun external checkpoint = %+v (found %v), want scored verifier failure replacement", external, ok)
+	}
+	final := readTerminalSubmitBatch(t, filepath.Join(runDir, "result.json"))
+	results := anySlice(final["results"])
+	if len(results) != 2 {
+		t.Fatalf("resumed external results = %#v, want two task records", results)
+	}
+	for _, raw := range results {
+		record := asObject(raw)
+		if turns, present := record["turns"]; !present || turns != nil {
+			t.Fatalf("external result turns = %#v (present %v) for %q, want explicit null", turns, present, record["question_id"])
+		}
+	}
+}
+
+func readTerminalAgentExecutions(t *testing.T, path string) map[string]int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read external agent execution log: %v", err)
+	}
+	counts := map[string]int{}
+	for _, taskID := range strings.Fields(string(data)) {
+		counts[taskID]++
+	}
+	return counts
+}
+
+func TestRunTerminalEvalResumeRejectsChangedManifestOrExecutionIdentity(t *testing.T) {
+	installFakeTerminalDocker(t, "")
+	bundleRoot := t.TempDir()
+	bundleDir := writeTerminalRuntimeBundle(t, bundleRoot, "identity-task")
+	runDir := t.TempDir()
+	server, modelCalls := newTerminalExecutionFixtureServer(t)
+	baseArgs := []string{
+		"eval", "terminal", "run",
+		"--task-dir", bundleRoot,
+		"--base-url", server.URL,
+		"--served-model", "fixture-model",
+		"--model", "fixture/model",
+		"--shell-mode", "persistent",
+		"--run-dir", runDir,
+		"--resume", "auto",
+		"--json-status", "--quiet",
+	}
+	if err := runTerminalEval(parseArgs(baseArgs), false); err != nil {
+		t.Fatalf("create resumable terminal checkpoint: %v", err)
+	}
+	checkpointData, err := os.ReadFile(filepath.Join(runDir, "run.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint terminalLiveCheckpoint
+	if err := json.Unmarshal(checkpointData, &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoint.FingerprintFields) == 0 {
+		t.Fatalf("checkpoint omitted fingerprint field hashes")
+	}
+	callsAfterInitialRun := modelCalls.Load()
+
+	taskPath := filepath.Join(bundleDir, "task.json")
+	taskData, err := os.ReadFile(taskPath)
+	if err != nil {
+		t.Fatalf("read original task manifest: %v", err)
+	}
+	var task terminalTask
+	if err := json.Unmarshal(taskData, &task); err != nil {
+		t.Fatalf("decode original task manifest: %v", err)
+	}
+	task.Instruction = "Changed instruction must invalidate the checkpoint"
+	writeTerminalTestJSON(t, taskPath, task)
+	assertTerminalCheckpointMismatch(t, parseArgs(baseArgs), "changed manifest")
+	if got := modelCalls.Load(); got != callsAfterInitialRun {
+		t.Fatalf("changed-manifest resume executed model: calls = %d, want %d", got, callsAfterInitialRun)
+	}
+
+	if err := os.WriteFile(taskPath, taskData, 0o644); err != nil {
+		t.Fatalf("restore original task manifest: %v", err)
+	}
+	changedIdentityArgs := append(append([]string(nil), baseArgs...), "--shell-mode", "stateless")
+	assertTerminalCheckpointMismatch(t, parseArgs(changedIdentityArgs), "changed execution identity")
+	if got := modelCalls.Load(); got != callsAfterInitialRun {
+		t.Fatalf("changed-identity resume executed model: calls = %d, want %d", got, callsAfterInitialRun)
+	}
+}
+
+func TestRunTerminalEvalResumeSelectorValidation(t *testing.T) {
+	bundleRoot := t.TempDir()
+	writeTerminalRuntimeBundle(t, bundleRoot, "resume-selector-task")
+	tests := []struct {
+		name        string
+		args        []string
+		wantMessage string
+	}{
+		{
+			name: "resume requires run directory",
+			args: []string{
+				"eval", "terminal", "run", "--task-dir", bundleRoot, "--oracle", "--resume", "auto",
+			},
+			wantMessage: "--resume requires --run-dir",
+		},
+		{
+			name: "selector is limited to auto or none",
+			args: []string{
+				"eval", "terminal", "run", "--task-dir", bundleRoot, "--oracle", "--run-dir", t.TempDir(), "--resume", "latest",
+			},
+			wantMessage: "--resume must be auto or none",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := runTerminalEval(parseArgs(tc.args), false)
+			var cliErr cliError
+			if !errors.As(err, &cliErr) || cliErr.Code != "invalid_option" {
+				t.Fatalf("error = %#v, want invalid_option", err)
+			}
+			if !strings.Contains(cliErr.Message, tc.wantMessage) {
+				t.Fatalf("message = %q, want clear validation containing %q", cliErr.Message, tc.wantMessage)
+			}
+		})
+	}
+}
+
+func TestRunTerminalEvalJSONStatusSeparatesStreamsAndEmitsStructuredCompletion(t *testing.T) {
+	installFakeTerminalDocker(t, "")
+	server, _ := newTerminalExecutionFixtureServer(t)
+	tests := []struct {
+		name            string
+		submit          bool
+		jsonOutput      bool
+		wantFinalEvent  string
+		wantRunIdentity bool
+	}{
+		{name: "local run leaves stdout empty", wantFinalEvent: "terminal_eval_completed"},
+		{name: "local JSON is one document", jsonOutput: true, wantFinalEvent: "terminal_eval_completed"},
+		{name: "submitted JSON is one document", submit: true, jsonOutput: true, wantFinalEvent: "terminal_eval_submitted", wantRunIdentity: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bundleRoot := t.TempDir()
+			writeTerminalRuntimeBundle(t, bundleRoot, "status-task")
+			args := []string{
+				"eval", "terminal", "run",
+				"--task-dir", bundleRoot,
+				"--base-url", server.URL,
+				"--served-model", "fixture-model",
+				"--model", "fixture/model",
+				"--shell-mode", "stateless",
+				"--json-status",
+				"--run-dir", filepath.Join(t.TempDir(), "run"),
+			}
+			if tc.jsonOutput {
+				args = append(args, "--json")
+			}
+			if tc.submit {
+				hardwarePath := filepath.Join(t.TempDir(), "hardware.json")
+				writeTerminalTestJSON(t, hardwarePath, map[string]any{"hwClass": "CPU_ONLY", "cpu": "Fixture CPU", "ramGb": 8})
+				args = append(args,
+					"--dataset", "terminal-status-fixture",
+					"--quantization", "Q4_K_M",
+					"--quant-format", "gguf",
+					"--hardware", hardwarePath,
+					"--api-url", server.URL,
+					"--api-key", "fixture-key",
+					"--submit",
+				)
+			}
+
+			stdout, stderr, err := captureTerminalStreams(t, func() error {
+				return runTerminalEval(parseArgs(args), false)
+			})
+			if err != nil {
+				t.Fatalf("terminal JSON-status run: %v", err)
+			}
+			statuses := decodeTerminalStatusLines(t, stderr)
+			seen := map[string]bool{}
+			for _, status := range statuses {
+				seen[stringValue(status["event"])] = true
+			}
+			for _, event := range []string{"terminal_eval_start", "terminal_task_started", "terminal_task_done", "terminal_cleanup_verified"} {
+				if !seen[event] {
+					t.Fatalf("stderr events omitted %q: %#v", event, statuses)
+				}
+			}
+			completion := statuses[len(statuses)-1]
+			if completion["event"] != tc.wantFinalEvent {
+				t.Fatalf("final stderr event = %#v, want %q", completion, tc.wantFinalEvent)
+			}
+			if tc.submit {
+				if completion["submitted"] != float64(1) || completion["runId"] != "terminal-status-run" {
+					t.Fatalf("submitted completion = %#v, want submitted count and run identity", completion)
+				}
+			} else if completion["submitted"] != false || completion["tasks"] != float64(1) || completion["scored"] != float64(1) {
+				t.Fatalf("local completion = %#v, want structured one-task scored summary", completion)
+			}
+
+			if !tc.jsonOutput {
+				if stdout != "" {
+					t.Fatalf("stdout without --json = %q, want empty machine-output stream", stdout)
+				}
+				return
+			}
+			var document map[string]any
+			if err := json.Unmarshal([]byte(stdout), &document); err != nil {
+				t.Fatalf("stdout is not exactly one JSON document: %v\n%s", err, stdout)
+			}
+			summary := asObject(document["summary"])
+			if summary["tasks"] != float64(1) || summary["scored"] != float64(1) {
+				t.Fatalf("stdout result summary = %#v, want one scored task", summary)
+			}
+			if tc.wantRunIdentity {
+				run := asObject(asObject(document["submission"])["run"])
+				if run["id"] != "terminal-status-run" || run["status"] != "APPROVED" {
+					t.Fatalf("stdout submission receipt = %#v, want approved terminal-status-run", document["submission"])
+				}
+			}
+		})
+	}
+}
+
+func assertTerminalCheckpointMismatch(t *testing.T, args cliArgs, changed string) {
+	t.Helper()
+	err := runTerminalEval(args, false)
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "checkpoint_mismatch" {
+		t.Fatalf("%s error = %#v, want checkpoint_mismatch", changed, err)
+	}
+	if !strings.Contains(cliErr.Message, "does not match") {
+		t.Fatalf("%s message = %q, want clear mismatch explanation", changed, cliErr.Message)
+	}
+	details := asObject(cliErr.Details)
+	changedFields, ok := details["changedFields"].([]string)
+	if !ok || len(changedFields) == 0 {
+		t.Fatalf("%s mismatch details = %#v, want changedFields", changed, cliErr.Details)
+	}
+}
+
+func TestTerminalDockerHintExplainsLinuxGroupAccess(t *testing.T) {
+	hint := terminalHint("docker_unavailable")
+	if !strings.Contains(hint, "usermod -aG docker") || !strings.Contains(hint, "new login session") {
+		t.Fatalf("Docker hint = %q, want group repair and session refresh", hint)
+	}
+}
+
+func newTerminalExecutionFixtureServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var modelCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "fixture-model"}}})
+		case r.URL.Path == "/v1/chat/completions":
+			modelCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "TASK_COMPLETE"}}}})
+		case strings.HasSuffix(r.URL.Path, "/submit"):
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"run":       map[string]any{"id": "terminal-status-run", "status": "APPROVED"},
+				"aggregate": map[string]any{"pooledScore": 1.0, "ciLower": 0.25, "ciUpper": 1.0, "shardsCovered": []any{1}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, &modelCalls
+}
+
+func captureTerminalStreams(t *testing.T, run func() error) (string, string, error) {
+	t.Helper()
+	stdoutFile, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+	if err != nil {
+		t.Fatalf("create stdout capture: %v", err)
+	}
+	stderrFile, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
+	if err != nil {
+		_ = stdoutFile.Close()
+		t.Fatalf("create stderr capture: %v", err)
+	}
+	originalStdout, originalStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = stdoutFile, stderrFile
+	defer func() {
+		os.Stdout, os.Stderr = originalStdout, originalStderr
+		_ = stdoutFile.Close()
+		_ = stderrFile.Close()
+	}()
+
+	runErr := run()
+	os.Stdout, os.Stderr = originalStdout, originalStderr
+	if err := stdoutFile.Close(); err != nil {
+		t.Fatalf("close stdout capture: %v", err)
+	}
+	if err := stderrFile.Close(); err != nil {
+		t.Fatalf("close stderr capture: %v", err)
+	}
+	stdout, err := os.ReadFile(stdoutFile.Name())
+	if err != nil {
+		t.Fatalf("read stdout capture: %v", err)
+	}
+	stderr, err := os.ReadFile(stderrFile.Name())
+	if err != nil {
+		t.Fatalf("read stderr capture: %v", err)
+	}
+	return string(stdout), string(stderr), runErr
+}
+
+func decodeTerminalStatusLines(t *testing.T, stderr string) []map[string]any {
+	t.Helper()
+	trimmed := strings.TrimSpace(stderr)
+	if trimmed == "" {
+		t.Fatal("JSON-status stderr was empty")
+	}
+	lines := strings.Split(trimmed, "\n")
+	statuses := make([]map[string]any, 0, len(lines))
+	for index, line := range lines {
+		var status map[string]any
+		if err := json.Unmarshal([]byte(line), &status); err != nil {
+			t.Fatalf("stderr line %d is not JSON: %v\n%s", index+1, err, line)
+		}
+		if stringValue(status["event"]) == "" {
+			t.Fatalf("stderr line %d has no lifecycle event: %#v", index+1, status)
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses
+}
+
+func waitForTerminalFileContent(t *testing.T, path, want string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil && strings.Contains(string(data), want) {
+			return data
+		}
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("read polled file %s: %v", path, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %q in %s; last content %q", want, path, data)
+		}
+		<-ticker.C
+	}
+}
+
+func writeTerminalRuntimeBundle(t *testing.T, root, id string) string {
+	t.Helper()
+	dir := filepath.Join(root, id)
+	mustMkdir(t, filepath.Join(dir, "tests"))
+	writeTerminalTestJSON(t, filepath.Join(dir, "task.json"), terminalTask{
+		ID: id, Instruction: "Complete " + id, Image: terminalImage{Prebuilt: "fake:image"},
+		Agent:    terminalAgentConfig{MaxTurns: 1},
+		Verifier: terminalVerifierConfig{Command: "fixture-verifier", RewardFile: "/logs/verifier/reward.txt"},
+	})
+	mustWrite(t, filepath.Join(dir, "tests", "test.sh"), "fixture verifier")
+	return dir
+}
+
+func installFakeTerminalDocker(t *testing.T, failVerifierTask string) string {
+	t.Helper()
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$LMX_TEST_DOCKER_LOG"
+if [ -n "$LMX_TEST_FAIL_VERIFIER_TASK" ]; then
+  case "$*" in
+    *"$LMX_TEST_FAIL_VERIFIER_TASK/tests/."*) exit 1 ;;
+  esac
+fi
+case "$*" in
+  *"cat /logs/verifier/reward.json"*) exit 1 ;;
+  *"cat /logs/verifier/reward.txt"*) printf '%s\n' "${LMX_TEST_VERIFIER_REWARD:-1}"; exit 0 ;;
+esac
+exit 0
+`
+	mustWrite(t, filepath.Join(binDir, "docker"), script)
+	if err := os.Chmod(filepath.Join(binDir, "docker"), 0o755); err != nil {
+		t.Fatalf("make fake Docker executable: %v", err)
+	}
+	t.Setenv("LMX_TEST_DOCKER_LOG", logPath)
+	t.Setenv("LMX_TEST_FAIL_VERIFIER_TASK", failVerifierTask)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return logPath
+}
+
+func terminalTestBundleArchive(t *testing.T, id string) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	tw := tar.NewWriter(gz)
+	taskData, err := json.Marshal(terminalTask{
+		ID: id, Instruction: "Complete " + id, Image: terminalImage{Prebuilt: "fake:image"},
+		Agent:    terminalAgentConfig{MaxTurns: 1},
+		Verifier: terminalVerifierConfig{Command: "fixture-verifier", RewardFile: "/logs/verifier/reward.txt"},
+	})
+	if err != nil {
+		t.Fatalf("encode archive task: %v", err)
+	}
+	entries := []struct {
+		name string
+		mode int64
+		body []byte
+	}{
+		{name: "task.json", mode: 0o644, body: taskData},
+		{name: "tests/", mode: 0o755},
+		{name: "tests/test.sh", mode: 0o755, body: []byte("#!/bin/sh\nexit 0\n")},
+	}
+	for _, entry := range entries {
+		typeFlag := byte(tar.TypeReg)
+		if strings.HasSuffix(entry.name, "/") {
+			typeFlag = tar.TypeDir
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: entry.name, Mode: entry.mode, Size: int64(len(entry.body)), Typeflag: typeFlag}); err != nil {
+			t.Fatalf("write archive header %q: %v", entry.name, err)
+		}
+		if len(entry.body) > 0 {
+			if _, err := tw.Write(entry.body); err != nil {
+				t.Fatalf("write archive entry %q: %v", entry.name, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar fixture: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip fixture: %v", err)
+	}
+	return compressed.Bytes()
+}
+
+func terminalFixtureServerURL(r *http.Request) string {
+	return "http://" + r.Host
+}
+
+func numberFromString(value string) int {
+	if value == "2" {
+		return 2
+	}
+	if value == "3" {
+		return 3
+	}
+	return 1
 }
 
 func TestSubmitTerminalEvalDryRunBuildsCanonicalPayloadWithoutNetworkOrBenchmarkExecution(t *testing.T) {
@@ -965,12 +2794,6 @@ func TestSubmitTerminalEvalDryRunBuildsCanonicalPayloadWithoutNetworkOrBenchmark
 	failResponse := stringValue(failArtifact["response"])
 	if !strings.Contains(failResponse, "SAVED_FAIL_RESPONSE") || !strings.Contains(failResponse, "FAIL_VERIFIER_RETAINED") {
 		t.Fatalf("fallback artifact did not retain saved response and verifier output:\n%s", failResponse)
-	}
-	if !strings.Contains(failResponse, "Source: saved task response.") {
-		t.Fatalf("fallback artifact did not identify its harness-neutral source:\n%s", failResponse)
-	}
-	if strings.Contains(strings.ToLower(failResponse), "omp.jsonl") {
-		t.Fatalf("fallback artifact exposed an irrelevant harness-specific trace filename:\n%s", failResponse)
 	}
 }
 
@@ -1208,347 +3031,6 @@ vulnerable-secret
 winning-avg-corewars
 write-compressor`
 
-func TestInspectTerminalDatasetRequiresExplicitAPIURLBeforeHTTP(t *testing.T) {
-	counter := &terminalInspectRequestCounter{}
-	originalClient := apiHTTPClient
-	apiHTTPClient = &http.Client{Transport: counter}
-	t.Cleanup(func() { apiHTTPClient = originalClient })
-
-	err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
-		"eval", "terminal", "inspect", terminalBench21Dataset,
-		"--json",
-	}))
-	var cliErr cliError
-	if !errors.As(err, &cliErr) || cliErr.Code != "missing_option" || cliErr.Message != "--api-url is required" {
-		t.Fatalf("error = %#v, want missing_option for --api-url", err)
-	}
-	if got := counter.calls.Load(); got != 0 {
-		t.Fatalf("inspect without --api-url made %d HTTP requests, want none", got)
-	}
-}
-
-func TestInspectTerminalDatasetRoutesToConfiguredAPIAndReportsCanonicalReadiness(t *testing.T) {
-	fixture := newTerminalInspectFixture(t, false)
-	fixture.wantAuthorization = "Bearer fixture-key"
-	server := fixture.start(t)
-	defer server.Close()
-
-	var modelCalls atomic.Int32
-	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		modelCalls.Add(1)
-		http.Error(w, "inspect must not contact a model endpoint", http.StatusInternalServerError)
-	}))
-	defer modelServer.Close()
-	dockerSentinel := filepath.Join(t.TempDir(), "docker-called")
-	binDir := t.TempDir()
-	dockerPath := filepath.Join(binDir, "docker")
-	mustWrite(t, dockerPath, "#!/bin/sh\necho called > "+dockerSentinel+"\n")
-	if err := os.Chmod(dockerPath, 0o755); err != nil {
-		t.Fatalf("chmod fake docker: %v", err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	output, err := captureTerminalTestStdout(t, func() error {
-		return inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
-			"eval", "terminal", "inspect", terminalBench21Dataset,
-			"--api-url", server.URL,
-			"--api-key", "fixture-key",
-			"--base-url", modelServer.URL,
-			"--json",
-		}))
-	})
-	if err != nil {
-		t.Fatalf("inspect canonical dataset: %v", err)
-	}
-	var summary map[string]any
-	if err := json.Unmarshal([]byte(output), &summary); err != nil {
-		t.Fatalf("decode inspect JSON %q: %v", output, err)
-	}
-	if summary["ready"] != true || summary["dataset"] != terminalBench21Dataset {
-		t.Fatalf("inspect identity = %#v", summary)
-	}
-	for field, want := range map[string]float64{
-		"itemCount": 89, "shardCount": 10, "manifestItems": 89, "uniqueTaskIds": 89,
-	} {
-		if summary[field] != want {
-			t.Fatalf("inspect %s = %#v, want %.0f", field, summary[field], want)
-		}
-	}
-	shards := anySlice(summary["shards"])
-	wantSizes := []int{8, 9, 9, 9, 9, 9, 9, 9, 9, 9}
-	if len(shards) != len(wantSizes) {
-		t.Fatalf("inspect shard summaries = %d, want %d", len(shards), len(wantSizes))
-	}
-	for i, wantSize := range wantSizes {
-		shard := asObject(shards[i])
-		if shard["shardIndex"] != float64(i+1) || shard["itemCount"] != float64(wantSize) {
-			t.Fatalf("inspect shard %d = %#v, want index %d size %d", i+1, shard, i+1, wantSize)
-		}
-	}
-	wantIndexes := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	if !reflect.DeepEqual(fixture.shardRequests, wantIndexes) {
-		t.Fatalf("shard requests = %v, want %v", fixture.shardRequests, wantIndexes)
-	}
-	if !reflect.DeepEqual(fixture.manifestRequests, wantIndexes) {
-		t.Fatalf("manifest requests = %v, want %v", fixture.manifestRequests, wantIndexes)
-	}
-	if fixture.bundleRequests != 0 {
-		t.Fatalf("default inspect downloaded %d bundles, want manifest-only inspection", fixture.bundleRequests)
-	}
-	if fixture.unexpectedRequests != 0 {
-		t.Fatalf("inspect made %d unexpected API/submit requests", fixture.unexpectedRequests)
-	}
-	if got := modelCalls.Load(); got != 0 {
-		t.Fatalf("inspect made %d model requests", got)
-	}
-	if _, err := os.Stat(dockerSentinel); !os.IsNotExist(err) {
-		t.Fatalf("inspect executed Docker: %v", err)
-	}
-}
-
-func TestInspectTerminalDatasetRejectsInvalidCanonicalManifests(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*terminalInspectFixture)
-	}{
-		{
-			name: "duplicate id within shard",
-			mutate: func(f *terminalInspectFixture) {
-				f.shards[1][1]["question_id"] = f.shards[1][0]["question_id"]
-			},
-		},
-		{
-			name: "cross-shard duplicate id",
-			mutate: func(f *terminalInspectFixture) {
-				f.shards[1][0]["question_id"] = f.shards[0][0]["question_id"]
-			},
-		},
-		{
-			name: "missing id",
-			mutate: func(f *terminalInspectFixture) {
-				f.shards[9] = f.shards[9][:len(f.shards[9])-1]
-			},
-		},
-		{
-			name: "extra id",
-			mutate: func(f *terminalInspectFixture) {
-				f.shards[9] = append(f.shards[9], terminalInspectManifestRow("extra-noncanonical-task"))
-			},
-		},
-		{
-			name: "canonical ids in wrong shard sizes",
-			mutate: func(f *terminalInspectFixture) {
-				moved := f.shards[0][len(f.shards[0])-1]
-				f.shards[0] = f.shards[0][:len(f.shards[0])-1]
-				f.shards[1] = append(f.shards[1], moved)
-			},
-		},
-		{
-			name: "wrong declared shard count",
-			mutate: func(f *terminalInspectFixture) {
-				f.datasetShardCount = 9
-			},
-		},
-		{
-			name: "wrong response shard index",
-			mutate: func(f *terminalInspectFixture) {
-				f.reportedShardIndexes[3] = 4
-			},
-		},
-		{
-			name: "wrong response item count",
-			mutate: func(f *terminalInspectFixture) {
-				f.reportedItemCounts[4] = len(f.shards[3]) + 1
-			},
-		},
-		{
-			name: "malformed sha256",
-			mutate: func(f *terminalInspectFixture) {
-				f.shards[2][0]["sha256"] = "not-a-sha256"
-			},
-		},
-		{
-			name: "zero byte size",
-			mutate: func(f *terminalInspectFixture) {
-				f.shards[2][0]["byteSize"] = 0
-			},
-		},
-		{
-			name: "missing bundle key",
-			mutate: func(f *terminalInspectFixture) {
-				f.shards[2][0]["bundle_key"] = ""
-			},
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			fixture := newTerminalInspectFixture(t, false)
-			tc.mutate(fixture)
-			server := fixture.start(t)
-			defer server.Close()
-			err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
-				"eval", "terminal", "inspect", terminalBench21Dataset,
-				"--api-url", server.URL,
-				"--json",
-			}))
-			var cliErr cliError
-			if !errors.As(err, &cliErr) || cliErr.Code != "terminal_inspect_failed" {
-				t.Fatalf("error = %#v, want terminal_inspect_failed", err)
-			}
-			if fixture.bundleRequests != 0 {
-				t.Fatalf("manifest rejection downloaded %d bundles", fixture.bundleRequests)
-			}
-		})
-	}
-}
-
-func TestInspectTerminalDatasetRejectsCountPreservingCrossShardSwap(t *testing.T) {
-	fixture := newTerminalInspectFixture(t, false)
-	shardTwoID := stringValue(fixture.shards[1][0]["question_id"])
-	fixture.shards[1][0], fixture.shards[2][0] = fixture.shards[2][0], fixture.shards[1][0]
-	server := fixture.start(t)
-	defer server.Close()
-
-	err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
-		"eval", "terminal", "inspect", terminalBench21Dataset,
-		"--api-url", server.URL,
-		"--json",
-	}))
-	var cliErr cliError
-	if !errors.As(err, &cliErr) || cliErr.Code != "terminal_inspect_failed" || cliErr.Message != "Terminal-Bench 2.1 task is assigned to a noncanonical shard." {
-		t.Fatalf("error = %#v, want noncanonical shard assignment rejection", err)
-	}
-	details := asObject(cliErr.Details)
-	if details["taskId"] != shardTwoID || details["expectedShardIndex"] != 2 || details["actualShardIndex"] != 3 {
-		t.Fatalf("assignment evidence = %#v, want task %q moved from shard 2 to shard 3", details, shardTwoID)
-	}
-	if fixture.bundleRequests != 0 {
-		t.Fatalf("shard assignment rejection downloaded %d bundles", fixture.bundleRequests)
-	}
-}
-
-func TestInspectTerminalDatasetVerifyBundlesChecksHashAndExtraction(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		fixture := newTerminalInspectFixture(t, true)
-		server := fixture.start(t)
-		defer server.Close()
-		var modelCalls atomic.Int32
-		modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			modelCalls.Add(1)
-			http.Error(w, "bundle inspection must not contact a model endpoint", http.StatusInternalServerError)
-		}))
-		defer modelServer.Close()
-		dockerSentinel := filepath.Join(t.TempDir(), "docker-called")
-		binDir := t.TempDir()
-		dockerPath := filepath.Join(binDir, "docker")
-		mustWrite(t, dockerPath, "#!/bin/sh\necho called > "+dockerSentinel+"\n")
-		if err := os.Chmod(dockerPath, 0o755); err != nil {
-			t.Fatalf("chmod fake docker: %v", err)
-		}
-		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-		output, err := captureTerminalTestStdout(t, func() error {
-			return inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
-				"eval", "terminal", "inspect", terminalBench21Dataset,
-				"--api-url", server.URL,
-				"--base-url", modelServer.URL,
-				"--verify-bundles", "--json",
-			}))
-		})
-		if err != nil {
-			t.Fatalf("verify canonical bundles: %v", err)
-		}
-		var summary map[string]any
-		if err := json.Unmarshal([]byte(output), &summary); err != nil {
-			t.Fatalf("decode verify summary %q: %v", output, err)
-		}
-		if summary["verifiedBundles"] != float64(89) {
-			t.Fatalf("verifiedBundles = %#v, want 89", summary["verifiedBundles"])
-		}
-		if fixture.bundleRequests != 89 {
-			t.Fatalf("bundle downloads = %d, want 89", fixture.bundleRequests)
-		}
-		if fixture.unexpectedRequests != 0 {
-			t.Fatalf("bundle inspection made %d unexpected API/submit requests", fixture.unexpectedRequests)
-		}
-		if got := modelCalls.Load(); got != 0 {
-			t.Fatalf("bundle inspection made %d model requests", got)
-		}
-		if _, err := os.Stat(dockerSentinel); !os.IsNotExist(err) {
-			t.Fatalf("bundle inspection executed Docker: %v", err)
-		}
-	})
-
-	t.Run("hash mismatch", func(t *testing.T) {
-		fixture := newTerminalInspectFixture(t, true)
-		fixture.shards[0][0]["sha256"] = strings.Repeat("0", 64)
-		server := fixture.start(t)
-		defer server.Close()
-		err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
-			"eval", "terminal", "inspect", terminalBench21Dataset,
-			"--api-url", server.URL,
-			"--verify-bundles", "--json",
-		}))
-		var cliErr cliError
-		if !errors.As(err, &cliErr) || cliErr.Code != "bundle_download_failed" {
-			t.Fatalf("error = %#v, want bundle_download_failed", err)
-		}
-	})
-
-	t.Run("byte size mismatch", func(t *testing.T) {
-		fixture := newTerminalInspectFixture(t, true)
-		fixture.shards[0][0]["byteSize"] = fixture.shards[0][0]["byteSize"].(int) + 1
-		server := fixture.start(t)
-		defer server.Close()
-		err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
-			"eval", "terminal", "inspect", terminalBench21Dataset,
-			"--api-url", server.URL,
-			"--verify-bundles", "--json",
-		}))
-		var cliErr cliError
-		if !errors.As(err, &cliErr) || cliErr.Code != "bundle_download_failed" {
-			t.Fatalf("error = %#v, want bundle_download_failed", err)
-		}
-	})
-
-	t.Run("traversal member", func(t *testing.T) {
-		fixture := newTerminalInspectFixture(t, true)
-		id := stringValue(fixture.shards[0][0]["question_id"])
-		key := stringValue(fixture.shards[0][0]["bundle_key"])
-		archive := terminalInspectBundleArchive(t, id, map[string]string{"../escaped": "unsafe"})
-		fixture.setBundle(fixture.shards[0][0], key, archive)
-		server := fixture.start(t)
-		defer server.Close()
-		err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
-			"eval", "terminal", "inspect", terminalBench21Dataset,
-			"--api-url", server.URL,
-			"--verify-bundles", "--json",
-		}))
-		var cliErr cliError
-		if !errors.As(err, &cliErr) || cliErr.Code != "bundle_download_failed" {
-			t.Fatalf("error = %#v, want bundle_download_failed", err)
-		}
-	})
-}
-
-func TestInspectTerminalDatasetRejectsBundleContainingSolution(t *testing.T) {
-	fixture := newTerminalInspectFixture(t, true)
-	id := stringValue(fixture.shards[0][0]["question_id"])
-	key := stringValue(fixture.shards[0][0]["bundle_key"])
-	archive := terminalInspectBundleArchive(t, id, map[string]string{id + "/solution/solve.sh": "#!/bin/sh\nexit 0\n"})
-	fixture.setBundle(fixture.shards[0][0], key, archive)
-	server := fixture.start(t)
-	defer server.Close()
-	err := inspectTerminalDataset(terminalBench21Dataset, parseArgs([]string{
-		"eval", "terminal", "inspect", terminalBench21Dataset,
-		"--api-url", server.URL,
-		"--verify-bundles", "--json",
-	}))
-	var cliErr cliError
-	if !errors.As(err, &cliErr) || cliErr.Code != "terminal_inspect_failed" {
-		t.Fatalf("error = %#v, want terminal_inspect_failed for solution archive", err)
-	}
-}
-
 func TestSubmitTerminalEvalCanonicalCheckpointDryRunPartitionsExactTaskSet(t *testing.T) {
 	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
 	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
@@ -1712,99 +3194,6 @@ func TestSubmitTerminalEvalCustomDatasetRequiresShardIndex(t *testing.T) {
 	}
 }
 
-func TestSubmitTerminalEvalPostsAllCanonicalShards(t *testing.T) {
-	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
-	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
-	wantSizes := []int{8, 9, 9, 9, 9, 9, 9, 9, 9, 9}
-	seenIDs := make(map[string]int, len(canonicalIDs))
-	requestCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-		if r.Method != http.MethodPost {
-			t.Errorf("request %d method = %s, want POST", requestCount, r.Method)
-		}
-		if r.URL.Path != "/api/evals/terminal-bench-2-1/submit" {
-			t.Errorf("request %d path = %q, want canonical submit path", requestCount, r.URL.Path)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer fixture-key" {
-			t.Errorf("request %d authorization = %q, want bearer fixture key", requestCount, got)
-		}
-		if got := r.Header.Get("Content-Type"); got != "application/json" {
-			t.Errorf("request %d content type = %q, want application/json", requestCount, got)
-		}
-		var payload map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Errorf("decode shard request %d: %v", requestCount, err)
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
-		}
-		if requestCount > terminalBench21ShardCount {
-			t.Errorf("received unexpected request %d", requestCount)
-			http.Error(w, "too many requests", http.StatusBadRequest)
-			return
-		}
-		offset := 0
-		for i := range requestCount - 1 {
-			offset += wantSizes[i]
-		}
-		wantIDs := canonicalIDs[offset : offset+wantSizes[requestCount-1]]
-		assertTerminalShardPayload(t, payload, requestCount, wantIDs)
-		for _, id := range wantIDs {
-			seenIDs[id]++
-		}
-		covered := make([]int, requestCount)
-		for i := range covered {
-			covered[i] = i + 1
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"run":       map[string]any{"id": fmt.Sprintf("run-%02d", requestCount), "status": "approved"},
-			"aggregate": map[string]any{"pooledScore": float64(requestCount) / 100, "shardsCovered": covered},
-		})
-	}))
-	defer server.Close()
-
-	output, err := captureTerminalTestStdout(t, func() error {
-		return submitTerminalEval(parseArgs([]string{
-			"eval", "terminal", "submit", runDir,
-			"--dataset", terminalBench21Dataset,
-			"--hf-id", "fixture/model",
-			"--hardware", hardwarePath,
-			"--api-url", server.URL,
-			"--api-key", "fixture-key",
-			"--quiet",
-		}))
-	})
-	if err != nil {
-		t.Fatalf("submit canonical checkpoint: %v", err)
-	}
-	if requestCount != terminalBench21ShardCount {
-		t.Fatalf("submission request count = %d, want %d", requestCount, terminalBench21ShardCount)
-	}
-	if len(seenIDs) != len(canonicalIDs) {
-		t.Fatalf("submitted unique task IDs = %d, want %d", len(seenIDs), len(canonicalIDs))
-	}
-	for _, id := range canonicalIDs {
-		if seenIDs[id] != 1 {
-			t.Fatalf("task %q submitted %d times, want exactly once", id, seenIDs[id])
-		}
-	}
-	for shard := range terminalBench21ShardCount {
-		if want := fmt.Sprintf("run-%02d", shard+1); !strings.Contains(output, want) {
-			t.Fatalf("completion output did not contain parsed receipt %q: %s", want, output)
-		}
-	}
-	for _, want := range []string{
-		"status:approved",
-		"pooledScore:0.1",
-		"coverage:[1 2 3 4 5 6 7 8 9 10]",
-	} {
-		if !strings.Contains(output, want) {
-			t.Fatalf("completion output did not contain parsed receipt field %q: %s", want, output)
-		}
-	}
-}
-
 func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *testing.T) {
 	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
 	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
@@ -1812,18 +3201,6 @@ func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *
 	var received [terminalBench21ShardCount]atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := int(requestCount.Add(1)) - 1
-		if r.Method != http.MethodPost {
-			t.Errorf("request %d method = %s, want POST", call+1, r.Method)
-		}
-		if r.URL.Path != "/api/evals/terminal-bench-2-1/submit" {
-			t.Errorf("request %d path = %q, want canonical submit path", call+1, r.URL.Path)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer fixture-key" {
-			t.Errorf("request %d authorization = %q, want bearer fixture key", call+1, got)
-		}
-		if got := r.Header.Get("Content-Type"); got != "application/json" {
-			t.Errorf("request %d content type = %q, want application/json", call+1, got)
-		}
 		var payload struct {
 			ShardIndex int `json:"shardIndex"`
 		}
@@ -1834,6 +3211,9 @@ func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *
 		}
 		if call < len(received) {
 			received[call].Store(int32(payload.ShardIndex))
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("request %d method = %s, want POST", call+1, r.Method)
 		}
 		if payload.ShardIndex == 3 {
 			http.Error(w, "synthetic shard failure", http.StatusServiceUnavailable)
@@ -1872,203 +3252,6 @@ func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *
 	if !reflect.DeepEqual(details["completedShardIndexes"], []int{1, 2}) {
 		t.Fatalf("completed shard evidence = %#v, want [1 2]", details["completedShardIndexes"])
 	}
-}
-
-type terminalInspectRequestCounter struct {
-	calls atomic.Int32
-}
-
-func (c *terminalInspectRequestCounter) RoundTrip(*http.Request) (*http.Response, error) {
-	c.calls.Add(1)
-	return nil, errors.New("unexpected HTTP request")
-}
-
-type terminalInspectFixture struct {
-	datasetItemCount     int
-	datasetShardCount    int
-	shards               [][]map[string]any
-	bundles              map[string][]byte
-	reportedShardIndexes map[int]int
-	reportedItemCounts   map[int]int
-	wantAuthorization    string
-	shardRequests        []int
-	manifestRequests     []int
-	bundleRequests       int
-	unexpectedRequests   int
-}
-
-func newTerminalInspectFixture(t *testing.T, includeBundles bool) *terminalInspectFixture {
-	t.Helper()
-	ids := terminalBench21CanonicalTestTaskIDs(t)
-	fixture := &terminalInspectFixture{
-		datasetItemCount:     len(ids),
-		datasetShardCount:    terminalBench21ShardCount,
-		shards:               make([][]map[string]any, terminalBench21ShardCount),
-		bundles:              make(map[string][]byte, len(ids)),
-		reportedShardIndexes: map[int]int{},
-		reportedItemCounts:   map[int]int{},
-	}
-	for shard := range terminalBench21ShardCount {
-		start := shard * len(ids) / terminalBench21ShardCount
-		end := (shard + 1) * len(ids) / terminalBench21ShardCount
-		fixture.shards[shard] = make([]map[string]any, 0, end-start)
-		for _, id := range ids[start:end] {
-			row := terminalInspectManifestRow(id)
-			if includeBundles {
-				key := stringValue(row["bundle_key"])
-				archive := terminalInspectBundleArchive(t, id, nil)
-				fixture.setBundle(row, key, archive)
-			}
-			fixture.shards[shard] = append(fixture.shards[shard], row)
-		}
-	}
-	return fixture
-}
-
-func terminalInspectManifestRow(id string) map[string]any {
-	return map[string]any{
-		"question_id": id,
-		"bundle_key":  "eval-datasets/terminal-bench-2-1/tasks/" + id + ".tar.gz",
-		"sha256":      strings.Repeat("a", 64),
-		"byteSize":    1,
-	}
-}
-
-func terminalInspectBundleArchive(t *testing.T, id string, extraFiles map[string]string) []byte {
-	t.Helper()
-	taskJSON, err := json.Marshal(map[string]any{
-		"id": id, "version": "2.1", "instruction": "Inspect fixture " + id,
-		"source": "terminal-bench/" + id,
-	})
-	if err != nil {
-		t.Fatalf("marshal task fixture: %v", err)
-	}
-	files := map[string]string{
-		id + "/task.json":              string(taskJSON),
-		id + "/environment/Dockerfile": "FROM scratch\n",
-		id + "/tests/test.sh":          "#!/bin/sh\nexit 0\n",
-	}
-	for name, body := range extraFiles {
-		files[name] = body
-	}
-	return testReleaseTarGz(t, files)
-}
-
-func (f *terminalInspectFixture) setBundle(row map[string]any, key string, archive []byte) {
-	f.bundles[key] = archive
-	sum := sha256.Sum256(archive)
-	row["sha256"] = fmt.Sprintf("%x", sum)
-	row["byteSize"] = len(archive)
-}
-
-func (f *terminalInspectFixture) start(t *testing.T) *httptest.Server {
-	t.Helper()
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		canonicalShardPath := "/api/evals/terminal-bench-2-1/shard"
-		switch {
-		case r.URL.Path == canonicalShardPath:
-			if r.Method != http.MethodGet {
-				t.Errorf("shard method = %s, want GET", r.Method)
-			}
-			f.assertAuthorization(t, r)
-			shardIndex, err := strconv.Atoi(r.URL.Query().Get("shard"))
-			if err != nil || shardIndex < 1 || shardIndex > len(f.shards) {
-				http.Error(w, "invalid shard", http.StatusNotFound)
-				return
-			}
-			f.shardRequests = append(f.shardRequests, shardIndex)
-			reportedIndex := shardIndex
-			if override := f.reportedShardIndexes[shardIndex]; override != 0 {
-				reportedIndex = override
-			}
-			reportedCount := len(f.shards[shardIndex-1])
-			if override, ok := f.reportedItemCounts[shardIndex]; ok {
-				reportedCount = override
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"dataset": map[string]any{
-					"slug": terminalBench21Dataset, "itemCount": f.datasetItemCount, "shardCount": f.datasetShardCount,
-				},
-				"shard": map[string]any{
-					"shardIndex": reportedIndex, "itemCount": reportedCount, "selectedQuestionCount": reportedCount,
-				},
-				"downloadUrl": server.URL + "/manifest/" + strconv.Itoa(shardIndex),
-			})
-		case strings.HasPrefix(r.URL.Path, "/manifest/"):
-			shardIndex, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/manifest/"))
-			if err != nil || shardIndex < 1 || shardIndex > len(f.shards) {
-				http.NotFound(w, r)
-				return
-			}
-			f.manifestRequests = append(f.manifestRequests, shardIndex)
-			w.Header().Set("Content-Type", "application/x-ndjson")
-			encoder := json.NewEncoder(w)
-			for _, row := range f.shards[shardIndex-1] {
-				if err := encoder.Encode(row); err != nil {
-					t.Errorf("encode manifest shard %d: %v", shardIndex, err)
-					return
-				}
-			}
-		case r.URL.Path == "/api/evals/storage/download-url":
-			if r.Method != http.MethodGet {
-				t.Errorf("presign method = %s, want GET", r.Method)
-			}
-			f.assertAuthorization(t, r)
-			key := r.URL.Query().Get("key")
-			if _, ok := f.bundles[key]; !ok {
-				http.Error(w, "unknown bundle", http.StatusNotFound)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": server.URL + "/bundle?key=" + url.QueryEscape(key)})
-		case r.URL.Path == "/bundle":
-			key := r.URL.Query().Get("key")
-			archive, ok := f.bundles[key]
-			if !ok {
-				http.Error(w, "unknown bundle", http.StatusNotFound)
-				return
-			}
-			f.bundleRequests++
-			w.Header().Set("Content-Type", "application/gzip")
-			_, _ = w.Write(archive)
-		default:
-			f.unexpectedRequests++
-			http.Error(w, "unexpected inspect request", http.StatusInternalServerError)
-		}
-	}))
-	return server
-}
-
-func (f *terminalInspectFixture) assertAuthorization(t *testing.T, r *http.Request) {
-	t.Helper()
-	if f.wantAuthorization != "" && r.Header.Get("Authorization") != f.wantAuthorization {
-		t.Errorf("authorization = %q, want %q", r.Header.Get("Authorization"), f.wantAuthorization)
-	}
-}
-
-func captureTerminalTestStdout(t *testing.T, fn func() error) (string, error) {
-	t.Helper()
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("create stdout pipe: %v", err)
-	}
-	original := os.Stdout
-	os.Stdout = writer
-	defer func() { os.Stdout = original }()
-	callErr := fn()
-	if err := writer.Close(); err != nil {
-		t.Fatalf("close stdout writer: %v", err)
-	}
-	output, readErr := io.ReadAll(reader)
-	if err := reader.Close(); err != nil {
-		t.Fatalf("close stdout reader: %v", err)
-	}
-	if readErr != nil {
-		t.Fatalf("read captured stdout: %v", readErr)
-	}
-	return string(output), callErr
 }
 
 func terminalBench21CanonicalTestTaskIDs(t *testing.T) []string {
@@ -2147,560 +3330,4 @@ func assertTerminalShardPayload(t *testing.T, payload map[string]any, wantShardI
 			t.Fatalf("shard %d artifact %q itemIndex = %#v, want local index %d", wantShardIndex, wantID, artifact["itemIndex"], i)
 		}
 	}
-}
-
-type terminalTestRoundTripFunc func(*http.Request) (*http.Response, error)
-
-func (fn terminalTestRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
-	return fn(request)
-}
-
-func terminalTestHTTPResponse(request *http.Request, status int, body string) *http.Response {
-	return &http.Response{
-		StatusCode: status,
-		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader(body)),
-		Request:    request,
-	}
-}
-
-func TestTerminalUXEndpointFileDecodesSelectedEndpointMetadata(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "endpoint.json")
-	writeTerminalTestJSON(t, path, map[string]any{"endpoints": []any{
-		map[string]any{"ok": false, "baseUrl": "http://ignored.invalid", "servedModel": "ignored"},
-		map[string]any{
-			"ok":          true,
-			"baseUrl":     "http://selected.test/v1",
-			"servedModel": "selected-alias",
-			"serverMetadata": map[string]any{
-				"quantization": "Q5_K_M",
-				"model_path":   "/models/selected-model-Q5_K_M.gguf",
-			},
-		},
-	}})
-
-	metadata, err := loadTerminalEndpointFile(path)
-	if err != nil {
-		t.Fatalf("loadTerminalEndpointFile: %v", err)
-	}
-	if metadata.baseURL != "http://selected.test/v1" || metadata.servedModel != "selected-alias" {
-		t.Fatalf("selected endpoint identity = %#v", metadata)
-	}
-	if metadata.quantization != "Q5_K_M" || metadata.modelPath != "/models/selected-model-Q5_K_M.gguf" {
-		t.Fatalf("selected endpoint model metadata = %#v", metadata)
-	}
-}
-
-func TestTerminalUXEndpointFileRejectsZeroOrMultipleHealthyEndpoints(t *testing.T) {
-	tests := []struct {
-		name     string
-		items    []any
-		wantCode string
-	}{
-		{
-			name: "zero healthy",
-			items: []any{
-				map[string]any{"ok": false, "baseUrl": "http://one.test"},
-				map[string]any{"ok": false, "baseUrl": "http://two.test"},
-			},
-			wantCode: "endpoint_file_no_selection",
-		},
-		{
-			name: "multiple healthy",
-			items: []any{
-				map[string]any{"ok": true, "baseUrl": "http://one.test"},
-				map[string]any{"ok": true, "baseUrl": "http://two.test"},
-			},
-			wantCode: "endpoint_file_ambiguous",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "endpoint.json")
-			writeTerminalTestJSON(t, path, map[string]any{"endpoints": tc.items})
-			_, err := loadTerminalEndpointFile(path)
-			var cliErr cliError
-			if !errors.As(err, &cliErr) || cliErr.Code != tc.wantCode {
-				t.Fatalf("error = %#v, want cliError code %q", err, tc.wantCode)
-			}
-		})
-	}
-}
-
-func TestTerminalUXAutoDiscoverySelectsUniqueHealthyCandidateWithoutNetwork(t *testing.T) {
-	originalClient := apiHTTPClient
-	t.Cleanup(func() { apiHTTPClient = originalClient })
-	requests := []string{}
-	apiHTTPClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		requests = append(requests, request.URL.String())
-		if request.URL.Host == "localhost:8000" {
-			return terminalTestHTTPResponse(request, http.StatusOK, `{"data":[{"id":"fixture-model","quantization":"Q6_K"}]}`), nil
-		}
-		return nil, errors.New("fixture endpoint unavailable")
-	})}
-
-	baseURL, servedModel, info, err := discoverTerminalEndpoint(parseArgs([]string{"--quiet"}), "")
-	if err != nil {
-		t.Fatalf("discoverTerminalEndpoint: %v", err)
-	}
-	if baseURL != "http://localhost:8000" || servedModel != "fixture-model" || stringValue(info["quantization"]) != "Q6_K" {
-		t.Fatalf("discovery result = (%q, %q, %#v)", baseURL, servedModel, info)
-	}
-	wantRequests := []string{
-		"http://localhost:8080/v1/models",
-		"http://localhost:8000/v1/models",
-		"http://localhost:11434/v1/models",
-		"http://127.0.0.1:30000/v1/models",
-	}
-	if !reflect.DeepEqual(requests, wantRequests) {
-		t.Fatalf("discovery requests = %#v, want %#v", requests, wantRequests)
-	}
-}
-
-func TestTerminalUXAutoDiscoveryRejectsCredentialsWithoutExplicitTarget(t *testing.T) {
-	originalClient := apiHTTPClient
-	t.Cleanup(func() { apiHTTPClient = originalClient })
-	var networkCalls atomic.Int32
-	apiHTTPClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		networkCalls.Add(1)
-		return nil, fmt.Errorf("credentials must not be broadcast to %s", request.URL)
-	})}
-
-	_, _, _, err := discoverTerminalEndpoint(parseArgs([]string{"--model-api-key", "secret"}), "fixture-model")
-	var cliErr cliError
-	if !errors.As(err, &cliErr) || cliErr.Code != "endpoint_credentials_require_explicit_target" {
-		t.Fatalf("error = %#v, want endpoint_credentials_require_explicit_target", err)
-	}
-	if networkCalls.Load() != 0 {
-		t.Fatalf("credentialed auto-discovery made %d requests", networkCalls.Load())
-	}
-}
-
-func TestTerminalUXEndpointSelectionRejectsFileAndBaseTogether(t *testing.T) {
-	err := runTerminalEval(parseArgs([]string{
-		"eval", "terminal", "run", "--task-dir", t.TempDir(),
-		"--endpoint-file", "endpoint.json", "--base-url", "http://model.test",
-	}), false)
-	var cliErr cliError
-	if !errors.As(err, &cliErr) || cliErr.Code != "endpoint_selection_conflict" {
-		t.Fatalf("error = %#v, want endpoint_selection_conflict", err)
-	}
-}
-
-func TestTerminalUXEndpointMetadataRejectsExplicitConflicts(t *testing.T) {
-	for _, tc := range []struct {
-		name            string
-		field           string
-		explicit, live  string
-		compareFilename bool
-	}{
-		{name: "model path", field: "model-path", explicit: "/models/explicit.gguf", live: "/models/live.gguf", compareFilename: true},
-		{name: "quantization", field: "quantization", explicit: "Q8_0", live: "Q4_K_M"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := reconcileTerminalEndpointField(tc.field, tc.explicit, tc.live, tc.compareFilename)
-			var cliErr cliError
-			if !errors.As(err, &cliErr) || cliErr.Code != "endpoint_metadata_conflict" {
-				t.Fatalf("error = %#v, want endpoint_metadata_conflict", err)
-			}
-		})
-	}
-}
-
-func TestTerminalUXEndpointMetadataAcceptsMatchingExplicitFallbacks(t *testing.T) {
-	modelPath, err := reconcileTerminalEndpointField("model-path", "/client/path/model-Q5_K_M.gguf", "/server/path/model-Q5_K_M.gguf", true)
-	if err != nil || modelPath != "/server/path/model-Q5_K_M.gguf" {
-		t.Fatalf("matching model filename reconciliation = (%q, %v)", modelPath, err)
-	}
-	quantization, err := reconcileTerminalEndpointField("quantization", "q5_k_m", "Q5_K_M", false)
-	if err != nil || quantization != "Q5_K_M" {
-		t.Fatalf("matching quantization reconciliation = (%q, %v)", quantization, err)
-	}
-}
-
-func TestTerminalUXEndpointFileReconcilesLiveMetadataAndCompletionIsNonSubmit(t *testing.T) {
-	bundleDir := t.TempDir()
-	mustMkdir(t, filepath.Join(bundleDir, "tests"))
-	writeTerminalTestJSON(t, filepath.Join(bundleDir, "task.json"), map[string]any{
-		"id": "endpoint-reconciliation", "version": "2.1", "instruction": "Exercise endpoint reconciliation.", "source": "terminal-bench/endpoint-reconciliation",
-		"image":    map[string]any{"prebuilt": "fixture-image"},
-		"agent":    map[string]any{"timeoutSec": 30, "maxTurns": 1},
-		"verifier": map[string]any{"timeoutSec": 30, "command": "bash /tests/test.sh", "rewardFile": "/logs/verifier/reward.txt"},
-	})
-	endpointFile := filepath.Join(t.TempDir(), "endpoint.json")
-	writeTerminalTestJSON(t, endpointFile, map[string]any{"endpoints": []any{map[string]any{
-		"ok": true, "baseUrl": "http://saved-endpoint.test", "servedModel": "explicit-alias", "quantization": "Q8_0", "modelPath": "/server/models/explicit-model-Q8_0.gguf",
-	}}})
-	out := filepath.Join(t.TempDir(), "completed.json")
-
-	binDir := t.TempDir()
-	dockerLog := filepath.Join(t.TempDir(), "docker.log")
-	dockerScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LMX_DOCKER_LOG\"\ncase \"$*\" in\n  *\"cat /logs/verifier/reward.json\"*) printf '{\"reward\":1}\\n' ;;\nesac\nexit 0\n"
-	mustWrite(t, filepath.Join(binDir, "docker"), dockerScript)
-	if err := os.Chmod(filepath.Join(binDir, "docker"), 0o755); err != nil {
-		t.Fatalf("make fake docker executable: %v", err)
-	}
-	t.Setenv("LMX_DOCKER_LOG", dockerLog)
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	originalAPIClient := apiHTTPClient
-	originalDefaultClient := http.DefaultClient
-	t.Cleanup(func() {
-		apiHTTPClient = originalAPIClient
-		http.DefaultClient = originalDefaultClient
-	})
-	var endpointCalls atomic.Int32
-	apiHTTPClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		switch {
-		case request.URL.Host == "saved-endpoint.test" && request.URL.Path == "/v1/models":
-			endpointCalls.Add(1)
-			return terminalTestHTTPResponse(request, http.StatusOK, `{"data":[{"id":"explicit-alias","quantization":"Q8_0","model_path":"/server/models/explicit-model-Q8_0.gguf"}]}`), nil
-		case request.URL.Host == "saved-endpoint.test" && request.URL.Path == "/props":
-			endpointCalls.Add(1)
-			return terminalTestHTTPResponse(request, http.StatusOK, `{"model_path":"/server/models/explicit-model-Q8_0.gguf","quantization":"Q8_0"}`), nil
-		case request.URL.Host == "localmaxxing.test" && request.URL.Path == "/api/models/search":
-			return terminalTestHTTPResponse(request, http.StatusOK, `{"models":[]}`), nil
-		default:
-			return nil, fmt.Errorf("unexpected API request %s", request.URL)
-		}
-	})}
-	http.DefaultClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Host == "saved-endpoint.test" && request.URL.Path == "/props" {
-			return terminalTestHTTPResponse(request, http.StatusOK, `{"model_path":"/server/models/explicit-model-Q8_0.gguf","quantization":"Q8_0"}`), nil
-		}
-		return nil, fmt.Errorf("unexpected default-client request %s", request.URL)
-	})}
-
-	stdout, err := captureTerminalTestStdout(t, func() error {
-		return runTerminalEval(parseArgs([]string{
-			"eval", "terminal", "run", "--task-dir", bundleDir,
-			"--endpoint-file", endpointFile,
-			"--served-model", "explicit-alias",
-			"--model", "explicit/model",
-			"--model-path", "/client/models/explicit-model-Q8_0.gguf",
-			"--quantization", "Q8_0", "--quant-format", "gguf",
-			"--api-url", "http://localmaxxing.test",
-			"--agent-cmd", "true", "--agent-name", "fixture-agent",
-			"--out", out, "--quiet",
-		}), false)
-	})
-	if err != nil {
-		t.Fatalf("runTerminalEval: %v", err)
-	}
-	if endpointCalls.Load() < 2 {
-		t.Fatalf("selected endpoint received %d metadata probes, want live models and props", endpointCalls.Load())
-	}
-	for _, want := range []string{"[localmaxxing] local_execution_results_not_submitted", "local_execution_results_not_submitted: terminal tasks executed and checkpointed; no result was submitted to LocalMaxxing.", "Submit later with: lmx eval terminal submit"} {
-		if !strings.Contains(stdout, want) {
-			t.Fatalf("completion output missing %q:\n%s", want, stdout)
-		}
-	}
-	if strings.Contains(stdout, "submitted successfully") {
-		t.Fatalf("non-submit completion claimed submission:\n%s", stdout)
-	}
-
-	var artifact map[string]any
-	data, readErr := os.ReadFile(out)
-	if readErr != nil {
-		t.Fatalf("read completed artifact: %v", readErr)
-	}
-	if err := json.Unmarshal(data, &artifact); err != nil {
-		t.Fatalf("decode completed artifact: %v", err)
-	}
-	summary := asObject(artifact["summary"])
-	if summary["servedModel"] != "explicit-alias" || summary["quantization"] != "Q8_0" || summary["quantFormat"] != "gguf" {
-		t.Fatalf("reconciled endpoint metadata = %#v", summary)
-	}
-	resolution := asObject(summary["modelResolution"])
-	if resolution["loadedFilename"] != "explicit-model-Q8_0.gguf" || resolution["declaredBaseModel"] != "explicit/model" {
-		t.Fatalf("reconciled model identity metadata = %#v", resolution)
-	}
-	runConfig := asObject(summary["runConfig"])
-	if runConfig["modelEndpoint"] != "http://saved-endpoint.test" || runConfig["servedModelSource"] != "cli" {
-		t.Fatalf("run endpoint identity = %#v", runConfig)
-	}
-}
-
-func TestTerminalUXLoadedFilenameResolvesCanonicalHuggingFaceRepository(t *testing.T) {
-	originalAPIClient := apiHTTPClient
-	originalDefaultClient := http.DefaultClient
-	t.Cleanup(func() {
-		apiHTTPClient = originalAPIClient
-		http.DefaultClient = originalDefaultClient
-	})
-	var searchQuery string
-	apiHTTPClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Path != "/api/models/search" {
-			return nil, fmt.Errorf("unexpected LocalMaxxing request %s", request.URL)
-		}
-		searchQuery = request.URL.Query().Get("q")
-		return terminalTestHTTPResponse(request, http.StatusOK, `{"models":[{"hfId":"unsloth/Qwen3-8B-GGUF"}]}`), nil
-	})}
-	http.DefaultClient = &http.Client{Transport: terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Path != "/api/models/unsloth/Qwen3-8B-GGUF" {
-			return nil, fmt.Errorf("unexpected HuggingFace request %s", request.URL)
-		}
-		return terminalTestHTTPResponse(request, http.StatusOK, `{"siblings":[{"rfilename":"Qwen3-8B-UD-Q4_K_XL.gguf"}]}`), nil
-	})}
-
-	args := parseArgs([]string{"--api-url", "http://localmaxxing.test", "--hf-api-url", "http://huggingface.test", "--quiet"})
-	resolved, metadata := resolveTerminalModelIdentity(args, "", "/models/Qwen3-8B-UD-Q4_K_XL.gguf", "v1_models", "/models/Qwen3-8B-UD-Q4_K_XL.gguf")
-	if resolved != "unsloth/Qwen3-8B-GGUF" {
-		t.Fatalf("resolved model = %q, want exact repository containing loaded filename", resolved)
-	}
-	if searchQuery != "Qwen3-8B" {
-		t.Fatalf("model search query = %q, want filename-derived Qwen3-8B", searchQuery)
-	}
-	if metadata["loadedFilename"] != "Qwen3-8B-UD-Q4_K_XL.gguf" || metadata["sourceRepoMatch"] != "exact_filename" || metadata["status"] != "source_repo_verified" {
-		t.Fatalf("model resolution metadata = %#v", metadata)
-	}
-}
-
-func TestTerminalUXMonolithicArtifactUsesSavedMetadataForOfflineDeferredSubmit(t *testing.T) {
-	artifactPath := writeTerminalMonolithicFixture(t)
-	payloadPath := filepath.Join(t.TempDir(), "payload.json")
-
-	originalAPIClient := apiHTTPClient
-	originalDefaultClient := http.DefaultClient
-	t.Cleanup(func() {
-		apiHTTPClient = originalAPIClient
-		http.DefaultClient = originalDefaultClient
-	})
-	var networkCalls atomic.Int32
-	denyNetwork := terminalTestRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		networkCalls.Add(1)
-		return nil, fmt.Errorf("deferred submit must not access %s", request.URL)
-	})
-	apiHTTPClient = &http.Client{Transport: denyNetwork}
-	http.DefaultClient = &http.Client{Transport: denyNetwork}
-
-	binDir := t.TempDir()
-	dockerSentinel := filepath.Join(t.TempDir(), "docker-called")
-	mustWrite(t, filepath.Join(binDir, "docker"), "#!/bin/sh\nprintf called > \"$LMX_DOCKER_SENTINEL\"\nexit 99\n")
-	if err := os.Chmod(filepath.Join(binDir, "docker"), 0o755); err != nil {
-		t.Fatalf("make docker sentinel executable: %v", err)
-	}
-	t.Setenv("LMX_DOCKER_SENTINEL", dockerSentinel)
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	if err := submitTerminalEval(parseArgs([]string{
-		"eval", "terminal", "submit", artifactPath,
-		"--dry-run", "--out", payloadPath, "--quiet",
-	})); err != nil {
-		t.Fatalf("submitTerminalEval monolithic dry-run: %v", err)
-	}
-	if networkCalls.Load() != 0 {
-		t.Fatalf("deferred submit made %d model/API requests", networkCalls.Load())
-	}
-	if _, err := os.Stat(dockerSentinel); !os.IsNotExist(err) {
-		t.Fatalf("deferred submit accessed Docker/verifier execution: %v", err)
-	}
-
-	batch := readTerminalSubmitBatch(t, payloadPath)
-	if batch["dataset"] != "fixture-dataset" {
-		t.Fatalf("dataset = %#v, want saved fixture-dataset", batch["dataset"])
-	}
-	shards := anySlice(batch["shards"])
-	if len(shards) != 1 {
-		t.Fatalf("shard payload count = %d, want 1", len(shards))
-	}
-	payload := asObject(shards[0])
-	if payload["hfId"] != "fixture/saved-model" || payload["modelRevision"] != "saved-revision" || payload["shardIndex"] != float64(4) {
-		t.Fatalf("saved model/shard defaults = %#v", payload)
-	}
-	if payload["quantization"] != "Q5_K_M" || payload["quantFormat"] != "gguf" || payload["runnerVersion"] != "saved-runner" {
-		t.Fatalf("saved run metadata defaults = %#v", payload)
-	}
-	hardware := asObject(payload["hardware"])
-	if hardware["cpu"] != "Saved CPU" || hardware["ramGb"] != float64(64) {
-		t.Fatalf("saved hardware = %#v", hardware)
-	}
-	runConfig := asObject(payload["runConfig"])
-	if runConfig["agent"] != "saved-agent" || runConfig["sourceArtifactVersion"] != float64(2) || runConfig["sourceServedModel"] != "saved-served-model" {
-		t.Fatalf("saved/additive monolithic provenance = %#v", runConfig)
-	}
-	artifacts := anySlice(payload["artifacts"])
-	response := stringValue(asObject(artifacts[0])["response"])
-	if !strings.Contains(response, "SAVED_MONOLITHIC_RESPONSE") || !strings.Contains(response, "SAVED_MONOLITHIC_VERIFIER") {
-		t.Fatalf("monolithic response/verifier were not packaged: %q", response)
-	}
-}
-
-func TestTerminalUXMonolithicArtifactRejectsExplicitSavedMetadataConflicts(t *testing.T) {
-	tests := []struct {
-		name string
-		args []string
-	}{
-		{name: "dataset", args: []string{"--dataset", "other-dataset"}},
-		{name: "hf id", args: []string{"--hf-id", "other/model"}},
-		{name: "model revision", args: []string{"--model-revision", "other-revision"}},
-		{name: "shard index", args: []string{"--shard-index", "3"}},
-		{name: "quantization", args: []string{"--quantization", "Q8_0"}},
-		{name: "quant format", args: []string{"--quant-format", "safetensors"}},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			artifactPath := writeTerminalMonolithicFixture(t)
-			argv := []string{"eval", "terminal", "submit", artifactPath, "--dry-run", "--quiet"}
-			argv = append(argv, tc.args...)
-			err := submitTerminalEval(parseArgs(argv))
-			var cliErr cliError
-			if !errors.As(err, &cliErr) || cliErr.Code != "checkpoint_metadata_conflict" {
-				t.Fatalf("error = %#v, want checkpoint_metadata_conflict", err)
-			}
-		})
-	}
-
-	t.Run("hardware", func(t *testing.T) {
-		artifactPath := writeTerminalMonolithicFixture(t)
-		hardwarePath := filepath.Join(t.TempDir(), "hardware.json")
-		writeTerminalTestJSON(t, hardwarePath, map[string]any{"hwClass": "CPU_ONLY", "cpu": "Different CPU", "ramGb": 64})
-		err := submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", artifactPath, "--hardware", hardwarePath, "--dry-run", "--quiet"}))
-		var cliErr cliError
-		if !errors.As(err, &cliErr) || cliErr.Code != "checkpoint_metadata_conflict" {
-			t.Fatalf("error = %#v, want checkpoint_metadata_conflict", err)
-		}
-	})
-}
-
-func TestTerminalUXLegacyCheckpointDirectoryRemainsAccepted(t *testing.T) {
-	runDir, _ := writeDeferredTerminalSubmitFixture(t)
-	source, err := loadTerminalDeferredSource(runDir)
-	if err != nil {
-		t.Fatalf("loadTerminalDeferredSource legacy directory: %v", err)
-	}
-	if source.monolithic || source.root == "" || len(source.entries) != 2 || len(source.results) != 0 {
-		t.Fatalf("legacy deferred source = %#v", source)
-	}
-	if source.entries[0].Task != "pass-task" || source.entries[1].Task != "fail-task" {
-		t.Fatalf("legacy summary entries = %#v", source.entries)
-	}
-}
-
-func TestTerminalUXFailureSummaryClassifiesOutcomesAndIncludesActionableFields(t *testing.T) {
-	bundles := []terminalBundle{
-		{Task: terminalTask{ID: "passed"}},
-		{Task: terminalTask{ID: "model-error"}},
-		{Task: terminalTask{ID: "unscored"}},
-		{Task: terminalTask{ID: "timed-out"}},
-		{Task: terminalTask{ID: "turn-limit", Agent: terminalAgentConfig{MaxTurns: 3}}},
-		{Task: terminalTask{ID: "verifier-rejected"}},
-	}
-	results := []terminalTaskResult{
-		{scored: true, pass: true},
-		{errCode: "model_call_failed", errText: "endpoint returned 503", turns: 1, lastProgressAt: "2026-07-17T01:01:01Z"},
-		{errText: "verifier never started", turns: 2, lastProgressAt: "2026-07-17T01:02:02Z"},
-		{scored: true, agentOutcomeCode: "agent_timeout", agentOutcomeText: "external agent timed out before verification", turns: 1, lastProgressAt: "2026-07-17T01:03:03Z"},
-		{scored: true, agentOutcomeCode: "max_turns_exhausted", agentOutcomeText: "agent exhausted its maximum turns before verifier success", turns: 3, lastProgressAt: "2026-07-17T01:04:04Z"},
-		{scored: true, turns: 1, verifierOutput: "canonical verifier rejected the task", lastProgressAt: "2026-07-17T01:05:05Z"},
-	}
-	checkpoint := filepath.Join("saved", "atomic-checkpoint")
-	stderr := captureTerminalTestStderr(t, func() {
-		printTerminalFailureSummary(
-			parseArgs([]string{"--json-status"}),
-			bundles,
-			results,
-			terminalConfig{maxTurns: 3},
-			checkpoint,
-		)
-	})
-	line := strings.TrimSpace(stderr)
-	var event map[string]any
-	if err := json.Unmarshal([]byte(line), &event); err != nil {
-		t.Fatalf("decode terminal_failure_summary event %q: %v", line, err)
-	}
-	if event["event"] != "terminal_failure_summary" || event["failedTasks"] != float64(5) {
-		t.Fatalf("failure summary identity = %#v", event)
-	}
-	categories := asObject(event["categories"])
-	for _, category := range []string{"model_call_failed", "infrastructure_error", "agent_timeout", "max_turns_exhausted", "verifier_failed"} {
-		if categories[category] != float64(1) {
-			t.Fatalf("category %q count = %#v; all categories = %#v", category, categories[category], categories)
-		}
-	}
-	failures := anySlice(event["failures"])
-	if len(failures) != 5 {
-		t.Fatalf("failure rows = %d, want 5", len(failures))
-	}
-	byTask := map[string]map[string]any{}
-	for _, raw := range failures {
-		failure := asObject(raw)
-		byTask[stringValue(failure["taskId"])] = failure
-		for _, field := range []string{"taskId", "outcome", "verifierSummary", "turns", "maxTurns", "artifactPath", "lastProgressAt"} {
-			if _, present := failure[field]; !present {
-				t.Fatalf("failure row missing actionable field %q: %#v", field, failure)
-			}
-		}
-	}
-	if byTask["model-error"]["outcome"] != "model_call_failed" || byTask["model-error"]["verifierSummary"] != "endpoint returned 503" {
-		t.Fatalf("model failure row = %#v", byTask["model-error"])
-	}
-	if byTask["turn-limit"]["outcome"] != "max_turns_exhausted" || byTask["turn-limit"]["turns"] != float64(3) || byTask["turn-limit"]["maxTurns"] != float64(3) {
-		t.Fatalf("turn exhaustion row = %#v", byTask["turn-limit"])
-	}
-	wantArtifact := filepath.Join(checkpoint, terminalCheckpointWrapperName("verifier-rejected"))
-	if byTask["verifier-rejected"]["artifactPath"] != wantArtifact || byTask["verifier-rejected"]["lastProgressAt"] != "2026-07-17T01:05:05Z" {
-		t.Fatalf("verifier failure recovery fields = %#v, want artifact %q", byTask["verifier-rejected"], wantArtifact)
-	}
-	if _, included := byTask["passed"]; included {
-		t.Fatalf("successful task appeared in failure summary: %#v", byTask["passed"])
-	}
-}
-
-func writeTerminalMonolithicFixture(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "completed-terminal-run.json")
-	writeTerminalTestJSON(t, path, map[string]any{
-		"summary": map[string]any{
-			"artifactVersion": 2,
-			"dataset":         "fixture-dataset",
-			"hfId":            "fixture/saved-model",
-			"modelRevision":   "saved-revision",
-			"shardIndex":      4,
-			"hardware":        map[string]any{"hwClass": "CPU_ONLY", "cpu": "Saved CPU", "ramGb": 64},
-			"quantization":    "Q5_K_M",
-			"quantFormat":     "gguf",
-			"agent":           "saved-agent",
-			"runnerVersion":   "saved-runner",
-			"servedModel":     "saved-served-model",
-			"declaredModel":   "fixture/saved-model",
-			"modelResolution": map[string]any{"status": "matched"},
-			"quantizationResolution": map[string]any{
-				"trusted": "Q5_K_M", "trustedSource": "endpoint_file",
-			},
-			"runConfig": map[string]any{"protocol": "react-shell", "modelEndpoint": "http://saved-endpoint.test"},
-		},
-		"results": []any{map[string]any{
-			"question_id": "saved-task", "pass": true, "scored": true,
-			"wallTimeMs": 125,
-			"tokenUsage": map[string]any{"inputTokens": 3, "outputTokens": 2, "totalTokens": 5, "modelCalls": 1},
-			"turns":      1, "question": "Saved question", "prompt": "Saved prompt",
-			"response": "SAVED_MONOLITHIC_RESPONSE", "verifierOutput": "SAVED_MONOLITHIC_VERIFIER",
-		}},
-	})
-	return path
-}
-
-func captureTerminalTestStderr(t *testing.T, fn func()) string {
-	t.Helper()
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("create stderr pipe: %v", err)
-	}
-	original := os.Stderr
-	os.Stderr = writer
-	fn()
-	if err := writer.Close(); err != nil {
-		t.Fatalf("close stderr writer: %v", err)
-	}
-	os.Stderr = original
-	data, err := io.ReadAll(reader)
-	if closeErr := reader.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		t.Fatalf("read captured stderr: %v", err)
-	}
-	return string(data)
 }

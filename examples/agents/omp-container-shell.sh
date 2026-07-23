@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -uo pipefail
+set -euo pipefail
 
 : "${LMX_TERMINAL_CONTAINER:?}"
 : "${LMX_TERMINAL_TASK_ID:?}"
@@ -106,6 +106,7 @@ docker cp "$PROMPT_FILE" "$LMX_TERMINAL_CONTAINER:$CONTAINER_PROMPT_FILE"
 
 printf '[harness=omp-container-shell]\n[container=%s]\n[session=%s]\n' "$LMX_TERMINAL_CONTAINER" "$SESSION_DIR"
 
+set +e
 timeout -k 10 "$OMP_BUDGET_SEC" docker exec \
   -e LLAMA_CPP_BASE_URL="$CONTAINER_BASE_URL" \
   -e OMP_MODEL="${OMP_MODEL:-${LMX_TERMINAL_MODEL:-}}" \
@@ -119,14 +120,118 @@ exec /tmp/localmaxxing-omp -p \
   --no-session \
   --provider llama.cpp \
   --model "${OMP_MODEL:?Set OMP_MODEL or LMX_TERMINAL_MODEL}" \
+  --tools bash \
+  --no-extensions \
   --auto-approve \
   --approval-mode yolo \
   --cwd /app \
   "$prompt"' \
   2>&1 | "$HOST_TRACE_FILTER" "$LOG" 67108864 2097152
-STATUS=${PIPESTATUS[0]}
+PIPE_STATUSES=("${PIPESTATUS[@]}")
+set -e
+STATUS="${PIPE_STATUSES[0]}"
+FILTER_STATUS="${PIPE_STATUSES[1]}"
 
 echo "[omp_exit=$STATUS]"
 echo "----- omp output -----"
 cat "$LOG" 2>/dev/null || true
+
+TRACE_STATUS=0
+python3 - "$LOG" <<'PY' || TRACE_STATUS=$?
+import json
+import sys
+
+trace_path = sys.argv[1]
+tool_executions = 0
+terminal_assistant = None
+parse_failed = False
+
+try:
+    trace = open(trace_path, "rb")
+except OSError:
+    raise SystemExit(20)
+
+with trace:
+    for raw_line in trace:
+        if not raw_line.strip():
+            continue
+        try:
+            event = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            parse_failed = True
+            continue
+        if not isinstance(event, dict):
+            parse_failed = True
+            continue
+        if event.get("type") == "tool_execution_end":
+            tool_executions += 1
+        if event.get("type") != "message_end":
+            continue
+        message = event.get("message")
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            terminal_assistant = (message, event)
+        elif event.get("role") == "assistant":
+            terminal_assistant = (event,)
+
+
+def reported(source, field):
+    if field not in source or source[field] is None:
+        return False
+    value = source[field]
+    return not isinstance(value, str) or bool(value.strip())
+
+
+def concise(value):
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    text = "".join(character if character.isprintable() else " " for character in text)
+    text = " ".join(text.split())
+    return text[:240]
+
+
+if terminal_assistant is not None:
+    stop_error = any(source.get("stopReason") == "error" for source in terminal_assistant)
+    error_message = next(
+        (source["errorMessage"] for source in terminal_assistant if reported(source, "errorMessage")),
+        None,
+    )
+    error_status = next(
+        (source["errorStatus"] for source in terminal_assistant if reported(source, "errorStatus")),
+        None,
+    )
+    if stop_error or error_message is not None or error_status is not None:
+        if tool_executions:
+            raise SystemExit(12)
+        if error_message is not None:
+            detail = concise(error_message)
+        elif error_status is not None:
+            detail = "errorStatus=" + concise(error_status)
+        else:
+            detail = "stopReason=error"
+        print(f"omp failed before tool execution: {detail}", file=sys.stderr)
+        raise SystemExit(10)
+
+raise SystemExit(20 if parse_failed else 0)
+PY
+
+if (( FILTER_STATUS != 0 )); then
+  exit "$FILTER_STATUS"
+fi
+if (( STATUS == 124 || STATUS == 137 )); then
+  exit 0
+fi
+if (( TRACE_STATUS == 12 )); then
+  exit 0
+fi
+if (( TRACE_STATUS == 10 )); then
+  if (( STATUS != 0 )); then
+    exit "$STATUS"
+  fi
+  exit 1
+fi
+if (( STATUS != 0 )); then
+  exit "$STATUS"
+fi
 exit 0

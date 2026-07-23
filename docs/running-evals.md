@@ -337,47 +337,35 @@ Verify a bundle with its oracle solution before scoring a model:
 lmx eval terminal verify ./tb-bundles/adaptive-rejection-sampler --oracle --out oracle.json
 ```
 
-Create a reusable endpoint selection file, then run local bundles without
-submitting:
+Preflight a local bundle selection before execution:
 
 ```bash
-lmx endpoint discover --out endpoint.json --include-server-metadata
-
 lmx eval terminal run --task-dir ./tb-bundles \
-  --api-url https://www.localmaxxing.com \
-  --endpoint-file endpoint.json \
+  --base-url http://localhost:8000 \
   --model Qwen/Qwen3-8B \
-  --hardware hardware.json \
+  --out terminal-preflight.json \
+  --dry-run
+```
+
+`--dry-run` is an explicit preflight: it validates the selected local bundles
+or fetches and resolves an approved dataset manifest. It writes the resolved
+plan to `--out` when provided, but does not start Docker, call the model
+endpoint, run an external agent, or invoke a verifier.
+
+Run the same bundles locally without publishing:
+
+```bash
+lmx eval terminal run --task-dir ./tb-bundles \
+  --base-url http://localhost:8000 \
+  --model Qwen/Qwen3-8B \
   --out terminal-run.json \
-  --checkpoint-dir terminal-run.checkpoint \
-  --resume none \
-  --repeat-batch-limit 3 \
   --trace-dir terminal-traces
 ```
 
-`eval terminal run` always executes tasks that are not safely resumed. Omitting
-`--submit` emits `local_execution_results_not_submitted`: execution happened,
-results were checkpointed, and nothing was submitted. `--dry-run` is not a
-no-execution mode for `run`. By contrast, deferred `submit --dry-run` emits
-`offline_submit_validation_no_execution` and executes no task, Docker, model,
-verifier, or network submission.
-
-For the built-in agent, `--base-url` and `--endpoint-file` are mutually
-exclusive endpoint selectors. The file must contain exactly one `ok:true`
-endpoint and contributes only that URL; the CLI re-probes its live `/v1/models`
-and optional `/props` state before execution. With neither selector and no
-`--model-api-key`, the CLI probes localhost ports 8080, 8000, 11434, and 30000
-and proceeds only when one endpoint matches unambiguously. Credentials disable
-broad auto-probing: `--model-api-key` requires an explicit `--base-url` or
-trusted `--endpoint-file`.
-
-`--served-model` is an exact live-model selector. Explicit `--model-path` and
-`--quantization` values are assertions reconciled with live endpoint metadata,
-not overrides; conflicts stop the run. A canonical `--model org/name` is also
-rejected if it conflicts with an exact source repo verified from the live loaded
-filename. Automatic canonical-HuggingFace resolution succeeds only when that
-exact filename is verified in one unambiguous candidate repo; otherwise the CLI
-does not guess, and submission requires the correct `--model org/name`.
+With neither `--dry-run` nor `--submit`, the CLI executes the tasks, agent, and
+verifier locally, saves the results, and prints `Local run complete — nothing
+submitted.` No LocalMaxxing API key or hardware file is required for that local
+execution.
 
 By default the built-in harness runs every turn in one persistent shell session
 (`docker exec -i <container> bash -l`), so `cd`, `export`, and `source` carry
@@ -385,50 +373,38 @@ across turns (`protocol: "react-shell"`). Pass `--shell-mode stateless` to run
 each command in a fresh `docker exec` with no shared state (`protocol:
 "react-bash"`).
 
-Every verifier attempt commits into one private checkpoint directory containing
-`checkpoint.json`, ordered `summary.json`, and one safe JSON task wrapper per
-attempted verifier. A process lock rejects concurrent writers. Each wrapper is
-written, synced, and renamed in that same directory first; checkpoint metadata
-is written atomically, and `summary.json` is the last atomic task-set commit.
-The directory and parent are synced. `--resume none` clears and initializes this
-private checkpoint before any task starts instead of rotating whole directories.
+Persistent shell mode changes command state, not task budgets. The resolved turn
+cap uses the first positive value in this order: explicit `--max-turns`, the
+task manifest's `agent.maxTurns`, then 50 turns. The built-in agent loop and the
+bundled Terminus-2 adapter enforce that cap. An arbitrary `--agent-cmd` only
+receives it through `LMX_TERMINAL_MAX_TURNS`; the CLI cannot verify that the
+wrapper enforces it. The whole-agent deadline uses explicit `--agent-timeout`,
+manifest `agent.timeoutSec`, then 900 seconds, and is enforced for every agent
+mode. Persistent mode does not inflate either limit. Built-in model requests default
+to a 10-minute per-request timeout, and the first attempt reserves part of the
+remaining agent budget for one retry. Terminal model completions are capped at
+16,384 tokens by default and 8,192 tokens on retry; pass `--max-tokens` to set
+an explicit cap for both attempts.
 
-After a persisted or resumed task the CLI prints dataset, shard, task index/ID,
-checkpoint path, and last-progress time. While any task is incomplete, it prints
-the exact `lmx eval terminal run ... --resume <checkpoint>` command and never a
-submit command. A deferred-submit command appears only after all selected tasks
-have complete canonical verifier scores.
+While a model request is in flight, JSON status emits a
+`terminal_model_call_heartbeat` every minute with the task ID, turn, initial or
+retry attempt, elapsed seconds, and remaining whole-agent time. This makes slow
+local inference distinguishable from a stalled CLI without changing the model
+request or agent deadlines.
 
-`--resume` accepts `none` (default), `auto` (the default checkpoint path), or an
-explicit directory. V3 resume is intentionally strict: dataset, shard, complete
-canonical manifest identity/hash/version and task IDs, selected task ordering
-and bundle digests, declared/canonical/served model identities and resolution,
-model revision, quantization, hardware object/hash, agent/harness configuration,
-runner label, and harness fingerprint must all match. A mismatch fails before
-task execution. Only wrappers with a completed verifier and a parsed canonical
-reward resume; interrupted, unscored, timed-out, or unparseable verifier attempts
-remain diagnostic artifacts but are rerun. Legacy directories remain submit-only.
+While an external command is in flight, JSON status similarly emits
+`terminal_external_agent_heartbeat` every minute with the task ID, execution
+mode, elapsed seconds, and remaining whole-agent time. Detached `status --json`
+reports the newest complete canonical event as `lastActivityAt`; checkpoint
+`updatedAt` remains the last task-state transition.
 
-Terminal runs use Harbor-like long task budgets by default. If `--agent-timeout`
-is omitted, each task gets `max(task.json agent.timeoutSec, 14400)` seconds.
-Task/agent budget, manifest verifier timeout, shell-command timeout, and model
-HTTP timeout are separate controls. `--command-timeout-seconds` bounds each
-built-in or routed Terminus-2 shell command (legacy `--command-timeout` is still
-accepted); it never changes the task verifier timeout. A built-in command timeout
-kills only that command, restarts the persistent shell, skips the rest of that
-command batch, and returns a recovery observation to the agent. Durable container
-files remain available, so the next turn can inspect partial state, resume a
-download, or choose a smaller bounded action. Repeating the same timed-out batch
-is still stopped by the no-progress guard. Routed external agents report
-`command_timeout` when their external harness exits on routed-shell timeout.
-`--endpoint-timeout-seconds` bounds only model HTTP requests (default 600 seconds,
-with retry reserve). Model completions default to 16,384 tokens and 8,192 on
-retry; explicit `--max-tokens` applies to both.
-
-The built-in harness fingerprints normalized command batches and observations.
-After `--repeat-batch-limit - 1` identical or near-identical no-progress batches
-it emits a concise protocol nudge; persistence after that ends the agent as
-`agent_protocol_exhausted` and still proceeds to the canonical verifier.
+Each shell command has a 300-second timeout by default, capped by the remaining
+whole-agent time; override it with `--command-timeout`. A timed-out command is
+visible as exit 124 in the transcript and as a `terminal_turn` status with
+`timedOut: true`; the next model observation includes a recovery hint to inspect
+partial state or try a smaller, bounded, non-interactive command. In persistent
+mode the timed-out shell is restarted and its shell state is reset, while the
+agent can continue within its remaining turn and time budgets.
 
 Use `--trace-dir <dir>` when you want a local, browsable copy of what happened
 inside each task. The CLI writes one subdirectory per `question_id` containing:
@@ -444,24 +420,18 @@ inside each task. The CLI writes one subdirectory per `question_id` containing:
   `usage.json` when the agent trace exposes model usage, when `--agent-cmd` is
   used.
 
-After execution, `terminal_failure_summary` contains actionable rows with task
-ID, outcome, concise verifier summary, `turns`/`maxTurns`, exact artifact path,
-and `lastProgressAt`. The human table prints the same data. Outcomes distinguish
-`command_timeout`, `agent_protocol_exhausted`, agent/task timeout, max-turn
-exhaustion, verifier failure, and infrastructure/model errors.
-
-Scoring follows Harbor canonical verifier semantics: after the agent finishes,
-`tests/` is copied to `/tests` and the verifier command runs in a non-login
-shell with its own manifest timeout. `/logs/verifier/reward.json` (`{"reward":
-<num>}`) takes precedence over `reward.txt` (bare float), and `reward >= 1.0`
-passes. The checkpoint separately records `verifierAttempted`,
-`verifierCompleted`, and `rewardParsed`. A completed parse is a canonical scored
-result; copy failures, timeouts, and missing/unparseable rewards are diagnostic
-attempts that are checkpointed but not resumed or submitted as canonical scores.
-Agent outcomes do not prevent verification: partial work left by
-`command_timeout`, task timeout, repetition exhaustion, or max-turn exhaustion
-is still verified.
-Oracle runs mirror Harbor's OracleAgent — `solution/` is copied to `/solution` and `solve.sh`
+Scoring follows harbor canonical verifier semantics: after the agent finishes,
+`tests/` is copied to `/tests` in the task container and the verifier command
+(default `bash /tests/test.sh`) runs in a non-login shell. The reward file is
+the sole pass signal — `/logs/verifier/reward.json` (`{"reward": <num>}`) takes
+precedence over `/logs/verifier/reward.txt` (bare float), and a task passes
+when `reward >= 1.0`. The verifier's exit code is ignored once a reward was
+written. A verifier timeout or missing/unparseable reward records a failed
+verifier result locally, but cannot satisfy complete-shard publication. If the
+built-in agent reaches its whole-agent deadline, the CLI still runs the verifier
+against whatever container state the agent left behind, so partial work
+completed before the deadline can score. Oracle runs (`verify --oracle`) mirror
+harbor's OracleAgent — `solution/` is copied to `/solution` and `solve.sh`
 runs as root with `DEBIAN_FRONTEND=noninteractive` plus the task's
 `[solution].env`, bounded by the agent timeout, and verification proceeds even
 when `solve.sh` exits non-zero. Task env values support harbor `${VAR}` /
@@ -472,94 +442,137 @@ import with a `terminal_import_skipped` event; this runner only supports
 single-container Dockerfile or prebuilt-image environments (all of Terminal-
 Bench 2.1 qualifies).
 
-Inspect every declared public shard before starting a live run. By default this
-downloads manifests only; add `--verify-bundles` to download and validate every
-referenced archive without starting Docker, contacting a model or verifier, or
-submitting results:
-
-```bash
-lmx eval terminal inspect terminal-bench-2-1 \
-  --api-url https://www.localmaxxing.com \
-  --verify-bundles \
-  --json
-```
-
-Run the inspected public dataset against the separate model origin and save the
-completed shard without submitting it:
+Run and submit an approved public dataset:
 
 ```bash
 lmx eval terminal run terminal-bench-2-1 \
-  --api-url https://www.localmaxxing.com \
-  --endpoint-file endpoint.json \
+  --base-url http://localhost:8000 \
   --model Qwen/Qwen3-8B \
   --hardware hardware.json \
-  --out completed-terminal-run.json \
+  --run-dir ./runs/tb21-qwen \
   --resume auto \
-  --command-timeout-seconds 1800
+  --out terminal-run.json \
+  --json-status \
+  --json \
+  --submit
 ```
 
-The default checkpoint for that command is
-`completed-terminal-run.json.checkpoint`. Public acquisition validates the full
-unfiltered canonical shard manifest—including ordered task assignment, bundle
-key, SHA-256, byte size, bundle task ID/version/source—before applying
-`--questions` or `--task`, downloading, or executing anything.
+The approved `terminal-bench-2-1` dataset deterministically partitions its 89
+tasks into 10 disjoint shards. For dataset preflight and publication flows,
+omitting `--shard` queries aggregate coverage for the resolved model,
+quantization, quantization format, and harness key, then selects the first
+missing shard. Pass `--shard <index>` to override that assignment explicitly.
+A preflight reports the selected shard but does not reserve it.
 
-The monolithic artifact persists the dataset and selected shard, resolved
-canonical model identity and model-resolution evidence, quantization,
-model revision, hardware, agent/harness configuration, timing, and token usage.
-Validate that exact completed work offline, then submit the same file—no task,
-model call, Docker container, or verifier is run again:
+### Durable runs and machine output
+
+For long-running or agent-driven execution, pass a unique `--run-dir`. The CLI
+creates the directory and maintains:
+
+- `run.json` — checkpoint version, state, immutable run fingerprint, ordered
+  task IDs, and task IDs whose latest attempt was durably persisted.
+- `results/<task>-<hash>.json` — one atomic result per attempted task, including
+  the full response, verifier output, usage, timing, and explicit `scored` value.
+- `traces/<task>/` — the normal browsable trace tree when `--trace-dir` was not
+  supplied separately.
+- `result.json` — the assembled final result and, after publication, submission
+  receipt.
+- `process.json` — detached-worker PID, lifecycle, timestamps, event/output paths,
+  exit status, and final error.
+- `events.jsonl` — canonical append-only JSONL progress and error records used by
+  `eval terminal logs`; raw diagnostics go to `worker.stderr`, while final worker
+  stdout remains isolated in `worker.stdout`.
+
+Preflight with the final dataset, endpoint/model, hardware, and selection first.
+Then launch the same run with a unique directory:
 
 ```bash
-lmx eval terminal submit completed-terminal-run.json \
-  --api-url https://www.localmaxxing.com \
-  --dry-run \
-  --out terminal-submit-batch.json
+lmx eval terminal run terminal-bench-2-1 \
+  --base-url http://localhost:8000 \
+  --model Qwen/Qwen3-8B \
+  --hardware hardware.json \
+  --run-dir ./runs/tb21-qwen \
+  --resume auto \
+  --json-status \
+  --submit \
+  --detach
 
-lmx eval terminal submit completed-terminal-run.json \
-  --api-url https://www.localmaxxing.com \
-  --api-key "$LMX_API_KEY"
+lmx eval terminal status ./runs/tb21-qwen --json
+lmx eval terminal logs ./runs/tb21-qwen --follow
+# When a cooperative stop is required:
+lmx eval terminal cancel ./runs/tb21-qwen --json
 ```
 
-To recover an incomplete task whose repaired state still exists in a named
-container, rerun the canonical verifier and atomically persist its fresh score:
+`--detach` requires `--run-dir` and cannot be combined with `--dry-run`. The
+launcher returns only after writing the process record and starting the worker;
+that acknowledgement is not run success. `status --json` emits one snapshot with
+worker liveness, scored/pending/current task counts, timestamps, durable paths,
+and any final error. `logs` emits only complete stored JSONL records; `--follow`
+waits for a persisted terminal state and EOF. Do not use PID disappearance, log
+EOF, or a heartbeat gap as a completion test.
 
-```bash
-lmx eval terminal recover completed-terminal-run.json.checkpoint \
-  --task-id caffe-cifar-10 \
-  --container lmx-tb-caffe-recovered \
-  --bundle ./tb-bundles/caffe-cifar-10 \
-  --result recovered-task.json
-```
+`cancel` is idempotent and cooperative: it records the request, signals the
+worker, stops scheduling new tasks, cancels active work, and lets bounded Docker
+cleanup finish. SIGINT and SIGTERM take the same resumable path. A second signal
+or `cancel --force` may hard-stop cleanup; on the next exact `--resume auto`, the
+CLI reconciles containers labeled for that run before starting pending work.
+Previously scored task files remain reusable; the interrupted active task runs
+again.
 
-`--result` is optional and may supply bounded telemetry only from an incomplete
-one-task wrapper; its pass/scored/verifier fields are never trusted. Recovery
-requires an exact v3 checkpoint, task membership, the unmodified bundle's
-deterministic identity/hash/version/task ID, and matching nested provenance. It
-rejects traversal, symlink, special-file, trailing-JSON, concurrent-writer, and
-completed-task overwrite inputs before verifier execution. It then copies the
-bundle's canonical tests into the existing container, runs the bundle's exact
-verifier command, parses its canonical reward file, and derives pass/fail only
-from that fresh verifier run. The scored wrapper and summary are persisted before
-`terminal_checkpoint_recovered` is emitted. Recovery invokes Docker and the
-verifier, but never invokes a model or LocalMaxxing submission endpoint.
+`--resume auto` is the default when `--run-dir` is present. A restarted command
+validates the dataset, shard, ordered task manifests, endpoint/model identity,
+quantization, hardware, harness, and execution options against the saved
+fingerprint. It reuses only tasks with `scored: true`; interrupted or unscored
+tasks run again. Each scored task emits `terminal_task_resumed` instead of
+`terminal_task_started`. A mismatch fails with `checkpoint_mismatch` rather
+than mixing results from different runs. A checkpoint already marked `submitted`
+fails with `checkpoint_already_submitted` instead of posting a duplicate receipt.
+`--resume none` requires a directory without an existing `run.json`; use a new
+directory to rerun and submit the same shard again intentionally.
 
-Deferred `submit --dry-run` emits
-`offline_submit_validation_no_execution`, validates and packages the saved
-artifact entirely offline, and performs no execution or network request. It
-therefore cannot prove `--api-url` routing or production readiness; use
-`eval terminal inspect` first. Saved dataset, shard, manifest, task order, model,
-quantization, hardware, agent, and runner provenance is authoritative; explicit
-conflicts are rejected.
+Per-task result files and `run.json` are written through a synced temporary file
+and atomic rename before `terminal_task_done` is emitted. An abrupt kill can lose
+the active task, but not a previously completed task. A graceful signal records
+`terminal_eval_interrupted` after active workers unwind. A run with all scored
+tasks can be restarted to assemble its final result and retry publication without
+starting Docker tasks again.
 
-Legacy completed checkpoint directories remain accepted. A canonical full
-89-task Terminal-Bench 2.1 directory is validated and partitioned into the 10
-ordered shard payloads without rerunning tasks:
+`--json-status` is strict machine mode for terminal runs. Stderr contains one
+JSON object per line for progress, completion, and errors; human status blocks
+and prose are suppressed. Stdout is empty unless `--json`, `--print`, or
+`--verbose` requests one final JSON result document. Successful local execution
+ends with `terminal_eval_completed`; successful publication ends with
+`terminal_eval_submitted`. Both carry final summary or receipt fields and durable
+result paths. Keep stdout and stderr separate: parse stderr incrementally as
+JSONL and parse stdout once after process exit.
+
+Publication rejects an incomplete shard unless every fetched task has a scored
+result. A parsed failing reward is still a scored result; an infrastructure
+error or otherwise unscored task prevents the entire shard from being
+submitted. After a successful `eval terminal run --submit`, the local `summary`
+and `results` are preserved and a durable `submission` receipt is merged into
+the same JSON document named by `--out`. The receipt contains the shard index,
+submitted count, run, and aggregate returned by LocalMaxxing.
+
+The submitted `runConfig` records resolved limits, their sources, and whether
+the turn cap was actually enforced: `maxTurnsPolicy`, `maxTurnsEnforcement`,
+`agentTimeoutPolicy`, `commandTimeoutSec`, and one `taskLimits` entry per task.
+`maxTurnsEnforcement` is `cli-agent-loop` for the built-in agent,
+`bundled-adapter` for Terminus-2, `not-enforced` for arbitrary external
+commands, and `not-applicable` for oracle runs. Each task entry repeats that
+value alongside the resolved/requested turn cap, deadline, command timeout,
+and CLI/task-manifest/fallback source. When every task has the same resolved
+turn cap, `maxTurns` carries that nonzero value. External agents that do not
+report a turn count serialize `turns: null`, never a misleading zero.
+
+Repeat the command to publish each missing shard. A complete 89-task checkpoint
+produced by Harbor or another offline runner can instead be validated and
+partitioned into the same 10 shard submissions without rerunning tasks or
+contacting a model endpoint:
 
 ```bash
 lmx eval terminal submit ./completed-terminal-run \
   --dataset terminal-bench-2-1 \
-  --api-url https://www.localmaxxing.com \
   --hf-id Qwen/Qwen3-8B \
   --hardware hardware.json \
   --quantization Q4_K_M \
@@ -568,17 +581,15 @@ lmx eval terminal submit ./completed-terminal-run \
   --out terminal-submit-batch.json
 ```
 
-For a legacy directory containing one isolated shard, pass `--shard-index <n>`;
-other dataset slugs also require an explicit shard index. Deferred submission
-preserves shard-local and full-checkpoint provenance and token totals in
-`runConfig`.
-
-`--api-url` always selects the LocalMaxxing dataset/submission origin;
-`--base-url` selects the OpenAI-compatible model inference origin. Keep
-`--api-url` explicit, and select model inference with either `--base-url` or a
-reviewed `--endpoint-file`, never both; never substitute the LocalMaxxing origin
-for the model origin.
-
+The dry-run output is `{ "dataset": "terminal-bench-2-1", "shards": [...] }`
+with 10 ordered payloads carrying explicit `shardIndex` values. The CLI verifies
+the exact canonical 89-task ID set before partitioning. Inspect the batch, then
+remove `--dry-run` and provide `--api-key` (or `LMX_API_KEY`) to submit all 10
+payloads sequentially. For a checkpoint that already contains one isolated
+shard, pass `--shard-index <n>`; other dataset slugs always require an explicit
+shard index. Deferred submission preserves shard-local and full-checkpoint token
+usage in `runConfig` and never starts Docker, reruns a verifier, or calls the
+model endpoint.
 
 The built-in `--agent terminus-2` adapter is embedded in release binaries. It
 requires Harbor's Python environment at runtime but does not require a source
@@ -588,14 +599,16 @@ Use a preferred external agent harness:
 
 ```bash
 lmx eval terminal run --task-dir ./tb-bundles \
-  --api-url https://www.localmaxxing.com \
   --agent-cmd './my-agent-wrapper.sh' \
   --agent-name my-agent \
   --agent-execution routed-shell \
   --model Qwen/Qwen3-8B \
-  --hardware hardware.json \
   --out terminal-run.json
 ```
+
+This no-submit command actually launches the external agent and verifier
+locally. Add `--dry-run` only when you want preflight validation without
+launching the wrapper, Docker, the model, or the verifier.
 
 `--agent-cmd` runs on the host after the task container starts and before the
 verifier runs. The command receives:
@@ -607,6 +620,12 @@ verifier runs. The command receives:
 - `LMX_TERMINAL_INSTRUCTION_FILE` — temporary file containing the task prompt.
 - `LMX_TERMINAL_BASE_URL` and `LMX_TERMINAL_MODEL` — values passed to the CLI,
   when your external agent wants to call the model itself.
+- `LMX_TERMINAL_MODEL_API_KEY` — optional model API key passed to an external
+  agent that owns model requests.
+- `LMX_TERMINAL_MAX_TURNS` — resolved requested turn cap. The bundled Terminus-2
+  adapter enforces it; arbitrary wrappers must explicitly consume it, and their
+  receipts remain `maxTurnsEnforcement: "not-enforced"`.
+- `LMX_TERMINAL_AGENT_TIMEOUT_SEC` — enforced whole-agent deadline in seconds.
 - `LMX_TERMINAL_CONTAINER_BASE_URL` — model/API URL as seen from Docker
   containers (default: `http://172.17.0.1:8080`, override with
   `--container-base-url`).
@@ -646,10 +665,229 @@ labeled with `runConfig.protocol="external-command/<mode>"`,
 For Oh My Pi / OMP container parity, use
 `examples/agents/omp-container-shell.sh` with `--agent-execution container`.
 The wrapper mirrors Harbor's installed-agent shape: it runs OMP inside `/app`,
-passes the task as direct prompt text, emits JSON event logs, copies live SQLite
-model-cache state for local llama.cpp models, and exits non-zero on model/API
-errors or no-tool-call runs so setup failures are not submitted as scored task
-failures.
+passes the task as direct prompt text, emits JSON event logs, and copies live
+SQLite model-cache state for local llama.cpp models. It uses
+`--tools bash --no-extensions`: the routed container shell is the only required
+model tool, and restricting the schema avoids llama.cpp rejecting unrelated OMP
+tools with open boolean JSON subschemas. A terminal model/provider error before
+the first completed tool execution makes the wrapper exit nonzero and leaves
+the task unscored. A provider error after useful tool execution, or an outer
+agent timeout, preserves Harbor semantics by proceeding to verification.
+
+### Prepare eval-derived adapter training
+
+`eval train prepare` converts a completed terminal run into two different
+datasets:
+
+- `sft.jsonl` contains only scored, passing OMP trajectories reconstructed from
+  finalized `message_end` events. Cumulative streaming updates and hidden
+  thinking are excluded.
+- `failures.jsonl` contains instructions, verifier output, and error metadata
+  for curriculum analysis. Failed trajectories are not correct SFT labels.
+
+```bash
+lmx eval train prepare ./completed-terminal-run \
+  --out ./training-data \
+  --base-model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --allow-benchmark-training
+```
+
+The command also writes `manifest.json` with source provenance, counts,
+truncation information, contamination status, and adapter output location. A
+single pass/fail attempt is outcome data, not a DPO preference pair, so the
+preparer does not fabricate preference examples.
+
+Use the bundled local QLoRA trainer through the explicit command boundary:
+
+```bash
+lmx eval train run ./training-data/manifest.json \
+  --trainer-cmd "python3 python/localmaxxing_helpers/train_eval_sft.py --backend unsloth --dataset {dataset} --model {base_model} --output {output} --lora-dropout 0"
+```
+
+This prints the fully expanded command without running it. Install a current
+Unsloth build for the host's CUDA and PyTorch versions, then add `--execute`.
+The Unsloth backend loads dense checkpoints in 4-bit by default, applies its
+gradient-checkpointing path, renders the checkpoint's own chat template, and
+constructs explicit labels so user, system, and tool-result tokens are excluded
+from assistant-only loss. Use `--full-sequence-loss` only intentionally.
+
+For an MoE checkpoint, current Unsloth guidance does not recommend bitsandbytes
+4-bit loading. The trainer warns when the model ID or loaded config identifies
+MoE; pass `--load-in-16bit` only if the checkpoint fits in aggregate VRAM, or
+select a supported prequantized checkpoint according to current Unsloth model
+documentation. `--target-modules` overrides the inferred dense or fused-MoE
+LoRA module suffixes.
+
+The plain alternative is `--backend trl`, after installing `trl[peft]`,
+`bitsandbytes`, and `datasets`. The base model must be a loadable HuggingFace
+checkpoint, not the evaluated GGUF file.
+
+The acknowledgement flag is deliberately required: once benchmark tasks become
+training examples, that model's score on the same tasks is contaminated. Use a
+separate, previously unseen holdout to measure whether the adapter generalizes.
+
+### Prepare online GRPO training
+
+`eval train rl` is a separate, online workflow. Its input is one imported
+terminal task bundle or a parent directory containing only imported bundles,
+as written by `eval terminal import`. Do not point it at a completed run,
+`summary.json`, an SFT export, or a checkpoint directory. Online GRPO generates
+new tool-using completions from the current policy and scores those rollouts in
+an environment; it does not learn from historical terminal transcripts,
+pass/fail fields, reward labels, or fabricated preference pairs.
+
+The complete preparation syntax is:
+
+```bash
+lmx eval train rl prepare <imported-bundle-or-parent> \
+  --out <rl-dir> \
+  --base-model <huggingface-id-or-path> \
+  --environment-factory <module:callable> \
+  [--environment-config <json-object-file>] \
+  [--grpo-config <json-object-file>] \
+  --allow-benchmark-training
+```
+
+For example:
+
+```bash
+lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1
+lmx eval train rl prepare ./tb-bundles \
+  --out ./rl-training \
+  --base-model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --environment-factory my_package.environments:make_environment \
+  --environment-config ./environment.json \
+  --grpo-config ./grpo.json \
+  --allow-benchmark-training
+```
+
+Both optional files must contain exactly one JSON object; omitted environment
+configuration is `{}`. `--grpo-config` can override only
+`num_generations`, `max_steps`, `learning_rate`,
+`per_device_train_batch_size`, `gradient_accumulation_steps`,
+`max_completion_length`, `max_tool_calling_iterations`,
+`gradient_checkpointing`, `logging_steps`,
+`save_steps`, `save_total_limit`, and `seed`. Unknown keys are rejected. The
+`--out` directory must be missing or empty and must not overlap the source tree.
+
+Preparation writes:
+
+- `prompts.jsonl`: sorted conversational prompt rows with exactly `prompt`,
+  `task_id`, and `bundle_ref`. Each prompt is the imported task instruction.
+  There are deliberately no completion, pass/fail, verifier-result, solution,
+  or reward columns.
+- `manifest.json`: a typed `online_grpo` manifest containing absolute source and
+  dataset paths, task count, base model, environment contract/configuration,
+  validated GRPO settings, default `<rl-dir>/grpo-output`, and the required
+  contamination acknowledgement.
+
+#### Required environment plugin
+
+There is no bundled task environment and no static-reward fallback. A plugin is
+required, and training is not runnable until `--environment-factory` names
+trusted, importable Python code. The callable has this runner-facing signature:
+
+```python
+def make_environment(*, bundle_root: pathlib.Path, config: dict) -> object:
+    ...
+```
+
+The runner binds those two keyword arguments, then gives TRL a zero-argument
+factory. `bundle_root` is the canonical imported-bundle root and `config` is a
+defensive copy of the JSON object. The returned TRL 1.8 environment must:
+
+- implement `reset(**row) -> str | None`; row metadata includes `task_id` and
+  `bundle_ref`, allowing the plugin to select and cleanly reset the task. A
+  returned string is appended to the final user message before generation;
+- expose each policy tool as a public method with typed parameters and return
+  type plus a Google-style docstring, as required by TRL tool schema generation;
+- implement synchronous or asynchronous `get_reward() -> float`, called after
+  the completed rollout, and derive that reward from the resulting environment
+  state and verifier rather than from a prepared label.
+
+TRL keeps separate environment instances for active rollouts and resets pooled
+instances before reuse. Its loop repeatedly generates with the current policy,
+parses a tool call, executes the corresponding environment method, appends the
+tool result, and generates again. Therefore the invariant is: **every training
+reward belongs to a fresh policy rollout**. Historical pass/fail or reward data
+must never be substituted for `get_reward()`.
+
+The plugin is loaded as trusted local code and has the same authority as the
+training process. It is responsible for real isolation: create a clean sandbox
+and tool state per rollout, constrain tool execution to that sandbox, run the
+verifier outside the policy's tool surface, and keep tests/verifier artifacts,
+expected outputs, reward files, and any `solution/` content unavailable to the
+policy. Do not expose `bundle_root` itself as a policy filesystem. A reset must
+remove state left by the previous rollout. Audit the plugin and its environment
+configuration before `--execute`.
+
+#### Plan, execute, output, and resume
+
+The complete run syntax is:
+
+```bash
+lmx eval train rl run <rl-manifest.json> \
+  [--output-dir <dir>] \
+  [--resume auto|none|<checkpoint-dir>] \
+  [--python-bin <path>] \
+  [--execute]
+```
+
+For example, inspect the default plan first, then execute it:
+
+```bash
+lmx eval train rl run ./rl-training/manifest.json --resume auto
+lmx eval train rl run ./rl-training/manifest.json \
+  --output-dir ./checkpoints/grpo \
+  --resume auto \
+  --python-bin python3 \
+  --execute
+```
+
+Without `--execute`, the CLI validates the manifest and prints JSON containing
+a direct-argv preview with an embedded-helper placeholder, plus the dataset,
+model, output directory, and resume selector; no plugin is imported and no
+trainer is started. Execution materializes the embedded helper and launches it
+with direct argv. It does not use a shell, does not accept `--trainer-cmd`, and
+offers no arbitrary trainer pass-through.
+
+The manifest's `<rl-dir>/grpo-output` is the default output. `--output-dir`
+overrides it, but may not be the imported bundle root or a directory beneath
+that root. Resume selectors behave as follows:
+
+- `auto` (default): start fresh when output is missing or empty. For nonempty
+  output, resume the numerically highest `checkpoint-N` containing
+  `trainer_state.json`; fail rather than overwrite if no valid checkpoint exists.
+- `none`: start fresh and require output to be missing or empty.
+- an explicit path: require an existing checkpoint directory containing
+  `trainer_state.json` and resume exactly that checkpoint.
+
+On execution, the helper writes `resolved-run.json` before training, calls
+`trainer.train(resume_from_checkpoint=...)`, and saves the trained model to the
+chosen output directory.
+
+#### Training prerequisites
+
+Install PyTorch first using the official selector for this host's GPU or other
+accelerator, driver, operating system, and desired CUDA/ROCm/CPU build. PyTorch
+is intentionally not pinned by the CLI because that choice is hardware-specific.
+Then install the exact trainer requirements:
+
+```bash
+python -m pip install 'trl==1.8.0' 'transformers>=5.2.0,<6'
+```
+
+TRL environment tools also need `jmespath` in that Python environment. The
+base model and chat template must support tool calling and preserve the
+assistant prefix across tool turns. The runner rejects every TRL version except
+`1.8.0` and Transformers versions outside `>=5.2.0,<6`; this environment API is
+version-sensitive, so do not silently upgrade either dependency.
+
+`--allow-benchmark-training` is deliberately required. Prompt-only preparation
+still exposes benchmark tasks to the model during online training, so scores on
+those tasks are contaminated even though historical outcomes are absent. Keep
+a separate, previously unseen holdout and use only that holdout for reported
+post-training quality.
 
 Security and footprint warning: terminal tasks execute arbitrary task Docker
 images, copy verifier assets into those containers, and give a model/agent control
@@ -765,7 +1003,7 @@ Submitted suites may require approval before public runs can target them.
 
 ## 10. Safety Notes
 
-- For deferred `eval terminal submit`, use `--dry-run` to validate the completed artifact offline; for `eval terminal run`, omit `--submit` to execute without uploading.
+- Always run `--dry-run` before `--submit`.
 - Do not put gold answers inside `input`, `choices`, prompt text, or artifact text.
 - Structured fields such as `gold`, `answer`, and `referenceAnswer` are redacted from suite discovery output and eval run artifacts, but arbitrary prose cannot be reliably redacted.
 - Never commit API keys, `.env` files, or raw private eval datasets.
@@ -804,3 +1042,17 @@ Missing lm-eval executable:
 ```
 
 Fix: install with `pip install lm-eval` or pass `--lm-eval-bin <path>`.
+
+Terminal run-directory and job errors:
+
+- `checkpoint_exists`: use the exact invocation with `--resume auto`, or choose a
+  new directory for an intentional rerun.
+- `checkpoint_mismatch`: restore the original dataset/shard, task manifests,
+  endpoint/model, hardware, and execution options; never mix runs in one directory.
+- `checkpoint_already_submitted`: read the durable receipt, or rerun intentionally
+  in a new directory.
+- `terminal_job_running`: inspect the existing owner with `eval terminal status`;
+  do not start a competing worker in the same directory.
+- `terminal_cancelled`: a resumable operator stop, not a benchmark failure.
+- `incomplete_shard`: inspect `status`, `logs`, and unscored task results, then
+  resume; publication requires a scored result for every fetched task.

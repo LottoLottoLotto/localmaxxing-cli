@@ -228,12 +228,14 @@ lmx benchmark add-hardware runs/Qwen-Qwen3-8B/run.json --hardware hardware.json
 Analyze and export runs:
 
 ```bash
+lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json --format table
 lmx benchmark runs stats --group-by quantization --metric tokSOut
-lmx benchmark runs compare --by quantization --metric tokSOut
+lmx benchmark runs compare --by quantization --metric tokSOut --format table
+lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs --format table
 lmx benchmark runs export --format csv --out runs.csv
 ```
 
-`stats`, `compare`, and `export` accept `--runs-dir`, plus filters such as `--model`, `--engine`, `--mode`, `--quantization`, `--kind`, and `--hardware-name`. Group stats report min/p50/mean/max/p95/stddev and the best single run; group comparisons rank by the median (`p50`) so a single outlier run cannot win. `export` defaults to JSON and supports `--fields path,hfId,hardware,tokSOut` for custom extraction.
+`stats`, `show`, `compare`, and `export` accept `--runs-dir`, plus filters such as `--model`, `--engine`, `--mode`, `--quantization`, `--kind`, and `--hardware-name`. Group stats report min/p50/mean/max/p95/stddev and the best single run; group comparisons rank by the median (`p50`) so a single outlier run cannot win. `show --format table` prints every field from a single run as a flattened ASCII field/value table. `compare` defaults to an ASCII table with baseline, candidate/value, deltas, percent deltas, and a better/worse column; pass `--format json` for machine-readable output. `export` defaults to JSON and supports `--fields path,hfId,hardware,tokSOut` for custom extraction.
 ## KV-Cache Context Sweeps
 
 Measure how prefill, TTFT, and decode TPS change as context length grows:
@@ -308,43 +310,90 @@ lmx eval run my-judge-suite \
   --submit
 ```
 
-### Terminal-Bench
+### Train from verified eval trajectories
+
+Prepare conversational SFT data from scored passing OMP trajectories. Failed
+tasks are written separately as diagnostics and are never treated as correct
+training targets:
 
 ```bash
-lmx endpoint discover --out endpoint.json --include-server-metadata
-lmx eval terminal inspect terminal-bench-2-1 --api-url https://www.localmaxxing.com
-lmx eval terminal run terminal-bench-2-1 \
-  --api-url https://www.localmaxxing.com \
-  --endpoint-file endpoint.json \
-  --model Qwen/Qwen3-8B \
-  --hardware hardware.json \
-  --out completed-terminal-run.json
-lmx eval terminal submit completed-terminal-run.json \
-  --api-url https://www.localmaxxing.com \
-  --dry-run \
-  --out terminal-submit-batch.json
-lmx eval terminal submit completed-terminal-run.json \
-  --api-url https://www.localmaxxing.com \
-  --api-key "$LMX_API_KEY"
+lmx eval train prepare ./completed-terminal-run \
+  --out ./training-data \
+  --base-model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --allow-benchmark-training
+
+lmx eval train run ./training-data/manifest.json \
+  --trainer-cmd "python3 python/localmaxxing_helpers/train_eval_sft.py --backend unsloth --dataset {dataset} --model {base_model} --output {output} --lora-dropout 0"
 ```
 
-`run` executes tasks even without `--submit`; omitting `--submit` keeps the
-completed run local. Its `--out` JSON persists shard, resolved model,
-quantization, hardware, harness, timing, and token metadata and is direct input
-to deferred `submit`, so submission never requires running the tasks again.
-Deferred `submit --dry-run` only validates and packages that saved work offline.
-Legacy completed checkpoint directories are accepted by `submit` as well.
+`eval train run` only prints the expanded local command by default. Add
+`--execute` to start it. The bundled trainer supports Unsloth's patched QLoRA
+stack and a plain TRL/PEFT backend. Install Unsloth using its CUDA/PyTorch-specific
+installation instructions; use `--backend trl` with
+`python3 -m pip install 'trl[peft]' bitsandbytes datasets` for the plain backend.
 
-For the built-in terminal agent, `--base-url` and `--endpoint-file` are mutually
-exclusive endpoint selectors. An endpoint file contributes only its one usable
-URL; model, path, and quantization are re-read from the live endpoint. With no
-selector, uncredentialed localhost probing must find one unambiguous match;
-`--model-api-key` instead requires an explicit URL or trusted endpoint file.
-Explicit `--served-model`, `--model-path`, `--quantization`, and canonical
-`--model` values are reconciled with live evidence and conflicts are rejected.
-Loaded-filename model resolution is accepted only when the exact filename is
-verified in one unambiguous HuggingFace source repo. Failed tasks are summarized
-by task, outcome, turns, reason, and their `--out` or `--trace-dir` artifact.
+Training on benchmark tasks contaminates future scores on those tasks, so
+preparation requires an explicit acknowledgement and the resulting adapter must
+be evaluated on a separate holdout.
+
+### Train with online GRPO
+
+Online GRPO starts from the task bundles produced by `eval terminal import`, not
+from a completed terminal result. Preparation writes prompt-only data and a
+typed manifest; it does not copy historical pass/fail or reward labels:
+
+```bash
+lmx eval train rl prepare ./tb-bundles \
+  --out ./rl-training \
+  --base-model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --environment-factory my_package.environments:make_environment \
+  --environment-config ./environment.json \
+  --grpo-config ./grpo.json \
+  --allow-benchmark-training
+```
+
+`./rl-training/prompts.jsonl` contains each user prompt, task ID, and bundle
+reference. `./rl-training/manifest.json` records that dataset, the absolute
+bundle root, base model, validated GRPO settings, output path, contamination
+acknowledgement, and trusted environment plugin. The plugin is required: the
+CLI does not provide a task environment, so training is not runnable until the
+named `module:callable` is importable by the selected Python environment.
+
+The factory must accept keyword arguments `bundle_root` (a `pathlib.Path`) and
+`config` (the JSON object from `--environment-config`) and return a TRL 1.8
+environment. Its `reset(**row)` selects and resets an isolated task from
+`task_id`/`bundle_ref`; typed, documented public methods become policy tools;
+and `get_reward()` returns the verifier reward after the rollout. Every reward
+must come from a fresh rollout of the current policy. The plugin must sandbox
+tools, run verification out of band, and keep verifier assets and any reference
+solution inaccessible to the policy. Treat the plugin as trusted local code.
+
+```bash
+lmx eval train rl run ./rl-training/manifest.json --resume auto
+lmx eval train rl run ./rl-training/manifest.json \
+  --output-dir ./checkpoints/grpo \
+  --resume none \
+  --python-bin python3 \
+  --execute
+```
+
+`rl run` prints a direct-argv plan by default; it never invokes a shell or
+accepts `--trainer-cmd`. `--execute` starts the embedded trainer. `--resume auto`
+(the default) starts fresh for a missing/empty output directory or selects the
+highest valid `checkpoint-N` in a nonempty one; `none` requires an empty output
+directory; a path must name a checkpoint containing `trainer_state.json`.
+
+Install a hardware-appropriate PyTorch build first, using PyTorch's selector for
+the host GPU/accelerator and driver. Then install the runner's pinned versions:
+
+```bash
+python -m pip install 'trl==1.8.0' 'transformers>=5.2.0,<6'
+```
+
+Environment tools also require `jmespath`. Use a model and chat template that
+support tool calling and preserve the generated prefix. As with SFT, these eval
+tasks contaminate same-task measurements: train only after acknowledging that
+fact and report quality on a separate, previously unseen holdout.
 
 ## Discover Models and Suites
 

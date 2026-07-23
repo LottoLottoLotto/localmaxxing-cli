@@ -21,7 +21,6 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,7 +36,8 @@ const terminalSystemPrompt = "You control a Linux terminal. Each reply MUST cont
 const terminalSessionSystemPrompt = "You control a persistent Linux shell session inside a container. State persists across replies: your working directory, environment variables, and background jobs carry over from one command block to the next. Each reply MUST contain exactly one ```bash fenced block containing one or more non-interactive shell commands, which are executed in that same shell; stdout/stderr and exit code are returned. Prefer batching related inspection/edit/test commands instead of spending one model turn per tiny command. When the task is complete, reply with the single token TASK_COMPLETE and no code block. If you need Python/Ruby/Node/etc., run it from bash with a heredoc (for example: python3 <<'PY' ... PY). Avoid dumping huge files; inspect with head/tail/grep/scripts. Bound password crackers and deliberately long-running commands yourself with timeout, but do not prematurely cap package installs, builds, or tests unless they are clearly stuck. Never run foreground servers; start them in the background and verify them."
 
 const defaultTerminalTaskTimeoutSec = 4 * 60 * 60
-const defaultTerminalCommandTimeoutSec = defaultTerminalTaskTimeoutSec
+const defaultTerminalCommandTimeoutSec = 30 * 60
+const defaultTerminalMaxTurns = 200
 const terminalModelObservationLimit = 2500
 const terminalMessageBudgetBytes = 60_000
 const terminalRecentMessageKeep = 12
@@ -45,14 +45,6 @@ const defaultTerminalModelMaxTokens = 16_384
 const defaultTerminalRetryMaxTokens = 8_192
 const defaultTerminalEndpointTimeout = 10 * time.Minute
 const maxTerminalRetryReserve = 5 * time.Minute
-const terminalEndpointProbeTimeout = 2 * time.Second
-const terminalIdentityLookupTimeout = 30 * time.Second
-const terminalMonolithicArtifactMaxBytes int64 = 256 * 1024 * 1024
-const terminalMonolithicResultLimit = 1000
-const terminalCheckpointArtifactVersion = 3
-const defaultTerminalRepeatBatchLimit = 3
-
-var errTerminalMonolithicResultLimit = errors.New("monolithic terminal result limit exceeded")
 
 const terminalJSONProtocolTemplate = `You are an AI assistant tasked with solving command-line tasks in a Linux environment. You will be given a task description and the output from previously executed commands. Your goal is to solve the task by providing batches of shell commands.
 
@@ -157,22 +149,24 @@ type terminalEnvironmentConfig struct {
 }
 
 type terminalConfig struct {
-	apiKey            string
-	args              cliArgs
-	maxTokens         int
-	temperature       float64
-	topP              float64
-	commandTimeoutSec int
-	repeatBatchLimit  int
-	agentTimeoutSec   int
-	maxTurns          int
-	cleanupImages     bool
-	oracle            bool
-	agentCommand      string
-	agentExecution    string
-	shellMode         string
-	traceRoot         string
-	endpointTimeout   time.Duration
+	apiKey                         string
+	args                           cliArgs
+	maxTokens                      int
+	temperature                    float64
+	topP                           float64
+	commandTimeoutSec              int
+	agentTimeoutSec                int
+	maxTurns                       int
+	cleanupImages                  bool
+	oracle                         bool
+	agentCommand                   string
+	agentExecution                 string
+	shellMode                      string
+	traceRoot                      string
+	endpointTimeout                time.Duration
+	modelHeartbeatInterval         time.Duration
+	externalAgentHeartbeatInterval time.Duration
+	runLabel                       string
 }
 
 type terminalJSONCommand struct {
@@ -217,59 +211,23 @@ func (u terminalTokenUsage) toMap() map[string]any {
 }
 
 type terminalTaskResult struct {
-	pass              bool
-	scored            bool
-	verifierAttempted bool
-	verifierCompleted bool
-	rewardParsed      bool
-	turns             int
-	transcript        string
-	verifierOutput    string
-	wallTimeMs        int64
-	usage             terminalTokenUsage
-	errText           string
-	errCode           string
-	agentOutcomeCode  string
-	agentOutcomeText  string
-	instruction       string
-	prompt            string
-	lastProgressAt    string
-}
-
-type terminalAgentOutcomeError struct {
-	code string
-	text string
-}
-
-func (e terminalAgentOutcomeError) Error() string { return e.text }
-
-func captureTerminalAgentOutcome(result *terminalTaskResult, err error) bool {
-	var outcome terminalAgentOutcomeError
-	if !errors.As(err, &outcome) {
-		return false
-	}
-	result.agentOutcomeCode = outcome.code
-	result.agentOutcomeText = outcome.text
-	return true
-}
-
-type terminalEndpointMetadata struct {
-	baseURL      string
-	servedModel  string
-	quantization string
-	modelPath    string
+	pass            bool
+	scored          bool
+	turns           int
+	turnsUnreported bool
+	transcript      string
+	verifierOutput  string
+	wallTimeMs      int64
+	usage           terminalTokenUsage
+	errText         string
+	errCode         string
+	instruction     string
+	prompt          string
 }
 
 type terminalBundle struct {
-	Task             terminalTask
-	Dir              string
-	BundleKey        string
-	BundleSHA256     string
-	ByteSize         int64
-	ManifestIdentity string
-	ManifestSHA256   string
-	ManifestVersion  string
-	ManifestTaskIDs  []string
+	Task terminalTask
+	Dir  string
 }
 
 type harborTaskToml struct {
@@ -338,18 +296,20 @@ func handleEvalTerminal(sub string, args cliArgs) error {
 	switch sub {
 	case "import":
 		return runTerminalImport(args)
-	case "inspect":
-		return inspectTerminalDataset(positional(args, 3), args)
-	case "recover":
-		return recoverTerminalCheckpoint(args)
 	case "run":
 		return runTerminalEval(args, false)
 	case "submit":
 		return submitTerminalEval(args)
 	case "verify":
 		return runTerminalEval(args, true)
+	case "status":
+		return terminalStatus(args)
+	case "logs":
+		return terminalLogs(args)
+	case "cancel":
+		return terminalCancel(args)
 	default:
-		return cliError{"unknown_subcommand", "Unknown eval terminal subcommand.", []string{"Use one of: import, inspect, recover, run, submit, verify."}, map[string]any{"subcommand": sub}}
+		return cliError{"unknown_subcommand", "Unknown eval terminal subcommand.", []string{"Use one of: import, run, submit, verify, status, logs, cancel."}, map[string]any{"subcommand": sub}}
 	}
 }
 
@@ -386,127 +346,6 @@ func runTerminalImport(args cliArgs) error {
 		return cliError{"task_import_failed", "Every harbor task was skipped.", []string{"docker-compose task environments are not supported; import tasks that use environment/Dockerfile or [environment].docker_image."}, map[string]any{"src": src, "skipped": skipped}}
 	}
 	printInfo("terminal_import_complete", map[string]any{"src": src, "out": out, "tasks": imported, "skipped": skipped, "version": version})
-	return nil
-}
-
-func recoverTerminalCheckpoint(args cliArgs) error {
-	checkpointPath := positional(args, 3)
-	if checkpointPath == "" {
-		return cliError{"missing_option", "eval terminal recover requires an atomic checkpoint directory.", []string{"Run: lmx eval terminal recover <checkpoint> --task-id <id> --container <name> --bundle <dir> [--result <file>]."}, nil}
-	}
-	if terminalPathContainsTraversal(checkpointPath) {
-		return cliError{"checkpoint_metadata_invalid", "Recovery checkpoint path contains traversal components.", nil, map[string]any{"path": checkpointPath}}
-	}
-	taskID, err := requireOpt(args, "task-id")
-	if err != nil {
-		return err
-	}
-	containerName, err := requireOpt(args, "container")
-	if err != nil {
-		return err
-	}
-	bundleDir, err := requireOpt(args, "bundle")
-	if err != nil {
-		return err
-	}
-	if !terminalCheckpointSafeTaskID.MatchString(taskID) {
-		return cliError{"recovery_identity_mismatch", "--task-id is not a safe checkpoint task identifier.", nil, map[string]any{"taskId": taskID}}
-	}
-	if !terminalContainerName.MatchString(containerName) {
-		return cliError{"recovery_container_invalid", "--container must name one existing Docker container without option or path syntax.", nil, map[string]any{"container": containerName}}
-	}
-
-	manager := &terminalCheckpointManager{path: filepath.Clean(checkpointPath), entries: map[string]terminalCheckpointEntry{}, results: map[string]terminalSavedResult{}}
-	if err := manager.acquireProcessLock(); err != nil {
-		return err
-	}
-	defer manager.releaseProcessLock()
-	metadata, provenance, taskOrder, err := loadTerminalCheckpointMetadata(manager.path)
-	if err != nil {
-		return err
-	}
-	manager.provenance = provenance
-	manager.taskOrder = taskOrder
-	allEntries, allResults, repaired, err := loadTerminalCheckpointCommittedEntries(manager.path, metadata, provenance, taskOrder, true)
-	if err != nil {
-		return err
-	}
-	manager.entries = allEntries
-	manager.results = allResults
-	if repaired {
-		if err := manager.persistLocked(); err != nil {
-			return cliError{"checkpoint_persist_failed", "Could not repair a metadata-committed checkpoint generation.", nil, map[string]any{"checkpoint": manager.path, "error": err.Error()}}
-		}
-	}
-
-	taskIndex := -1
-	for index, id := range taskOrder {
-		if id == taskID {
-			taskIndex = index
-			break
-		}
-	}
-	if taskIndex < 0 {
-		return cliError{"recovery_identity_mismatch", "The requested recovery task is not a member of this checkpoint.", nil, map[string]any{"taskId": taskID}}
-	}
-	if saved, exists := allResults[taskID]; exists && terminalSavedResultComplete(saved) {
-		return cliError{"recovery_task_complete", "Recovery refuses to overwrite a task that already has a completed canonical verifier score.", []string{"Resume the checkpoint to rerun only incomplete tasks."}, map[string]any{"taskId": taskID}}
-	}
-
-	bundle, err := loadSingleTerminalBundleStrict(bundleDir)
-	if err != nil {
-		return err
-	}
-	if bundle.Task.ID != taskID {
-		return cliError{"recovery_identity_mismatch", "The supplied bundle task id does not match --task-id.", nil, map[string]any{"taskId": taskID, "bundleTaskId": bundle.Task.ID}}
-	}
-	manifestItem, err := validateTerminalRecoveryBundle(provenance, taskIndex, bundle)
-	if err != nil {
-		return err
-	}
-	bundle.BundleKey = stringValue(manifestItem["bundleKey"])
-
-	telemetry := terminalSavedResult{QuestionID: taskID, Provenance: managerSafeMap(provenance)}
-	if resultPath := opt(args, "result"); resultPath != "" {
-		telemetry, err = loadTerminalRecoveryTelemetry(resultPath, taskID, provenance)
-		if err != nil {
-			return err
-		}
-	}
-
-	started := time.Now()
-	pass, verifierOutput, verifierCompleted, rewardParsed, verifierErr := runTerminalVerifier(context.Background(), bundle.Task, bundle.Dir, containerName, terminalConfig{args: args})
-	if verifierErr != nil || !verifierCompleted || !rewardParsed {
-		if verifierErr != nil {
-			return verifierErr
-		}
-		return cliError{"verifier_failed", "Recovery verifier did not produce a complete canonical reward.", nil, map[string]any{"taskId": taskID}}
-	}
-	result := terminalTaskResult{
-		pass:              pass,
-		scored:            true,
-		verifierAttempted: true,
-		verifierCompleted: true,
-		rewardParsed:      true,
-		turns:             telemetry.Turns,
-		transcript:        telemetry.Response,
-		verifierOutput:    verifierOutput,
-		wallTimeMs:        telemetry.WallTimeMs,
-		usage:             tokenUsageFromObject(telemetry.TokenUsage),
-		agentOutcomeCode:  telemetry.AgentOutcomeCode,
-		agentOutcomeText:  telemetry.AgentOutcome,
-		prompt:            telemetry.Prompt,
-		lastProgressAt:    time.Now().UTC().Format(time.RFC3339Nano),
-	}
-	if result.wallTimeMs <= 0 {
-		result.wallTimeMs = time.Since(started).Milliseconds()
-	}
-	if err := manager.persist(taskIndex, bundle, result); err != nil {
-		return cliError{"checkpoint_persist_failed", "Could not atomically persist the canonically verified recovered task.", nil, map[string]any{"checkpoint": manager.path, "taskId": taskID, "error": err.Error()}}
-	}
-	fields := map[string]any{"checkpoint": manager.path, "taskId": taskID, "taskIndex": taskIndex + 1, "taskTotal": len(taskOrder), "pass": pass, "lastProgressAt": result.lastProgressAt, "canonicalVerifierExecuted": true, "container": containerName}
-	printInfo("terminal_checkpoint_recovered", fields)
-	fmt.Println("Recovered task was canonically verified against the existing container and persisted atomically.")
 	return nil
 }
 
@@ -591,7 +430,7 @@ func importHarborTask(taskDir, out, version string) error {
 		Category:    ht.Metadata.Category,
 		Source:      firstNonEmpty(ht.Task.Name, "terminal-bench/"+id),
 		Image:       image,
-		Agent:       terminalAgentConfig{TimeoutSec: firstPositive(ht.Agent.TimeoutSec.Int(), 900), MaxTurns: firstPositive(ht.Agent.MaxTurns.Int(), 50), User: ht.Agent.User},
+		Agent:       terminalAgentConfig{TimeoutSec: ht.Agent.TimeoutSec.Int(), MaxTurns: ht.Agent.MaxTurns.Int(), User: ht.Agent.User},
 		Verifier:    terminalVerifierConfig{TimeoutSec: firstPositive(ht.Verifier.TimeoutSec.Int(), 900), Command: firstNonEmpty(ht.Verifier.Command, "bash /tests/test.sh"), RewardFile: firstNonEmpty(ht.Verifier.RewardFile, "/logs/verifier/reward.txt"), User: ht.Verifier.User, Env: nonNilStringMap(ht.Verifier.Env)},
 		Solution:    terminalSolutionConfig{Env: nonNilStringMap(ht.Solution.Env)},
 		Environment: terminalEnvironmentConfig{CPUs: firstPositiveFloat(ht.Environment.CPUs.Float(), 1), MemoryMb: firstPositive(ht.Environment.MemoryMb.Int(), 2048), StorageMb: firstPositive(ht.Environment.StorageMb.Int(), 10240), GPUs: ht.Environment.GPUs.Int(), Network: network, AllowedHosts: ht.Environment.AllowedHosts, Env: nonNilStringMap(ht.Environment.Env)},
@@ -621,6 +460,27 @@ func importHarborTask(taskDir, out, version string) error {
 }
 
 func runTerminalEval(args cliArgs, forceOracle bool) error {
+	if hasFlag(args, "detach") && !hasFlag(args, "detached-child") {
+		return startDetachedTerminalEval(args)
+	}
+	if hasFlag(args, "detached-child") {
+		if err := awaitDetachedTerminalProcessRecord(args); err != nil {
+			return err
+		}
+	}
+	ctx, stopSignals := terminalSignalContext()
+	defer stopSignals()
+	go func() {
+		<-ctx.Done()
+		stopSignals()
+	}()
+	if runDir := opt(args, "run-dir"); runDir != "" && !hasFlag(args, "detached-child") {
+		root, err := filepath.Abs(runDir)
+		if err != nil {
+			return err
+		}
+		args.opts["status-log"] = terminalEventsPath(root)
+	}
 	localDir := opt(args, "task-dir")
 	if forceOracle && localDir == "" {
 		localDir = positional(args, 3)
@@ -629,45 +489,21 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if localDir != "" && (forceOracle || hasFlag(args, "oracle")) {
 		dataset = opt(args, "dataset")
 	}
-	if localDir != "" && dataset == "" {
+	submit := hasFlag(args, "submit")
+	dryRun := hasFlag(args, "dry-run")
+	if submit && localDir != "" && dataset == "" {
 		dataset = opt(args, "dataset")
 	}
 	if !forceOracle && localDir == "" && dataset == "" {
-		return cliError{"missing_option", "eval terminal run requires a dataset slug or --task-dir.", []string{"Run: lmx eval terminal run terminal-bench-2-1 --api-url <localmaxxing-origin> --base-url <model-origin> --model <hfId>.", "For local bundles, run: lmx eval terminal run --task-dir ./bundles --api-url <localmaxxing-origin> --base-url <model-origin> --model <hfId>."}, nil}
-	}
-	if !forceOracle && !hasFlag(args, "oracle") {
-		if opt(args, "endpoint-file") != "" && opt(args, "base-url") != "" {
-			return cliError{"endpoint_selection_conflict", "--endpoint-file cannot be combined with --base-url.", []string{"Choose the trusted endpoint file or pass the model endpoint explicitly, not both."}, nil}
-		}
-		if opt(args, "model-api-key") != "" && opt(args, "base-url") == "" && opt(args, "endpoint-file") == "" {
-			return cliError{"endpoint_credentials_require_explicit_target", "--model-api-key requires an explicit --base-url or trusted --endpoint-file.", []string{"Do not attach model credentials while probing broad localhost candidates."}, nil}
-		}
-	}
-	bundles, cleanup, shardIndex, err := acquireTerminalBundles(args, dataset, localDir)
-	if cleanup != "" {
-		defer os.RemoveAll(cleanup)
-	}
-	if err != nil {
-		return err
-	}
-	if len(bundles) == 0 {
-		return cliError{"bundle_invalid", "No terminal task bundles were found.", []string{"Point --task-dir at one bundle or a parent directory of bundles containing task.json and tests/."}, map[string]any{"taskDir": localDir}}
-	}
-	if len(bundles) > terminalMonolithicResultLimit && opt(args, "out") != "" {
-		return cliError{"bundle_count_invalid", "The terminal run selects too many task bundles for one bounded artifact.", []string{"Split the evaluation into smaller shards."}, map[string]any{"tasks": len(bundles), "maxTasks": terminalMonolithicResultLimit}}
+		return cliError{"missing_option", "eval terminal run requires a dataset slug or --task-dir.", []string{"Run: lmx eval terminal run terminal-bench-2-1 --base-url <url> --model <hfId>.", "For local bundles, run: lmx eval terminal run --task-dir ./bundles --base-url <url> --model <hfId>."}, nil}
 	}
 
 	rawBaseURL := opt(args, "base-url")
 	baseURL := ""
 	callModel := ""
 	declaredModel := opt(args, "model")
-	servedModel := opt(args, "served-model")
-	servedModelSource := "cli"
-	var servedModelInfo map[string]any
 	var quantResolution map[string]any
 	resolvedQuant, resolvedQuantFormat := "", opt(args, "quant-format")
-	modelPath := opt(args, "model-path")
-	verifiedModelPath := ""
 	var modelResolution map[string]any
 	agentBackend := opt(args, "agent")
 	agentCommand := opt(args, "agent-cmd")
@@ -682,83 +518,52 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		agentCommand = extractedCommand
 		defer cleanupAdapter()
 	}
-
 	if !forceOracle && !hasFlag(args, "oracle") {
-		endpointFile := opt(args, "endpoint-file")
-		explicitServedModel := servedModel
-		explicitModelPath := modelPath
-		explicitQuantization := opt(args, "quantization")
-		if endpointFile != "" {
-			savedEndpoint, loadErr := loadTerminalEndpointFile(endpointFile)
-			if loadErr != nil {
-				return loadErr
-			}
-			rawBaseURL = savedEndpoint.baseURL
-			printStatus(args, "terminal_endpoint_file_selected", map[string]any{"baseUrl": terminalSanitizedEndpointOrigin(rawBaseURL), "path": endpointFile})
-		}
-
-		if agentCommand == "" && rawBaseURL == "" {
-			rawBaseURL, servedModel, servedModelInfo, err = discoverTerminalEndpoint(args, declaredModel)
+		if agentCommand == "" {
+			var err error
+			rawBaseURL, err = requireOpt(args, "base-url")
 			if err != nil {
 				return err
 			}
-			servedModelSource = "endpoint_discovery"
-		} else if agentCommand != "" && rawBaseURL == "" {
-			rawBaseURL = firstNonEmpty(os.Getenv("LM_STUDIO_BASE_URL"), os.Getenv("LLAMA_CPP_BASE_URL"))
+		} else {
+			rawBaseURL = firstNonEmpty(rawBaseURL, os.Getenv("LM_STUDIO_BASE_URL"), os.Getenv("LLAMA_CPP_BASE_URL"))
 		}
-
 		if rawBaseURL != "" {
 			baseURL = openAIBaseURL(rawBaseURL)
-			if servedModelInfo == nil {
-				preferred := explicitServedModel
-				detected, info, probeErr := probeTerminalEndpoint(baseURL, opt(args, "model-api-key"), preferred, explicitServedModel != "", terminalEndpointProbeTimeout)
-				if probeErr != nil {
-					return cliError{"model_detection_failed", "Could not reconcile the selected endpoint with its live /v1/models metadata.", []string{"Check the endpoint, or correct --served-model to an exact model id exposed by that endpoint."}, map[string]any{"baseUrl": terminalSanitizedEndpointOrigin(baseURL), "error": probeErr.Error()}}
+			servedModel := opt(args, "served-model")
+			if dryRun {
+				callModel = firstNonEmpty(servedModel, declaredModel, "local")
+				resolvedQuant = opt(args, "quantization")
+			} else {
+				var servedModelInfo map[string]any
+				if servedModel == "" {
+					if detected, info, derr := detectTerminalServedModel(ctx, baseURL, opt(args, "model-api-key"), declaredModel); derr == nil {
+						servedModel = detected
+						servedModelInfo = info
+					} else {
+						if ctx.Err() != nil {
+							return terminalCancelledError(ctx)
+						}
+						printStatus(args, "eval_model_detection_unavailable", map[string]any{"baseUrl": baseURL, "reason": derr.Error()})
+					}
+				} else if _, info, derr := detectTerminalServedModel(ctx, baseURL, opt(args, "model-api-key"), servedModel); derr == nil {
+					servedModelInfo = info
+				} else if ctx.Err() != nil {
+					return terminalCancelledError(ctx)
 				}
-				servedModel = detected
-				servedModelInfo = info
-				if explicitServedModel == "" {
-					servedModelSource = "v1_models"
+				callModel = firstNonEmpty(servedModel, declaredModel, "local")
+				quantResolution = remoteQuantizationResolutionContext(ctx, args, baseURL, opt(args, "model-api-key"), opt(args, "quantization"), servedModelInfo)
+				if ctx.Err() != nil {
+					return terminalCancelledError(ctx)
 				}
-			}
-			callModel = servedModel
-
-			liveModelPath := terminalModelPathFromMetadata(servedModelInfo)
-			liveQuantization := terminalQuantizationFromMetadata(servedModelInfo)
-			if props, propsErr := fetchTerminalEndpointJSON(baseURL+"/props", opt(args, "model-api-key"), terminalEndpointProbeTimeout); propsErr == nil {
-				if obj := asObject(props); obj != nil {
-					liveModelPath = firstNonEmpty(terminalModelPathFromMetadata(obj), liveModelPath)
-					liveQuantization = firstNonEmpty(terminalQuantizationFromMetadata(obj), liveQuantization)
+				resolvedQuant = firstNonEmpty(stringValue(quantResolution["trusted"]), opt(args, "quantization"))
+				if resolvedQuantFormat == "" && strings.EqualFold(filepath.Ext(stringValue(quantResolution["modelPath"])), ".gguf") {
+					resolvedQuantFormat = "gguf"
 				}
-			}
-			verifiedModelPath = liveModelPath
-			modelPath, err = reconcileTerminalEndpointField("model-path", explicitModelPath, liveModelPath, true)
-			if err != nil {
-				return err
-			}
-			_, err = reconcileTerminalEndpointField("quantization", explicitQuantization, liveQuantization, false)
-			if err != nil {
-				return err
-			}
-			quantResolution, err = terminalEndpointQuantizationResolution(explicitQuantization, liveQuantization, liveModelPath)
-			if err != nil {
-				return err
-			}
-			if quantResolution == nil {
-				quantResolution = map[string]any{}
-			}
-			resolvedQuant = stringValue(quantResolution["trusted"])
-			if modelPath != "" {
-				quantResolution["modelPath"] = modelPath
-			}
-			if resolvedQuantFormat == "" && strings.EqualFold(filepath.Ext(modelPath), ".gguf") {
-				resolvedQuantFormat = "gguf"
 			}
 		} else if agentCommand != "" {
-			callModel = firstNonEmpty(servedModel, declaredModel, "external-agent")
-			printStatus(args, "eval_model_detection_unavailable", map[string]any{"reason": "external agent did not provide --base-url, --endpoint-file, LM_STUDIO_BASE_URL, or LLAMA_CPP_BASE_URL"})
-		} else {
-			return cliError{"endpoint_discovery_failed", "No model endpoint was selected.", []string{"Start a supported local endpoint, pass --base-url, or pass --endpoint-file from lmx endpoint discover --out."}, nil}
+			callModel = firstNonEmpty(opt(args, "served-model"), declaredModel, "external-agent")
+			printStatus(args, "eval_model_detection_unavailable", map[string]any{"reason": "external agent did not provide --base-url, LM_STUDIO_BASE_URL, or LLAMA_CPP_BASE_URL"})
 		}
 	}
 
@@ -770,15 +575,11 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if err != nil {
 		return err
 	}
-	repeatBatchLimit, err := intOption(args, defaultTerminalRepeatBatchLimit, 3, "repeat-batch-limit")
-	if err != nil {
-		return err
-	}
 	concurrency, err := intOption(args, 1, 1, "concurrency")
 	if err != nil {
 		return err
 	}
-	cfg := terminalConfig{apiKey: opt(args, "model-api-key"), args: args, maxTokens: maxTokens, temperature: floatOption(args, "temperature", 0), topP: floatOption(args, "top-p", 1), commandTimeoutSec: commandTimeout, repeatBatchLimit: repeatBatchLimit, cleanupImages: hasFlag(args, "cleanup-images"), oracle: forceOracle || hasFlag(args, "oracle"), agentCommand: agentCommand, agentExecution: firstNonEmpty(opt(args, "agent-execution"), map[bool]string{true: "routed-shell"}[agentBackend == "terminus-2"], "host"), traceRoot: opt(args, "trace-dir")}
+	cfg := terminalConfig{apiKey: opt(args, "model-api-key"), args: args, maxTokens: maxTokens, temperature: floatOption(args, "temperature", 0), topP: floatOption(args, "top-p", 1), commandTimeoutSec: commandTimeout, cleanupImages: hasFlag(args, "cleanup-images"), oracle: forceOracle || hasFlag(args, "oracle"), agentCommand: agentCommand, agentExecution: firstNonEmpty(opt(args, "agent-execution"), map[bool]string{true: "routed-shell"}[agentBackend == "terminus-2"], "host"), traceRoot: opt(args, "trace-dir")}
 	cfg.maxTurns, err = intOption(args, 0, 0, "max-turns")
 	if err != nil {
 		return err
@@ -800,91 +601,111 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if cfg.agentExecution != "host" && cfg.agentExecution != "container" && cfg.agentExecution != "routed-shell" {
 		return cliError{"invalid_option", "--agent-execution must be host, container, or routed-shell", []string{"Use host for legacy external commands, container for agents launched inside the task container, or routed-shell for host agents whose shell is mechanically routed into the task container."}, map[string]any{"agentExecution": cfg.agentExecution}}
 	}
+	if cfg.traceRoot == "" && opt(args, "run-dir") != "" {
+		cfg.traceRoot = filepath.Join(opt(args, "run-dir"), "traces")
+	}
 
 	var hardware any
-	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
+	if submit || (dryRun && dataset != "") {
+		if declaredModel == "" {
+			return cliError{"missing_model", "eval terminal publication requires --model <HuggingFace model id>", []string{"Pass --model org/name so the submission records a real model.", "Use lmx model search <name> to find the canonical id."}, nil}
+		}
+		hardwarePath := opt(args, "hardware")
+		if hardwarePath == "" {
+			return cliError{"missing_hardware", "eval terminal publication requires --hardware hardware.json", []string{"Run lmx hardware --out hardware.json and pass --hardware hardware.json."}, nil}
+		}
 		hardware, err = readJSON(hardwarePath)
 		if err != nil {
 			return err
 		}
-		hardware = normalizeHardwarePayload(hardware)
-	}
-
-	resolvedHFID := ""
-	if !cfg.oracle {
-		resolvedHFID, modelResolution, err = resolveTerminalModelIdentityChecked(argsWithTerminalBaseURL(args, rawBaseURL), declaredModel, servedModel, servedModelSource, verifiedModelPath)
-		if err != nil {
-			return err
+		if submit && apiKey(args) == "" {
+			return missingAPIKey("--api-key or LMX_API_KEY is required for eval terminal --submit")
 		}
-	}
-	protocol := terminalProtocolLabel(cfg)
-	agentName := "lmx-terminus"
-	if cfg.oracle {
-		agentName = "oracle"
-	} else if cfg.agentCommand != "" {
-		agentName = firstNonEmpty(opt(args, "agent-name"), agentBackend, "external-agent")
-	}
-	runnerVersion := firstNonEmpty(opt(args, "runner-version"), "localmaxxing-go terminal-agent")
-	harnessFingerprint := shortHash(terminalSystemPrompt + "\n" + terminalSessionSystemPrompt + "\ncheckpoint-v" + strconv.Itoa(terminalCheckpointArtifactVersion))
-	runConfig := map[string]any{
-		"protocol":                   protocol,
-		"agent":                      agentName,
-		"modelRevision":              firstNonEmpty(opt(args, "model-revision"), "main"),
-		"maxTurns":                   cfg.maxTurns,
-		"maxTokens":                  cfg.maxTokens,
-		"temperature":                cfg.temperature,
-		"topP":                       cfg.topP,
-		"commandTimeoutSeconds":      terminalCommandTimeoutSec(cfg),
-		"agentTimeoutSec":            cfg.agentTimeoutSec,
-		"repeatBatchLimit":           cfg.repeatBatchLimit,
-		"concurrency":                concurrency,
-		"shellMode":                  cfg.shellMode,
-		"agentExecution":             cfg.agentExecution,
-		"oracle":                     cfg.oracle,
-		"modelEndpoint":              terminalSanitizedEndpointOrigin(baseURL),
-		"servedModelSource":          servedModelSource,
-		"endpointTimeoutSeconds":     int(terminalEndpointTimeout(cfg).Seconds()),
-		"terminalHarnessFingerprint": harnessFingerprint,
-	}
-	if cfg.agentCommand != "" {
-		runConfig["agentBackend"] = firstNonEmpty(agentBackend, "custom")
-		runConfig["toolRouting"] = map[string]any{"shell": cfg.agentExecution, "workdir": "/app", "hostFilesystemVisible": cfg.agentExecution == "host"}
-	}
-
-	provenance, err := terminalRunProvenance(dataset, shardIndex, bundles, declaredModel, resolvedHFID, servedModel, resolvedQuant, resolvedQuantFormat, runnerVersion, hardware, modelResolution, quantResolution, runConfig)
-	if err != nil {
-		return cliError{"checkpoint_provenance_invalid", "Could not encode immutable terminal run provenance.", nil, err.Error()}
-	}
-	checkpoint, err := newTerminalCheckpointManager(args, dataset, shardIndex, bundles, provenance)
-	if err != nil {
-		return err
-	}
-	if err := checkpoint.acquireProcessLock(); err != nil {
-		return err
-	}
-	defer checkpoint.releaseProcessLock()
-	if checkpoint.resumeMode != "none" {
-		if err := checkpoint.loadForResume(); err != nil {
-			return err
-		}
-	} else {
-		_, savedProvenance, savedOrder, err := loadTerminalCheckpointMetadata(checkpoint.path)
-		if err != nil {
-			return err
-		}
-		entries, _, err := loadTerminalCheckpointEntries(checkpoint.path, savedProvenance, savedOrder, true)
-		if err != nil {
-			return err
-		}
-		if !terminalJSONEqual(savedProvenance, checkpoint.provenance) || !terminalJSONEqual(savedOrder, checkpoint.taskOrder) || len(entries) != 0 {
-			return cliError{"checkpoint_concurrent_write", "The clean checkpoint changed before task execution could acquire exclusive ownership.", []string{"Retry with --resume none after confirming no other writer is using this checkpoint."}, map[string]any{"path": checkpoint.path}}
+		if rawBaseURL != "" && opt(args, "quantization") == "" && resolvedQuant == "" {
+			return cliError{"model_detection_failed", "Could not verify the local endpoint model/quantization before terminal execution.", []string{"Keep the model endpoint running.", "Or pass --quantization and --quant-format explicitly if the endpoint cannot expose model metadata."}, map[string]any{"baseUrl": baseURL}}
 		}
 	}
 
-	printInfo("terminal_eval_start", map[string]any{"dataset": firstNonEmpty(dataset, "local"), "tasks": len(bundles), "model": firstNonEmpty(callModel, "oracle"), "baseUrl": terminalSanitizedEndpointOrigin(baseURL), "concurrency": concurrency, "oracle": cfg.oracle, "checkpoint": checkpoint.path, "resume": firstNonEmpty(opt(args, "resume"), "none"), "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg), "endpointTimeoutSeconds": int(terminalEndpointTimeout(cfg).Seconds())})
-	results, err := runTerminalBundles(args, dataset, shardIndex, bundles, baseURL, callModel, cfg, concurrency, checkpoint)
+	hfID := declaredModel
+	if declaredModel != "" && (submit || (dryRun && dataset != "")) {
+		submitArgs := argsWithTerminalBaseURL(args, rawBaseURL)
+		hfID, modelResolution = resolveEvalModelID(submitArgs, declaredModel)
+	}
+	var coverageBefore map[string]any
+	if dataset != "" && localDir == "" && (submit || dryRun) && opt(args, "shard") == "" {
+		args, coverageBefore, err = selectMissingTerminalShard(ctx, args, dataset, hfID, resolvedQuant, resolvedQuantFormat, cfg)
+		if err != nil {
+			return err
+		}
+		cfg.args = args
+	}
+
+	if dryRun {
+		taskCount, shardIndex := 0, -1
+		if localDir != "" {
+			bundles, loadErr := loadTerminalBundles(localDir)
+			if loadErr != nil {
+				return loadErr
+			}
+			taskCount = len(bundles)
+		} else {
+			items, selectedShard, manifestErr := fetchTerminalManifestItems(ctx, args, dataset)
+			if manifestErr != nil {
+				return manifestErr
+			}
+			taskCount, shardIndex = len(items), selectedShard
+		}
+		plan := map[string]any{"dryRun": true, "dataset": firstNonEmpty(dataset, "local"), "tasks": taskCount, "shardIndex": shardIndex, "apiUrl": apiURL(args), "baseUrl": baseURL, "model": hfID, "servedModel": callModel, "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "harnessKey": terminalHarnessKey(args, cfg), "agentTimeoutDefaultSec": defaultTerminalTaskTimeoutSec, "commandTimeoutDefaultSec": defaultTerminalCommandTimeoutSec, "coverageBefore": coverageBefore, "canSubmit": apiKey(args) != "" && hfID != "" && hardware != nil}
+		return writeOrPrintJSON("terminal_eval_preflight", args, plan)
+	}
+
+	bundles, cleanup, shardIndex, err := acquireTerminalBundles(ctx, args, dataset, localDir)
+	if cleanup != "" {
+		defer os.RemoveAll(cleanup)
+	}
 	if err != nil {
 		return err
+	}
+	if len(bundles) == 0 {
+		return cliError{"bundle_invalid", "No terminal task bundles were found.", []string{"Point --task-dir at one bundle or a parent directory of bundles containing task.json and tests/."}, map[string]any{"taskDir": localDir}}
+	}
+	checkpoint, resumed, err := openTerminalLiveCheckpoint(args, dataset, shardIndex, bundles, baseURL, callModel, hfID, resolvedQuant, resolvedQuantFormat, hardware, cfg)
+	defer checkpoint.close()
+	if err != nil {
+		return err
+	}
+	if len(resumed) < len(bundles) {
+		if err := dockerPreflightContext(ctx); err != nil {
+			return err
+		}
+	}
+	if checkpoint != nil {
+		cfg.runLabel = shortHash(checkpoint.root)
+		if len(resumed) < len(bundles) {
+			if err := cleanupTerminalRunContainers(ctx, cfg.runLabel); err != nil {
+				return err
+			}
+		}
+	}
+	startFields := map[string]any{"dataset": firstNonEmpty(dataset, "local"), "tasks": len(bundles), "resumedTasks": len(resumed), "pendingTasks": len(bundles) - len(resumed), "model": firstNonEmpty(callModel, "oracle"), "baseUrl": baseURL, "concurrency": concurrency, "oracle": cfg.oracle}
+	if checkpoint != nil {
+		startFields["runDir"] = checkpoint.root
+	}
+	printStatus(args, "terminal_eval_start", startFields)
+	results, err := runTerminalBundles(ctx, args, bundles, baseURL, callModel, cfg, concurrency, resumed, checkpoint)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			_ = checkpoint.interrupt()
+			printStatus(args, "terminal_eval_interrupted", map[string]any{"runDir": opt(args, "run-dir"), "resumable": opt(args, "run-dir") != ""})
+			return terminalCancelledError(ctx)
+		}
+		return err
+	}
+	if cfg.runLabel != "" {
+		if err := cleanupTerminalRunContainers(ctx, cfg.runLabel); err != nil {
+			return err
+		}
+		printStatus(args, "terminal_cleanup_verified", map[string]any{"runLabel": cfg.runLabel, "runDir": opt(args, "run-dir")})
 	}
 	stats := shardStats{}
 	errorCodes := map[string]string{}
@@ -914,101 +735,110 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if len(results) > 0 {
 		avgLatency = stats.totalLatencyMs / int64(len(results))
 	}
-	submitRunConfig := managerSafeMap(runConfig)
-	submitRunConfig["accuracy"] = accuracy
-	submitRunConfig["tasksRun"] = len(results)
-	submitRunConfig["errors"] = stats.errors
-	submitRunConfig["avgLatencyMs"] = avgLatency
-	submitRunConfig["modelResolution"] = modelResolution
-	submitRunConfig["quantizationResolution"] = quantResolution
-	summary := managerSafeMap(provenance)
-	summary["artifactVersion"] = terminalCheckpointArtifactVersion
-	summary["tasks"] = len(results)
-	summary["correct"] = stats.correct
-	summary["scored"] = stats.scored
-	summary["errors"] = stats.errors
-	summary["accuracyPct"] = roundMetric(accuracy * 100)
-	summary["avgWallTimeMs"] = avgLatency
-	summary["wallTimeMs"] = stats.totalLatencyMs
-	summary["tokenUsage"] = totalUsage.toMap()
-	summary["modelRevision"] = firstNonEmpty(opt(args, "model-revision"), "main")
-	summary["agent"] = agentName
-	summary["runnerVersion"] = runnerVersion
-	summary["errorCodes"] = errorCodes
-	summary["checkpoint"] = checkpoint.path
-	summary["provenance"] = managerSafeMap(provenance)
-	if shardIndex >= 1 {
-		summary["shardIndex"] = shardIndex
+	summary := map[string]any{"dataset": firstNonEmpty(dataset, "local"), "shardIndex": shardIndex, "tasks": len(results), "correct": stats.correct, "scored": stats.scored, "errors": stats.errors, "accuracyPct": roundMetric(accuracy * 100), "avgWallTimeMs": avgLatency, "wallTimeMs": stats.totalLatencyMs, "tokenUsage": totalUsage.toMap(), "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "errorCodes": errorCodes}
+	records := make([]any, len(results))
+	for i, r := range results {
+		records[i] = map[string]any{"question_id": bundles[i].Task.ID, "pass": r.pass, "scored": r.scored, "error": r.errText, "errorCode": r.errCode, "latencyMs": r.wallTimeMs, "wallTimeMs": r.wallTimeMs, "tokenUsage": r.usage.toMap(), "turns": terminalTaskTurnsValue(r), "question": bundles[i].Task.Instruction, "prompt": r.prompt, "response": r.transcript, "verifierOutput": r.verifierOutput}
 	}
-	if resolvedHFID != "" {
-		summary["hfId"] = resolvedHFID
+	resultDocument := map[string]any{"summary": summary, "results": records}
+	if err := checkpoint.finish("completed", resultDocument); err != nil {
+		return err
 	}
-	if hardware != nil {
-		summary["hardware"] = hardware
-	}
-
-	out := opt(args, "out")
-	printTerminalFailureSummary(args, bundles, results, cfg, checkpoint.path)
-	if out != "" {
-		records := make([]any, len(results))
-		for i, r := range results {
-			records[i] = terminalSavedResultFromRun(bundles[i], r, provenance)
-		}
-		if err := writeJSON(out, map[string]any{"summary": summary, "results": records}); err != nil {
+	outPath := opt(args, "out")
+	if outPath != "" {
+		if err := writeJSON(outPath, resultDocument); err != nil {
 			return err
 		}
-		printStatus(args, "terminal_results_written", map[string]any{"path": out})
+		printStatus(args, "terminal_results_written", map[string]any{"path": outPath})
 	}
-	checkpointComplete := checkpoint.complete()
-	if !checkpointComplete {
-		resumeCommand := terminalResumeCommand(args, dataset, checkpoint.path)
-		printInfo("terminal_checkpoint_incomplete", map[string]any{"checkpoint": checkpoint.path, "tasks": len(results), "scored": stats.scored, "resumeCommand": resumeCommand})
-		fmt.Println("Resume incomplete checkpoint with: " + resumeCommand)
+	if !submit {
+		completeFields := map[string]any{"submitted": false}
+		for key, value := range summary {
+			completeFields[key] = value
+		}
+		if outPath != "" {
+			completeFields["resultPath"] = outPath
+		}
+		if checkpoint != nil {
+			completeFields["runDir"] = checkpoint.root
+			completeFields["checkpointResultPath"] = filepath.Join(checkpoint.root, "result.json")
+		}
+		if hasFlag(args, "json-status") {
+			printStatus(args, "terminal_eval_completed", completeFields)
+		} else {
+			printInfo("terminal_eval_complete", summary)
+			fmt.Println("Local run complete — nothing submitted.")
+			if dataset != "" {
+				if cfg.agentCommand != "" {
+					fmt.Println("Publish with: lmx eval terminal run " + dataset + " --agent-cmd '<your-agent-command>' --model <hfId> --hardware hardware.json --submit")
+				} else {
+					fmt.Println("Publish with: lmx eval terminal run " + dataset + " --base-url " + rawBaseURL + " --model <hfId> --hardware hardware.json --submit")
+				}
+			}
+		}
+		if hasFlag(args, "json-status") && (hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose")) {
+			printJSON(resultDocument)
+		}
 		if stats.errors == len(results) {
 			code := dominantTerminalErrorCode(errorCodes)
-			return cliError{code, "Every terminal task errored before scoring.", []string{"Use the emitted resume command after fixing the task or infrastructure failure."}, map[string]any{"checkpoint": checkpoint.path, "errors": errorCodes, "resumeCommand": resumeCommand}}
-		}
-		if hasFlag(args, "submit") {
-			return cliError{"checkpoint_incomplete", "Terminal submission requires every selected task to have a completed canonical verifier score.", []string{"Use the emitted resume command; submit is available only after the checkpoint is complete."}, map[string]any{"checkpoint": checkpoint.path, "tasks": len(results), "scored": stats.scored, "resumeCommand": resumeCommand}}
+			return cliError{code, "Every terminal task errored before scoring.", []string{"Inspect --out results.json and the terminal_task_error events."}, map[string]any{"errors": errorCodes}}
 		}
 		return nil
 	}
-	if !hasFlag(args, "submit") {
-		printInfo("local_execution_results_not_submitted", summary)
-		fmt.Println("local_execution_results_not_submitted: terminal tasks executed and checkpointed; no result was submitted to LocalMaxxing.")
-		if command := terminalDeferredSubmitCommand(args, checkpoint.path, summary); command != "" {
-			fmt.Println("Submit later with: " + command)
+	if stats.scored != len(bundles) || stats.errors != 0 {
+		unscored := make([]string, 0, stats.errors)
+		for i, result := range results {
+			if !result.scored {
+				unscored = append(unscored, bundles[i].Task.ID)
+			}
 		}
-		return nil
+		return cliError{"incomplete_shard", "Terminal shard submission requires every fetched task to be scored.", []string{"Inspect --out results.json and fix every infrastructure error before retrying.", "Do not publish a partial shard."}, map[string]any{"tasks": len(bundles), "scored": stats.scored, "errors": stats.errors, "unscoredTaskIds": unscored, "errorCodes": errorCodes, "shardIndex": shardIndex}}
 	}
-	key := apiKey(args)
-	if key == "" {
-		return missingAPIKey("--api-key or LMX_API_KEY is required for eval terminal --submit")
-	}
-	if resolvedHFID == "" {
-		return cliError{"missing_model", "eval terminal --submit requires a canonical HuggingFace model id.", []string{"Pass --model org/name, or use an endpoint that exposes the loaded model filename so it can be resolved."}, nil}
-	}
-	if hardware == nil {
-		return cliError{"missing_hardware", "eval terminal --submit requires --hardware hardware.json", []string{"Run lmx hardware --out hardware.json and pass --hardware hardware.json."}, nil}
-	}
-	submitResults := []any{}
-	submitArtifacts := []any{}
+
+	submitResults := make([]any, 0, len(results))
+	submitArtifacts := make([]any, 0, len(results))
 	for i, r := range results {
-		if !r.scored {
-			continue
-		}
 		task := bundles[i].Task
 		submitResults = append(submitResults, map[string]any{"question_id": task.ID, "pass": r.pass})
 		artifactResponse := truncateString(r.transcript+"\n\n# Verifier\n\n"+r.verifierOutput, 4_900_000)
 		submitArtifacts = append(submitArtifacts, map[string]any{"question_id": task.ID, "itemIndex": i, "promptHash": shortHash(task.ID + ":" + r.prompt), "question": task.Instruction, "prompt": r.prompt, "response": artifactResponse, "score": boolScore(r.pass), "testPassed": r.pass, "latencyMs": r.wallTimeMs, "wallTimeMs": r.wallTimeMs, "tokenUsage": r.usage.toMap()})
 	}
-	if len(submitResults) == 0 {
-		return cliError{"no_scored_questions", "Every terminal task failed to score, so there is nothing to submit.", []string{"Check Docker and the model endpoint.", "Inspect failures with --out results.json."}, map[string]any{"errors": errorCodes}}
+	protocol := terminalProtocolLabel(cfg)
+	agentName := "lmx-terminus"
+	if cfg.agentCommand != "" {
+		agentName = firstNonEmpty(opt(args, "agent-name"), agentBackend, "external-agent")
 	}
-	if rawBaseURL != "" && opt(args, "quantization") == "" && resolvedQuant == "" {
-		return cliError{"model_detection_failed", "Could not verify the local endpoint model/quantization before submission.", []string{"Keep the model endpoint running through submission.", "Or pass --quantization and --quant-format explicitly if the endpoint cannot expose model metadata."}, map[string]any{"baseUrl": terminalSanitizedEndpointOrigin(baseURL)}}
+	taskLimits := make([]any, 0, len(bundles))
+	commonMaxTurns := -1
+	maxTurnsEnforcement := terminalMaxTurnsEnforcement(cfg)
+	for _, bundle := range bundles {
+		resolvedMaxTurns := terminalAgentMaxTurns(cfg, bundle.Task)
+		if commonMaxTurns == -1 {
+			commonMaxTurns = resolvedMaxTurns
+		} else if commonMaxTurns != resolvedMaxTurns {
+			commonMaxTurns = 0
+		}
+		taskLimits = append(taskLimits, map[string]any{
+			"taskId":               bundle.Task.ID,
+			"maxTurns":             resolvedMaxTurns,
+			"maxTurnsSource":       terminalLimitSource(cfg.maxTurns, bundle.Task.Agent.MaxTurns),
+			"maxTurnsEnforcement":  maxTurnsEnforcement,
+			"agentTimeoutSec":      terminalAgentTimeoutSec(cfg, bundle.Task),
+			"agentTimeoutSource":   terminalLimitSource(cfg.agentTimeoutSec, bundle.Task.Agent.TimeoutSec),
+			"commandTimeoutSec":    terminalCommandTimeoutSec(cfg),
+			"commandTimeoutSource": terminalLimitSource(cfg.commandTimeoutSec, 0),
+		})
 	}
-	payload := map[string]any{"hfId": resolvedHFID, "modelRevision": summary["modelRevision"], "hardware": hardware, "results": submitResults, "artifacts": submitArtifacts, "runnerVersion": firstNonEmpty(opt(args, "runner-version"), "localmaxxing-go terminal-agent"), "runConfig": submitRunConfig}
+	runConfig := map[string]any{"accuracy": accuracy, "tasksRun": len(results), "errors": stats.errors, "avgLatencyMs": avgLatency, "protocol": protocol, "agent": agentName, "maxTurnsPolicy": map[bool]string{true: "cli-override", false: "per-task-manifest-or-fallback"}[cfg.maxTurns > 0], "maxTurnsEnforcement": maxTurnsEnforcement, "agentTimeoutPolicy": map[bool]string{true: "cli-override", false: "per-task-manifest-or-fallback"}[cfg.agentTimeoutSec > 0], "commandTimeoutSec": terminalCommandTimeoutSec(cfg), "taskLimits": taskLimits, "concurrency": concurrency, "modelResolution": modelResolution, "quantizationResolution": quantResolution}
+	if commonMaxTurns > 0 {
+		runConfig["maxTurns"] = commonMaxTurns
+	}
+	if cfg.agentCommand != "" {
+		runConfig["agentCommand"] = cfg.agentCommand
+		runConfig["agentExecution"] = cfg.agentExecution
+		runConfig["toolRouting"] = map[string]any{"shell": cfg.agentExecution, "workdir": "/app", "hostFilesystemVisible": cfg.agentExecution == "host"}
+	}
+	payload := map[string]any{"hfId": hfID, "modelRevision": firstNonEmpty(opt(args, "model-revision"), "main"), "hardware": normalizeHardwarePayload(hardware), "results": submitResults, "artifacts": submitArtifacts, "runnerVersion": firstNonEmpty(opt(args, "runner-version"), "localmaxxing-go terminal-agent"), "runConfig": runConfig}
 	if shardIndex >= 1 {
 		payload["shardIndex"] = shardIndex
 	}
@@ -1021,1128 +851,61 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if notes := opt(args, "notes"); notes != "" {
 		payload["notes"] = notes
 	}
-	value, err := fetchJSON("POST", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/submit", key, payload)
+	value, err := fetchJSONContext(ctx, "POST", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/submit", apiKey(args), payload)
 	if err != nil {
+		if ctx.Err() != nil {
+			return terminalCancelledError(ctx)
+		}
 		return err
 	}
-	if hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose") {
+	if !hasFlag(args, "json-status") && (hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose")) {
 		printJSON(value)
 	}
+	obj := asObject(value)
+	submission := map[string]any{"shardIndex": shardIndex, "submitted": len(submitResults), "run": obj["run"], "aggregate": obj["aggregate"]}
+	resultDocument["submission"] = submission
 	fields := map[string]any{"dataset": dataset, "submitted": len(submitResults), "accuracyPct": summary["accuracyPct"]}
-	if obj := asObject(value); obj != nil {
-		if agg := asObject(obj["aggregate"]); agg != nil {
-			fields["pooledScore"] = agg["pooledScore"]
-			fields["ciLower"] = agg["ciLower"]
-			fields["ciUpper"] = agg["ciUpper"]
-			fields["coverage"] = agg["shardsCovered"]
+	if agg := asObject(obj["aggregate"]); agg != nil {
+		fields["pooledScore"] = agg["pooledScore"]
+		fields["ciLower"] = agg["ciLower"]
+		fields["ciUpper"] = agg["ciUpper"]
+		fields["coverage"] = agg["shardsCovered"]
+		summary["pooledScore"] = agg["pooledScore"]
+		summary["ciLower"] = agg["ciLower"]
+		summary["ciUpper"] = agg["ciUpper"]
+		summary["coverage"] = agg["shardsCovered"]
+	}
+	if run := asObject(obj["run"]); run != nil {
+		fields["runId"] = run["id"]
+		fields["status"] = run["status"]
+		summary["runId"] = run["id"]
+		summary["status"] = run["status"]
+	}
+	if outPath != "" {
+		if err := writeJSON(outPath, resultDocument); err != nil {
+			return err
 		}
-		if run := asObject(obj["run"]); run != nil {
-			fields["runId"] = run["id"]
-			fields["status"] = run["status"]
-		}
+		printStatus(args, "terminal_submission_receipt_written", map[string]any{"path": outPath, "shardIndex": shardIndex})
 	}
-	printInfo("terminal_eval_submitted", fields)
-	return nil
-}
-
-func loadTerminalEndpointFile(filename string) (terminalEndpointMetadata, error) {
-	value, err := readJSON(filename)
-	if err != nil {
-		return terminalEndpointMetadata{}, err
+	if outPath != "" {
+		fields["resultPath"] = outPath
 	}
-	root := asObject(value)
-	if root == nil {
-		return terminalEndpointMetadata{}, cliError{"endpoint_file_invalid", "Endpoint discovery file must contain a JSON object.", []string{"Create it with lmx endpoint discover --out endpoint.json."}, map[string]any{"path": filename}}
-	}
-	items, ok := root["endpoints"].([]any)
-	if !ok {
-		return terminalEndpointMetadata{}, cliError{"endpoint_file_invalid", "Endpoint discovery file is missing its endpoints array.", []string{"Create it with lmx endpoint discover --out endpoint.json."}, map[string]any{"path": filename}}
-	}
-	selected := make([]map[string]any, 0, 1)
-	for _, item := range items {
-		obj := asObject(item)
-		if obj == nil {
-			continue
-		}
-		entryOK, _ := obj["ok"].(bool)
-		if entryOK {
-			selected = append(selected, obj)
-		}
-	}
-	if len(selected) == 0 {
-		return terminalEndpointMetadata{}, cliError{"endpoint_file_no_selection", "Endpoint discovery file contains no ok:true endpoint.", []string{"Regenerate it while exactly one intended endpoint is available."}, map[string]any{"path": filename}}
-	}
-	if len(selected) > 1 {
-		return terminalEndpointMetadata{}, cliError{"endpoint_file_ambiguous", "Endpoint discovery file contains more than one ok:true endpoint.", []string{"Remove unintended entries, leaving one selected endpoint."}, map[string]any{"path": filename, "selectedEndpoints": len(selected)}}
-	}
-	entry := selected[0]
-	metadata := terminalEndpointMetadata{
-		baseURL:      stringValue(entry["baseUrl"]),
-		servedModel:  stringValue(entry["servedModel"]),
-		quantization: stringValue(entry["quantization"]),
-		modelPath:    firstNonEmpty(stringValue(entry["modelPath"]), stringValue(entry["model_path"])),
-	}
-	if serverMetadata := asObject(entry["serverMetadata"]); serverMetadata != nil {
-		metadata.quantization = firstNonEmpty(metadata.quantization, stringValue(serverMetadata["quantization"]))
-		metadata.modelPath = firstNonEmpty(metadata.modelPath, stringValue(serverMetadata["modelPath"]), stringValue(serverMetadata["model_path"]))
-	}
-	if metadata.baseURL == "" {
-		return terminalEndpointMetadata{}, cliError{"endpoint_file_invalid", "The selected endpoint has no baseUrl.", []string{"Regenerate the file with lmx endpoint discover --out endpoint.json."}, map[string]any{"path": filename}}
-	}
-	return metadata, nil
-}
-
-func discoverTerminalEndpoint(args cliArgs, _ string) (string, string, map[string]any, error) {
-	probeKey := opt(args, "model-api-key")
-	if probeKey != "" && opt(args, "base-url") == "" {
-		return "", "", nil, cliError{"endpoint_credentials_require_explicit_target", "--model-api-key requires an explicit --base-url or trusted --endpoint-file.", []string{"Do not attach model credentials while probing broad localhost candidates."}, nil}
-	}
-	attempts := make([]any, 0)
-	preferred := strings.TrimSpace(opt(args, "served-model"))
-	type candidateMatch struct {
-		index       int
-		baseURL     string
-		servedModel string
-		info        map[string]any
-	}
-	matches := make([]candidateMatch, 0, 1)
-	ambiguousCandidates := make([]string, 0)
-	for index, candidate := range endpointDiscoveryCandidates(args) {
-		servedModel, info, err := probeTerminalEndpoint(candidate, probeKey, preferred, preferred != "", terminalEndpointProbeTimeout)
-		if err != nil {
-			attempts = append(attempts, map[string]any{"baseUrl": terminalSanitizedEndpointOrigin(candidate), "error": err.Error()})
-			if strings.Contains(strings.ToLower(err.Error()), "ambiguous") {
-				ambiguousCandidates = append(ambiguousCandidates, terminalSanitizedEndpointOrigin(candidate))
-			}
-			continue
-		}
-		matches = append(matches, candidateMatch{index: index, baseURL: candidate, servedModel: servedModel, info: info})
-	}
-	if len(ambiguousCandidates) > 0 {
-		candidates := append([]string{}, ambiguousCandidates...)
-		for _, match := range matches {
-			candidates = append(candidates, terminalSanitizedEndpointOrigin(match.baseURL))
-		}
-		return "", "", nil, cliError{"endpoint_discovery_ambiguous", "Automatic discovery found a healthy endpoint with multiple models or more than one healthy endpoint.", []string{"Pass --served-model with an exact id, or select a trusted single-model endpoint explicitly."}, map[string]any{"servedModelSelector": preferred, "candidates": candidates, "attempts": attempts}}
-	}
-	if len(matches) == 0 {
-		return "", "", nil, cliError{"endpoint_discovery_failed", "No supported local model endpoint exposed an unambiguous served model.", []string{"Start the intended model server, pass --served-model with its exact live id, or pass --base-url/--endpoint-file explicitly."}, map[string]any{"servedModelSelector": preferred, "attempts": attempts}}
-	}
-	if len(matches) > 1 {
-		candidates := make([]string, len(matches))
-		for i, match := range matches {
-			candidates[i] = terminalSanitizedEndpointOrigin(match.baseURL)
-		}
-		return "", "", nil, cliError{"endpoint_discovery_ambiguous", "More than one local model endpoint is healthy or matches the exact --served-model selector.", []string{"Pass --base-url or a trusted --endpoint-file to select one endpoint atomically."}, map[string]any{"servedModelSelector": preferred, "candidates": candidates}}
-	}
-	match := matches[0]
-	printStatus(args, "terminal_endpoint_discovered", map[string]any{"baseUrl": terminalSanitizedEndpointOrigin(match.baseURL), "servedModel": match.servedModel, "candidateIndex": match.index + 1})
-	return match.baseURL, match.servedModel, match.info, nil
-}
-
-func probeTerminalEndpoint(baseURL, apiKey, preferred string, requirePreferred bool, timeout time.Duration) (string, map[string]any, error) {
-	value, err := fetchTerminalEndpointJSON(openAIBaseURL(baseURL)+"/v1/models", apiKey, timeout)
-	if err != nil {
-		return "", nil, err
-	}
-	body := asObject(value)
-	if body == nil {
-		return "", nil, errors.New("/v1/models did not return a JSON object")
-	}
-	type modelMatch struct {
-		id   string
-		info map[string]any
-	}
-	models := make([]modelMatch, 0)
-	seen := map[string]bool{}
-	for _, item := range modelInfoItems(body) {
-		obj := asObject(item)
-		if obj == nil {
-			continue
-		}
-		id := firstNonEmpty(stringValue(obj["id"]), stringValue(obj["name"]), stringValue(obj["model"]))
-		key := strings.ToLower(strings.TrimSpace(id))
-		if key == "" || seen[key] {
-			continue
-		}
-		seen[key] = true
-		models = append(models, modelMatch{id: id, info: obj})
-		if preferred != "" && strings.EqualFold(id, preferred) {
-			return id, obj, nil
-		}
-	}
-	if preferred != "" && requirePreferred {
-		return "", nil, fmt.Errorf("/v1/models does not expose requested model %q", preferred)
-	}
-	if len(models) == 1 {
-		return models[0].id, models[0].info, nil
-	}
-	if len(models) == 0 {
-		return "", nil, errors.New("/v1/models did not return any model ids")
-	}
-	ids := make([]string, len(models))
-	for i, model := range models {
-		ids[i] = model.id
-	}
-	return "", nil, fmt.Errorf("/v1/models is ambiguous; select one of %s with --served-model", strings.Join(ids, ", "))
-}
-
-func fetchTerminalEndpointJSON(rawURL, apiKey string, timeout time.Duration) (any, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, errors.New("invalid model endpoint URL")
-	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-	res, err := apiHTTPClient.Do(req)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("model endpoint probe timed out after %s", timeout)
-		}
-		return nil, errors.New("model endpoint probe failed")
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("endpoint returned %s", res.Status)
-	}
-	var body any
-	if err := json.NewDecoder(io.LimitReader(res.Body, 4*1024*1024)).Decode(&body); err != nil {
-		return nil, err
-	}
-	return body, nil
-}
-
-func terminalModelPathFromMetadata(metadata map[string]any) string {
-	return terminalModelPathFromMetadataDepth(metadata, 0)
-}
-
-func terminalModelPathFromMetadataDepth(metadata map[string]any, depth int) string {
-	if metadata == nil || depth >= 4 {
-		return ""
-	}
-	if value := firstNonEmpty(stringValue(metadata["model_path"]), stringValue(metadata["modelPath"]), stringValue(metadata["filename"]), stringValue(metadata["path"])); value != "" {
-		return value
-	}
-	for _, key := range []string{"metadata", "meta", "serverMetadata"} {
-		if nested := asObject(metadata[key]); nested != nil {
-			if value := terminalModelPathFromMetadataDepth(nested, depth+1); value != "" {
-				return value
-			}
-		}
-	}
-	return ""
-}
-
-func terminalQuantizationFromMetadata(metadata map[string]any) string {
-	return terminalQuantizationFromMetadataDepth(metadata, 0)
-}
-
-func terminalQuantizationFromMetadataDepth(metadata map[string]any, depth int) string {
-	if metadata == nil || depth >= 4 {
-		return ""
-	}
-	if value := firstNonEmpty(stringValue(metadata["quantization"]), stringValue(metadata["quant"])); value != "" {
-		return value
-	}
-	for _, key := range []string{"metadata", "meta", "serverMetadata"} {
-		if nested := asObject(metadata[key]); nested != nil {
-			if value := terminalQuantizationFromMetadataDepth(nested, depth+1); value != "" {
-				return value
-			}
-		}
-	}
-	return ""
-}
-
-func terminalEndpointQuantizationResolution(explicit, live, liveModelPath string) (map[string]any, error) {
-	resolution := map[string]any{"cli": explicit}
-	if live != "" {
-		resolution["v1Models"] = live
-	}
-	if liveModelPath != "" {
-		resolution["modelPath"] = liveModelPath
-		if filenameQuantization := quantizationFromFilename(liveModelPath); filenameQuantization != "" {
-			resolution["filename"] = filenameQuantization
-		}
-	}
-	trusted := firstNonEmpty(stringValue(resolution["filename"]), live, explicit)
-	if trusted == "" {
-		return nil, nil
-	}
-	if live != "" && !quantizationEqual(live, trusted) {
-		return nil, cliError{"endpoint_metadata_conflict", "Live endpoint quantization metadata is inconsistent.", []string{"Correct the endpoint metadata before running the evaluation."}, map[string]any{"live": live, "resolved": trusted}}
-	}
-	if explicit != "" && !quantizationEqual(explicit, trusted) {
-		return nil, cliError{"endpoint_metadata_conflict", "--quantization conflicts with the live endpoint artifact metadata.", []string{"Correct --quantization or load the intended model artifact."}, map[string]any{"explicit": explicit, "live": trusted}}
-	}
-	resolution["trusted"] = trusted
-	switch {
-	case stringValue(resolution["filename"]) != "":
-		resolution["trustedSource"] = "live_filename"
-	case live != "":
-		resolution["trustedSource"] = "live_endpoint"
-	default:
-		resolution["trustedSource"] = "cli"
-	}
-	resolution["status"] = "matched"
-	return resolution, nil
-}
-
-func reconcileTerminalEndpointField(field, explicit, live string, compareFilename bool) (string, error) {
-	if explicit == "" {
-		return live, nil
-	}
-	if live == "" {
-		return explicit, nil
-	}
-	left, right := explicit, live
-	matches := strings.EqualFold(left, right)
-	if compareFilename {
-		left, right = filepath.Base(left), filepath.Base(right)
-		matches = strings.EqualFold(left, right)
-	} else if field == "quantization" {
-		matches = quantizationEqual(left, right)
-	}
-	if !matches {
-		return "", cliError{"endpoint_metadata_conflict", "--" + field + " conflicts with metadata reported by the live endpoint.", []string{"Correct the explicit value or load the intended endpoint."}, map[string]any{"field": field, "explicit": explicit, "live": live}}
-	}
-	return live, nil
-}
-
-func terminalSanitizedEndpointOrigin(raw string) string {
-	parsed, err := url.Parse(openAIBaseURL(raw))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return ""
-	}
-	parsed.User = nil
-	parsed.Path = ""
-	parsed.RawPath = ""
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return strings.TrimRight(parsed.String(), "/")
-}
-
-func terminalSanitizedDownloadURL(raw string) string {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return ""
-	}
-	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.ForceQuery = false
-	parsed.Fragment = ""
-	parsed.RawFragment = ""
-	return parsed.String()
-}
-
-func terminalSafeDownloadError(err error) string {
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		return "request failed"
-	}
-	return err.Error()
-}
-
-func resolveTerminalModelIdentity(args cliArgs, declared, servedModel, servedModelSource, modelPath string) (string, map[string]any) {
-	resolved, resolution, err := resolveTerminalModelIdentityChecked(args, declared, servedModel, servedModelSource, modelPath)
-	if err != nil {
-		if resolution == nil {
-			resolution = map[string]any{}
-		}
-		resolution["status"] = "identity_conflict"
-		resolution["conflict"] = err.Error()
-		return "", resolution
-	}
-	return resolved, resolution
-}
-
-func resolveTerminalModelIdentityChecked(args cliArgs, declared, servedModel, servedModelSource, modelPath string) (string, map[string]any, error) {
-	declared = strings.TrimSpace(declared)
-	if declared == "<required-before-submit>" {
-		declared = ""
-	}
-	canonicalDeclared := declared != "" && canonicalModelAlias(declared) && strings.Count(declared, "/") == 1
-	seed := declared
-	if seed == "" {
-		seed = firstNonEmpty(modelNameFromGGUFFilename(modelPath), servedModel)
-	}
-	var resolution map[string]any
-	if seed != "" {
-		resolution = remoteModelResolution(args, servedModel, servedModelSource, seed, modelPath)
-	}
-	exactSourceRepo := ""
-	if modelPath != "" {
-		filename := filepath.Base(modelPath)
-		var candidates []any
-		if resolution != nil {
-			candidates = anySlice(resolution["candidates"])
-			if hint := stringValue(resolution["sourceRepo"]); hint != "" {
-				resolution["sourceRepoHint"] = hint
-			}
-			delete(resolution, "sourceRepo")
-			delete(resolution, "sourceRepoMatch")
-		}
-		sourceRepo, lookupErr := terminalExactSourceRepoFromFilename(args, candidates, filename)
-		if lookupErr != nil {
-			if resolution == nil {
-				resolution = map[string]any{"hfId": seed, "servedModel": servedModel, "servedModelSource": servedModelSource}
-			}
-			resolution["sourceRepoVerificationError"] = lookupErr.Error()
-		} else if sourceRepo != "" {
-			exactSourceRepo = sourceRepo
-			if resolution == nil {
-				resolution = map[string]any{"hfId": seed, "servedModel": servedModel, "servedModelSource": servedModelSource}
-			}
-			resolution["loadedFilename"] = filename
-			resolution["sourceRepo"] = sourceRepo
-			resolution["sourceRepoMatch"] = "exact_filename"
-			resolution["status"] = "source_repo_verified"
-		}
-	}
-	if canonicalDeclared {
-		if exactSourceRepo != "" && !strings.EqualFold(exactSourceRepo, declared) {
-			if resolution == nil {
-				resolution = map[string]any{}
-			}
-			resolution["declaredHfId"] = declared
-			resolution["verifiedSourceRepo"] = exactSourceRepo
-			return "", resolution, cliError{"model_identity_conflict", "The explicit canonical --model conflicts with the repository verified from the live loaded filename.", []string{"Correct --model to the verified repository, or load the intended model artifact."}, map[string]any{"declared": declared, "verifiedSourceRepo": exactSourceRepo, "filename": filepath.Base(modelPath)}}
-		}
-		return declared, resolution, nil
-	}
-	if exactSourceRepo != "" {
-		printStatus(args, "eval_hf_id_resolved", map[string]any{"resolved": exactSourceRepo, "servedModel": servedModel, "filename": filepath.Base(modelPath), "source": "exact_filename"})
-		return exactSourceRepo, resolution, nil
-	}
-	return "", resolution, nil
-}
-
-func terminalExactSourceRepoFromFilename(args cliArgs, candidates []any, filename string) (string, error) {
-	repositories := append([]string{}, filenameDerivedSourceRepos(filename)...)
-	for _, candidate := range candidates {
-		if repo := candidateRepoID(candidate); repo != "" {
-			repositories = append(repositories, repo)
-		}
-	}
-	seen := map[string]bool{}
-	matches := make([]string, 0, 1)
-	var firstErr error
-	for _, repo := range repositories {
-		key := strings.ToLower(repo)
-		if repo == "" || seen[key] {
-			continue
-		}
-		seen[key] = true
-		matched, err := terminalHFRepoContainsExactFilename(args, repo, filename)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if matched {
-			matches = append(matches, repo)
-		}
-	}
-	if len(matches) > 1 {
-		return "", fmt.Errorf("loaded filename %q exists in multiple candidate repositories: %s", filename, strings.Join(matches, ", "))
-	}
-	if len(matches) == 1 {
-		return matches[0], nil
-	}
-	return "", firstErr
-}
-
-func terminalHFRepoContainsExactFilename(args cliArgs, repo, filename string) (bool, error) {
-	body, err := fetchEndpointJSONWithTimeout(strings.TrimRight(hfAPIURL(args), "/")+"/api/models/"+hfRepoPath(repo), "", terminalIdentityLookupTimeout)
-	if err != nil {
-		return false, err
-	}
-	obj := asObject(body)
-	if obj == nil {
-		return false, nil
-	}
-	for _, sibling := range modelFileItems(obj) {
-		file := firstNonEmpty(stringValue(sibling["rfilename"]), stringValue(sibling["filename"]), stringValue(sibling["path"]))
-		file = filepath.Base(strings.ReplaceAll(file, `\`, "/"))
-		if file != "" && strings.EqualFold(file, filename) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func terminalDeferredSubmitCommand(args cliArgs, out string, summary map[string]any) string {
-	tasks := int(numberField(summary, "tasks"))
-	if tasks <= 0 || int(numberField(summary, "scored")) != tasks {
-		return ""
-	}
-	dataset := stringValue(summary["dataset"])
-	if dataset == terminalBench21Dataset && int(numberField(summary, "artifactVersion")) >= terminalCheckpointArtifactVersion {
-		taskOrder := summary["taskOrder"]
-		shardIndex := int(numberField(summary, "shardIndex"))
-		expected := terminalBench21CanonicalTaskIDs
-		if shardIndex >= 1 && shardIndex <= terminalBench21ShardCount {
-			start := ((shardIndex - 1) * len(expected)) / terminalBench21ShardCount
-			end := (shardIndex * len(expected)) / terminalBench21ShardCount
-			expected = expected[start:end]
-		}
-		if !terminalJSONEqual(taskOrder, expected) {
-			return ""
-		}
-	}
-
-	command := []string{"lmx", "eval", "terminal", "submit", shellQuote(out), "--api-url", shellQuote(apiURL(args))}
-	if dataset == "" || dataset == "local" {
-		command = append(command, "--dataset", shellQuote("<dataset-slug>"))
-	}
-	if stringValue(summary["hfId"]) == "" {
-		command = append(command, "--hf-id", shellQuote("<org/model>"))
-	}
-	if summary["hardware"] == nil {
-		command = append(command, "--hardware", "hardware.json")
-	}
-	if dataset != "" && dataset != "local" && dataset != terminalBench21Dataset && int(numberField(summary, "shardIndex")) < 1 {
-		command = append(command, "--shard-index", shellQuote("<n>"))
-	}
-	return strings.Join(command, " ")
-}
-
-func terminalJSONHash(value any) (string, error) {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
-}
-
-func terminalRunProvenance(dataset string, shardIndex int, bundles []terminalBundle, declaredModel, canonicalModel, servedModel, quantization, quantFormat, runnerVersion string, hardware any, modelResolution, quantizationResolution, runConfig map[string]any) (map[string]any, error) {
-	selectedTaskOrder := make([]string, len(bundles))
-	selectedRows := make([]any, len(bundles))
-	taskVersions := make([]string, len(bundles))
-	for i, bundle := range bundles {
-		selectedTaskOrder[i] = bundle.Task.ID
-		taskVersions[i] = bundle.Task.Version
-		selectedRows[i] = map[string]any{"questionId": bundle.Task.ID, "version": bundle.Task.Version, "source": bundle.Task.Source, "bundleKey": bundle.BundleKey, "sha256": bundle.BundleSHA256, "byteSize": bundle.ByteSize, "verifierCommand": bundle.Task.Verifier.Command, "rewardFile": bundle.Task.Verifier.RewardFile, "verifierTimeoutSeconds": bundle.Task.Verifier.TimeoutSec, "agentTimeoutSeconds": bundle.Task.Agent.TimeoutSec, "agentMaxTurns": bundle.Task.Agent.MaxTurns}
-	}
-	selectedHash, err := terminalJSONHash(selectedRows)
-	if err != nil {
-		return nil, err
-	}
-	manifestIdentity := "local-bundle-set"
-	manifestHash := selectedHash
-	manifestVersion := "local-bundle-tree/v1"
-	canonicalTaskIDs := append([]string(nil), selectedTaskOrder...)
-	if len(bundles) > 0 && bundles[0].ManifestSHA256 != "" {
-		manifestIdentity = bundles[0].ManifestIdentity
-		manifestHash = bundles[0].ManifestSHA256
-		manifestVersion = bundles[0].ManifestVersion
-		canonicalTaskIDs = append([]string(nil), bundles[0].ManifestTaskIDs...)
-	}
-	hardwareHash := ""
-	if hardware != nil {
-		hardwareHash, err = terminalJSONHash(hardware)
-		if err != nil {
-			return nil, err
-		}
-	}
-	provenance := map[string]any{
-		"artifactVersion":        terminalCheckpointArtifactVersion,
-		"dataset":                firstNonEmpty(dataset, "local"),
-		"shardIndex":             shardIndex,
-		"canonicalTaskIds":       canonicalTaskIDs,
-		"selectedTaskIds":        selectedTaskOrder,
-		"taskOrder":              selectedTaskOrder,
-		"taskOrderSha256":        shortHash(strings.Join(selectedTaskOrder, "\n")),
-		"manifestIdentity":       manifestIdentity,
-		"manifestSha256":         manifestHash,
-		"manifestVersion":        manifestVersion,
-		"manifestTaskVersions":   taskVersions,
-		"selectedManifestSha256": selectedHash,
-		"manifestItems":          selectedRows,
-		"declaredModel":          declaredModel,
-		"hfId":                   canonicalModel,
-		"servedModel":            servedModel,
-		"quantization":           quantization,
-		"quantFormat":            quantFormat,
-		"hardware":               hardware,
-		"hardwareSha256":         hardwareHash,
-		"runnerVersion":          runnerVersion,
-		"modelResolution":        modelResolution,
-		"quantizationResolution": quantizationResolution,
-		"runConfig":              runConfig,
-	}
-	provenanceHash, err := terminalJSONHash(provenance)
-	if err != nil {
-		return nil, err
-	}
-	provenance["provenanceSha256"] = provenanceHash
-	return provenance, nil
-}
-
-func terminalCheckpointDefaultPath(args cliArgs, dataset string, shardIndex int) string {
-	if explicit := opt(args, "checkpoint-dir"); explicit != "" {
-		return explicit
-	}
-	if out := opt(args, "out"); out != "" {
-		return out + ".checkpoint"
-	}
-	name := sanitizeDockerName(firstNonEmpty(dataset, "local"))
-	if shardIndex > 0 {
-		name += fmt.Sprintf("-shard-%02d", shardIndex)
-	}
-	return filepath.Join(".lmx-terminal-checkpoints", name)
-}
-
-func newTerminalCheckpointManager(args cliArgs, dataset string, shardIndex int, bundles []terminalBundle, provenance map[string]any) (*terminalCheckpointManager, error) {
-	if hasFlag(args, "resume") {
-		return nil, cliError{"missing_option_value", "--resume requires none, auto, or a checkpoint directory.", []string{"Pass --resume auto to use the default checkpoint, or --resume <dir> to select one explicitly."}, nil}
-	}
-	mode := firstNonEmpty(opt(args, "resume"), "none")
-	checkpointPath := terminalCheckpointDefaultPath(args, dataset, shardIndex)
-	if mode != "none" && mode != "auto" {
-		if explicit := opt(args, "checkpoint-dir"); explicit != "" && filepath.Clean(explicit) != filepath.Clean(mode) {
-			return nil, cliError{"checkpoint_path_conflict", "--resume <dir> conflicts with --checkpoint-dir.", []string{"Use one checkpoint directory for both options."}, map[string]any{"resume": mode, "checkpointDir": explicit}}
-		}
-		checkpointPath = mode
-	}
-	if terminalPathContainsTraversal(checkpointPath) {
-		return nil, cliError{"checkpoint_path_invalid", "Checkpoint paths must not contain traversal components.", nil, map[string]any{"path": checkpointPath}}
-	}
-	taskOrder := make([]string, len(bundles))
-	for i := range bundles {
-		taskOrder[i] = bundles[i].Task.ID
-	}
-	manager := &terminalCheckpointManager{path: filepath.Clean(checkpointPath), provenance: managerSafeMap(provenance), taskOrder: taskOrder, entries: map[string]terminalCheckpointEntry{}, results: map[string]terminalSavedResult{}, resumeMode: mode}
-	if err := manager.acquireProcessLock(); err != nil {
-		return nil, err
-	}
-	defer manager.releaseProcessLock()
-	if mode == "none" {
-		if err := manager.initializeClean(); err != nil {
-			return nil, cliError{"checkpoint_initialize_failed", "Could not initialize a clean private checkpoint before task execution.", nil, map[string]any{"path": manager.path, "error": err.Error()}}
-		}
-		return manager, nil
-	}
-	info, statErr := os.Lstat(manager.path)
-	if errors.Is(statErr, os.ErrNotExist) && mode == "auto" {
-		if err := manager.initializeClean(); err != nil {
-			return nil, cliError{"checkpoint_initialize_failed", "Could not initialize a clean private checkpoint before task execution.", nil, map[string]any{"path": manager.path, "error": err.Error()}}
-		}
-		manager.resumeMode = "none"
-		return manager, nil
-	}
-	if statErr != nil {
-		return nil, cliError{"checkpoint_missing", "The requested resume checkpoint directory is unavailable.", []string{"Use --resume none to start clean, or pass the correct v3 checkpoint directory."}, map[string]any{"path": manager.path, "error": statErr.Error()}}
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return nil, cliError{"checkpoint_metadata_invalid", "The resume checkpoint must be a real directory, not a symlink or special file.", nil, map[string]any{"path": manager.path}}
-	}
-	if err := manager.loadForResume(); err != nil {
-		return nil, err
-	}
-	return manager, nil
-}
-
-func (manager *terminalCheckpointManager) loadForResume() error {
-	_, savedProvenance, savedOrder, err := loadTerminalCheckpointMetadata(manager.path)
-	if err != nil {
+	if err := checkpoint.finish("submitted", resultDocument); err != nil {
 		return err
 	}
-	for _, field := range terminalCheckpointProvenanceFields {
-		if !terminalJSONEqual(savedProvenance[field], manager.provenance[field]) {
-			return cliError{"checkpoint_provenance_mismatch", "Resume checkpoint does not match the immutable terminal run provenance.", []string{"Use --resume none, or select the checkpoint created by this exact dataset shard, manifest, model, hardware, and runner."}, map[string]any{"path": manager.path, "field": field, "saved": savedProvenance[field], "current": manager.provenance[field]}}
+	if checkpoint != nil {
+		fields["runDir"] = checkpoint.root
+		fields["checkpointResultPath"] = filepath.Join(checkpoint.root, "result.json")
+	}
+	if hasFlag(args, "json-status") {
+		printStatus(args, "terminal_eval_submitted", fields)
+		if hasFlag(args, "json") || hasFlag(args, "print") || hasFlag(args, "verbose") {
+			printJSON(resultDocument)
 		}
-	}
-	if !terminalJSONEqual(savedProvenance, manager.provenance) {
-		return cliError{"checkpoint_provenance_mismatch", "Resume checkpoint provenance contains fields that differ from the current immutable run.", []string{"Use the unmodified checkpoint from this exact run."}, map[string]any{"path": manager.path, "field": "provenance"}}
-	}
-	if !terminalJSONEqual(savedOrder, manager.taskOrder) {
-		return cliError{"checkpoint_task_order_mismatch", "Resume checkpoint task ordering does not match the current manifest.", []string{"Do not reorder, filter, or replace tasks when resuming."}, map[string]any{"saved": savedOrder, "current": manager.taskOrder}}
-	}
-	entries, results, err := loadTerminalCheckpointEntries(manager.path, savedProvenance, savedOrder, true)
-	if err != nil {
-		return err
-	}
-	manager.entries = map[string]terminalCheckpointEntry{}
-	manager.results = map[string]terminalSavedResult{}
-	for taskID, result := range results {
-		if !terminalSavedResultComplete(result) {
-			continue
-		}
-		manager.entries[taskID] = entries[taskID]
-		manager.results[taskID] = result
+	} else {
+		printInfo("terminal_eval_submitted", fields)
 	}
 	return nil
-}
-
-func terminalResultFromSaved(saved terminalSavedResult) terminalTaskResult {
-	result := terminalTaskResult{pass: saved.Pass, verifierAttempted: saved.VerifierAttempted, verifierCompleted: saved.VerifierCompleted, rewardParsed: saved.RewardParsed, turns: saved.Turns, transcript: saved.Response, verifierOutput: saved.VerifierOutput, wallTimeMs: saved.WallTimeMs, errText: saved.Error, errCode: saved.ErrorCode, agentOutcomeCode: saved.AgentOutcomeCode, agentOutcomeText: saved.AgentOutcome, instruction: saved.QuestionID, prompt: saved.Prompt, lastProgressAt: saved.LastProgressAt}
-	result.scored = saved.Scored != nil && *saved.Scored
-	result.usage = tokenUsageFromObject(saved.TokenUsage)
-	return result
-}
-
-func terminalSavedResultFromRun(bundle terminalBundle, result terminalTaskResult, provenance map[string]any) terminalSavedResult {
-	scored := result.scored
-	return terminalSavedResult{QuestionID: bundle.Task.ID, Pass: result.pass, Scored: &scored, VerifierAttempted: result.verifierAttempted, VerifierCompleted: result.verifierCompleted, RewardParsed: result.rewardParsed, Error: boundedTerminalUTF8(result.errText, 2*1024, "saved task error"), ErrorCode: result.errCode, AgentOutcomeCode: result.agentOutcomeCode, AgentOutcome: boundedTerminalUTF8(result.agentOutcomeText, 1024, "saved agent outcome"), LatencyMs: result.wallTimeMs, WallTimeMs: result.wallTimeMs, TokenUsage: result.usage.toMap(), Turns: result.turns, Question: boundedTerminalUTF8(bundle.Task.Instruction, 4*1024, "saved task question"), Prompt: boundedTerminalUTF8(result.prompt, 4*1024, "saved task prompt"), Response: boundedTerminalUTF8(result.transcript, 16*1024, "saved task response"), VerifierOutput: boundedTerminalUTF8(result.verifierOutput, 4*1024, "saved verifier output"), LastProgressAt: result.lastProgressAt, Provenance: managerSafeMap(provenance)}
-}
-
-func managerSafeMap(value map[string]any) map[string]any {
-	data, _ := json.Marshal(value)
-	cloned := map[string]any{}
-	_ = json.Unmarshal(data, &cloned)
-	return cloned
-}
-
-func writeTerminalJSONAtomic(path string, value any) error {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeTerminalBytesAtomic(path, append(data, '\n'))
-}
-
-func writeTerminalBytesAtomic(target string, data []byte) error {
-	if info, err := os.Lstat(target); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return fmt.Errorf("checkpoint target %s is not a regular file", target)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	dir := filepath.Dir(target)
-	tmp := filepath.Join(dir, "."+filepath.Base(target)+".tmp-"+randomHex(8))
-	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	removeTmp := true
-	defer func() {
-		if removeTmp {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if _, err = file.Write(data); err == nil {
-		err = file.Sync()
-	}
-	closeErr := file.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if err := os.Rename(tmp, target); err != nil {
-		return err
-	}
-	removeTmp = false
-	return syncTerminalDirectory(dir)
-}
-
-func syncTerminalDirectory(dir string) error {
-	file, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	err = file.Sync()
-	closeErr := file.Close()
-	if err != nil {
-		return err
-	}
-	return closeErr
-}
-
-var terminalCheckpointSafeTaskID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-var terminalContainerName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
-
-func terminalCheckpointWrapperName(taskID string) string {
-	if terminalCheckpointSafeTaskID.MatchString(taskID) {
-		return taskID + ".json"
-	}
-	sum := sha256.Sum256([]byte(taskID))
-	return "task-" + hex.EncodeToString(sum[:]) + ".json"
-}
-
-func terminalCheckpointEntrySummary(provenance map[string]any) map[string]any {
-	summary := managerSafeMap(provenance)
-	summary["provenance"] = managerSafeMap(provenance)
-	if runConfig := asObject(provenance["runConfig"]); runConfig != nil {
-		summary["agent"] = runConfig["agent"]
-		summary["modelRevision"] = runConfig["modelRevision"]
-	}
-	return summary
-}
-
-func terminalSavedResultComplete(result terminalSavedResult) bool {
-	return result.Scored != nil && *result.Scored && result.VerifierAttempted && result.VerifierCompleted && result.RewardParsed
-}
-
-func (manager *terminalCheckpointManager) persist(index int, bundle terminalBundle, result terminalTaskResult) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	taskID := bundle.Task.ID
-	oldEntry, hadEntry := manager.entries[taskID]
-	oldResult, hadResult := manager.results[taskID]
-	saved := terminalSavedResultFromRun(bundle, result, manager.provenance)
-	scored := result.scored
-	manager.results[taskID] = saved
-	manager.entries[taskID] = terminalCheckpointEntry{Index: index + 1, Total: len(manager.taskOrder), Task: taskID, Out: terminalCheckpointWrapperName(taskID), Pass: result.pass, Scored: &scored, Summary: terminalCheckpointEntrySummary(manager.provenance)}
-	if err := manager.persistLocked(); err != nil {
-		if hadEntry {
-			manager.entries[taskID] = oldEntry
-		} else {
-			delete(manager.entries, taskID)
-		}
-		if hadResult {
-			manager.results[taskID] = oldResult
-		} else {
-			delete(manager.results, taskID)
-		}
-		return err
-	}
-	return nil
-}
-
-func (manager *terminalCheckpointManager) persistLocked() error {
-	release := false
-	if !manager.lockOwned {
-		if err := manager.acquireProcessLock(); err != nil {
-			return err
-		}
-		release = true
-	}
-	if release {
-		defer manager.releaseProcessLock()
-	}
-	if err := ensureTerminalCheckpointDirectory(manager.path); err != nil {
-		return err
-	}
-	entries := make([]terminalCheckpointEntry, 0, len(manager.entries))
-	type checkpointWrite struct {
-		path string
-		data []byte
-	}
-	writes := make([]checkpointWrite, 0, len(manager.entries))
-	for _, id := range manager.taskOrder {
-		entry, exists := manager.entries[id]
-		if !exists {
-			continue
-		}
-		result, exists := manager.results[id]
-		if !exists {
-			return fmt.Errorf("checkpoint entry %s has no result wrapper", id)
-		}
-		entries = append(entries, entry)
-		data, err := terminalJSONBytes(terminalSavedTaskFile{Results: []terminalSavedResult{result}})
-		if err != nil {
-			return err
-		}
-		writes = append(writes, checkpointWrite{path: filepath.Join(manager.path, terminalCheckpointWrapperName(id)), data: data})
-	}
-	metadata := terminalCheckpointMetadata{ArtifactVersion: terminalCheckpointArtifactVersion, Provenance: managerSafeMap(manager.provenance), TaskOrder: append([]string(nil), manager.taskOrder...), CompletedTasks: len(entries), UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
-	metadataData, err := terminalJSONBytes(metadata)
-	if err != nil {
-		return err
-	}
-	summaryData, err := terminalJSONBytes(entries)
-	if err != nil {
-		return err
-	}
-	for _, write := range writes {
-		if err := writeTerminalBytesAtomic(write.path, write.data); err != nil {
-			return err
-		}
-	}
-	if err := writeTerminalBytesAtomic(filepath.Join(manager.path, "checkpoint.json"), metadataData); err != nil {
-		return err
-	}
-	if err := writeTerminalBytesAtomic(filepath.Join(manager.path, "summary.json"), summaryData); err != nil {
-		return err
-	}
-	if err := syncTerminalDirectory(manager.path); err != nil {
-		return err
-	}
-	return syncTerminalDirectory(filepath.Dir(manager.path))
-}
-
-func terminalJSONBytes(value any) ([]byte, error) {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	return append(data, '\n'), nil
-}
-
-func ensureTerminalCheckpointDirectory(checkpointPath string) error {
-	parent := filepath.Dir(filepath.Clean(checkpointPath))
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return err
-	}
-	info, err := os.Lstat(checkpointPath)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(checkpointPath, 0o700); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	} else if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("checkpoint path is not a real directory")
-	}
-	return os.Chmod(checkpointPath, 0o700)
-}
-
-func (manager *terminalCheckpointManager) initializeClean() error {
-	if info, err := os.Lstat(manager.path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return fmt.Errorf("checkpoint path is not a real directory")
-		}
-		entries, err := os.ReadDir(manager.path)
-		if err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			if err := os.RemoveAll(filepath.Join(manager.path, entry.Name())); err != nil {
-				return err
-			}
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	manager.entries = map[string]terminalCheckpointEntry{}
-	manager.results = map[string]terminalSavedResult{}
-	return manager.persistLocked()
-}
-
-type terminalCheckpointLockRecord struct {
-	PID        int    `json:"pid"`
-	Host       string `json:"host"`
-	StartToken string `json:"startToken"`
-	CreatedAt  string `json:"createdAt"`
-}
-
-func terminalProcessStartToken(pid int) string {
-	if runtime.GOOS != "linux" || pid <= 0 {
-		return ""
-	}
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
-	if err != nil {
-		return ""
-	}
-	closeParen := bytes.LastIndexByte(data, ')')
-	if closeParen < 0 {
-		return ""
-	}
-	fields := strings.Fields(string(data[closeParen+1:]))
-	if len(fields) <= 19 {
-		return ""
-	}
-	return fields[19]
-}
-
-func terminalCheckpointLockIsStale(path string) bool {
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return false
-	}
-	record := terminalCheckpointLockRecord{}
-	if err := decodeTerminalRegularJSON(path, 64*1024, &record, true); err == nil {
-		host, _ := os.Hostname()
-		if record.Host == host && record.PID > 0 && runtime.GOOS == "linux" {
-			current := terminalProcessStartToken(record.PID)
-			return current == "" || record.StartToken == "" || current != record.StartToken
-		}
-	}
-	return time.Since(info.ModTime()) > time.Duration(defaultTerminalTaskTimeoutSec+3600)*time.Second
-}
-
-func (manager *terminalCheckpointManager) acquireProcessLock() error {
-	if manager.lockOwned {
-		return nil
-	}
-	parent := filepath.Dir(filepath.Clean(manager.path))
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return err
-	}
-	lockPath := manager.path + ".lock"
-	var file *os.File
-	var err error
-	for attempt := range 2 {
-		file, err = os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return err
-		}
-		if attempt > 0 || !terminalCheckpointLockIsStale(lockPath) {
-			return cliError{"checkpoint_locked", "Another live process already owns this terminal checkpoint.", []string{"Wait for that process to finish; stale same-host Linux locks are reclaimed automatically."}, map[string]any{"path": manager.path, "lock": lockPath}}
-		}
-		stalePath := lockPath + ".stale-" + randomHex(8)
-		if err := os.Rename(lockPath, stalePath); err != nil {
-			return cliError{"checkpoint_locked", "Checkpoint ownership changed while reclaiming a stale lock.", []string{"Retry after the active owner finishes."}, map[string]any{"path": manager.path, "lock": lockPath}}
-		}
-		_ = os.Remove(stalePath)
-		_ = syncTerminalDirectory(parent)
-	}
-	if file == nil {
-		return err
-	}
-	host, _ := os.Hostname()
-	record := terminalCheckpointLockRecord{PID: os.Getpid(), Host: host, StartToken: terminalProcessStartToken(os.Getpid()), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
-	data, writeErr := terminalJSONBytes(record)
-	if writeErr == nil {
-		_, writeErr = file.Write(data)
-	}
-	if writeErr == nil {
-		writeErr = file.Sync()
-	}
-	if writeErr != nil {
-		_ = file.Close()
-		_ = os.Remove(lockPath)
-		return writeErr
-	}
-	manager.lockFile = file
-	manager.lockPath = lockPath
-	manager.lockOwned = true
-	if err := syncTerminalDirectory(parent); err != nil {
-		manager.releaseProcessLock()
-		return err
-	}
-	return nil
-}
-
-func (manager *terminalCheckpointManager) releaseProcessLock() {
-	if !manager.lockOwned {
-		return
-	}
-	_ = manager.lockFile.Close()
-	_ = os.Remove(manager.lockPath)
-	_ = syncTerminalDirectory(filepath.Dir(manager.lockPath))
-	manager.lockFile = nil
-	manager.lockPath = ""
-	manager.lockOwned = false
-}
-
-func (manager *terminalCheckpointManager) complete() bool {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	return manager.completeLocked()
-}
-
-func (manager *terminalCheckpointManager) completeLocked() bool {
-	if len(manager.taskOrder) == 0 {
-		return false
-	}
-	for _, taskID := range manager.taskOrder {
-		result, exists := manager.results[taskID]
-		if !exists || !terminalSavedResultComplete(result) {
-			return false
-		}
-	}
-	return true
-}
-
-func (manager *terminalCheckpointManager) recoveryCommandState() (complete, advertiseSubmit bool) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	complete = manager.completeLocked()
-	if complete && !manager.submitAdvertised {
-		manager.submitAdvertised = true
-		advertiseSubmit = true
-	}
-	return complete, advertiseSubmit
-}
-
-func printTerminalTaskRecovery(args cliArgs, dataset string, shardIndex, index, total int, bundle terminalBundle, result terminalTaskResult, manager *terminalCheckpointManager) {
-	complete, advertiseSubmit := manager.recoveryCommandState()
-	fields := map[string]any{"dataset": firstNonEmpty(dataset, "local"), "shardIndex": shardIndex, "taskIndex": index + 1, "taskTotal": total, "taskId": bundle.Task.ID, "checkpoint": manager.path, "lastProgressAt": result.lastProgressAt, "checkpointComplete": complete}
-	commandLabel, command := "", ""
-	if !complete {
-		commandLabel = "Resume saved work"
-		command = terminalResumeCommand(args, dataset, manager.path)
-		fields["resumeCommand"] = command
-	} else if advertiseSubmit {
-		summary := managerSafeMap(manager.provenance)
-		summary["tasks"] = len(manager.taskOrder)
-		summary["scored"] = len(manager.taskOrder)
-		summary["taskOrder"] = append([]string(nil), manager.taskOrder...)
-		command = terminalDeferredSubmitCommand(args, manager.path, summary)
-		if command != "" {
-			fields["deferredSubmitCommand"] = command
-			commandLabel = "Submit completed work"
-		}
-	}
-	printStatus(args, "terminal_task_recovery", fields)
-	if !hasFlag(args, "quiet") && !hasFlag(args, "json-status") {
-		fmt.Fprintf(os.Stderr, "Recovery: dataset=%s shard=%d task=%d/%d id=%s checkpoint=%s last_progress=%s\n", firstNonEmpty(dataset, "local"), shardIndex, index+1, total, bundle.Task.ID, manager.path, result.lastProgressAt)
-		if command != "" {
-			fmt.Fprintf(os.Stderr, "%s: %s\n", commandLabel, command)
-		}
-	}
-}
-
-func terminalResumeCommand(args cliArgs, dataset, checkpointPath string) string {
-	command := []string{"lmx", "eval", "terminal", "run"}
-	if dataset != "" && dataset != "local" {
-		command = append(command, shellQuote(dataset))
-	}
-	for _, key := range []string{"task-dir", "dataset", "shard", "questions", "task", "api-url", "base-url", "endpoint-file", "model", "served-model", "model-path", "hardware", "quantization", "quant-format", "model-revision", "protocol", "agent", "agent-name", "agent-cmd", "agent-execution", "container-base-url", "shell-mode", "max-turns", "max-tokens", "temperature", "top-p", "command-timeout-seconds", "endpoint-timeout-seconds", "agent-timeout", "repeat-batch-limit", "concurrency", "trace-dir", "runner-version"} {
-		if value := opt(args, key); value != "" {
-			command = append(command, "--"+key, shellQuote(value))
-		}
-	}
-	for _, key := range []string{"oracle", "cleanup-images"} {
-		if hasFlag(args, key) {
-			command = append(command, "--"+key)
-		}
-	}
-	command = append(command, "--resume", shellQuote(checkpointPath))
-	return strings.Join(command, " ")
-}
-
-func printTerminalFailureSummary(args cliArgs, bundles []terminalBundle, results []terminalTaskResult, cfg terminalConfig, checkpointPath string) {
-	rows := make([]any, 0)
-	counts := map[string]int{}
-	for index, result := range results {
-		if result.scored && result.pass && result.errCode == "" {
-			continue
-		}
-		outcome := "verifier_failed"
-		if result.agentOutcomeCode != "" {
-			outcome = result.agentOutcomeCode
-		} else if result.errCode != "" {
-			outcome = result.errCode
-		} else if !result.scored {
-			outcome = "infrastructure_error"
-		}
-		verifierSummary := terminalSingleLine(firstNonEmpty(result.verifierOutput, result.errText, result.agentOutcomeText, "no canonical verifier reward was recorded"), 240)
-		artifactPath := filepath.Join(checkpointPath, terminalCheckpointWrapperName(bundles[index].Task.ID))
-		if !result.verifierAttempted && cfg.traceRoot != "" {
-			artifactPath = filepath.Join(cfg.traceRoot, sanitizeDockerName(bundles[index].Task.ID), "result.json")
-		}
-		maxTurns := terminalAgentMaxTurns(cfg, bundles[index].Task)
-		counts[outcome]++
-		rows = append(rows, map[string]any{"taskId": bundles[index].Task.ID, "outcome": outcome, "verifierSummary": verifierSummary, "turns": result.turns, "maxTurns": maxTurns, "artifactPath": artifactPath, "lastProgressAt": result.lastProgressAt})
-	}
-	if len(rows) == 0 {
-		return
-	}
-	printStatus(args, "terminal_failure_summary", map[string]any{"failedTasks": len(rows), "categories": counts, "failures": rows})
-	if hasFlag(args, "quiet") || hasFlag(args, "json-status") {
-		return
-	}
-	fmt.Fprintln(os.Stderr, "TASK                             RESULT                    TURNS/MAX  LAST PROGRESS                 VERIFIER / ARTIFACT")
-	for _, raw := range rows {
-		row := asObject(raw)
-		turns := fmt.Sprintf("%d/%d", int(numberField(row, "turns")), int(numberField(row, "maxTurns")))
-		detail := terminalSingleLine(stringValue(row["verifierSummary"]), 72) + " | " + stringValue(row["artifactPath"])
-		fmt.Fprintf(os.Stderr, "%-32s %-25s %9s  %-29s %s\n", terminalSingleLine(stringValue(row["taskId"]), 32), stringValue(row["outcome"]), turns, stringValue(row["lastProgressAt"]), detail)
-	}
 }
 
 const (
@@ -2163,65 +926,413 @@ type terminalCheckpointEntry struct {
 }
 
 type terminalSavedResult struct {
-	QuestionID        string         `json:"question_id"`
-	Pass              bool           `json:"pass"`
-	Scored            *bool          `json:"scored"`
-	VerifierAttempted bool           `json:"verifierAttempted,omitempty"`
-	VerifierCompleted bool           `json:"verifierCompleted,omitempty"`
-	RewardParsed      bool           `json:"rewardParsed,omitempty"`
-	Error             string         `json:"error"`
-	ErrorCode         string         `json:"errorCode"`
-	AgentOutcomeCode  string         `json:"agentOutcomeCode"`
-	AgentOutcome      string         `json:"agentOutcome"`
-	LatencyMs         int64          `json:"latencyMs"`
-	WallTimeMs        int64          `json:"wallTimeMs"`
-	TokenUsage        map[string]any `json:"tokenUsage"`
-	Turns             int            `json:"turns"`
-	Question          string         `json:"question"`
-	Prompt            string         `json:"prompt"`
-	Response          string         `json:"response"`
-	VerifierOutput    string         `json:"verifierOutput"`
-	LastProgressAt    string         `json:"lastProgressAt,omitempty"`
-	Provenance        map[string]any `json:"provenance,omitempty"`
+	QuestionID     string         `json:"question_id"`
+	Pass           bool           `json:"pass"`
+	Scored         *bool          `json:"scored"`
+	Error          string         `json:"error"`
+	ErrorCode      string         `json:"errorCode"`
+	LatencyMs      int64          `json:"latencyMs"`
+	WallTimeMs     int64          `json:"wallTimeMs"`
+	TokenUsage     map[string]any `json:"tokenUsage"`
+	Turns          *int           `json:"turns"`
+	Question       string         `json:"question"`
+	Prompt         string         `json:"prompt"`
+	Response       string         `json:"response"`
+	VerifierOutput string         `json:"verifierOutput"`
 }
 
 type terminalSavedTaskFile struct {
 	Results []terminalSavedResult `json:"results"`
 }
 
-type terminalCheckpointMetadata struct {
-	ArtifactVersion int            `json:"artifactVersion"`
-	Provenance      map[string]any `json:"provenance"`
-	TaskOrder       []string       `json:"taskOrder"`
-	CompletedTasks  int            `json:"completedTasks"`
-	UpdatedAt       string         `json:"updatedAt"`
+const terminalLiveCheckpointVersion = 1
+
+type terminalLiveActiveTask struct {
+	TaskID    string `json:"taskId"`
+	Index     int    `json:"index"`
+	StartedAt string `json:"startedAt"`
 }
 
-type terminalCheckpointManager struct {
-	mu               sync.Mutex
-	path             string
-	provenance       map[string]any
-	taskOrder        []string
-	entries          map[string]terminalCheckpointEntry
-	results          map[string]terminalSavedResult
-	resumeMode       string
-	lockPath         string
-	lockFile         *os.File
-	submitAdvertised bool
-	lockOwned        bool
+type terminalLiveCheckpoint struct {
+	Version           int                      `json:"version"`
+	State             string                   `json:"state"`
+	Fingerprint       string                   `json:"fingerprint"`
+	FingerprintFields map[string]string        `json:"fingerprintFields,omitempty"`
+	Dataset           string                   `json:"dataset"`
+	ShardIndex        int                      `json:"shardIndex"`
+	TaskIDs           []string                 `json:"taskIds"`
+	CompletedTasks    []string                 `json:"completedTasks"`
+	ActiveTasks       []terminalLiveActiveTask `json:"activeTasks,omitempty"`
+	CreatedAt         string                   `json:"createdAt"`
+	UpdatedAt         string                   `json:"updatedAt"`
 }
 
-type terminalMonolithicArtifact struct {
-	Summary map[string]any        `json:"summary"`
-	Results []terminalSavedResult `json:"results"`
+type terminalLiveCheckpointStore struct {
+	root  string
+	state terminalLiveCheckpoint
+	lock  *os.File
+	mu    sync.Mutex
 }
 
-type terminalDeferredSource struct {
-	root       string
-	monolithic bool
-	summary    map[string]any
-	entries    []terminalCheckpointEntry
-	results    map[string]terminalSavedResult
+func terminalLiveCheckpointIdentity(args cliArgs, dataset string, shardIndex int, bundles []terminalBundle, baseURL, callModel, hfID, quantization, quantFormat string, hardware any, cfg terminalConfig) map[string]any {
+	tasks := make([]terminalTask, len(bundles))
+	for i := range bundles {
+		tasks[i] = bundles[i].Task
+	}
+	return map[string]any{
+		"dataset": dataset, "shardIndex": shardIndex, "tasks": tasks,
+		"apiUrl": apiURL(args), "baseUrl": baseURL, "model": callModel,
+		"hfId": hfID, "quantization": quantization, "quantFormat": quantFormat,
+		"hardware": hardware, "harnessKey": terminalHarnessKey(args, cfg),
+		"maxTokens": cfg.maxTokens, "temperature": cfg.temperature, "topP": cfg.topP,
+		"commandTimeoutSec": cfg.commandTimeoutSec, "agentTimeoutSec": cfg.agentTimeoutSec,
+		"endpointTimeoutNs": cfg.endpointTimeout.Nanoseconds(), "maxTurns": cfg.maxTurns,
+		"oracle": cfg.oracle, "agentCommand": cfg.agentCommand,
+		"agentExecution": cfg.agentExecution, "shellMode": cfg.shellMode,
+		"containerBaseUrl": opt(args, "container-base-url"),
+	}
+}
+
+func terminalLiveCheckpointFingerprint(identity map[string]any) (string, map[string]string, error) {
+	data, err := json.Marshal(identity)
+	if err != nil {
+		return "", nil, err
+	}
+	fields := make(map[string]string, len(identity))
+	for key, value := range identity {
+		fieldData, err := json.Marshal(value)
+		if err != nil {
+			return "", nil, err
+		}
+		fieldSum := sha256.Sum256(fieldData)
+		fields[key] = hex.EncodeToString(fieldSum[:])
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), fields, nil
+}
+
+func terminalChangedFingerprintFields(expected, actual map[string]string) []string {
+	if len(expected) == 0 {
+		return nil
+	}
+	changed := make([]string, 0)
+	for key, expectedHash := range expected {
+		if actual[key] != expectedHash {
+			changed = append(changed, key)
+		}
+	}
+	for key := range actual {
+		if _, ok := expected[key]; !ok {
+			changed = append(changed, key)
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+func openTerminalLiveCheckpoint(args cliArgs, dataset string, shardIndex int, bundles []terminalBundle, baseURL, callModel, hfID, quantization, quantFormat string, hardware any, cfg terminalConfig) (*terminalLiveCheckpointStore, map[string]terminalTaskResult, error) {
+	runDir := opt(args, "run-dir")
+	resume := opt(args, "resume")
+	if hasFlag(args, "resume") {
+		return nil, nil, cliError{"invalid_option", "--resume requires a value for terminal runs.", []string{"Pass --resume auto or --resume none."}, nil}
+	}
+	if runDir == "" {
+		if resume != "" {
+			return nil, nil, cliError{"invalid_option", "--resume requires --run-dir for terminal runs.", []string{"Pass a durable --run-dir, or omit --resume."}, nil}
+		}
+		return nil, nil, nil
+	}
+	if resume == "" {
+		resume = "auto"
+	}
+	if resume != "auto" && resume != "none" {
+		return nil, nil, cliError{"invalid_option", "Terminal --resume must be auto or none.", []string{"Use --resume auto to continue scored tasks, or --resume none with a new run directory."}, map[string]any{"resume": resume}}
+	}
+	root, err := filepath.Abs(runDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(root, "results"), 0o755); err != nil {
+		return nil, nil, err
+	}
+	lock, err := os.OpenFile(filepath.Join(root, "run.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := lockTerminalRunFile(lock); err != nil {
+		_ = lock.Close()
+		return nil, nil, cliError{"terminal_run_locked", "Another terminal worker owns this run directory.", []string{"Inspect it with eval terminal status, or choose a different --run-dir."}, map[string]any{"runDir": root}}
+	}
+	releaseLock := true
+	defer func() {
+		if releaseLock {
+			_ = unlockTerminalRunFile(lock)
+			_ = lock.Close()
+		}
+	}()
+	identity := terminalLiveCheckpointIdentity(args, dataset, shardIndex, bundles, baseURL, callModel, hfID, quantization, quantFormat, hardware, cfg)
+	fingerprint, fingerprintFields, err := terminalLiveCheckpointFingerprint(identity)
+	if err != nil {
+		return nil, nil, err
+	}
+	taskIDs := make([]string, len(bundles))
+	for i := range bundles {
+		taskIDs[i] = bundles[i].Task.ID
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	store := &terminalLiveCheckpointStore{root: root, lock: lock, state: terminalLiveCheckpoint{Version: terminalLiveCheckpointVersion, State: "running", Fingerprint: fingerprint, FingerprintFields: fingerprintFields, Dataset: firstNonEmpty(dataset, "local"), ShardIndex: shardIndex, TaskIDs: taskIDs, CreatedAt: now, UpdatedAt: now}}
+	statePath := filepath.Join(root, "run.json")
+	resuming := false
+	if data, readErr := os.ReadFile(statePath); readErr == nil {
+		if resume == "none" {
+			return nil, nil, cliError{"checkpoint_exists", "The terminal run directory already contains a checkpoint.", []string{"Use --resume auto to continue it, or choose a new --run-dir for a fresh rerun."}, map[string]any{"runDir": root}}
+		}
+		var savedState terminalLiveCheckpoint
+		if err := json.Unmarshal(data, &savedState); err != nil {
+			return nil, nil, cliError{"checkpoint_invalid", "Could not decode the terminal run checkpoint.", []string{"Repair or replace run.json, or choose a new --run-dir."}, map[string]any{"path": statePath, "error": err.Error()}}
+		}
+		store.state = savedState
+		if store.state.Version != terminalLiveCheckpointVersion || store.state.Fingerprint != fingerprint || !slicesEqual(store.state.TaskIDs, taskIDs) {
+			details := map[string]any{"runDir": root, "expectedFingerprint": store.state.Fingerprint, "actualFingerprint": fingerprint}
+			if changedFields := terminalChangedFingerprintFields(store.state.FingerprintFields, fingerprintFields); len(changedFields) > 0 {
+				details["changedFields"] = changedFields
+			}
+			return nil, nil, cliError{"checkpoint_mismatch", "The terminal checkpoint does not match this run configuration and task manifest.", []string{"Resume with the exact original model, endpoint, options, hardware, dataset, and shard.", "Use a new --run-dir to rerun with different inputs."}, details}
+		}
+		if store.state.State == "submitted" {
+			return nil, nil, cliError{"checkpoint_already_submitted", "This terminal checkpoint already has a successful submission receipt.", []string{"Read the saved result.json receipt.", "Use a new --run-dir to rerun and submit the same shard again intentionally."}, map[string]any{"runDir": root, "resultPath": filepath.Join(root, "result.json")}}
+		}
+		resuming = true
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return nil, nil, readErr
+	}
+	resumed := make(map[string]terminalTaskResult)
+	if resuming {
+		var completed []string
+		for _, bundle := range bundles {
+			result, ok, err := loadTerminalLiveResult(store.root, bundle.Task.ID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !ok {
+				continue
+			}
+			completed = append(completed, bundle.Task.ID)
+			if result.scored {
+				resumed[bundle.Task.ID] = result
+			}
+		}
+		sort.Strings(completed)
+		store.state.CompletedTasks = completed
+		store.state.ActiveTasks = nil
+	}
+	store.state.State = "running"
+	store.state.UpdatedAt = now
+	if err := writeTerminalJSONAtomic(statePath, store.state); err != nil {
+		return nil, nil, err
+	}
+	releaseLock = false
+	return store, resumed, nil
+}
+
+func slicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func terminalLiveResultPath(root, taskID string) string {
+	sum := sha256.Sum256([]byte(taskID))
+	name := sanitizeDockerName(taskID) + "-" + hex.EncodeToString(sum[:6]) + ".json"
+	return filepath.Join(root, "results", name)
+}
+
+func terminalSavedResultFromTask(task terminalTask, result terminalTaskResult) terminalSavedResult {
+	scored := result.scored
+	var turns *int
+	if !result.turnsUnreported {
+		turns = &result.turns
+	}
+	return terminalSavedResult{QuestionID: task.ID, Pass: result.pass, Scored: &scored, Error: result.errText, ErrorCode: result.errCode, LatencyMs: result.wallTimeMs, WallTimeMs: result.wallTimeMs, TokenUsage: result.usage.toMap(), Turns: turns, Question: task.Instruction, Prompt: result.prompt, Response: result.transcript, VerifierOutput: result.verifierOutput}
+}
+
+func terminalTaskResultFromSaved(saved terminalSavedResult) terminalTaskResult {
+	scored := saved.Scored != nil && *saved.Scored
+	turns := 0
+	if saved.Turns != nil {
+		turns = *saved.Turns
+	}
+	return terminalTaskResult{pass: saved.Pass, scored: scored, turns: turns, turnsUnreported: saved.Turns == nil, transcript: saved.Response, verifierOutput: saved.VerifierOutput, wallTimeMs: firstPositiveInt64(saved.WallTimeMs, saved.LatencyMs), usage: tokenUsageFromObject(saved.TokenUsage), errText: saved.Error, errCode: saved.ErrorCode, instruction: saved.QuestionID, prompt: saved.Prompt}
+}
+
+func firstPositiveInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func loadTerminalLiveResult(root, taskID string) (terminalTaskResult, bool, error) {
+	resultPath := terminalLiveResultPath(root, taskID)
+	data, err := os.ReadFile(resultPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return terminalTaskResult{}, false, nil
+	}
+	if err != nil {
+		return terminalTaskResult{}, false, err
+	}
+	var saved terminalSavedResult
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return terminalTaskResult{}, false, cliError{"checkpoint_invalid", "Could not decode a terminal task checkpoint.", []string{"Repair the task result or use a new --run-dir."}, map[string]any{"path": resultPath, "error": err.Error()}}
+	}
+	if saved.QuestionID != taskID || saved.Scored == nil {
+		return terminalTaskResult{}, false, cliError{"checkpoint_invalid", "A terminal task checkpoint has invalid identity or scoring metadata.", []string{"Restore the result written for this run, or use a new --run-dir."}, map[string]any{"path": resultPath, "expectedTaskId": taskID, "actualTaskId": saved.QuestionID}}
+	}
+	return terminalTaskResultFromSaved(saved), true, nil
+}
+
+func (store *terminalLiveCheckpointStore) close() {
+	if store == nil || store.lock == nil {
+		return
+	}
+	_ = unlockTerminalRunFile(store.lock)
+	_ = store.lock.Close()
+	store.lock = nil
+}
+
+func (store *terminalLiveCheckpointStore) startTask(taskID string, index int) error {
+	if store == nil {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, active := range store.state.ActiveTasks {
+		if active.TaskID == taskID {
+			return nil
+		}
+	}
+	store.state.ActiveTasks = append(store.state.ActiveTasks, terminalLiveActiveTask{TaskID: taskID, Index: index, StartedAt: time.Now().UTC().Format(time.RFC3339)})
+	store.state.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return writeTerminalJSONAtomic(filepath.Join(store.root, "run.json"), store.state)
+}
+
+func (store *terminalLiveCheckpointStore) removeActiveTask(taskID string) {
+	active := store.state.ActiveTasks[:0]
+	for _, item := range store.state.ActiveTasks {
+		if item.TaskID != taskID {
+			active = append(active, item)
+		}
+	}
+	store.state.ActiveTasks = active
+}
+
+func (store *terminalLiveCheckpointStore) persistTask(task terminalTask, result terminalTaskResult) error {
+	if store == nil {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.removeActiveTask(task.ID)
+	if err := writeTerminalJSONAtomic(terminalLiveResultPath(store.root, task.ID), terminalSavedResultFromTask(task, result)); err != nil {
+		return err
+	}
+	found := false
+	for _, taskID := range store.state.CompletedTasks {
+		if taskID == task.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		store.state.CompletedTasks = append(store.state.CompletedTasks, task.ID)
+		sort.Strings(store.state.CompletedTasks)
+	}
+	store.state.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return writeTerminalJSONAtomic(filepath.Join(store.root, "run.json"), store.state)
+}
+
+func (store *terminalLiveCheckpointStore) finish(state string, resultDocument map[string]any) error {
+	if store == nil {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if resultDocument != nil {
+		if err := writeTerminalJSONAtomic(filepath.Join(store.root, "result.json"), resultDocument); err != nil {
+			return err
+		}
+	}
+	store.state.State = state
+	store.state.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return writeTerminalJSONAtomic(filepath.Join(store.root, "run.json"), store.state)
+}
+
+func (store *terminalLiveCheckpointStore) interrupt() error {
+	if store == nil {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.state.State = "interrupted"
+	store.state.ActiveTasks = nil
+	store.state.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return writeTerminalJSONAtomic(filepath.Join(store.root, "run.json"), store.state)
+}
+
+func writeTerminalJSONAtomic(path string, value any) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".lmx-checkpoint-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	remove := true
+	defer func() {
+		if remove {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	remove = false
+	handle, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	return handle.Sync()
 }
 
 type terminalTracePreviewStats struct {
@@ -2236,9 +1347,9 @@ type terminalTracePreviewStats struct {
 const terminalBench21Dataset = "terminal-bench-2-1"
 const terminalBench21ShardCount = 10
 
-// terminalBench21CanonicalTaskIDsText is the exact sorted canonical
-// Terminal-Bench 2.1 task set. Keeping the IDs compiled into the binary makes
-// dataset inspection and deferred validation independent of local fixtures.
+// terminalBench21CanonicalTaskIDsText is the exact sorted 89-task set from
+// .terminal-smoke/omp-full-tb21-20260710-localmaxxing-cli/summary.json. Keeping
+// the IDs compiled into the binary makes deferred validation independent of it.
 const terminalBench21CanonicalTaskIDsText = `adaptive-rejection-sampler
 bn-fit-modify
 break-filter-js-from-html
@@ -2331,272 +1442,6 @@ write-compressor`
 
 var terminalBench21CanonicalTaskIDs = strings.Fields(terminalBench21CanonicalTaskIDsText)
 
-type terminalInspectionItem struct {
-	questionID string
-	bundleKey  string
-	sha256     string
-	byteSize   int64
-}
-
-var terminalInspectionSHA256 = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
-
-// inspectTerminalDataset validates that every declared shard and manifest is
-// ready to acquire. Bundle verification is opt-in and never executes a task.
-func inspectTerminalDataset(dataset string, args cliArgs) error {
-	dataset = strings.TrimSpace(dataset)
-	if dataset == "" {
-		return cliError{"missing_dataset", "eval terminal inspect requires a dataset slug.", []string{"Run: lmx eval terminal inspect <dataset> --api-url <localmaxxing-origin> [--verify-bundles] [--json]."}, nil}
-	}
-	inspectionOrigin, err := requireOpt(args, "api-url")
-	if err != nil {
-		return err
-	}
-	inspectionOrigin = strings.TrimRight(inspectionOrigin, "/")
-
-	itemCount := 0
-	shardCount := 0
-	seenTasks := make(map[string]int)
-	items := make([]terminalInspectionItem, 0)
-	shards := make([]map[string]any, 0)
-
-	for requestedShard := 1; requestedShard == 1 || requestedShard <= shardCount; requestedShard++ {
-		metaURL := inspectionOrigin + "/api/evals/" + url.PathEscape(dataset) + "/shard?shard=" + strconv.Itoa(requestedShard)
-		value, err := fetchJSON("GET", metaURL, apiKey(args), nil)
-		if err != nil {
-			return terminalInspectionError("Could not fetch a declared terminal dataset shard.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "url": metaURL, "error": err.Error()})
-		}
-		response := asObject(value)
-		datasetMeta := asObject(response["dataset"])
-		shardMeta := asObject(response["shard"])
-		if datasetMeta == nil || shardMeta == nil {
-			return terminalInspectionError("Terminal shard response is missing dataset or shard metadata.", map[string]any{"dataset": dataset, "shardIndex": requestedShard})
-		}
-		if responseSlug := strings.TrimSpace(stringValue(datasetMeta["slug"])); responseSlug != dataset {
-			return terminalInspectionError("Terminal shard response names a different dataset.", map[string]any{"dataset": dataset, "actual": responseSlug, "shardIndex": requestedShard})
-		}
-
-		responseItemCount, ok := terminalInspectionPositiveInt(datasetMeta["itemCount"])
-		if !ok {
-			return terminalInspectionError("Terminal dataset itemCount must be a positive integer.", map[string]any{"dataset": dataset, "itemCount": datasetMeta["itemCount"]})
-		}
-		responseShardCount, ok := terminalInspectionPositiveInt(datasetMeta["shardCount"])
-		if !ok {
-			return terminalInspectionError("Terminal dataset shardCount must be a positive integer.", map[string]any{"dataset": dataset, "shardCount": datasetMeta["shardCount"]})
-		}
-		if requestedShard == 1 {
-			itemCount = responseItemCount
-			shardCount = responseShardCount
-			if dataset == terminalBench21Dataset && (itemCount != len(terminalBench21CanonicalTaskIDs) || shardCount != terminalBench21ShardCount) {
-				return terminalInspectionError("Terminal-Bench 2.1 dataset metadata is not canonical.", map[string]any{"expectedItemCount": len(terminalBench21CanonicalTaskIDs), "actualItemCount": itemCount, "expectedShardCount": terminalBench21ShardCount, "actualShardCount": shardCount})
-			}
-		} else if responseItemCount != itemCount || responseShardCount != shardCount {
-			return terminalInspectionError("Terminal dataset metadata changed between shard responses.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "expectedItemCount": itemCount, "actualItemCount": responseItemCount, "expectedShardCount": shardCount, "actualShardCount": responseShardCount})
-		}
-
-		responseShardIndex, ok := terminalInspectionPositiveInt(shardMeta["shardIndex"])
-		if !ok || responseShardIndex != requestedShard {
-			return terminalInspectionError("Terminal shard response index does not match the requested shard.", map[string]any{"dataset": dataset, "requestedShardIndex": requestedShard, "actualShardIndex": shardMeta["shardIndex"]})
-		}
-		responseShardItems, ok := terminalInspectionPositiveInt(shardMeta["itemCount"])
-		if !ok {
-			return terminalInspectionError("Terminal shard itemCount must be a positive integer.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "itemCount": shardMeta["itemCount"]})
-		}
-		selectedItems, ok := terminalInspectionPositiveInt(shardMeta["selectedQuestionCount"])
-		if !ok || selectedItems != responseShardItems {
-			return terminalInspectionError("Terminal shard selectedQuestionCount does not match itemCount.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "itemCount": responseShardItems, "selectedQuestionCount": shardMeta["selectedQuestionCount"]})
-		}
-
-		downloadURL := strings.TrimSpace(stringValue(response["downloadUrl"]))
-		if downloadURL == "" {
-			return terminalInspectionError("Terminal shard response did not include downloadUrl.", map[string]any{"dataset": dataset, "shardIndex": requestedShard})
-		}
-		manifestRows, err := fetchDatasetItems(downloadURL, "jsonl")
-		if err != nil {
-			details := map[string]any{"dataset": dataset, "shardIndex": requestedShard, "error": terminalSafeDownloadError(err)}
-			if sanitized := terminalSanitizedDownloadURL(downloadURL); sanitized != "" {
-				details["downloadUrl"] = sanitized
-			}
-			return terminalInspectionError("Could not download a terminal shard manifest.", details)
-		}
-		if len(manifestRows) != responseShardItems {
-			return terminalInspectionError("Terminal shard manifest row count does not match shard itemCount.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "itemCount": responseShardItems, "manifestItems": len(manifestRows)})
-		}
-
-		for rowIndex, row := range manifestRows {
-			questionID := strings.TrimSpace(stringValue(row["question_id"]))
-			bundleKey := strings.TrimSpace(stringValue(row["bundle_key"]))
-			hash := strings.TrimSpace(stringValue(row["sha256"]))
-			byteSize, validByteSize := terminalInspectionPositiveInt64(row["byteSize"])
-			if questionID == "" {
-				return terminalInspectionError("Terminal manifest row is missing question_id.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "rowIndex": rowIndex})
-			}
-			if previousShard, exists := seenTasks[questionID]; exists {
-				return terminalInspectionError("Terminal task appears more than once across shard manifests.", map[string]any{"dataset": dataset, "taskId": questionID, "firstShardIndex": previousShard, "duplicateShardIndex": requestedShard})
-			}
-			if bundleKey == "" {
-				return terminalInspectionError("Terminal manifest row is missing bundle_key.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "taskId": questionID})
-			}
-			if !terminalInspectionSHA256.MatchString(hash) {
-				return terminalInspectionError("Terminal manifest row sha256 must contain exactly 64 hexadecimal characters.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "taskId": questionID, "sha256": hash})
-			}
-			if !validByteSize {
-				return terminalInspectionError("Terminal manifest row byteSize must be a positive integer.", map[string]any{"dataset": dataset, "shardIndex": requestedShard, "taskId": questionID, "byteSize": row["byteSize"]})
-			}
-			seenTasks[questionID] = requestedShard
-			items = append(items, terminalInspectionItem{questionID: questionID, bundleKey: bundleKey, sha256: hash, byteSize: byteSize})
-		}
-		shards = append(shards, map[string]any{"shardIndex": requestedShard, "itemCount": responseShardItems})
-	}
-
-	if len(items) != itemCount || len(seenTasks) != itemCount {
-		return terminalInspectionError("Terminal manifests do not contain the dataset's declared number of unique tasks.", map[string]any{"dataset": dataset, "itemCount": itemCount, "manifestItems": len(items), "uniqueTaskIds": len(seenTasks)})
-	}
-	if dataset == terminalBench21Dataset {
-		if err := validateTerminalBench21Inspection(seenTasks, shards); err != nil {
-			return err
-		}
-	}
-
-	summary := map[string]any{
-		"ready":         true,
-		"dataset":       dataset,
-		"itemCount":     itemCount,
-		"shardCount":    shardCount,
-		"manifestItems": len(items),
-		"uniqueTaskIds": len(seenTasks),
-		"shards":        shards,
-	}
-	if hasFlag(args, "verify-bundles") {
-		verified, err := verifyTerminalInspectionBundles(args, items)
-		if err != nil {
-			return err
-		}
-		summary["verifiedBundles"] = verified
-	}
-	if hasFlag(args, "json") || hasFlag(args, "print") || opt(args, "out") != "" {
-		return writeOrPrintJSON("terminal_dataset_inspection", args, summary)
-	}
-	printInfo("terminal_dataset_ready", summary)
-	return nil
-}
-
-func terminalInspectionError(message string, details any) error {
-	return cliError{"terminal_inspect_failed", message, []string{"Check the dataset ingestion and LocalMaxxing API response, then retry inspection."}, details}
-}
-
-func terminalInspectionPositiveInt(value any) (int, bool) {
-	n, ok := terminalInspectionPositiveInt64(value)
-	if !ok || int64(int(n)) != n {
-		return 0, false
-	}
-	return int(n), true
-}
-
-func terminalInspectionPositiveInt64(value any) (int64, bool) {
-	var n int64
-	switch typed := value.(type) {
-	case float64:
-		n = int64(typed)
-		if float64(n) != typed {
-			return 0, false
-		}
-	case float32:
-		n = int64(typed)
-		if float32(n) != typed {
-			return 0, false
-		}
-	case int:
-		n = int64(typed)
-	case int64:
-		n = typed
-	case json.Number:
-		parsed, err := typed.Int64()
-		if err != nil {
-			return 0, false
-		}
-		n = parsed
-	default:
-		return 0, false
-	}
-	return n, n > 0
-}
-
-func validateTerminalBench21Inspection(seenTasks map[string]int, shards []map[string]any) error {
-	missing := make([]string, 0)
-	extra := make([]string, 0)
-	expected := make(map[string]bool, len(terminalBench21CanonicalTaskIDs))
-	for _, id := range terminalBench21CanonicalTaskIDs {
-		expected[id] = true
-		if _, ok := seenTasks[id]; !ok {
-			missing = append(missing, id)
-		}
-	}
-	for id := range seenTasks {
-		if !expected[id] {
-			extra = append(extra, id)
-		}
-	}
-	sort.Strings(extra)
-	if len(missing) > 0 || len(extra) > 0 {
-		return terminalInspectionError("Terminal-Bench 2.1 manifests do not match the canonical task set.", map[string]any{"missingTaskIds": missing, "extraTaskIds": extra})
-	}
-	for index, id := range terminalBench21CanonicalTaskIDs {
-		expectedShard := (((index+1)*terminalBench21ShardCount)-1)/len(terminalBench21CanonicalTaskIDs) + 1
-		if actualShard := seenTasks[id]; actualShard != expectedShard {
-			return terminalInspectionError("Terminal-Bench 2.1 task is assigned to a noncanonical shard.", map[string]any{"taskId": id, "expectedShardIndex": expectedShard, "actualShardIndex": actualShard})
-		}
-	}
-	if len(shards) != terminalBench21ShardCount {
-		return terminalInspectionError("Terminal-Bench 2.1 does not contain exactly ten shards.", map[string]any{"expectedShardCount": terminalBench21ShardCount, "actualShardCount": len(shards)})
-	}
-	for i, shard := range shards {
-		expectedSize := ((i + 1) * len(terminalBench21CanonicalTaskIDs) / terminalBench21ShardCount) - (i * len(terminalBench21CanonicalTaskIDs) / terminalBench21ShardCount)
-		if shard["itemCount"] != expectedSize {
-			return terminalInspectionError("Terminal-Bench 2.1 shard size is not canonical.", map[string]any{"shardIndex": i + 1, "expectedItemCount": expectedSize, "actualItemCount": shard["itemCount"]})
-		}
-	}
-	return nil
-}
-
-func verifyTerminalInspectionBundles(args cliArgs, items []terminalInspectionItem) (int, error) {
-	tmp, err := os.MkdirTemp("", "lmx-terminal-inspect-*")
-	if err != nil {
-		return 0, err
-	}
-	defer os.RemoveAll(tmp)
-
-	for index, item := range items {
-		extractionRoot := filepath.Join(tmp, strconv.Itoa(index+1))
-		bundleDir, err := downloadTerminalBundle(args, extractionRoot, item.questionID, item.bundleKey, item.sha256, item.byteSize)
-		if err != nil {
-			return index, err
-		}
-		if err := rejectTerminalInspectionSolution(extractionRoot, item.questionID); err != nil {
-			return index, err
-		}
-		bundle, err := loadSingleTerminalBundle(bundleDir)
-		if err != nil {
-			return index, err
-		}
-		if bundle.Task.ID != item.questionID {
-			return index, terminalInspectionError("Downloaded terminal bundle task id does not match its manifest row.", map[string]any{"questionId": item.questionID, "bundleTaskId": bundle.Task.ID, "bundleKey": item.bundleKey})
-		}
-	}
-	return len(items), nil
-}
-
-func rejectTerminalInspectionSolution(root, questionID string) error {
-	return filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() && entry.Name() == "solution" {
-			return terminalInspectionError("Public terminal bundle contains a forbidden solution directory.", map[string]any{"taskId": questionID, "path": current})
-		}
-		return nil
-	})
-}
-
 type terminalSubmissionRecord struct {
 	questionID string
 	pass       bool
@@ -2606,93 +1451,53 @@ type terminalSubmissionRecord struct {
 	artifact   map[string]any
 }
 
-// submitTerminalEval packages an already completed legacy checkpoint directory
-// or monolithic run artifact. It deliberately does not share runTerminalEval's
-// acquisition path: deferred submit must never contact a model endpoint,
-// acquire tasks, start Docker, or rerun a verifier.
+// submitTerminalEval packages an already completed checkpoint. It deliberately
+// does not share runTerminalEval's acquisition path: deferred submit must never
+// contact a model endpoint, acquire tasks, start Docker, or rerun a verifier.
 func submitTerminalEval(args cliArgs) error {
-	runPath := positional(args, 3)
-	if runPath == "" {
-		return cliError{"missing_option", "eval terminal submit requires a completed run artifact.", []string{"Run: lmx eval terminal submit <run-dir-or-results.json> --dataset <slug> --hf-id <org/model> --hardware hardware.json --api-url <localmaxxing-origin> --dry-run."}, nil}
+	runDir := positional(args, 3)
+	if runDir == "" {
+		return cliError{"missing_option", "eval terminal submit requires a completed run directory.", []string{"Run: lmx eval terminal submit <run-dir> --dataset <slug> --hf-id <org/model> --hardware hardware.json --dry-run."}, nil}
 	}
-	source, err := loadTerminalDeferredSource(runPath)
-	if err != nil {
-		if requestedDataset := opt(args, "dataset"); requestedDataset != "" && requestedDataset != terminalBench21Dataset {
-			if _, explicitShard, shardErr := terminalSubmitShardIndex(args, requestedDataset); shardErr != nil {
-				return shardErr
-			} else if !explicitShard {
-				return cliError{"missing_shard_index", "Deferred submission for this dataset requires --shard-index <n>.", []string{"Pass the registered shard index for this already-isolated checkpoint.", "The CLI only performs automatic batching for terminal-bench-2-1 because its exact canonical task set is built in."}, map[string]any{"dataset": requestedDataset}}
-			}
-		}
-		return err
-	}
-
-	savedDataset := stringValue(source.summary["dataset"])
-	if savedDataset == "local" {
-		savedDataset = ""
-	}
-	dataset, err := resolveTerminalSavedString("dataset", savedDataset, opt(args, "dataset"), true)
+	root, err := filepath.Abs(runDir)
 	if err != nil {
 		return err
 	}
-	savedHFID := stringValue(source.summary["hfId"])
-	hfID, err := resolveTerminalSavedString("hf-id", savedHFID, opt(args, "hf-id"), true)
+	info, err := os.Stat(root)
 	if err != nil {
-		return err
+		return cliError{"checkpoint_missing", "Could not open the completed terminal run directory.", []string{"Pass the directory containing summary.json and one <task>.json file per task."}, map[string]any{"runDir": runDir, "error": err.Error()}}
 	}
-	savedRevision := stringValue(source.summary["modelRevision"])
-	modelRevision, err := resolveTerminalSavedString("model-revision", savedRevision, opt(args, "model-revision"), false)
-	if err != nil {
-		return err
+	if !info.IsDir() {
+		return cliError{"checkpoint_invalid", "The terminal checkpoint path is not a directory.", []string{"Pass the directory containing summary.json and the per-task JSON files."}, map[string]any{"runDir": runDir}}
 	}
-	modelRevision = firstNonEmpty(modelRevision, "main")
-
+	dataset := opt(args, "dataset")
+	if dataset == "" {
+		return cliError{"missing_dataset", "eval terminal submit requires --dataset <slug>.", []string{"Pass the terminal dataset slug used for the completed run."}, nil}
+	}
 	shardIndex, explicitShard, err := terminalSubmitShardIndex(args, dataset)
 	if err != nil {
 		return err
 	}
-	savedShardIndex := 0
-	if rawSavedShard, exists := source.summary["shardIndex"]; exists && rawSavedShard != nil {
-		var valid bool
-		savedShardIndex, valid = terminalInspectionPositiveInt(rawSavedShard)
-		if !valid {
-			return cliError{"checkpoint_metadata_invalid", "Saved shardIndex must be a positive integer.", []string{"Use an unmodified completed terminal run artifact."}, map[string]any{"savedShardIndex": rawSavedShard}}
-		}
-	}
-	if dataset == terminalBench21Dataset && savedShardIndex > terminalBench21ShardCount {
-		return cliError{"checkpoint_metadata_invalid", fmt.Sprintf("Saved shardIndex for Terminal-Bench 2.1 must be between 1 and %d.", terminalBench21ShardCount), nil, map[string]any{"savedShardIndex": savedShardIndex}}
-	}
-	if savedShardIndex > 0 {
-		if explicitShard && shardIndex != savedShardIndex {
-			return cliError{"checkpoint_metadata_conflict", "--shard-index conflicts with the saved terminal artifact.", []string{"Submit the artifact using its recorded shard index."}, map[string]any{"saved": savedShardIndex, "explicit": shardIndex}}
-		}
-		shardIndex = savedShardIndex
-		explicitShard = true
-	}
 	if dataset != terminalBench21Dataset && !explicitShard {
 		return cliError{"missing_shard_index", "Deferred submission for this dataset requires --shard-index <n>.", []string{"Pass the registered shard index for this already-isolated checkpoint.", "The CLI only performs automatic batching for terminal-bench-2-1 because its exact canonical task set is built in."}, map[string]any{"dataset": dataset}}
 	}
-
-	var hardware any
-	if hardwarePath := opt(args, "hardware"); hardwarePath != "" {
-		hardware, err = readJSON(hardwarePath)
-		if err != nil {
-			return err
-		}
-		hardware = normalizeHardwarePayload(hardware)
+	hfID := opt(args, "hf-id")
+	if hfID == "" {
+		return cliError{"missing_model", "eval terminal submit requires --hf-id <HuggingFace model id>.", []string{"Pass the canonical org/model identifier for the completed run."}, nil}
 	}
-	if savedHardware := source.summary["hardware"]; savedHardware != nil {
-		savedHardware = normalizeHardwarePayload(savedHardware)
-		if hardware != nil && !terminalJSONEqual(hardware, savedHardware) {
-			return cliError{"checkpoint_metadata_conflict", "--hardware conflicts with the hardware saved in the terminal artifact.", []string{"Remove --hardware to use the saved value, or select the matching run artifact."}, nil}
-		}
-		hardware = savedHardware
+	hardwarePath := opt(args, "hardware")
+	if hardwarePath == "" {
+		return cliError{"missing_hardware", "eval terminal submit requires --hardware hardware.json.", []string{"Run lmx hardware --out hardware.json and pass that saved hardware object."}, nil}
 	}
-	if hardware == nil {
-		return cliError{"missing_hardware", "eval terminal submit requires --hardware hardware.json or saved hardware metadata.", []string{"Run lmx hardware --out hardware.json and pass that saved hardware object."}, nil}
+	hardware, err := readJSON(hardwarePath)
+	if err != nil {
+		return err
 	}
 
-	entries := source.entries
+	entries, err := loadTerminalCheckpointSummary(filepath.Join(root, "summary.json"))
+	if err != nil {
+		return err
+	}
 	seenTasks := make(map[string]bool, len(entries))
 	seenIndexes := make(map[int]bool, len(entries))
 	for _, entry := range entries {
@@ -2714,25 +1519,16 @@ func submitTerminalEval(args cliArgs) error {
 		}
 	}
 
-	quantization := stringValue(source.summary["quantization"])
-	quantFormat := stringValue(source.summary["quantFormat"])
-	quantization, err = resolveTerminalSavedString("quantization", quantization, opt(args, "quantization"), false)
+	quantization, quantFormat, err := terminalCheckpointQuantization(entries)
 	if err != nil {
 		return err
 	}
-	quantFormat, err = resolveTerminalSavedString("quant-format", quantFormat, opt(args, "quant-format"), false)
-	if err != nil {
-		return err
+	if quantization != "" && opt(args, "quantization") == "" {
+		return cliError{"missing_quantization", "The saved terminal run records a quantization; pass --quantization explicitly.", []string{"Pass --quantization " + quantization + " to confirm the saved run metadata."}, map[string]any{"savedQuantization": quantization}}
 	}
-	agentName, err := resolveTerminalSavedString("agent-name", stringValue(source.summary["agent"]), opt(args, "agent-name"), false)
-	if err != nil {
-		return err
+	if quantFormat != "" && opt(args, "quant-format") == "" {
+		return cliError{"missing_quant_format", "The saved terminal run records a quantization format; pass --quant-format explicitly.", []string{"Pass --quant-format " + quantFormat + " to confirm the saved run metadata."}, map[string]any{"savedQuantFormat": quantFormat}}
 	}
-	runnerVersion, err := resolveTerminalSavedString("runner-version", stringValue(source.summary["runnerVersion"]), opt(args, "runner-version"), false)
-	if err != nil {
-		return err
-	}
-	resolvedArgs := terminalArgsWithOptions(args, map[string]string{"model-revision": modelRevision, "quantization": quantization, "quant-format": quantFormat, "agent-name": agentName, "runner-version": runnerVersion})
 
 	records := make([]terminalSubmissionRecord, 0, len(entries))
 	seenResults := make(map[string]bool, len(entries))
@@ -2742,16 +1538,20 @@ func submitTerminalEval(args cliArgs) error {
 	totalUsage := terminalTokenUsage{}
 	previewTotals := terminalTracePreviewStats{}
 	for _, entry := range entries {
-		record, recordPath, err := terminalDeferredResult(source, entry)
+		recordPath, err := terminalCheckpointResultPath(root, entry)
+		if err != nil {
+			return err
+		}
+		record, err := loadTerminalSavedResult(recordPath, entry.Task)
 		if err != nil {
 			return err
 		}
 		if seenResults[record.QuestionID] {
-			return cliError{"duplicate_task_result", fmt.Sprintf("Task result %q appears more than once.", record.QuestionID), []string{"Ensure every task has exactly one unique result record."}, map[string]any{"taskId": record.QuestionID, "file": recordPath}}
+			return cliError{"duplicate_task_result", fmt.Sprintf("Task result %q appears more than once.", record.QuestionID), []string{"Ensure every task has exactly one unique per-task result file."}, map[string]any{"taskId": record.QuestionID, "file": recordPath}}
 		}
 		seenResults[record.QuestionID] = true
 		if record.Pass != entry.Pass {
-			return cliError{"checkpoint_result_mismatch", fmt.Sprintf("Task %q has conflicting pass values in the summary and result record.", entry.Task), []string{"Recover matching metadata and results from the same completed run."}, map[string]any{"taskId": entry.Task, "summaryPass": entry.Pass, "resultPass": record.Pass}}
+			return cliError{"checkpoint_result_mismatch", fmt.Sprintf("Task %q has conflicting pass values in summary.json and its result file.", entry.Task), []string{"Recover the matching summary.json and per-task files from the same completed run."}, map[string]any{"taskId": entry.Task, "summaryPass": entry.Pass, "resultPass": record.Pass}}
 		}
 		if record.Pass {
 			passed++
@@ -2763,22 +1563,14 @@ func submitTerminalEval(args cliArgs) error {
 		usage := tokenUsageFromObject(record.TokenUsage)
 		totalLatencyMs += latency
 		totalUsage.add(usage)
-		response := ""
-		previewStats := terminalTracePreviewStats{}
-		usedTrace := false
-		if source.monolithic {
-			response = truncateString(record.Response+"\n\n# Verifier\n\n"+record.VerifierOutput, terminalArtifactResponseBytes)
-			fallbackCount++
+		response, previewStats, usedTrace, err := terminalSavedArtifactResponse(root, recordPath, record)
+		if err != nil {
+			return cliError{"trace_read_failed", fmt.Sprintf("Could not package the OMP trace for task %q.", entry.Task), []string{"Check that the selected omp.jsonl is readable, or remove the broken trace to use the bounded saved response fallback."}, map[string]any{"taskId": entry.Task, "error": err.Error()}}
+		}
+		if usedTrace {
+			traceCount++
 		} else {
-			response, previewStats, usedTrace, err = terminalSavedArtifactResponse(source.root, recordPath, record)
-			if err != nil {
-				return cliError{"trace_read_failed", fmt.Sprintf("Could not package the selected agent trace for task %q.", entry.Task), []string{"Check that the selected trace is readable, or remove the broken trace to use the bounded saved response fallback."}, map[string]any{"taskId": entry.Task, "error": err.Error()}}
-			}
-			if usedTrace {
-				traceCount++
-			} else {
-				fallbackCount++
-			}
+			fallbackCount++
 		}
 		previewTotals.AssistantMessages += previewStats.AssistantMessages
 		previewTotals.ToolExecutions += previewStats.ToolExecutions
@@ -2811,7 +1603,7 @@ func submitTerminalEval(args cliArgs) error {
 		})
 	}
 	if len(seenResults) != len(entries) {
-		return cliError{"checkpoint_incomplete", "The terminal checkpoint did not produce one unique result for every summary record.", []string{"Restore the missing task results and rerun deferred submit."}, map[string]any{"summaryRecords": len(entries), "uniqueResults": len(seenResults)}}
+		return cliError{"checkpoint_incomplete", "The terminal checkpoint did not produce one unique result for every summary record.", []string{"Restore the missing per-task JSON files and rerun deferred submit."}, map[string]any{"summaryRecords": len(entries), "uniqueResults": len(seenResults)}}
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].questionID < records[j].questionID })
 
@@ -2824,6 +1616,8 @@ func submitTerminalEval(args cliArgs) error {
 			fullTaskIDs[i] = records[i].questionID
 		}
 		fullTaskSetHash := sha256.Sum256([]byte(strings.Join(fullTaskIDs, "\n")))
+		// These fullCheckpoint* keys preserve the source checkpoint aggregate on
+		// every shard while the unprefixed runConfig metrics remain shard-local.
 		fullProvenance = map[string]any{
 			"fullCheckpoint":                    true,
 			"fullCheckpointTasksRun":            len(records),
@@ -2832,29 +1626,6 @@ func submitTerminalEval(args cliArgs) error {
 			"fullCheckpointTokenUsage":          totalUsage.toMap(),
 			"fullCheckpointTaskSetSha256":       hex.EncodeToString(fullTaskSetHash[:]),
 			"fullCheckpointCanonicalShardCount": terminalBench21ShardCount,
-		}
-	}
-	if len(source.summary) > 0 {
-		fullProvenance["sourceArtifactVersion"] = source.summary["artifactVersion"]
-		if int(numberField(source.summary, "artifactVersion")) >= terminalCheckpointArtifactVersion {
-			sourceProvenance := asObject(source.summary["provenance"])
-			if sourceProvenance == nil {
-				return cliError{"checkpoint_provenance_mismatch", "V3 terminal artifact is missing its complete provenance object.", nil, nil}
-			}
-			fullProvenance["sourceProvenance"] = managerSafeMap(sourceProvenance)
-			fullProvenance["sourceAgent"] = source.summary["agent"]
-			fullProvenance["sourceServedModel"] = sourceProvenance["servedModel"]
-			fullProvenance["sourceDeclaredModel"] = sourceProvenance["declaredModel"]
-			fullProvenance["sourceModelResolution"] = sourceProvenance["modelResolution"]
-			fullProvenance["sourceQuantizationResolution"] = sourceProvenance["quantizationResolution"]
-			fullProvenance["sourceRunConfig"] = sourceProvenance["runConfig"]
-		} else {
-			fullProvenance["sourceAgent"] = source.summary["agent"]
-			fullProvenance["sourceServedModel"] = source.summary["servedModel"]
-			fullProvenance["sourceDeclaredModel"] = source.summary["declaredModel"]
-			fullProvenance["sourceModelResolution"] = terminalSanitizeNestedRunConfig(source.summary["modelResolution"], []string{"hfId", "servedModel", "servedModelSource", "status", "declaredBaseModel", "loadedFilename", "sourceRepo", "sourceRepoMatch", "declaredHfId", "verifiedSourceRepo", "searchQuery", "searchQuerySource"})
-			fullProvenance["sourceQuantizationResolution"] = terminalSanitizeNestedRunConfig(source.summary["quantizationResolution"], []string{"cli", "v1Models", "filename", "trusted", "trustedSource", "status"})
-			fullProvenance["sourceRunConfig"] = terminalSanitizeSourceRunConfig(source.summary["runConfig"])
 		}
 	}
 
@@ -2870,7 +1641,7 @@ func submitTerminalEval(args cliArgs) error {
 	payloads := make([]any, 0, len(recordShards))
 	shardSizes := make([]int, 0, len(recordShards))
 	for i, shardRecords := range recordShards {
-		payload := terminalSubmissionPayload(resolvedArgs, hfID, hardware, shardIndexes[i], shardRecords, fullProvenance)
+		payload := terminalSubmissionPayload(args, hfID, hardware, shardIndexes[i], shardRecords, fullProvenance)
 		payloads = append(payloads, payload)
 		shardSizes = append(shardSizes, len(shardRecords))
 	}
@@ -2881,7 +1652,6 @@ func submitTerminalEval(args cliArgs) error {
 	}
 	fields := map[string]any{
 		"dataset":                dataset,
-		"source":                 map[bool]string{true: "monolithic", false: "checkpoint_directory"}[source.monolithic],
 		"tasks":                  len(records),
 		"uniqueTasks":            len(seenResults),
 		"scored":                 len(records),
@@ -2907,10 +1677,8 @@ func submitTerminalEval(args cliArgs) error {
 		fields["payloadOut"] = out
 	}
 	if hasFlag(args, "dry-run") {
-		fields["execution"] = false
-		fields["submission"] = false
-		printInfo("offline_submit_validation_no_execution", fields)
-		fmt.Println("offline_submit_validation_no_execution: saved results were validated and packaged; no Docker, model, verifier, or network submission was executed.")
+		printInfo("terminal_submit_dry_run", fields)
+		fmt.Println("Dry run only — payload batch validated locally; no network request was made.")
 		return nil
 	}
 	key := apiKey(args)
@@ -2947,295 +1715,6 @@ func submitTerminalEval(args cliArgs) error {
 	fields["shardReceipts"] = receipts
 	printInfo("terminal_submit_complete", fields)
 	return nil
-}
-
-func loadTerminalDeferredSource(runPath string) (terminalDeferredSource, error) {
-	resolved, err := filepath.Abs(runPath)
-	if err != nil {
-		return terminalDeferredSource{}, err
-	}
-	info, err := os.Lstat(resolved)
-	if err != nil {
-		return terminalDeferredSource{}, cliError{"checkpoint_missing", "Could not open the completed terminal run artifact.", []string{"Pass a legacy checkpoint directory, a complete v3 checkpoint directory, or the monolithic JSON written by eval terminal run --out."}, map[string]any{"path": runPath, "error": err.Error()}}
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return terminalDeferredSource{}, cliError{"checkpoint_invalid", "Deferred submit refuses symlinked run artifacts.", nil, map[string]any{"path": runPath}}
-	}
-	if info.IsDir() {
-		if _, metadataErr := os.Lstat(filepath.Join(resolved, "checkpoint.json")); metadataErr == nil {
-			metadata, provenance, taskOrder, err := loadTerminalCheckpointMetadata(resolved)
-			if err != nil {
-				return terminalDeferredSource{}, err
-			}
-			entryMap, results, err := loadTerminalCheckpointEntries(resolved, provenance, taskOrder, false)
-			if err != nil {
-				return terminalDeferredSource{}, err
-			}
-			if len(entryMap) != len(taskOrder) || metadata.CompletedTasks != len(taskOrder) {
-				return terminalDeferredSource{}, cliError{"checkpoint_incomplete", "V3 deferred submit requires one committed task wrapper for every immutable task-order entry.", nil, map[string]any{"tasks": len(taskOrder), "summaryEntries": len(entryMap), "completedTasks": metadata.CompletedTasks}}
-			}
-			entries := make([]terminalCheckpointEntry, 0, len(taskOrder))
-			for _, taskID := range taskOrder {
-				result := results[taskID]
-				if !terminalSavedResultComplete(result) {
-					return terminalDeferredSource{}, cliError{"checkpoint_incomplete", "V3 deferred submit refuses incomplete, unscored, or verifier-incomplete task wrappers.", nil, map[string]any{"taskId": taskID}}
-				}
-				entries = append(entries, entryMap[taskID])
-			}
-			summary, err := aggregateTerminalCheckpointSummary(entries)
-			if err != nil {
-				return terminalDeferredSource{}, err
-			}
-			if !terminalJSONEqual(asObject(summary["provenance"]), provenance) {
-				return terminalDeferredSource{}, cliError{"checkpoint_provenance_mismatch", "V3 summary entries do not aggregate to checkpoint.json immutable provenance.", nil, nil}
-			}
-			return terminalDeferredSource{root: resolved, summary: summary, entries: entries}, nil
-		}
-		entries, err := loadTerminalCheckpointSummary(filepath.Join(resolved, "summary.json"))
-		if err != nil {
-			return terminalDeferredSource{}, err
-		}
-		summary, err := aggregateTerminalCheckpointSummary(entries)
-		if err != nil {
-			return terminalDeferredSource{}, err
-		}
-		if int(numberField(summary, "artifactVersion")) >= terminalCheckpointArtifactVersion {
-			return terminalDeferredSource{}, cliError{"checkpoint_metadata_invalid", "A v3 checkpoint directory requires its regular checkpoint.json authority.", nil, map[string]any{"path": resolved}}
-		}
-		return terminalDeferredSource{root: resolved, summary: summary, entries: entries}, nil
-	}
-	if !info.Mode().IsRegular() {
-		return terminalDeferredSource{}, cliError{"checkpoint_invalid", "The monolithic terminal run artifact must be a regular file.", nil, map[string]any{"path": runPath}}
-	}
-	if info.Size() > terminalMonolithicArtifactMaxBytes {
-		return terminalDeferredSource{}, cliError{"checkpoint_too_large", "The monolithic terminal run artifact exceeds the safe input limit.", []string{"Use the bounded artifact written by eval terminal run --out, or submit a legacy checkpoint directory."}, map[string]any{"path": runPath, "bytes": info.Size(), "maxBytes": terminalMonolithicArtifactMaxBytes}}
-	}
-	file, err := os.Open(resolved)
-	if err != nil {
-		return terminalDeferredSource{}, cliError{"checkpoint_invalid", "Could not read the monolithic terminal run artifact.", nil, map[string]any{"path": runPath, "error": err.Error()}}
-	}
-	defer file.Close()
-	decoder := json.NewDecoder(io.LimitReader(file, terminalMonolithicArtifactMaxBytes+1))
-	artifact, decodeErr := decodeTerminalMonolithicArtifact(decoder)
-	if decodeErr != nil {
-		if errors.Is(decodeErr, errTerminalMonolithicResultLimit) {
-			return terminalDeferredSource{}, cliError{"checkpoint_result_count_invalid", "Monolithic terminal run JSON contains too many results.", []string{"Split unrelated runs; one artifact must describe one bounded completed evaluation."}, map[string]any{"path": runPath, "maxResults": terminalMonolithicResultLimit}}
-		}
-		return terminalDeferredSource{}, cliError{"checkpoint_invalid", "Could not decode the monolithic terminal run artifact as {summary,results} JSON.", []string{"Pass the JSON file written by eval terminal run --out."}, map[string]any{"path": runPath, "error": decodeErr.Error()}}
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return terminalDeferredSource{}, cliError{"checkpoint_invalid", "Monolithic terminal run JSON contains trailing data.", []string{"Pass exactly one JSON object written by eval terminal run --out."}, map[string]any{"path": runPath}}
-	}
-	if artifact.Summary == nil || len(artifact.Results) == 0 {
-		return terminalDeferredSource{}, cliError{"checkpoint_invalid", "Monolithic terminal run JSON must contain a summary object and non-empty results array.", []string{"Pass the completed JSON file written by eval terminal run --out."}, map[string]any{"path": runPath}}
-	}
-	entries := make([]terminalCheckpointEntry, len(artifact.Results))
-	results := make(map[string]terminalSavedResult, len(artifact.Results))
-	for index, record := range artifact.Results {
-		if _, duplicate := results[record.QuestionID]; duplicate {
-			return terminalDeferredSource{}, cliError{"duplicate_task_result", fmt.Sprintf("Monolithic results contain duplicate task %q.", record.QuestionID), []string{"Keep exactly one result per task."}, map[string]any{"taskId": record.QuestionID}}
-		}
-		entries[index] = terminalCheckpointEntry{Index: index + 1, Total: len(artifact.Results), Task: record.QuestionID, Pass: record.Pass, Scored: record.Scored, Summary: artifact.Summary}
-		results[record.QuestionID] = record
-	}
-	return terminalDeferredSource{root: filepath.Dir(resolved), monolithic: true, summary: artifact.Summary, entries: entries, results: results}, nil
-}
-
-func decodeTerminalMonolithicArtifact(decoder *json.Decoder) (terminalMonolithicArtifact, error) {
-	artifact := terminalMonolithicArtifact{}
-	opening, err := decoder.Token()
-	if err != nil {
-		return artifact, err
-	}
-	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
-		return artifact, errors.New("monolithic terminal artifact must be a JSON object")
-	}
-	seenSummary, seenResults := false, false
-	for decoder.More() {
-		rawKey, err := decoder.Token()
-		if err != nil {
-			return artifact, err
-		}
-		key, ok := rawKey.(string)
-		if !ok {
-			return artifact, errors.New("monolithic terminal artifact contains a non-string field name")
-		}
-		switch key {
-		case "summary":
-			if seenSummary {
-				return artifact, errors.New("monolithic terminal artifact contains duplicate summary fields")
-			}
-			seenSummary = true
-			if err := decoder.Decode(&artifact.Summary); err != nil {
-				return artifact, err
-			}
-		case "results":
-			if seenResults {
-				return artifact, errors.New("monolithic terminal artifact contains duplicate results fields")
-			}
-			seenResults = true
-			openingResults, err := decoder.Token()
-			if err != nil {
-				return artifact, err
-			}
-			if delimiter, ok := openingResults.(json.Delim); !ok || delimiter != '[' {
-				return artifact, errors.New("monolithic terminal results must be a JSON array")
-			}
-			for decoder.More() {
-				if len(artifact.Results) >= terminalMonolithicResultLimit {
-					return artifact, errTerminalMonolithicResultLimit
-				}
-				var record terminalSavedResult
-				if err := decoder.Decode(&record); err != nil {
-					return artifact, err
-				}
-				artifact.Results = append(artifact.Results, record)
-			}
-			if _, err := decoder.Token(); err != nil {
-				return artifact, err
-			}
-		default:
-			return artifact, fmt.Errorf("monolithic terminal artifact contains unexpected top-level field %q", key)
-		}
-	}
-	if _, err := decoder.Token(); err != nil {
-		return artifact, err
-	}
-	if !seenSummary || !seenResults {
-		return artifact, errors.New("monolithic terminal artifact must contain summary and results")
-	}
-	return artifact, nil
-}
-
-func aggregateTerminalCheckpointSummary(entries []terminalCheckpointEntry) (map[string]any, error) {
-	authoritative := []string{"artifactVersion", "dataset", "hfId", "modelRevision", "shardIndex", "hardware", "quantization", "quantFormat", "agent", "runnerVersion", "servedModel", "declaredModel", "modelResolution", "quantizationResolution", "runConfig", "canonicalTaskIds", "selectedTaskIds", "taskOrder", "taskOrderSha256", "manifestIdentity", "manifestSha256", "manifestVersion", "manifestTaskVersions", "selectedManifestSha256", "manifestItems", "hardwareSha256", "provenanceSha256", "provenance"}
-	summary := map[string]any{}
-	sources := map[string]string{}
-	for _, entry := range entries {
-		for _, field := range authoritative {
-			value, exists := entry.Summary[field]
-			if !exists || !terminalMetadataValuePresent(value) {
-				continue
-			}
-			if saved, found := summary[field]; found && !terminalJSONEqual(saved, value) {
-				return nil, cliError{"checkpoint_metadata_mismatch", fmt.Sprintf("Checkpoint task summaries contain conflicting %s values.", field), []string{"Recover summary.json from one completed run."}, map[string]any{"field": field, "firstTaskId": sources[field], "taskId": entry.Task}}
-			}
-			if _, found := summary[field]; !found {
-				summary[field] = value
-				sources[field] = entry.Task
-			}
-		}
-	}
-	return summary, nil
-}
-
-func terminalMetadataValuePresent(value any) bool {
-	if value == nil {
-		return false
-	}
-	if text, ok := value.(string); ok {
-		return strings.TrimSpace(text) != ""
-	}
-	return true
-}
-
-func terminalDeferredResult(source terminalDeferredSource, entry terminalCheckpointEntry) (terminalSavedResult, string, error) {
-	if source.monolithic {
-		record, ok := source.results[entry.Task]
-		if !ok {
-			return terminalSavedResult{}, "", cliError{"task_result_missing", fmt.Sprintf("Missing monolithic result for %q.", entry.Task), nil, map[string]any{"taskId": entry.Task}}
-		}
-		if err := validateTerminalSavedResult(record, entry.Task, "monolithic results"); err != nil {
-			return terminalSavedResult{}, "", err
-		}
-		return record, "monolithic results", nil
-	}
-	recordPath, err := terminalCheckpointResultPath(source.root, entry)
-	if err != nil {
-		return terminalSavedResult{}, "", err
-	}
-	record, err := loadTerminalSavedResult(recordPath, entry.Task)
-	return record, recordPath, err
-}
-
-func resolveTerminalSavedString(flag, saved, explicit string, required bool) (string, error) {
-	if saved != "" && explicit != "" && saved != explicit {
-		return "", cliError{"checkpoint_metadata_conflict", "--" + flag + " conflicts with authoritative metadata saved in the terminal artifact.", []string{"Remove the explicit flag to use the saved value, or select the matching run artifact."}, map[string]any{"field": flag, "saved": saved, "explicit": explicit}}
-	}
-	value := firstNonEmpty(explicit, saved)
-	if value != "" || !required {
-		return value, nil
-	}
-	if flag == "dataset" {
-		return "", cliError{"missing_dataset", "eval terminal submit requires --dataset <slug> when the artifact does not record one.", []string{"Pass the terminal dataset slug used for the completed run."}, nil}
-	}
-	return "", cliError{"missing_model", "eval terminal submit requires --hf-id <HuggingFace model id> when the artifact does not record one.", []string{"Pass the canonical org/model identifier for the completed run."}, nil}
-}
-
-func terminalJSONEqual(left, right any) bool {
-	leftJSON, leftErr := json.Marshal(left)
-	rightJSON, rightErr := json.Marshal(right)
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
-}
-
-func terminalSanitizeSourceRunConfig(value any) map[string]any {
-	source := asObject(value)
-	safe := map[string]any{}
-	if source == nil {
-		return safe
-	}
-	for _, key := range []string{"protocol", "agent", "agentBackend", "maxTurns", "maxTokens", "temperature", "topP", "commandTimeoutSec", "agentTimeoutSec", "concurrency", "shellMode", "agentExecution", "oracle", "servedModelSource", "endpointTimeoutMillis", "accuracy", "tasksRun", "errors", "avgLatencyMs", "deferredSubmit"} {
-		if scalar, ok := terminalSafeRunConfigScalar(source[key]); ok {
-			safe[key] = scalar
-		}
-	}
-	if endpoint := terminalSanitizedEndpointOrigin(stringValue(source["modelEndpoint"])); endpoint != "" {
-		safe["modelEndpoint"] = endpoint
-	}
-	if routing := terminalSanitizeNestedRunConfig(source["toolRouting"], []string{"shell", "workdir", "hostFilesystemVisible"}); len(routing) > 0 {
-		safe["toolRouting"] = routing
-	}
-	if usage := terminalSanitizeNestedRunConfig(source["tokenUsage"], []string{"inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens", "modelCalls"}); len(usage) > 0 {
-		safe["tokenUsage"] = usage
-	}
-	return safe
-}
-
-func terminalSanitizeNestedRunConfig(value any, allowed []string) map[string]any {
-	source := asObject(value)
-	safe := map[string]any{}
-	for _, key := range allowed {
-		if scalar, ok := terminalSafeRunConfigScalar(source[key]); ok {
-			safe[key] = scalar
-		}
-	}
-	return safe
-}
-
-func terminalSafeRunConfigScalar(value any) (any, bool) {
-	switch value.(type) {
-	case string, bool, float64, float32, int, int64, int32, uint, uint64, uint32, json.Number:
-		return value, true
-	default:
-		return nil, false
-	}
-}
-
-func terminalArgsWithOptions(args cliArgs, values map[string]string) cliArgs {
-	copied := cliArgs{positional: append([]string(nil), args.positional...), opts: map[string]string{}, flags: map[string]bool{}}
-	for key, value := range args.opts {
-		copied.opts[key] = value
-	}
-	for key, value := range args.flags {
-		copied.flags[key] = value
-	}
-	for key, value := range values {
-		if value != "" && copied.opts[key] == "" {
-			copied.opts[key] = value
-		}
-	}
-	return copied
 }
 
 func terminalSubmitShardIndex(args cliArgs, dataset string) (int, bool, error) {
@@ -3375,245 +1854,20 @@ func terminalSubmissionPayload(args cliArgs, hfID string, hardware any, shardInd
 	return payload
 }
 
-var terminalCheckpointProvenanceFields = []string{"artifactVersion", "dataset", "shardIndex", "canonicalTaskIds", "selectedTaskIds", "manifestIdentity", "manifestSha256", "manifestVersion", "manifestTaskVersions", "selectedManifestSha256", "declaredModel", "hfId", "servedModel", "quantization", "quantFormat", "hardware", "hardwareSha256", "runnerVersion", "modelResolution", "quantizationResolution", "runConfig", "taskOrder", "taskOrderSha256", "manifestItems", "provenanceSha256"}
-
-func decodeTerminalRegularJSON(path string, maxBytes int64, destination any, strict bool) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("%s is not a regular file", path)
-	}
-	if info.Size() > maxBytes {
-		return fmt.Errorf("%s exceeds %d bytes", path, maxBytes)
-	}
+func loadTerminalCheckpointSummary(path string) ([]terminalCheckpointEntry, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, cliError{"checkpoint_summary_missing", "The terminal checkpoint is missing summary.json.", []string{"Pass the completed run directory containing summary.json."}, map[string]any{"path": path, "error": err.Error()}}
 	}
 	defer file.Close()
-	opened, err := file.Stat()
-	if err != nil || !os.SameFile(info, opened) {
-		return fmt.Errorf("%s changed while it was opened", path)
-	}
-	decoder := json.NewDecoder(io.LimitReader(file, maxBytes+1))
-	if strict {
-		decoder.DisallowUnknownFields()
-	}
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("JSON contains trailing data")
-		}
-		return fmt.Errorf("JSON contains trailing data: %w", err)
-	}
-	return nil
-}
-
-func loadTerminalCheckpointMetadata(root string) (terminalCheckpointMetadata, map[string]any, []string, error) {
-	metadata := terminalCheckpointMetadata{}
-	info, err := os.Lstat(root)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return metadata, nil, nil, cliError{"checkpoint_metadata_invalid", "Recovery and resume require a real v3 checkpoint directory.", nil, map[string]any{"path": root, "error": fmt.Sprint(err)}}
-	}
-	metadataPath := filepath.Join(root, "checkpoint.json")
-	if err := decodeTerminalRegularJSON(metadataPath, 16*1024*1024, &metadata, true); err != nil {
-		return metadata, nil, nil, cliError{"checkpoint_metadata_invalid", "Resume requires one regular checkpoint.json object from the v3 atomic checkpoint runner.", []string{"Legacy checkpoints remain submit-only."}, map[string]any{"path": metadataPath, "error": err.Error()}}
-	}
-	if metadata.ArtifactVersion != terminalCheckpointArtifactVersion || metadata.Provenance == nil || metadata.CompletedTasks < 0 || strings.TrimSpace(metadata.UpdatedAt) == "" {
-		return metadata, nil, nil, cliError{"checkpoint_metadata_invalid", "Checkpoint metadata has an unsupported or incomplete v3 schema.", nil, map[string]any{"path": metadataPath, "artifactVersion": metadata.ArtifactVersion, "completedTasks": metadata.CompletedTasks}}
-	}
-	order, err := validateTerminalCheckpointProvenance(metadata.Provenance, metadata.TaskOrder)
-	if err != nil {
-		return metadata, nil, nil, err
-	}
-	if metadata.CompletedTasks > len(order) {
-		return metadata, nil, nil, cliError{"checkpoint_metadata_invalid", "Checkpoint completedTasks exceeds its immutable task order.", nil, map[string]any{"completedTasks": metadata.CompletedTasks, "taskTotal": len(order)}}
-	}
-	return metadata, managerSafeMap(metadata.Provenance), order, nil
-}
-
-func validateTerminalCheckpointProvenance(provenance map[string]any, metadataOrder []string) ([]string, error) {
-	for _, field := range terminalCheckpointProvenanceFields {
-		if _, present := provenance[field]; !present {
-			return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint immutable provenance is missing a required v3 field.", nil, map[string]any{"field": field}}
-		}
-	}
-	if int(numberField(provenance, "artifactVersion")) != terminalCheckpointArtifactVersion {
-		return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint provenance artifactVersion is not v3.", nil, nil}
-	}
-	withoutHash := managerSafeMap(provenance)
-	claimedHash := stringValue(withoutHash["provenanceSha256"])
-	delete(withoutHash, "provenanceSha256")
-	computedHash, err := terminalJSONHash(withoutHash)
-	if err != nil || claimedHash == "" || !strings.EqualFold(claimedHash, computedHash) {
-		return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint provenance digest is missing or invalid.", []string{"Use the unmodified atomic checkpoint."}, map[string]any{"claimed": claimedHash, "computed": computedHash}}
-	}
-	order := make([]string, 0, len(anySlice(provenance["taskOrder"])))
-	seen := map[string]bool{}
-	for _, raw := range anySlice(provenance["taskOrder"]) {
-		id := stringValue(raw)
-		if !terminalCheckpointSafeTaskID.MatchString(id) || seen[id] {
-			return nil, cliError{"checkpoint_task_order_mismatch", "Checkpoint task order contains an empty, duplicated, or unsafe task id.", nil, map[string]any{"taskId": id}}
-		}
-		seen[id] = true
-		order = append(order, id)
-	}
-	if len(order) == 0 || !terminalJSONEqual(order, metadataOrder) || !terminalJSONEqual(order, provenance["selectedTaskIds"]) {
-		return nil, cliError{"checkpoint_task_order_mismatch", "Checkpoint metadata, selected tasks, and immutable task order differ.", nil, map[string]any{"metadata": metadataOrder, "provenance": order}}
-	}
-	canonical := map[string]bool{}
-	for _, raw := range anySlice(provenance["canonicalTaskIds"]) {
-		id := stringValue(raw)
-		if !terminalCheckpointSafeTaskID.MatchString(id) || canonical[id] {
-			return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint canonical task set is empty, duplicated, or unsafe.", nil, map[string]any{"taskId": id}}
-		}
-		canonical[id] = true
-	}
-	for _, id := range order {
-		if !canonical[id] {
-			return nil, cliError{"checkpoint_provenance_mismatch", "A selected checkpoint task is absent from the canonical task set.", nil, map[string]any{"taskId": id}}
-		}
-	}
-	if stringValue(provenance["taskOrderSha256"]) != shortHash(strings.Join(order, "\n")) {
-		return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint task order digest is invalid.", nil, nil}
-	}
-	items := anySlice(provenance["manifestItems"])
-	versions := anySlice(provenance["manifestTaskVersions"])
-	if len(items) != len(order) || len(versions) != len(order) {
-		return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint manifest rows and task versions do not cover the selected task order.", nil, map[string]any{"tasks": len(order), "manifestItems": len(items), "versions": len(versions)}}
-	}
-	for index, raw := range items {
-		item := asObject(raw)
-		for _, field := range []string{"questionId", "version", "source", "bundleKey", "sha256", "byteSize", "verifierCommand", "rewardFile", "verifierTimeoutSeconds", "agentTimeoutSeconds", "agentMaxTurns"} {
-			if item == nil {
-				return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint manifest contains a non-object row.", nil, map[string]any{"index": index}}
-			}
-			if _, present := item[field]; !present {
-				return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint manifest row is missing a required identity field.", nil, map[string]any{"index": index, "field": field}}
-			}
-		}
-		if stringValue(item["questionId"]) != order[index] || stringValue(item["version"]) == "" || stringValue(item["version"]) != stringValue(versions[index]) || stringValue(item["source"]) == "" || stringValue(item["bundleKey"]) == "" || !terminalInspectionSHA256.MatchString(stringValue(item["sha256"])) || numberField(item, "byteSize") <= 0 || stringValue(item["verifierCommand"]) == "" || stringValue(item["rewardFile"]) == "" {
-			return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint manifest row identity is malformed or misordered.", nil, map[string]any{"index": index, "taskId": order[index]}}
-		}
-	}
-	selectedHash, err := terminalJSONHash(items)
-	if err != nil || !strings.EqualFold(selectedHash, stringValue(provenance["selectedManifestSha256"])) {
-		return nil, cliError{"checkpoint_provenance_mismatch", "Checkpoint selected manifest digest is invalid.", nil, nil}
-	}
-	return order, nil
-}
-
-func loadTerminalCheckpointEntries(root string, provenance map[string]any, taskOrder []string, allowEmpty bool) (map[string]terminalCheckpointEntry, map[string]terminalSavedResult, error) {
-	entries, err := loadTerminalCheckpointSummaryMode(filepath.Join(root, "summary.json"), allowEmpty)
-	if err != nil {
-		return nil, nil, err
-	}
-	entryByTask := make(map[string]terminalCheckpointEntry, len(entries))
-	results := make(map[string]terminalSavedResult, len(entries))
-	indexes := make(map[string]int, len(taskOrder))
-	for index, id := range taskOrder {
-		indexes[id] = index + 1
-	}
-	for _, entry := range entries {
-		expectedIndex, exists := indexes[entry.Task]
-		if !exists || entry.Index != expectedIndex || entry.Total != len(taskOrder) || entryByTask[entry.Task].Task != "" {
-			return nil, nil, cliError{"checkpoint_task_order_mismatch", "Checkpoint summary contains an unknown, duplicated, or misordered task.", nil, map[string]any{"taskId": entry.Task, "savedIndex": entry.Index, "expectedIndex": expectedIndex}}
-		}
-		expectedOut := terminalCheckpointWrapperName(entry.Task)
-		if entry.Out != expectedOut || filepath.IsAbs(entry.Out) || filepath.Clean(entry.Out) != entry.Out || filepath.Dir(entry.Out) != "." {
-			return nil, nil, cliError{"task_result_missing", "A v3 checkpoint summary contains an unsafe or non-canonical task wrapper path.", nil, map[string]any{"taskId": entry.Task, "summaryOut": entry.Out, "expected": expectedOut}}
-		}
-		if !terminalJSONEqual(entry.Summary, terminalCheckpointEntrySummary(provenance)) {
-			return nil, nil, cliError{"checkpoint_provenance_mismatch", "A v3 summary entry lacks the exact nested immutable provenance shape.", nil, map[string]any{"taskId": entry.Task}}
-		}
-		recordPath := filepath.Join(root, expectedOut)
-		record, err := loadTerminalSavedResultMode(recordPath, entry.Task, false)
-		if err != nil {
-			return nil, nil, err
-		}
-		if !terminalJSONEqual(record.Provenance, provenance) {
-			return nil, nil, cliError{"checkpoint_provenance_mismatch", "A checkpoint task wrapper lacks matching immutable provenance.", nil, map[string]any{"taskId": entry.Task}}
-		}
-		if record.Pass != entry.Pass || !terminalJSONEqual(record.Scored, entry.Scored) {
-			entryCommittedComplete := entry.Scored != nil && *entry.Scored
-			if entryCommittedComplete {
-				return nil, nil, cliError{"checkpoint_result_mismatch", "A completed checkpoint summary and its task wrapper scoring fields differ.", nil, map[string]any{"taskId": entry.Task}}
-			}
-			// A wrapper rename can durably precede the final summary commit. The
-			// older incomplete summary remains authoritative and fail-closed: keep
-			// the telemetry, but force this task to rerun rather than trusting the
-			// ahead-of-summary wrapper score.
-			record.Pass = entry.Pass
-			record.Scored = entry.Scored
-		}
-		entryByTask[entry.Task] = entry
-		results[entry.Task] = record
-	}
-	return entryByTask, results, nil
-}
-
-func loadTerminalCheckpointCommittedEntries(root string, metadata terminalCheckpointMetadata, provenance map[string]any, taskOrder []string, allowEmpty bool) (map[string]terminalCheckpointEntry, map[string]terminalSavedResult, bool, error) {
-	entries, results, err := loadTerminalCheckpointEntries(root, provenance, taskOrder, allowEmpty)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	if len(entries) > metadata.CompletedTasks {
-		return nil, nil, false, cliError{"checkpoint_metadata_invalid", "Checkpoint summary contains more committed tasks than checkpoint metadata.", nil, map[string]any{"summaryTasks": len(entries), "completedTasks": metadata.CompletedTasks}}
-	}
-	if len(entries) == metadata.CompletedTasks {
-		return entries, results, false, nil
-	}
-	for index, taskID := range taskOrder {
-		if len(entries) == metadata.CompletedTasks {
-			break
-		}
-		if entries[taskID].Task != "" {
-			continue
-		}
-		wrapperPath := filepath.Join(root, terminalCheckpointWrapperName(taskID))
-		if _, statErr := os.Lstat(wrapperPath); errors.Is(statErr, os.ErrNotExist) {
-			continue
-		} else if statErr != nil {
-			return nil, nil, false, cliError{"task_result_invalid", "Could not inspect metadata-committed task wrapper.", nil, map[string]any{"taskId": taskID, "error": statErr.Error()}}
-		}
-		record, loadErr := loadTerminalSavedResultMode(wrapperPath, taskID, false)
-		if loadErr != nil {
-			return nil, nil, false, loadErr
-		}
-		if !terminalJSONEqual(record.Provenance, provenance) {
-			return nil, nil, false, cliError{"checkpoint_provenance_mismatch", "Metadata-committed task wrapper lacks matching immutable provenance.", nil, map[string]any{"taskId": taskID}}
-		}
-		scored := record.Scored != nil && *record.Scored
-		entries[taskID] = terminalCheckpointEntry{Index: index + 1, Total: len(taskOrder), Task: taskID, Out: terminalCheckpointWrapperName(taskID), Pass: record.Pass, Scored: &scored, Summary: terminalCheckpointEntrySummary(provenance)}
-		results[taskID] = record
-	}
-	if len(entries) != metadata.CompletedTasks {
-		return nil, nil, false, cliError{"checkpoint_metadata_invalid", "Checkpoint metadata references task wrappers that are not durably available.", nil, map[string]any{"recoveredTasks": len(entries), "completedTasks": metadata.CompletedTasks}}
-	}
-	return entries, results, true, nil
-}
-
-func loadTerminalCheckpointSummaryMode(path string, allowEmpty bool) ([]terminalCheckpointEntry, error) {
 	var entries []terminalCheckpointEntry
-	if err := decodeTerminalRegularJSON(path, terminalMonolithicArtifactMaxBytes, &entries, true); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, cliError{"checkpoint_summary_missing", "The terminal checkpoint is missing summary.json.", []string{"Pass the run directory containing its committed summary.json."}, map[string]any{"path": path, "error": err.Error()}}
-		}
-		return nil, cliError{"checkpoint_summary_invalid", "Could not decode terminal checkpoint summary.json as one regular JSON array.", []string{"Use the summary.json written by the checkpoint runner."}, map[string]any{"path": path, "error": err.Error()}}
+	if err := json.NewDecoder(file).Decode(&entries); err != nil {
+		return nil, cliError{"checkpoint_summary_invalid", "Could not decode terminal checkpoint summary.json as an array.", []string{"Use the summary.json written by the completed checkpoint runner."}, map[string]any{"path": path, "error": err.Error()}}
 	}
-	if len(entries) == 0 && !allowEmpty {
+	if len(entries) == 0 {
 		return nil, cliError{"checkpoint_summary_empty", "Terminal checkpoint summary.json contains no task records.", []string{"Pass a completed run directory with at least one scored task."}, map[string]any{"path": path}}
 	}
 	return entries, nil
-}
-
-func loadTerminalCheckpointSummary(path string) ([]terminalCheckpointEntry, error) {
-	return loadTerminalCheckpointSummaryMode(path, false)
 }
 
 func validateTerminalCheckpointEntry(entry terminalCheckpointEntry, count int, seenTasks map[string]bool, seenIndexes map[int]bool) error {
@@ -3667,68 +1921,53 @@ func terminalCheckpointQuantization(entries []terminalCheckpointEntry) (string, 
 }
 
 func terminalCheckpointResultPath(root string, entry terminalCheckpointEntry) (string, error) {
-	direct := filepath.Join(root, terminalCheckpointWrapperName(entry.Task))
-	if info, err := os.Lstat(direct); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return "", cliError{"task_result_invalid", fmt.Sprintf("Task result file for %q is a symlink or special file.", entry.Task), nil, map[string]any{"path": direct}}
-		}
+	direct := filepath.Join(root, entry.Task+".json")
+	if info, err := os.Stat(direct); err == nil && !info.IsDir() {
 		return direct, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", cliError{"task_result_invalid", fmt.Sprintf("Could not inspect task result file for %q.", entry.Task), nil, map[string]any{"path": direct, "error": err.Error()}}
 	}
-	if entry.Out != "" && !filepath.IsAbs(entry.Out) && filepath.Clean(entry.Out) == entry.Out && filepath.Dir(entry.Out) == "." {
-		candidate := filepath.Join(root, entry.Out)
-		if info, err := os.Lstat(candidate); err == nil {
-			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-				return "", cliError{"task_result_invalid", fmt.Sprintf("Task result file for %q is a symlink or special file.", entry.Task), nil, map[string]any{"path": candidate}}
+	if entry.Out != "" {
+		candidate := entry.Out
+		if !filepath.IsAbs(candidate) {
+			candidate = filepath.Join(root, candidate)
+		}
+		candidate = filepath.Clean(candidate)
+		rel, relErr := filepath.Rel(root, candidate)
+		if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+				return candidate, nil
 			}
-			return candidate, nil
 		}
 	}
-	return "", cliError{"task_result_missing", fmt.Sprintf("Missing per-task result file for %q.", entry.Task), []string{"Restore " + terminalCheckpointWrapperName(entry.Task) + " beneath the completed run directory."}, map[string]any{"taskId": entry.Task, "expected": direct, "summaryOut": entry.Out}}
+	return "", cliError{"task_result_missing", fmt.Sprintf("Missing per-task result file for %q.", entry.Task), []string{"Restore " + entry.Task + ".json beneath the completed run directory."}, map[string]any{"taskId": entry.Task, "expected": direct, "summaryOut": entry.Out}}
 }
 
 func loadTerminalSavedResult(path, taskID string) (terminalSavedResult, error) {
-	return loadTerminalSavedResultMode(path, taskID, true)
-}
-
-func loadTerminalSavedResultMode(path, taskID string, requireScored bool) (terminalSavedResult, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return terminalSavedResult{}, err
+	}
+	defer file.Close()
 	var saved terminalSavedTaskFile
-	if err := decodeTerminalRegularJSON(path, terminalMonolithicArtifactMaxBytes, &saved, true); err != nil {
-		return terminalSavedResult{}, cliError{"task_result_invalid", fmt.Sprintf("Could not decode one regular result file for task %q.", taskID), []string{"Use the per-task JSON written by the terminal checkpoint runner."}, map[string]any{"path": path, "error": err.Error()}}
+	if err := json.NewDecoder(file).Decode(&saved); err != nil {
+		return terminalSavedResult{}, cliError{"task_result_invalid", fmt.Sprintf("Could not decode result file for task %q.", taskID), []string{"Use the per-task JSON written by the completed terminal run."}, map[string]any{"path": path, "error": err.Error()}}
 	}
 	if len(saved.Results) != 1 {
 		return terminalSavedResult{}, cliError{"task_result_count_invalid", fmt.Sprintf("Task file %q contains %d results; expected exactly one.", path, len(saved.Results)), []string{"Keep exactly one result record in each <task>.json file."}, map[string]any{"taskId": taskID, "results": len(saved.Results)}}
 	}
 	record := saved.Results[0]
 	if record.QuestionID == "" {
-		return terminalSavedResult{}, cliError{"task_result_id_missing", fmt.Sprintf("Task result %q has no question_id.", path), []string{"Every saved terminal result must identify its task."}, nil}
+		return terminalSavedResult{}, cliError{"task_result_id_missing", fmt.Sprintf("Task file %q has no question_id.", path), []string{"Every saved terminal result must identify its task."}, nil}
 	}
 	if record.QuestionID != taskID {
-		return terminalSavedResult{}, cliError{"task_result_id_mismatch", fmt.Sprintf("Task result for %q contains question_id %q.", taskID, record.QuestionID), []string{"Restore the matching task result from the same checkpoint."}, map[string]any{"source": path}}
-	}
-	if requireScored {
-		if err := validateTerminalSavedResult(record, taskID, path); err != nil {
-			return terminalSavedResult{}, err
-		}
-	}
-	return record, nil
-}
-
-func validateTerminalSavedResult(record terminalSavedResult, taskID, source string) error {
-	if record.QuestionID == "" {
-		return cliError{"task_result_id_missing", fmt.Sprintf("Task result %q has no question_id.", source), []string{"Every saved terminal result must identify its task."}, nil}
-	}
-	if record.QuestionID != taskID {
-		return cliError{"task_result_id_mismatch", fmt.Sprintf("Task result for %q contains question_id %q.", taskID, record.QuestionID), []string{"Restore the matching task result from the completed run."}, map[string]any{"source": source}}
+		return terminalSavedResult{}, cliError{"task_result_id_mismatch", fmt.Sprintf("Task file for %q contains question_id %q.", taskID, record.QuestionID), []string{"Restore the matching per-task JSON file from the completed run."}, map[string]any{"path": path}}
 	}
 	if record.Scored == nil {
-		return cliError{"task_result_score_missing", fmt.Sprintf("Task result %q is missing scored.", taskID), []string{"Every deferred task result must explicitly record scored: true."}, nil}
+		return terminalSavedResult{}, cliError{"task_result_score_missing", fmt.Sprintf("Task result %q is missing scored.", taskID), []string{"Every deferred task result must explicitly record scored: true."}, nil}
 	}
 	if !*record.Scored {
-		return cliError{"task_result_unscored", fmt.Sprintf("Task result %q was not scored.", taskID), []string{"Deferred submit only accepts results completed by the verifier."}, nil}
+		return terminalSavedResult{}, cliError{"task_result_unscored", fmt.Sprintf("Task result %q was not scored.", taskID), []string{"Deferred submit only accepts results completed by the verifier."}, nil}
 	}
-	return nil
+	return record, nil
 }
 
 func loadTerminalSavedResponse(path string) (string, error) {
@@ -3790,7 +2029,7 @@ func terminalSavedArtifactResponse(root, recordPath string, record terminalSaved
 		if err != nil {
 			return "", stats, false, err
 		}
-		preview = "# Agent trace\n\nSource: saved task response.\n\n## Final answer\n\n" + terminalMarkdownCode(boundedTerminalUTF8(savedResponse, terminalTracePreviewBytes-128, "saved response"))
+		preview = "# Agent trace\n\nSource: saved task response (no omp.jsonl trace was found).\n\n## Final answer\n\n" + terminalMarkdownCode(boundedTerminalUTF8(savedResponse, terminalTracePreviewBytes-128, "saved response"))
 	}
 	if strings.TrimSpace(record.VerifierOutput) != "" {
 		verifier := boundedTerminalUTF8(record.VerifierOutput, terminalVerifierPreviewBytes, "verifier output")
@@ -4144,53 +2383,60 @@ func terminalUTF8Suffix(value string, maxBytes int) string {
 	return strings.ToValidUTF8(value[start:], "�")
 }
 
-func validateTerminalRunManifest(dataset string, shardIndex int, items []map[string]any) (string, []string, error) {
-	seen := map[string]bool{}
-	taskIDs := make([]string, len(items))
-	identityRows := make([]any, len(items))
-	for index, row := range items {
-		id := firstNonEmpty(stringValue(row["question_id"]), stringValue(row["questionId"]), stringValue(row["id"]))
-		key := firstNonEmpty(stringValue(row["bundle_key"]), stringValue(row["bundleKey"]))
-		hash := strings.ToLower(strings.TrimSpace(stringValue(row["sha256"])))
-		byteSize, validByteSize := terminalInspectionPositiveInt64(row["byteSize"])
-		if id == "" || key == "" || seen[id] || !terminalInspectionSHA256.MatchString(hash) || !validByteSize {
-			return "", nil, cliError{"manifest_invalid", "Terminal run requires a complete manifest with unique task ids, bundle keys, SHA-256 hashes, and positive byte sizes.", []string{"Repair and re-ingest the dataset before execution."}, map[string]any{"dataset": dataset, "shardIndex": shardIndex, "rowIndex": index, "questionId": id, "bundleKey": key, "sha256": hash, "byteSize": row["byteSize"], "duplicate": seen[id]}}
-		}
-		seen[id] = true
-		taskIDs[index] = id
-		identityRows[index] = map[string]any{"question_id": id, "bundle_key": key, "sha256": hash, "byteSize": byteSize}
+func detectTerminalServedModel(ctx context.Context, baseURL, apiKey, preferred string) (string, map[string]any, error) {
+	value, err := fetchJSONContext(ctx, http.MethodGet, openAIBaseURL(baseURL)+"/v1/models", apiKey, nil)
+	if err != nil {
+		return "", nil, err
 	}
-	if dataset == terminalBench21Dataset {
-		if shardIndex < 1 || shardIndex > terminalBench21ShardCount {
-			return "", nil, cliError{"manifest_invalid", "Terminal-Bench 2.1 requires a canonical shard index from 1 through 10.", nil, map[string]any{"shardIndex": shardIndex}}
+	if ctx.Err() != nil {
+		return "", nil, terminalCancelledError(ctx)
+	}
+	first := ""
+	var firstInfo map[string]any
+	for _, item := range modelInfoItems(asObject(value)) {
+		obj := asObject(item)
+		if obj == nil {
+			continue
 		}
-		start := ((shardIndex - 1) * len(terminalBench21CanonicalTaskIDs)) / terminalBench21ShardCount
-		end := (shardIndex * len(terminalBench21CanonicalTaskIDs)) / terminalBench21ShardCount
-		expected := terminalBench21CanonicalTaskIDs[start:end]
-		if !terminalJSONEqual(taskIDs, expected) {
-			return "", nil, cliError{"manifest_task_set_mismatch", "Terminal-Bench 2.1 shard manifest does not match the canonical ordered task assignment.", []string{"Inspect or re-ingest the canonical dataset before executing any task."}, map[string]any{"shardIndex": shardIndex, "expectedTaskIds": expected, "actualTaskIds": taskIDs}}
+		id := firstNonEmpty(stringValue(obj["id"]), stringValue(obj["name"]), stringValue(obj["model"]))
+		if id == "" {
+			continue
+		}
+		if first == "" {
+			first = id
+			firstInfo = obj
+		}
+		if id == preferred || strings.EqualFold(id, preferred) {
+			return id, obj, nil
 		}
 	}
-	hash, err := terminalJSONHash(identityRows)
-	return hash, taskIDs, err
+	if first != "" {
+		return first, firstInfo, nil
+	}
+	return "", nil, errors.New("/v1/models did not return any model ids")
 }
 
-func acquireTerminalBundles(args cliArgs, dataset, localDir string) ([]terminalBundle, string, int, error) {
-	if localDir != "" {
-		bundles, err := loadTerminalBundles(localDir)
-		return bundles, "", -1, err
-	}
+func fetchTerminalManifestItems(ctx context.Context, args cliArgs, dataset string) ([]map[string]any, int, error) {
 	params := url.Values{}
 	if s := opt(args, "shard"); s != "" {
 		params.Set("shard", s)
+	}
+	if q := opt(args, "questions"); q != "" {
+		params.Set("questions", q)
 	}
 	metaURL := apiURL(args) + "/api/evals/" + url.PathEscape(dataset) + "/shard"
 	if enc := params.Encode(); enc != "" {
 		metaURL += "?" + enc
 	}
-	meta, err := fetchJSON("GET", metaURL, apiKey(args), nil)
+	meta, err := fetchJSONContext(ctx, "GET", metaURL, apiKey(args), nil)
 	if err != nil {
-		return nil, "", -1, cliError{"manifest_fetch_failed", fmt.Sprintf("Could not fetch terminal dataset manifest: %v", err), []string{"Check the dataset slug and API URL.", "Confirm the dataset is approved and eval storage is configured."}, map[string]any{"url": metaURL, "error": err.Error()}}
+		if ctx.Err() != nil {
+			return nil, -1, terminalCancelledError(ctx)
+		}
+		return nil, -1, cliError{"manifest_fetch_failed", fmt.Sprintf("Could not fetch terminal dataset manifest: %v", err), []string{"Check the dataset slug and API URL.", "Confirm the dataset is approved and eval storage is configured."}, map[string]any{"url": metaURL, "error": err.Error()}}
+	}
+	if ctx.Err() != nil {
+		return nil, -1, terminalCancelledError(ctx)
 	}
 	shardIndex := -1
 	if sh := asObject(asObject(meta)["shard"]); sh != nil {
@@ -4200,24 +2446,19 @@ func acquireTerminalBundles(args cliArgs, dataset, localDir string) ([]terminalB
 	}
 	downloadURL := stringValue(asObject(meta)["downloadUrl"])
 	if downloadURL == "" {
-		return nil, "", shardIndex, cliError{"manifest_fetch_failed", "Dataset shard response did not include downloadUrl.", []string{"Confirm the dataset is approved and eval storage is configured."}, meta}
+		return nil, shardIndex, cliError{"manifest_fetch_failed", "Dataset shard response did not include downloadUrl.", []string{"Confirm the dataset is approved and eval storage is configured."}, meta}
 	}
-	items, err := fetchDatasetItems(downloadURL, "jsonl")
+	items, err := fetchTerminalDatasetItems(ctx, downloadURL)
 	if err != nil {
-		details := map[string]any{"error": terminalSafeDownloadError(err)}
-		if sanitized := terminalSanitizedDownloadURL(downloadURL); sanitized != "" {
-			details["downloadUrl"] = sanitized
+		if ctx.Err() != nil {
+			return nil, shardIndex, terminalCancelledError(ctx)
 		}
-		return nil, "", shardIndex, cliError{"manifest_fetch_failed", "Could not download terminal manifest JSONL: " + terminalSafeDownloadError(err), []string{"Signed manifest URLs expire after 15 minutes; re-run the command.", "Check network access to the storage host."}, details}
-	}
-	manifestHash, manifestTaskIDs, err := validateTerminalRunManifest(dataset, shardIndex, items)
-	if err != nil {
-		return nil, "", shardIndex, err
+		return nil, shardIndex, cliError{"manifest_fetch_failed", fmt.Sprintf("Could not download terminal manifest JSONL: %v", err), []string{"Signed manifest URLs expire after 15 minutes; re-run the command.", "Check network access to the storage host."}, map[string]any{"downloadUrl": downloadURL}}
 	}
 	if q := opt(args, "questions"); q != "" {
 		limit, err := strconv.Atoi(q)
 		if err != nil || limit < 1 {
-			return nil, "", shardIndex, cliError{"manifest_fetch_failed", "--questions must be a positive integer.", []string{"Pass --questions <n> to run the first n manifest rows, or use --task <id>[,<id>...] to filter task ids."}, map[string]any{"questions": q}}
+			return nil, shardIndex, cliError{"manifest_fetch_failed", "--questions must be a positive integer.", []string{"Pass --questions <n> to run the first n manifest rows, or use --task <id>[,<id>...] to filter task ids."}, map[string]any{"questions": q}}
 		}
 		if limit < len(items) {
 			items = items[:limit]
@@ -4225,20 +2466,46 @@ func acquireTerminalBundles(args cliArgs, dataset, localDir string) ([]terminalB
 	}
 	requested := parseStringSet(opt(args, "task"))
 	if len(requested) > 0 {
-		available := map[string]bool{}
+		filtered := make([]map[string]any, 0, len(requested))
 		for _, row := range items {
-			available[firstNonEmpty(stringValue(row["question_id"]), stringValue(row["questionId"]), stringValue(row["id"]))] = true
-		}
-		missing := make([]string, 0)
-		for id := range requested {
-			if !available[id] {
-				missing = append(missing, id)
+			id := firstNonEmpty(stringValue(row["question_id"]), stringValue(row["questionId"]), stringValue(row["id"]))
+			if requested[id] {
+				filtered = append(filtered, row)
 			}
 		}
-		sort.Strings(missing)
-		if len(missing) > 0 {
-			return nil, "", shardIndex, cliError{"manifest_task_missing", "One or more requested task ids are not present in the selected complete shard manifest.", nil, map[string]any{"missingTaskIds": missing, "shardIndex": shardIndex}}
-		}
+		items = filtered
+	}
+	return items, shardIndex, nil
+}
+
+func fetchTerminalDatasetItems(ctx context.Context, rawURL string) ([]map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := apiHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	text, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("dataset download failed: %s", res.Status)
+	}
+	return parseDatasetItems(string(text), rawURL, "jsonl")
+}
+
+func acquireTerminalBundles(ctx context.Context, args cliArgs, dataset, localDir string) ([]terminalBundle, string, int, error) {
+	if localDir != "" {
+		bundles, err := loadTerminalBundles(localDir)
+		return bundles, "", -1, err
+	}
+	items, shardIndex, err := fetchTerminalManifestItems(ctx, args, dataset)
+	if err != nil {
+		return nil, "", shardIndex, err
 	}
 	tmp, err := os.MkdirTemp("", "lmx-terminal-bundles-*")
 	if err != nil {
@@ -4246,10 +2513,10 @@ func acquireTerminalBundles(args cliArgs, dataset, localDir string) ([]terminalB
 	}
 	bundles := []terminalBundle{}
 	for _, row := range items {
-		id := firstNonEmpty(stringValue(row["question_id"]), stringValue(row["questionId"]), stringValue(row["id"]))
-		if len(requested) > 0 && !requested[id] {
-			continue
+		if ctx.Err() != nil {
+			return nil, tmp, shardIndex, terminalCancelledError(ctx)
 		}
+		id := firstNonEmpty(stringValue(row["question_id"]), stringValue(row["questionId"]), stringValue(row["id"]))
 		key := stringValue(row["bundle_key"])
 		if key == "" {
 			key = stringValue(row["bundleKey"])
@@ -4257,9 +2524,7 @@ func acquireTerminalBundles(args cliArgs, dataset, localDir string) ([]terminalB
 		if key == "" {
 			return nil, tmp, shardIndex, cliError{"manifest_fetch_failed", "Terminal manifest row is missing bundle_key.", []string{"Re-ingest the terminal dataset manifest."}, row}
 		}
-		bundleHash := strings.ToLower(strings.TrimSpace(stringValue(row["sha256"])))
-		byteSize, _ := terminalInspectionPositiveInt64(row["byteSize"])
-		bundleDir, err := downloadTerminalBundle(args, tmp, id, key, bundleHash, byteSize)
+		bundleDir, err := downloadTerminalBundle(ctx, args, tmp, id, key, stringValue(row["sha256"]))
 		if err != nil {
 			return nil, tmp, shardIndex, err
 		}
@@ -4267,44 +2532,100 @@ func acquireTerminalBundles(args cliArgs, dataset, localDir string) ([]terminalB
 		if err != nil {
 			return nil, tmp, shardIndex, err
 		}
-		if loaded.Task.ID != id {
-			return nil, tmp, shardIndex, cliError{"manifest_bundle_mismatch", "Downloaded bundle task id does not match its manifest question_id.", nil, map[string]any{"questionId": id, "bundleTaskId": loaded.Task.ID, "bundleKey": key}}
-		}
-		if dataset == terminalBench21Dataset && (loaded.Task.Version != "2.1" || loaded.Task.Source != "terminal-bench/"+id) {
-			return nil, tmp, shardIndex, cliError{"manifest_bundle_mismatch", "Terminal-Bench 2.1 bundle version/source does not match the canonical identity.", nil, map[string]any{"taskId": id, "version": loaded.Task.Version, "source": loaded.Task.Source}}
-		}
-		loaded.BundleKey = key
-		loaded.BundleSHA256 = bundleHash
-		loaded.ByteSize = byteSize
-		loaded.ManifestIdentity = dataset + "/shard/" + strconv.Itoa(shardIndex)
-		loaded.ManifestSHA256 = manifestHash
-		loaded.ManifestVersion = "terminal-manifest-jsonl/v1"
-		loaded.ManifestTaskIDs = append([]string(nil), manifestTaskIDs...)
 		bundles = append(bundles, loaded)
 	}
 	return bundles, tmp, shardIndex, nil
 }
 
-func downloadTerminalBundle(args cliArgs, tmp, id, key, wantHash string, wantByteSize ...int64) (string, error) {
-	value, err := fetchJSON("GET", apiURL(args)+"/api/evals/storage/download-url?key="+url.QueryEscape(key), apiKey(args), nil)
+func terminalHarnessKey(args cliArgs, cfg terminalConfig) string {
+	agentName := "lmx-terminus"
+	if cfg.agentCommand != "" {
+		agentName = firstNonEmpty(opt(args, "agent-name"), opt(args, "agent"), "external-agent")
+	}
+	return firstNonEmpty(opt(args, "runner-version"), "localmaxxing-go terminal-agent") + "|" + terminalProtocolLabel(cfg) + "|" + agentName
+}
+
+func terminalArgsWithOption(args cliArgs, name, value string) cliArgs {
+	copied := cliArgs{opts: map[string]string{}, flags: map[string]bool{}, positional: append([]string(nil), args.positional...)}
+	for k, v := range args.opts {
+		copied.opts[k] = v
+	}
+	for k, v := range args.flags {
+		copied.flags[k] = v
+	}
+	copied.opts[name] = value
+	return copied
+}
+
+func selectMissingTerminalShard(ctx context.Context, args cliArgs, dataset, hfID, quantization, quantFormat string, cfg terminalConfig) (cliArgs, map[string]any, error) {
+	if opt(args, "shard") != "" {
+		return args, nil, nil
+	}
+	query := url.Values{}
+	query.Set("hfId", hfID)
+	query.Set("harnessKey", terminalHarnessKey(args, cfg))
+	if quantization != "" {
+		query.Set("quantization", quantization)
+	}
+	if quantFormat != "" {
+		query.Set("quantFormat", quantFormat)
+	}
+	value, err := fetchJSONContext(ctx, "GET", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/coverage?"+query.Encode(), apiKey(args), nil)
 	if err != nil {
+		if ctx.Err() != nil {
+			return args, nil, terminalCancelledError(ctx)
+		}
+		return args, nil, cliError{"coverage_fetch_failed", fmt.Sprintf("Could not select a missing terminal shard: %v", err), []string{"Pass --shard <index> to select one explicitly.", "Check the model, quantization, quant format, harness, and API URL."}, nil}
+	}
+	if ctx.Err() != nil {
+		return args, nil, terminalCancelledError(ctx)
+	}
+	coverage := asObject(value)
+	_, _, missing := shardCoverageDetails(coverage)
+	if len(missing) == 0 {
+		return args, coverage, cliError{"no_missing_shards", "This terminal aggregate already covers every registered shard.", []string{"Use --shard <index> --rerun to repeat a covered shard deliberately."}, map[string]any{"dataset": dataset, "model": hfID, "harnessKey": terminalHarnessKey(args, cfg)}}
+	}
+	selected := strconv.Itoa(missing[0])
+	printStatus(args, "terminal_missing_shard_selected", map[string]any{"dataset": dataset, "model": hfID, "shardIndex": missing[0], "missingShards": missing, "harnessKey": terminalHarnessKey(args, cfg)})
+	return terminalArgsWithOption(args, "shard", selected), coverage, nil
+}
+
+func downloadTerminalBundle(ctx context.Context, args cliArgs, tmp, id, key, wantHash string) (string, error) {
+	value, err := fetchJSONContext(ctx, "GET", apiURL(args)+"/api/evals/storage/download-url?key="+url.QueryEscape(key), apiKey(args), nil)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", terminalCancelledError(ctx)
+		}
 		return "", cliError{"bundle_download_failed", fmt.Sprintf("Could not presign terminal bundle download: %v", err), []string{"Check that the dataset is approved and the bundle key exists."}, map[string]any{"taskId": id, "bundle_key": key, "error": err.Error()}}
+	}
+	if ctx.Err() != nil {
+		return "", terminalCancelledError(ctx)
 	}
 	downloadURL := stringValue(asObject(value)["downloadUrl"])
 	if downloadURL == "" {
 		return "", cliError{"bundle_download_failed", "Presign response did not include downloadUrl.", []string{"Check the LocalMaxxing API response."}, value}
 	}
-	res, err := http.Get(downloadURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
-		return "", cliError{"bundle_download_failed", "Could not download terminal bundle: " + terminalSafeDownloadError(err), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key}}
+		return "", cliError{"bundle_download_failed", fmt.Sprintf("Could not prepare terminal bundle download: %v", err), []string{"Check the signed download URL returned by the LocalMaxxing API."}, map[string]any{"taskId": id, "bundle_key": key}}
+	}
+	res, err := apiHTTPClient.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", terminalCancelledError(ctx)
+		}
+		return "", cliError{"bundle_download_failed", fmt.Sprintf("Could not download terminal bundle: %v", err), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key}}
 	}
 	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", cliError{"bundle_download_failed", fmt.Sprintf("Terminal bundle download returned %s", res.Status), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key}}
+	data, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		if ctx.Err() != nil {
+			return "", terminalCancelledError(ctx)
+		}
+		return "", cliError{"bundle_download_failed", fmt.Sprintf("Could not read terminal bundle download: %v", readErr), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key}}
 	}
-	if len(wantByteSize) > 0 && wantByteSize[0] != int64(len(data)) {
-		return "", cliError{"bundle_download_failed", "Terminal bundle byte size did not match the manifest.", []string{"Re-ingest the dataset; the manifest and bundle object are inconsistent."}, map[string]any{"taskId": id, "bundle_key": key, "expected": wantByteSize[0], "actual": len(data)}}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", cliError{"bundle_download_failed", fmt.Sprintf("Terminal bundle download returned %s", res.Status), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key, "body": truncateString(string(data), 4096)}}
 	}
 	if wantHash != "" {
 		sum := sha256.Sum256(data)
@@ -4312,6 +2633,9 @@ func downloadTerminalBundle(args cliArgs, tmp, id, key, wantHash string, wantByt
 		if !strings.EqualFold(got, wantHash) {
 			return "", cliError{"bundle_download_failed", "Terminal bundle sha256 did not match the manifest.", []string{"Re-ingest the dataset; the manifest and bundle object are inconsistent."}, map[string]any{"taskId": id, "bundle_key": key, "expected": wantHash, "actual": got}}
 		}
+	}
+	if ctx.Err() != nil {
+		return "", terminalCancelledError(ctx)
 	}
 	bundleDir := filepath.Join(tmp, sanitizeDockerName(id))
 	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
@@ -4356,56 +2680,6 @@ func loadTerminalBundles(dir string) ([]terminalBundle, error) {
 	return bundles, nil
 }
 
-func terminalLocalBundleDigest(dir string) (string, int64, error) {
-	hash := sha256.New()
-	var contentBytes int64
-	for _, rootName := range []string{"task.json", "environment", "tests", "solution"} {
-		root := filepath.Join(dir, rootName)
-		if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
-			continue
-		} else if err != nil {
-			return "", 0, err
-		}
-		err := filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			info, err := entry.Info()
-			if err != nil {
-				return err
-			}
-			if info.Mode()&os.ModeSymlink != 0 || (!info.Mode().IsRegular() && !info.IsDir()) {
-				return cliError{"bundle_invalid", "Terminal bundle provenance rejects symlinks and special files.", []string{"Replace the entry with a regular file or directory before running."}, map[string]any{"path": current}}
-			}
-			relative, err := filepath.Rel(dir, current)
-			if err != nil {
-				return err
-			}
-			_, _ = io.WriteString(hash, filepath.ToSlash(relative)+"\x00"+info.Mode().Perm().String()+"\x00")
-			if info.IsDir() {
-				_, _ = io.WriteString(hash, "directory\x00")
-				return nil
-			}
-			file, err := os.Open(current)
-			if err != nil {
-				return err
-			}
-			written, copyErr := io.Copy(hash, file)
-			closeErr := file.Close()
-			contentBytes += written
-			_, _ = io.WriteString(hash, "\x00")
-			if copyErr != nil {
-				return copyErr
-			}
-			return closeErr
-		})
-		if err != nil {
-			return "", 0, err
-		}
-	}
-	return hex.EncodeToString(hash.Sum(nil)), contentBytes, nil
-}
-
 func loadSingleTerminalBundle(dir string) (terminalBundle, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "task.json"))
 	if err != nil {
@@ -4421,160 +2695,96 @@ func loadSingleTerminalBundle(dir string) (terminalBundle, error) {
 	if _, err := os.Stat(filepath.Join(dir, "tests")); err != nil {
 		return terminalBundle{}, cliError{"bundle_invalid", "Terminal bundle is missing tests/.", []string{"Copy harbor tests/ into the bundle or re-run the importer."}, map[string]any{"bundleDir": dir, "taskId": task.ID}}
 	}
-	digest, byteSize, err := terminalLocalBundleDigest(dir)
-	if err != nil {
-		return terminalBundle{}, err
-	}
-	return terminalBundle{Task: task, Dir: dir, BundleKey: "local-bundle/" + task.ID, BundleSHA256: digest, ByteSize: byteSize}, nil
+	return terminalBundle{Task: task, Dir: dir}, nil
 }
 
-func terminalPathContainsTraversal(raw string) bool {
-	for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == '/' || r == '\\' }) {
-		if part == ".." {
-			return true
-		}
-	}
-	return false
-}
-
-func loadSingleTerminalBundleStrict(dir string) (terminalBundle, error) {
-	clean := filepath.Clean(dir)
-	if terminalPathContainsTraversal(dir) {
-		return terminalBundle{}, cliError{"bundle_invalid", "Recovery bundle paths must contain no traversal components.", nil, map[string]any{"bundleDir": dir}}
-	}
-	info, err := os.Lstat(clean)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return terminalBundle{}, cliError{"bundle_invalid", "Recovery --bundle must be a real directory, not a symlink or special file.", nil, map[string]any{"bundleDir": dir, "error": fmt.Sprint(err)}}
-	}
-	allowedRoots := map[string]bool{"task.json": true, "environment": true, "tests": true, "solution": true}
-	entries, err := os.ReadDir(clean)
-	if err != nil {
-		return terminalBundle{}, cliError{"bundle_invalid", "Could not enumerate the recovery bundle.", nil, map[string]any{"bundleDir": dir, "error": err.Error()}}
-	}
-	for _, entry := range entries {
-		if !allowedRoots[entry.Name()] {
-			return terminalBundle{}, cliError{"bundle_invalid", "Recovery bundle contains an unexpected top-level entry outside its deterministic identity.", nil, map[string]any{"bundleDir": dir, "entry": entry.Name()}}
-		}
-	}
-	testsInfo, err := os.Lstat(filepath.Join(clean, "tests"))
-	if err != nil || testsInfo.Mode()&os.ModeSymlink != 0 || !testsInfo.IsDir() {
-		return terminalBundle{}, cliError{"bundle_invalid", "Recovery bundle tests/ must be a real directory.", nil, map[string]any{"bundleDir": dir, "error": fmt.Sprint(err)}}
-	}
-	bundle, err := loadSingleTerminalBundle(clean)
-	if err != nil {
-		return terminalBundle{}, err
-	}
-	if !terminalCheckpointSafeTaskID.MatchString(bundle.Task.ID) || bundle.Task.Version == "" || bundle.Task.Source == "" || bundle.Task.Verifier.Command == "" || bundle.Task.Verifier.RewardFile == "" {
-		return terminalBundle{}, cliError{"bundle_invalid", "Recovery bundle task.json lacks a safe task id, version, source, or canonical verifier identity.", nil, map[string]any{"bundleDir": dir, "taskId": bundle.Task.ID}}
-	}
-	return bundle, nil
-}
-
-func validateTerminalRecoveryBundle(provenance map[string]any, taskIndex int, bundle terminalBundle) (map[string]any, error) {
-	items := anySlice(provenance["manifestItems"])
-	if taskIndex < 0 || taskIndex >= len(items) {
-		return nil, cliError{"recovery_identity_mismatch", "Checkpoint manifest does not contain the requested recovery task.", nil, map[string]any{"taskId": bundle.Task.ID}}
-	}
-	item := asObject(items[taskIndex])
-	if item == nil || stringValue(item["questionId"]) != bundle.Task.ID || stringValue(item["version"]) != bundle.Task.Version || stringValue(item["source"]) != bundle.Task.Source || !strings.EqualFold(stringValue(item["sha256"]), bundle.BundleSHA256) || int64(numberField(item, "byteSize")) != bundle.ByteSize || stringValue(item["verifierCommand"]) != bundle.Task.Verifier.Command || stringValue(item["rewardFile"]) != bundle.Task.Verifier.RewardFile || int(numberField(item, "verifierTimeoutSeconds")) != bundle.Task.Verifier.TimeoutSec || int(numberField(item, "agentTimeoutSeconds")) != bundle.Task.Agent.TimeoutSec || int(numberField(item, "agentMaxTurns")) != bundle.Task.Agent.MaxTurns {
-		return nil, cliError{"recovery_identity_mismatch", "Recovery bundle identity, hash, version, task id, or verifier configuration differs from immutable checkpoint provenance.", []string{"Use the exact unmodified bundle selected by the original run."}, map[string]any{"taskId": bundle.Task.ID, "bundleSha256": bundle.BundleSHA256, "savedSha256": stringValue(item["sha256"]), "bundleVersion": bundle.Task.Version, "savedVersion": stringValue(item["version"])}}
-	}
-	return item, nil
-}
-
-func loadTerminalRecoveryTelemetry(resultPath, taskID string, provenance map[string]any) (terminalSavedResult, error) {
-	if terminalPathContainsTraversal(resultPath) {
-		return terminalSavedResult{}, cliError{"task_result_invalid", "Recovery --result path contains traversal components.", nil, map[string]any{"path": resultPath}}
-	}
-	result, err := loadTerminalSavedResultMode(resultPath, taskID, false)
-	if err != nil {
-		return terminalSavedResult{}, err
-	}
-	if !terminalJSONEqual(result.Provenance, provenance) {
-		return terminalSavedResult{}, cliError{"checkpoint_provenance_mismatch", "Recovery telemetry result provenance does not match the checkpoint.", nil, map[string]any{"taskId": taskID}}
-	}
-	if terminalSavedResultComplete(result) {
-		return terminalSavedResult{}, cliError{"task_result_invalid", "--result is optional telemetry from an incomplete task only; completed or self-scored results are never recovery evidence.", nil, map[string]any{"taskId": taskID}}
-	}
-	return result, nil
-}
-
-func (manager *terminalCheckpointManager) resumedResult(taskID string) (terminalSavedResult, bool) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	result, ok := manager.results[taskID]
-	return result, ok
-}
-
-func runTerminalBundles(args cliArgs, dataset string, shardIndex int, bundles []terminalBundle, baseURL, model string, cfg terminalConfig, concurrency int, checkpoint *terminalCheckpointManager) ([]terminalTaskResult, error) {
+func runTerminalBundles(ctx context.Context, args cliArgs, bundles []terminalBundle, baseURL, model string, cfg terminalConfig, concurrency int, resumed map[string]terminalTaskResult, checkpoint *terminalLiveCheckpointStore) ([]terminalTaskResult, error) {
 	results := make([]terminalTaskResult, len(bundles))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	jobs := make(chan int)
-	persistErrors := make(chan error, 1)
+	dispatchCtx, cancelDispatch := context.WithCancel(ctx)
+	defer cancelDispatch()
 	var wg sync.WaitGroup
+	var persistMu sync.Mutex
+	var persistErr error
+	recordPersistError := func(err error) {
+		persistMu.Lock()
+		defer persistMu.Unlock()
+		if persistErr == nil {
+			persistErr = err
+			cancelDispatch()
+		}
+	}
+	for i, bundle := range bundles {
+		if result, ok := resumed[bundle.Task.ID]; ok {
+			results[i] = result
+			printStatus(args, "terminal_task_resumed", map[string]any{"taskId": bundle.Task.ID, "index": i + 1, "total": len(bundles), "pass": result.pass, "scored": result.scored})
+		}
+	}
 	for range concurrency {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for idx := range jobs {
-				bundle := bundles[idx]
-				if saved, ok := checkpoint.resumedResult(bundle.Task.ID); ok {
-					results[idx] = terminalResultFromSaved(saved)
-					printStatus(args, "terminal_task_resumed", map[string]any{"taskId": bundle.Task.ID, "index": idx + 1, "total": len(bundles), "checkpoint": checkpoint.path, "lastProgressAt": results[idx].lastProgressAt})
-					printTerminalTaskRecovery(args, dataset, shardIndex, idx, len(bundles), bundle, results[idx], checkpoint)
-					continue
-				}
-				printStatus(args, "terminal_task_started", map[string]any{"taskId": bundle.Task.ID, "index": idx + 1, "total": len(bundles), "image": firstNonEmpty(bundle.Task.Image.Prebuilt, bundle.Task.Image.Dockerfile)})
-				results[idx] = runTerminalTask(ctx, bundle.Task, bundle.Dir, baseURL, model, cfg)
-				results[idx].lastProgressAt = time.Now().UTC().Format(time.RFC3339Nano)
-				persisted := false
-				if results[idx].verifierAttempted {
-					if err := checkpoint.persist(idx, bundle, results[idx]); err != nil {
-						select {
-						case persistErrors <- cliError{"checkpoint_persist_failed", "Could not atomically persist terminal checkpoint after the verifier attempt.", []string{"Fix checkpoint directory permissions or disk space before resuming."}, map[string]any{"taskId": bundle.Task.ID, "checkpoint": checkpoint.path, "error": err.Error()}}:
-						default:
-						}
-						cancel()
+			for {
+				select {
+				case <-dispatchCtx.Done():
+					return
+				case idx, ok := <-jobs:
+					if !ok || dispatchCtx.Err() != nil {
 						return
 					}
-					persisted = true
-				}
-				if results[idx].errCode != "" {
-					printStatus(args, "terminal_task_error", map[string]any{"taskId": bundle.Task.ID, "code": results[idx].errCode, "detail": results[idx].errText})
-				}
-				printStatus(args, "terminal_task_done", map[string]any{"taskId": bundle.Task.ID, "pass": results[idx].pass, "scored": results[idx].scored, "verifierAttempted": results[idx].verifierAttempted, "verifierCompleted": results[idx].verifierCompleted, "rewardParsed": results[idx].rewardParsed, "turns": results[idx].turns, "wallTimeMs": results[idx].wallTimeMs, "lastProgressAt": results[idx].lastProgressAt, "tokenUsage": results[idx].usage.toMap()})
-				if persisted {
-					printTerminalTaskRecovery(args, dataset, shardIndex, idx, len(bundles), bundle, results[idx], checkpoint)
+					b := bundles[idx]
+					if err := checkpoint.startTask(b.Task.ID, idx+1); err != nil {
+						recordPersistError(err)
+						return
+					}
+					printStatus(args, "terminal_task_started", map[string]any{"taskId": b.Task.ID, "index": idx + 1, "total": len(bundles), "image": firstNonEmpty(b.Task.Image.Prebuilt, b.Task.Image.Dockerfile)})
+					results[idx] = runTerminalTask(dispatchCtx, b.Task, b.Dir, baseURL, model, cfg)
+					if results[idx].errCode != "" {
+						printStatus(args, "terminal_task_error", map[string]any{"taskId": b.Task.ID, "code": results[idx].errCode, "detail": results[idx].errText})
+					}
+					if err := checkpoint.persistTask(b.Task, results[idx]); err != nil {
+						recordPersistError(err)
+						return
+					}
+					printStatus(args, "terminal_task_done", map[string]any{"taskId": b.Task.ID, "pass": results[idx].pass, "scored": results[idx].scored, "turns": terminalTaskTurnsValue(results[idx]), "wallTimeMs": results[idx].wallTimeMs, "tokenUsage": results[idx].usage.toMap()})
 				}
 			}
 		}()
 	}
-	dispatchStopped := false
-	for i := range bundles {
+sendJobs:
+	for i, bundle := range bundles {
+		if _, ok := resumed[bundle.Task.ID]; ok {
+			continue
+		}
 		select {
 		case jobs <- i:
-		case <-ctx.Done():
-			dispatchStopped = true
-		}
-		if dispatchStopped {
-			break
+		case <-dispatchCtx.Done():
+			break sendJobs
 		}
 	}
 	close(jobs)
 	wg.Wait()
-	select {
-	case err := <-persistErrors:
-		return nil, err
-	default:
-		return results, nil
+	if persistErr != nil {
+		return nil, cliError{"checkpoint_write_failed", "Could not persist terminal task state.", []string{"Check --run-dir permissions and available disk space, then rerun with --resume auto."}, map[string]any{"runDir": opt(args, "run-dir"), "error": persistErr.Error()}}
 	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return results, nil
 }
 
-func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL, model string, cfg terminalConfig) terminalTaskResult {
+func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL, model string, cfg terminalConfig) (result terminalTaskResult) {
 	started := time.Now()
-	result := terminalTaskResult{instruction: task.ID, prompt: terminalSystemPrompt}
-	if err := dockerPreflight(); err != nil {
+	result = terminalTaskResult{instruction: task.ID, prompt: terminalSystemPrompt, turnsUnreported: cfg.oracle || cfg.agentCommand != ""}
+	defer func() {
+		if ctx.Err() != nil {
+			result.scored = false
+			result.errCode = "terminal_cancelled"
+			result.errText = "Terminal execution was cancelled."
+			result.wallTimeMs = time.Since(started).Milliseconds()
+		}
+	}()
+	if err := dockerPreflightContext(ctx); err != nil {
 		result.errCode = "docker_unavailable"
 		result.errText = err.Error()
 		return result
@@ -4588,6 +2798,9 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 	printStatus(cfg.args, "terminal_image_resolved", map[string]any{"taskId": task.ID, "mode": imageMode(task.Image), "ms": time.Since(imageStart).Milliseconds()})
 	containerName := "lmx-tb-" + sanitizeDockerName(task.ID) + "-" + randomHex(6)
 	startArgs := []string{"run", "-d", "--rm", "--name", containerName}
+	if cfg.runLabel != "" {
+		startArgs = append(startArgs, "--label", "localmaxxing.run="+cfg.runLabel, "--label", "localmaxxing.task="+task.ID)
+	}
 	if task.Environment.CPUs > 0 {
 		startArgs = append(startArgs, "--cpus", strconv.FormatFloat(task.Environment.CPUs, 'f', -1, 64))
 	}
@@ -4614,8 +2827,8 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 		cleanupTerminalImage(cleanupImage, cfg.cleanupImages)
 		return result
 	}
-	defer runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
 	defer cleanupTerminalImage(cleanupImage, cfg.cleanupImages)
+	defer runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
 	if cfg.oracle {
 		transcript, err := runOracleSolution(ctx, task, bundleDir, containerName, cfg)
 		result.transcript = transcript
@@ -4630,7 +2843,7 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 		result.transcript = transcript
 		result.usage = usage
 		result.prompt = "external agent command"
-		if err != nil && !captureTerminalAgentOutcome(&result, err) {
+		if err != nil {
 			result.errCode, result.errText = cliErrorCodeText(err)
 			result.wallTimeMs = time.Since(started).Milliseconds()
 			return persistTerminalTaskErrorTrace(task, result, cfg)
@@ -4640,10 +2853,15 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 		result.turns = turns
 		result.transcript = transcript
 		result.usage = usage
-		if err != nil && !captureTerminalAgentOutcome(&result, err) {
-			result.errCode, result.errText = cliErrorCodeText(err)
-			result.wallTimeMs = time.Since(started).Milliseconds()
-			return persistTerminalTaskErrorTrace(task, result, cfg)
+		if err != nil {
+			code, text := cliErrorCodeText(err)
+			if code != "agent_timeout" {
+				result.errCode, result.errText = code, text
+				result.wallTimeMs = time.Since(started).Milliseconds()
+				return persistTerminalTaskErrorTrace(task, result, cfg)
+			}
+			result.transcript += "\n\n## Agent timeout\n" + text + "\nProceeding to verification with the container state left by the agent.\n"
+			printStatus(cfg.args, "terminal_agent_timeout", map[string]any{"taskId": task.ID, "timeoutSec": terminalAgentTimeoutSec(cfg, task), "proceedingToVerifier": true})
 		}
 	} else {
 		result.prompt = terminalSessionSystemPrompt
@@ -4651,19 +2869,21 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 		result.turns = turns
 		result.transcript = transcript
 		result.usage = usage
-		if err != nil && !captureTerminalAgentOutcome(&result, err) {
-			result.errCode, result.errText = cliErrorCodeText(err)
-			result.wallTimeMs = time.Since(started).Milliseconds()
-			return persistTerminalTaskErrorTrace(task, result, cfg)
+		if err != nil {
+			code, text := cliErrorCodeText(err)
+			if code != "agent_timeout" {
+				result.errCode, result.errText = code, text
+				result.wallTimeMs = time.Since(started).Milliseconds()
+				return persistTerminalTaskErrorTrace(task, result, cfg)
+			}
+			result.transcript += "\n\n## Agent timeout\n" + text + "\nProceeding to verification with the container state left by the agent.\n"
+			printStatus(cfg.args, "terminal_agent_timeout", map[string]any{"taskId": task.ID, "timeoutSec": terminalAgentTimeoutSec(cfg, task), "proceedingToVerifier": true})
 		}
 	}
-	result.verifierAttempted = true
-	pass, verifierOutput, verifierCompleted, rewardParsed, err := runTerminalVerifier(ctx, task, bundleDir, containerName, cfg)
+	pass, verifierOutput, err := runTerminalVerifier(ctx, task, bundleDir, containerName, cfg)
 	result.pass = pass
 	result.verifierOutput = verifierOutput
-	result.verifierCompleted = verifierCompleted
-	result.rewardParsed = rewardParsed
-	result.scored = rewardParsed
+	result.scored = err == nil
 	result.wallTimeMs = time.Since(started).Milliseconds()
 	if err != nil {
 		result.errCode, result.errText = cliErrorCodeText(err)
@@ -4770,91 +2990,120 @@ func runExternalTerminalAgent(ctx context.Context, task terminalTask, bundleDir,
 		"LMX_TERMINAL_TRACE_DIR=" + traceDir,
 		"LMX_TERMINAL_EXECUTION_MODE=" + cfg.agentExecution,
 		"LMX_TERMINAL_AGENT_TIMEOUT_SEC=" + strconv.Itoa(terminalAgentTimeoutSec(cfg, task)),
-		"LMX_TERMINAL_COMMAND_TIMEOUT_SECONDS=" + strconv.Itoa(terminalCommandTimeoutSec(cfg)),
 		"LMX_TERMINAL_AGENT_USER=" + task.Agent.User,
 		"LMX_TERMINAL_SHELL_COMMAND=" + shellCommand,
 		"LMX_TERMINAL_MODEL_API_KEY=" + cfg.apiKey,
 		"LMX_TERMINAL_MAX_TURNS=" + strconv.Itoa(terminalAgentMaxTurns(cfg, task)),
 	}
 	timeout := time.Duration(terminalAgentTimeoutSec(cfg, task)) * time.Second
-	printStatus(cfg.args, "terminal_external_agent_started", map[string]any{"taskId": task.ID, "backend": firstNonEmpty(opt(cfg.args, "agent"), "custom"), "execution": cfg.agentExecution})
-	out, code, timedOut, runErr := runHostCommandWithEnv(ctx, timeout, env, cfg.agentCommand)
-	out = terminalRedactAgentText(out, cfg.agentCommand, cfg.apiKey, baseURL)
-	transcript := "$ [external agent command omitted]\n" + out + "\n[exit=" + strconv.Itoa(code) + "]\n"
+	agentStarted := time.Now()
+	agentDeadline := agentStarted.Add(timeout)
+	printStatus(cfg.args, "terminal_external_agent_started", map[string]any{"taskId": task.ID, "command": truncateString(cfg.agentCommand, 240), "execution": cfg.agentExecution})
+	heartbeatInterval := cfg.externalAgentHeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = time.Minute
+	}
+	out, code, timedOut, runErr := runHostCommandWithEnvHeartbeat(ctx, timeout, env, cfg.agentCommand, heartbeatInterval, func(now time.Time) {
+		remaining := int(agentDeadline.Sub(now).Seconds())
+		if remaining < 0 {
+			remaining = 0
+		}
+		printStatus(cfg.args, "terminal_external_agent_heartbeat", map[string]any{"taskId": task.ID, "execution": cfg.agentExecution, "elapsedSec": int(now.Sub(agentStarted).Seconds()), "agentTimeRemainingSec": remaining})
+	})
+	transcript := "$ " + cfg.agentCommand + "\n" + out + "\n[exit=" + strconv.Itoa(code) + "]\n"
 	usage := externalAgentTokenUsage(traceDir)
 	if usage.modelCalls > 0 {
 		usageData, _ := json.MarshalIndent(usage.toMap(), "", "  ")
 		_ = os.WriteFile(filepath.Join(traceDir, "usage.json"), append(usageData, '\n'), 0o644)
 	}
-	if traceText := terminalRedactAgentText(externalAgentTraceText(traceDir), cfg.agentCommand, cfg.apiKey, baseURL); traceText != "" {
+	if traceText := externalAgentTraceText(traceDir); traceText != "" {
 		transcript += "\n\n# External agent trace directory\n\n" + traceText
-	}
-	if terminalExternalAgentCommandTimedOut(traceDir) {
-		transcript += "\n[command_timeout: routed shell command exceeded --command-timeout-seconds; proceeding to verification]\n"
-		printStatus(cfg.args, "terminal_command_timeout", map[string]any{"taskId": task.ID, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg), "agentExecution": cfg.agentExecution})
-		return transcript, usage, terminalAgentOutcomeError{code: "command_timeout", text: "a routed external-agent shell command exceeded --command-timeout-seconds"}
 	}
 	printStatus(cfg.args, "terminal_external_agent_done", map[string]any{"taskId": task.ID, "exitCode": code, "timedOut": timedOut, "execution": cfg.agentExecution})
 	if timedOut {
 		transcript += "\n[agent timed out after " + timeout.String() + "; proceeding to verification]\n"
 		printStatus(cfg.args, "terminal_external_agent_timeout", map[string]any{"taskId": task.ID, "timeoutSec": int(timeout.Seconds())})
-		return transcript, usage, terminalAgentOutcomeError{code: "agent_timeout", text: "external agent timed out before verification"}
+		return transcript, usage, nil
 	}
 	if runErr != nil || code != 0 {
-		return transcript, usage, terminalCommandError("command_exec_failed", "External terminal agent command failed.", "bash", []string{"-lc", "[redacted]"}, code, out, timedOut)
+		return transcript, usage, terminalCommandError("command_exec_failed", "External terminal agent command failed.", "bash", []string{"-lc", cfg.agentCommand}, code, out, timedOut)
 	}
 	return transcript, usage, nil
 }
 
-func terminalExternalAgentCommandTimedOut(traceDir string) bool {
-	data, err := os.ReadFile(filepath.Join(traceDir, "environment-exec.jsonl"))
-	if err != nil || len(data) > 8*1024*1024 {
-		return false
-	}
-	for _, line := range bytes.Split(data, []byte{'\n'}) {
-		var event map[string]any
-		if json.Unmarshal(line, &event) == nil && int(numberField(event, "return_code")) == 124 && strings.Contains(stringValue(event["stderr_tail"]), "command_timeout") {
-			return true
-		}
-	}
-	return false
-}
-
-func terminalRedactAgentText(text, agentCommand, apiKey, baseURL string) string {
-	if agentCommand != "" {
-		text = strings.ReplaceAll(text, agentCommand, "[external agent command omitted]")
-	}
-	if apiKey != "" {
-		text = strings.ReplaceAll(text, apiKey, "[model credential omitted]")
-	}
-	if safeEndpoint := terminalSanitizedEndpointOrigin(baseURL); safeEndpoint != "" && safeEndpoint != baseURL {
-		text = strings.ReplaceAll(text, baseURL, safeEndpoint)
-	}
-	return text
-}
-
 func runHostCommandWithEnv(ctx context.Context, timeout time.Duration, env []string, command string) (string, int, bool, error) {
+	return runHostCommandWithEnvHeartbeat(ctx, timeout, env, command, 0, nil)
+}
+
+func runHostCommandWithEnvHeartbeat(ctx context.Context, timeout time.Duration, env []string, command string, heartbeatInterval time.Duration, heartbeat func(time.Time)) (string, int, bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "bash", "-lc", command)
 	configureCommandProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		killCommandProcessGroup(cmd)
+		return nil
+	}
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = append(os.Environ(), env...)
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
-	err := cmd.Run()
-	if cctx.Err() == context.DeadlineExceeded {
-		killCommandProcessGroup(cmd)
-		return output.String(), 124, true, err
+	if err := cmd.Start(); err != nil {
+		if cctx.Err() == context.DeadlineExceeded {
+			return output.String(), 124, true, err
+		}
+		if cctx.Err() != nil {
+			return output.String(), 130, false, cctx.Err()
+		}
+		return output.String(), 1, false, err
 	}
-	code := 0
-	if err != nil {
-		code = 1
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			code = exitErr.ExitCode()
+	waitResult := make(chan error, 1)
+	go func() {
+		waitResult <- cmd.Wait()
+	}()
+	var ticker *time.Ticker
+	var ticks <-chan time.Time
+	if heartbeat != nil && heartbeatInterval > 0 {
+		ticker = time.NewTicker(heartbeatInterval)
+		ticks = ticker.C
+		defer ticker.Stop()
+	}
+	finish := func(err error) (string, int, bool, error) {
+		if cctx.Err() == context.DeadlineExceeded {
+			return output.String(), 124, true, err
+		}
+		if cctx.Err() != nil {
+			return output.String(), 130, false, cctx.Err()
+		}
+		code := 0
+		if err != nil {
+			code = 1
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				code = exitErr.ExitCode()
+			}
+		}
+		return output.String(), code, false, err
+	}
+	for {
+		select {
+		case err := <-waitResult:
+			return finish(err)
+		case <-cctx.Done():
+			killCommandProcessGroup(cmd)
+			return finish(<-waitResult)
+		case now := <-ticks:
+			select {
+			case err := <-waitResult:
+				return finish(err)
+			case <-cctx.Done():
+				killCommandProcessGroup(cmd)
+				return finish(<-waitResult)
+			default:
+				heartbeat(now)
+			}
 		}
 	}
-	return output.String(), code, false, err
 }
 
 // terminalTraceHeader records one model turn (reasoning + full reply) into the
@@ -4902,40 +3151,28 @@ func terminalCommandFromKeystrokes(keystrokes string) (string, bool) {
 	return strings.TrimRight(keystrokes, "\r\n"), true
 }
 
-var terminalVolatileCommandToken = regexp.MustCompile(`(?i)\b(0x)?[0-9a-f]{8,}|\b\d{3,}\b`)
-
-type terminalRepeatGuard struct {
-	fingerprint     string
-	observationHash string
-	count           int
+type terminalStagnationTracker struct {
+	fingerprint [sha256.Size]byte
+	repeats     int
+	initialized bool
 }
 
-func terminalCommandBatchFingerprint(commands []string) string {
-	normalized := make([]string, 0, len(commands))
-	for _, command := range commands {
-		command = strings.ToLower(strings.Join(strings.Fields(command), " "))
-		command = terminalVolatileCommandToken.ReplaceAllString(command, "<volatile>")
-		if command != "" {
-			normalized = append(normalized, command)
-		}
-	}
-	return shortHash(strings.Join(normalized, "\n---\n"))
-}
-
-func (guard *terminalRepeatGuard) observe(commands []string, observation string, limit int) (nudge, exhausted bool) {
-	fingerprint := terminalCommandBatchFingerprint(commands)
-	observationHash := shortHash(strings.Join(strings.Fields(observation), " "))
-	if fingerprint != "" && fingerprint == guard.fingerprint && observationHash == guard.observationHash {
-		guard.count++
+func (tracker *terminalStagnationTracker) observe(command, observation string) (warn, stop bool) {
+	hash := sha256.New()
+	_, _ = io.WriteString(hash, command)
+	_, _ = io.WriteString(hash, "\x00")
+	_, _ = io.WriteString(hash, observation)
+	var fingerprint [sha256.Size]byte
+	copy(fingerprint[:], hash.Sum(nil))
+	if tracker.initialized && fingerprint == tracker.fingerprint {
+		tracker.repeats++
 	} else {
-		guard.fingerprint = fingerprint
-		guard.observationHash = observationHash
-		guard.count = 1
+		tracker.fingerprint = fingerprint
+		tracker.repeats = 1
+		tracker.initialized = true
 	}
-	return guard.count == limit-1, guard.count >= limit
+	return tracker.repeats == 3, tracker.repeats >= 6
 }
-
-const terminalRepeatProtocolNudge = "Protocol nudge: this command batch and its observable result are repeating without progress. Inspect a different signal or take a different bounded action; do not repeat the same or cosmetically changed batch."
 
 func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName, baseURL, model string, cfg terminalConfig) (int, string, terminalTokenUsage, error) {
 	messages := []map[string]any{{"role": "system", "content": terminalSystemPrompt}, {"role": "user", "content": task.Instruction}}
@@ -4944,21 +3181,28 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
 	var transcript strings.Builder
 	nonConforming := 0
-	repeatGuard := terminalRepeatGuard{}
 	usage := terminalTokenUsage{}
-	turnsCompleted := 0
+	stagnation := terminalStagnationTracker{}
 	for turn := 1; turn <= maxTurns && time.Now().Before(deadline); turn++ {
-		turnsCompleted = turn
+		if ctx.Err() != nil {
+			return turn - 1, transcript.String(), usage, ctx.Err()
+		}
 		messages = trimTerminalMessages(messages)
-		content, reasoning, callUsage, err := callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, terminalModelRequestTimeout(cfg, deadline, true))
+		requestTimeout := terminalModelRequestTimeout(cfg, deadline, true)
+		content, reasoning, callUsage, err := callTerminalModelWithHeartbeatContext(ctx, cfg, task.ID, turn, "initial", deadline, func() (string, string, terminalTokenUsage, error) {
+			return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, requestTimeout)
+		})
 		usage.add(callUsage)
 		if err != nil {
 			firstErr := err
 			messages = trimTerminalMessagesForRetry(messages)
-			content, reasoning, callUsage, err = callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, terminalModelRequestTimeout(cfg, deadline, false))
+			retryTimeout := terminalModelRequestTimeout(cfg, deadline, false)
+			content, reasoning, callUsage, err = callTerminalModelWithHeartbeatContext(ctx, cfg, task.ID, turn, "retry", deadline, func() (string, string, terminalTokenUsage, error) {
+				return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, retryTimeout)
+			})
 			usage.add(callUsage)
 			if err != nil {
-				return turn, transcript.String(), usage, terminalModelCallFailure(task.ID, deadline, firstErr, err)
+				return turn - 1, transcript.String(), usage, terminalModelCallFailure(task.ID, deadline, firstErr, err)
 			}
 		}
 		cmdText, found := extractBashCommand(content)
@@ -4974,7 +3218,7 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 			messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, "")}, map[string]any{"role": "user", "content": "Your previous reply was not executable. Reply with exactly one ```bash fenced block. If you meant to run Python, wrap it as: python3 <<'PY'\n...\nPY"})
 			if nonConforming >= 3 {
 				transcript.WriteString("## Note\nStopping after repeated non-executable replies.\n")
-				return turn, transcript.String(), usage, terminalAgentOutcomeError{code: "agent_protocol_exhausted", text: "agent exhausted the terminal response protocol retry limit"}
+				return turn - 1, transcript.String(), usage, nil
 			}
 			continue
 		}
@@ -4982,11 +3226,12 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 		messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, cmdText)})
 		terminalTraceHeader(&transcript, turn, reasoning, content)
 		transcript.WriteString("## Command\n$ " + cmdText + "\n")
-		out, code, timedOut, execErr := runTerminalContainerCommand(ctx, containerName, task.Agent.User, cmdText, terminalCommandExecutionTimeout(cmdText, time.Duration(terminalCommandTimeoutSec(cfg))*time.Second, deadline))
-		if execErr != nil {
-			transcript.WriteString(truncateString(out, 8192) + "\n[command cleanup failed]\n")
-			return turn, transcript.String(), usage, cliError{"command_exec_failed", "Could not stop a timed-out shell command in the task container.", []string{"Inspect Docker and the task container process state before retrying."}, map[string]any{"taskId": task.ID, "error": execErr.Error()}}
+		execArgs := []string{"exec"}
+		if task.Agent.User != "" {
+			execArgs = append(execArgs, "--user", task.Agent.User)
 		}
+		execArgs = append(execArgs, containerName, "bash", "-lc", cmdText)
+		out, code, timedOut, _ := runCommand(ctx, terminalCommandExecutionTimeout(cmdText, time.Duration(terminalCommandTimeoutSec(cfg))*time.Second, deadline), "docker", execArgs...)
 		if timedOut {
 			out += "\n[command timed out]"
 			code = 124
@@ -4995,83 +3240,31 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 		observation := terminalObservationForModel(out, code, timedOut)
 		transcript.WriteString(shown + "\n[exit=" + strconv.Itoa(code) + "]\n")
 		messages = append(messages, map[string]any{"role": "user", "content": observation})
-		printStatus(cfg.args, "terminal_turn", map[string]any{"taskId": task.ID, "turn": turn, "exitCode": code, "commandTimedOut": timedOut, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg), "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)})
+		warn, stop := stagnation.observe(cmdText, observation)
+		if warn {
+			messages = append(messages, map[string]any{"role": "user", "content": "No progress: you have repeated the same command and received the same result three times. Do not repeat it again; change your approach or finish the task."})
+			transcript.WriteString("## Note\nRepeated command and result detected; instructed the model to change approach.\n")
+			printStatus(cfg.args, "terminal_agent_stagnation_warning", map[string]any{"taskId": task.ID, "turn": turn})
+		}
+		if stop {
+			transcript.WriteString("## Note\nStopping after six identical command/result turns; proceeding to verification.\n")
+			printStatus(cfg.args, "terminal_agent_stagnation_stopped", map[string]any{"taskId": task.ID, "turn": turn})
+			return turn, transcript.String(), usage, nil
+		}
+		fields := map[string]any{"taskId": task.ID, "turn": turn, "exitCode": code, "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)}
 		if timedOut {
-			printStatus(cfg.args, "terminal_command_timeout", map[string]any{"taskId": task.ID, "turn": turn, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg), "recoverable": true})
+			fields["timedOut"] = true
+			fields["timeoutSec"] = terminalCommandTimeoutSec(cfg)
 		}
-		nudge, exhausted := repeatGuard.observe([]string{cmdText}, observation, cfg.repeatBatchLimit)
-		if nudge {
-			transcript.WriteString("## Protocol nudge\n" + terminalRepeatProtocolNudge + "\n")
-			messages = append(messages, map[string]any{"role": "user", "content": terminalRepeatProtocolNudge})
-			printStatus(cfg.args, "terminal_agent_protocol_nudge", map[string]any{"taskId": task.ID, "turn": turn, "repeatBatchLimit": cfg.repeatBatchLimit})
-		}
-		if exhausted {
-			transcript.WriteString("## Note\nRepeated identical or near-identical command batches persisted after the protocol nudge.\n")
-			return turn, transcript.String(), usage, terminalAgentOutcomeError{code: "agent_protocol_exhausted", text: "agent repeated an identical or near-identical command batch without observable progress"}
-		}
+		printStatus(cfg.args, "terminal_turn", fields)
 	}
-	return turnsCompleted, transcript.String(), usage, terminalAgentLoopExhaustion(deadline)
-}
-
-func terminalContainerCommandWrapper(command, pidfile string) string {
-	return "pidfile=" + shellQuote(pidfile) + "; rm -f \"$pidfile\"; " +
-		"setsid bash -lc " + shellQuote(command) + " & child=$!; " +
-		"printf '%s\\n' \"$child\" > \"$pidfile\"; " +
-		"wait \"$child\"; rc=$?; rm -f \"$pidfile\"; exit \"$rc\""
-}
-
-func terminateTerminalContainerProcessGroup(containerName, pidfile string) error {
-	cleanup := "pidfile=" + shellQuote(pidfile) + "; " +
-		"test -s \"$pidfile\" || exit 0; pid=$(cat \"$pidfile\"); " +
-		"case \"$pid\" in ''|*[!0-9]*) exit 3;; esac; " +
-		"kill -TERM -- -\"$pid\" 2>/dev/null || true; " +
-		"i=0; while kill -0 -- -\"$pid\" 2>/dev/null && [ \"$i\" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; " +
-		"if kill -0 -- -\"$pid\" 2>/dev/null; then kill -KILL -- -\"$pid\" 2>/dev/null || true; fi; " +
-		"i=0; while kill -0 -- -\"$pid\" 2>/dev/null && [ \"$i\" -lt 20 ]; do sleep 0.1; i=$((i+1)); done; " +
-		"alive=0; kill -0 -- -\"$pid\" 2>/dev/null && alive=1; rm -f \"$pidfile\"; exit \"$alive\""
-	out, code, timedOut, err := runCommand(context.Background(), 10*time.Second, "docker", "exec", containerName, "bash", "-lc", cleanup)
-	if err != nil || timedOut || code != 0 {
-		return fmt.Errorf("container process-group cleanup failed (code=%d timedOut=%t): %s", code, timedOut, strings.TrimSpace(out))
-	}
-	return nil
-}
-
-func waitTerminalContainerPIDFile(containerName, pidfile string) error {
-	check := "pidfile=" + shellQuote(pidfile) + "; " +
-		"i=0; while [ ! -s \"$pidfile\" ] && [ \"$i\" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; " +
-		"test -s \"$pidfile\" || exit 2; pid=$(cat \"$pidfile\"); " +
-		"case \"$pid\" in ''|*[!0-9]*) exit 3;; esac"
-	out, code, timedOut, err := runCommand(context.Background(), 10*time.Second, "docker", "exec", containerName, "bash", "-lc", check)
-	if err != nil || timedOut || code != 0 {
-		return fmt.Errorf("container process-group startup failed (code=%d timedOut=%t): %s", code, timedOut, strings.TrimSpace(out))
-	}
-	return nil
-}
-
-func runTerminalContainerCommand(ctx context.Context, containerName, user, command string, timeout time.Duration) (string, int, bool, error) {
-	pidfile := "/tmp/lmx-terminal-command-" + randomHex(12) + ".pid"
-	execArgs := []string{"exec"}
-	if user != "" {
-		execArgs = append(execArgs, "--user", user)
-	}
-	execArgs = append(execArgs, containerName, "bash", "-lc", terminalContainerCommandWrapper(command, pidfile))
-	out, code, timedOut, _ := runCommand(ctx, timeout, "docker", execArgs...)
-	if timedOut || ctx.Err() != nil {
-		if cleanupErr := terminateTerminalContainerProcessGroup(containerName, pidfile); cleanupErr != nil {
-			return out, code, timedOut, cleanupErr
-		}
-	}
-	if ctx.Err() != nil && !timedOut {
-		return out, code, false, ctx.Err()
-	}
-	return out, code, timedOut, nil
+	return maxTurns, transcript.String(), usage, nil
 }
 
 type terminalShell struct {
 	containerName string
 	user          string
 	nonce         string
-	pidfile       string
 	cmd           *exec.Cmd
 	stdin         io.WriteCloser
 	reader        *bufio.Reader
@@ -5089,15 +3282,11 @@ func startTerminalShell(containerName, user string) (*terminalShell, error) {
 func (s *terminalShell) start() error {
 	// No context timeout on the shell process itself; per-command timeouts are
 	// enforced in exec(). The shell lives for the whole agent loop.
-	s.pidfile = "/tmp/lmx-terminal-shell-" + s.nonce + ".pid"
 	execArgs := []string{"exec", "-i"}
 	if s.user != "" {
 		execArgs = append(execArgs, "--user", s.user)
 	}
-	wrapper := "pidfile=" + shellQuote(s.pidfile) + "; rm -f \"$pidfile\"; " +
-		"setsid bash -l <&0 & child=$!; printf '%s\\n' \"$child\" > \"$pidfile\"; " +
-		"wait \"$child\"; rc=$?; rm -f \"$pidfile\"; exit \"$rc\""
-	execArgs = append(execArgs, s.containerName, "bash", "-lc", wrapper)
+	execArgs = append(execArgs, s.containerName, "bash", "-l")
 	cmd := exec.Command("docker", execArgs...)
 	configureCommandProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
@@ -5120,41 +3309,26 @@ func (s *terminalShell) start() error {
 	s.stdin = stdin
 	s.pr = pr
 	s.reader = bufio.NewReader(pr)
-	if err := waitTerminalContainerPIDFile(s.containerName, s.pidfile); err != nil {
-		_ = s.close()
-		return err
-	}
 	return nil
 }
 
 func (s *terminalShell) restart() error {
-	if err := s.close(); err != nil {
-		return err
-	}
+	s.close()
 	s.nonce = randomHex(8)
 	return s.start()
 }
 
-func (s *terminalShell) close() error {
-	var cleanupErr error
-	if s.pidfile != "" {
-		cleanupErr = terminateTerminalContainerProcessGroup(s.containerName, s.pidfile)
-		s.pidfile = ""
-	}
+func (s *terminalShell) close() {
 	if s.stdin != nil {
 		s.stdin.Close()
-		s.stdin = nil
 	}
 	if s.cmd != nil {
 		killCommandProcessGroup(s.cmd)
 		_ = s.cmd.Wait()
-		s.cmd = nil
 	}
 	if s.pr != nil {
 		s.pr.Close()
-		s.pr = nil
 	}
-	return cleanupErr
 }
 
 func terminalShellPayload(command, marker string) string {
@@ -5166,12 +3340,16 @@ func terminalShellPayload(command, marker string) string {
 // exec runs one command in the persistent shell. timedOut means the per-command
 // budget elapsed; restarted means the shell was rebuilt (state reset) due to
 // timeout or the shell dying (e.g. the command ran `exit` or crashed bash).
-func (s *terminalShell) exec(command string, timeout time.Duration) (output string, exitCode int, timedOut bool, restarted bool, err error) {
+func (s *terminalShell) exec(command string, timeout time.Duration) (output string, exitCode int, timedOut bool, restarted bool) {
+	return s.execContext(context.Background(), command, timeout)
+}
+
+func (s *terminalShell) execContext(ctx context.Context, command string, timeout time.Duration) (output string, exitCode int, timedOut bool, restarted bool) {
 	marker := "__LMX_END_" + s.nonce + "__"
 	payload := terminalShellPayload(command, marker)
 	if _, err := io.WriteString(s.stdin, payload); err != nil {
-		restartErr := s.restart()
-		return "[shell write failed; session restarted]", 1, false, true, restartErr
+		_ = s.restart()
+		return "[shell write failed; session restarted]", 1, false, true
 	}
 	type readResult struct {
 		out  string
@@ -5197,16 +3375,21 @@ func (s *terminalShell) exec(command string, timeout time.Duration) (output stri
 			}
 		}
 	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case r := <-done:
 		if r.eof {
-			restartErr := s.restart()
-			return r.out + "\n[shell ended; session restarted, state reset]", r.code, false, true, restartErr
+			_ = s.restart()
+			return r.out + "\n[shell ended; session restarted, state reset]", r.code, false, true
 		}
-		return r.out, r.code, false, false, nil
-	case <-time.After(timeout):
-		restartErr := s.restart()
-		return "[command timed out after " + timeout.String() + "; session restarted, state reset]", 124, true, true, restartErr
+		return r.out, r.code, false, false
+	case <-ctx.Done():
+		killCommandProcessGroup(s.cmd)
+		return "[command cancelled]", 130, false, false
+	case <-timer.C:
+		_ = s.restart()
+		return "[command timed out after " + timeout.String() + "; session restarted, state reset]", 124, true, true
 	}
 }
 
@@ -5215,7 +3398,7 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 	if err != nil {
 		return 0, "", terminalTokenUsage{}, cliError{"command_exec_failed", "Could not open a persistent shell in the task container.", []string{"Check Docker and that the task image provides /bin/bash.", "Or rerun with --shell-mode stateless."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
 	}
-	defer func() { _ = shell.close() }()
+	defer shell.close()
 
 	messages := []map[string]any{{"role": "user", "content": terminalJSONPrompt(task.Instruction, "")}}
 	maxTurns := terminalAgentMaxTurns(cfg, task)
@@ -5224,22 +3407,29 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 	cmdTimeout := time.Duration(terminalCommandTimeoutSec(cfg)) * time.Second
 	var transcript strings.Builder
 	nonConforming := 0
-	repeatGuard := terminalRepeatGuard{}
 	usage := terminalTokenUsage{}
+	stagnation := terminalStagnationTracker{}
 	terminalState := ""
-	turnsCompleted := 0
 	for turn := 1; turn <= maxTurns && time.Now().Before(deadline); turn++ {
-		turnsCompleted = turn
+		if ctx.Err() != nil {
+			return turn - 1, transcript.String(), usage, ctx.Err()
+		}
 		messages = trimTerminalMessages(messages)
-		content, reasoning, callUsage, err := callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, terminalModelRequestTimeout(cfg, deadline, true))
+		requestTimeout := terminalModelRequestTimeout(cfg, deadline, true)
+		content, reasoning, callUsage, err := callTerminalModelWithHeartbeatContext(ctx, cfg, task.ID, turn, "initial", deadline, func() (string, string, terminalTokenUsage, error) {
+			return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, requestTimeout)
+		})
 		usage.add(callUsage)
 		if err != nil {
 			firstErr := err
 			messages = trimTerminalMessagesForRetry(messages)
-			content, reasoning, callUsage, err = callOpenAIChatMessages(baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, terminalModelRequestTimeout(cfg, deadline, false))
+			retryTimeout := terminalModelRequestTimeout(cfg, deadline, false)
+			content, reasoning, callUsage, err = callTerminalModelWithHeartbeatContext(ctx, cfg, task.ID, turn, "retry", deadline, func() (string, string, terminalTokenUsage, error) {
+				return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, retryTimeout)
+			})
 			usage.add(callUsage)
 			if err != nil {
-				return turn, transcript.String(), usage, terminalModelCallFailure(task.ID, deadline, firstErr, err)
+				return turn - 1, transcript.String(), usage, terminalModelCallFailure(task.ID, deadline, firstErr, err)
 			}
 		}
 
@@ -5257,7 +3447,7 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 				messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, "")}, map[string]any{"role": "user", "content": terminalJSONContinuePrompt(terminalState)})
 				if nonConforming >= 3 {
 					transcript.WriteString("## Note\nStopping after repeated non-executable replies.\n")
-					return turn, transcript.String(), usage, terminalAgentOutcomeError{code: "agent_protocol_exhausted", text: "agent exhausted the terminal response protocol retry limit"}
+					return turn - 1, transcript.String(), usage, nil
 				}
 				continue
 			}
@@ -5275,9 +3465,7 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 			return turn - 1, transcript.String(), usage, nil
 		}
 
-		executedCommands := make([]string, 0, len(response.Commands))
 		var observation strings.Builder
-		batchTimedOut := false
 		for i, command := range response.Commands {
 			cmdText, _ := terminalCommandFromKeystrokes(command.Keystrokes)
 			if cmdText == "" {
@@ -5288,16 +3476,17 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 				if wait > time.Minute {
 					wait = time.Minute
 				}
-				time.Sleep(wait)
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return turn - 1, transcript.String(), usage, ctx.Err()
+				case <-timer.C:
+				}
 				continue
 			}
 			transcript.WriteString("## Command\n$ " + cmdText + "\n")
-			executedCommands = append(executedCommands, cmdText)
-			out, code, timedOut, restarted, execErr := shell.exec(cmdText, terminalCommandExecutionTimeout(cmdText, cmdTimeout, deadline))
-			if execErr != nil {
-				transcript.WriteString(truncateString(out, 8192) + "\n[command cleanup failed]\n")
-				return turn, transcript.String(), usage, cliError{"command_exec_failed", "Could not stop a shell command in the task container.", []string{"Inspect Docker and the task container process state before retrying."}, map[string]any{"taskId": task.ID, "error": execErr.Error()}}
-			}
+			out, code, timedOut, restarted := shell.execContext(ctx, cmdText, terminalCommandExecutionTimeout(cmdText, cmdTimeout, deadline))
 			if timedOut {
 				out += "\n[command timed out]"
 			}
@@ -5306,42 +3495,36 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 			observation.WriteString(terminalObservationForModel(out, code, timedOut))
 			observation.WriteString("\n")
 			transcript.WriteString(shown + "\n[exit=" + strconv.Itoa(code) + "]\n")
-			fields := map[string]any{"taskId": task.ID, "turn": turn, "commandIndex": i + 1, "exitCode": code, "commandTimedOut": timedOut, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg), "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)}
+			fields := map[string]any{"taskId": task.ID, "turn": turn, "commandIndex": i + 1, "exitCode": code, "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)}
+			if timedOut {
+				fields["timedOut"] = true
+				fields["timeoutSec"] = terminalCommandTimeoutSec(cfg)
+			}
 			if restarted {
 				fields["shellRestarted"] = true
 			}
 			printStatus(cfg.args, "terminal_turn", fields)
-			if timedOut {
-				batchTimedOut = true
-				printStatus(cfg.args, "terminal_command_timeout", map[string]any{"taskId": task.ID, "turn": turn, "commandIndex": i + 1, "commandTimeoutSeconds": terminalCommandTimeoutSec(cfg), "recoverable": true})
-				break
-			}
 		}
 		terminalState = truncateString(observation.String(), terminalModelObservationLimit)
-		messages = append(messages, map[string]any{"role": "user", "content": terminalJSONContinuePrompt(terminalState)})
-		nudge, exhausted := repeatGuard.observe(executedCommands, terminalState, cfg.repeatBatchLimit)
-		if nudge {
-			transcript.WriteString("## Protocol nudge\n" + terminalRepeatProtocolNudge + "\n")
-			messages = append(messages, map[string]any{"role": "user", "content": terminalRepeatProtocolNudge})
-			printStatus(cfg.args, "terminal_agent_protocol_nudge", map[string]any{"taskId": task.ID, "turn": turn, "repeatBatchLimit": cfg.repeatBatchLimit})
+		warn, stop := stagnation.observe("", terminalState)
+		nextPrompt := terminalJSONContinuePrompt(terminalState)
+		if warn {
+			nextPrompt += "\n\nNo progress: you have repeated the same command batch and received the same result three times. Do not repeat it again; change your approach or finish the task."
+			transcript.WriteString("## Note\nRepeated command batch and result detected; instructed the model to change approach.\n")
+			printStatus(cfg.args, "terminal_agent_stagnation_warning", map[string]any{"taskId": task.ID, "turn": turn})
 		}
-		if exhausted {
-			transcript.WriteString("## Note\nRepeated identical or near-identical command batches persisted after the protocol nudge.\n")
-			return turn, transcript.String(), usage, terminalAgentOutcomeError{code: "agent_protocol_exhausted", text: "agent repeated an identical or near-identical command batch without observable progress"}
+		messages = append(messages, map[string]any{"role": "user", "content": nextPrompt})
+		if stop {
+			transcript.WriteString("## Note\nStopping after six identical command/result turns; proceeding to verification.\n")
+			printStatus(cfg.args, "terminal_agent_stagnation_stopped", map[string]any{"taskId": task.ID, "turn": turn})
+			return turn, transcript.String(), usage, nil
 		}
-		if response.TaskComplete && !batchTimedOut {
+		if response.TaskComplete {
 			transcript.WriteString("## Note\nModel marked task complete after command batch.\n")
 			return turn, transcript.String(), usage, nil
 		}
 	}
-	return turnsCompleted, transcript.String(), usage, terminalAgentLoopExhaustion(deadline)
-}
-
-func terminalAgentLoopExhaustion(deadline time.Time) terminalAgentOutcomeError {
-	if !time.Now().Before(deadline) {
-		return terminalAgentOutcomeError{code: "agent_timeout", text: "agent exhausted its wall-clock timeout before verifier success"}
-	}
-	return terminalAgentOutcomeError{code: "max_turns_exhausted", text: "agent exhausted its maximum turns before verifier success"}
+	return maxTurns, transcript.String(), usage, nil
 }
 
 // runOracleSolution mirrors harbor's OracleAgent: solution/ is copied to
@@ -5377,13 +3560,13 @@ func runOracleSolution(ctx context.Context, task terminalTask, bundleDir, contai
 // /tests, the verifier command runs in a non-login shell, and the reward file
 // is the sole pass signal — reward.json ({"reward": <num>}) takes precedence
 // over reward.txt (bare float), pass means reward >= 1.0, and the verifier's
-// exit code is ignored once a reward was written. The additional booleans
-// distinguish command completion from canonical reward parsing for recovery.
-func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, containerName string, cfg terminalConfig) (pass bool, output string, verifierCompleted bool, rewardParsed bool, err error) {
+// exit code is ignored once a reward was written. A verifier timeout or a
+// missing/unparseable reward file scores the task as failed.
+func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, containerName string, cfg terminalConfig) (bool, string, error) {
 	_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "mkdir", "-p", "/logs/verifier")
-	out, code, timedOut, copyErr := runCommand(ctx, 120*time.Second, "docker", "cp", filepath.Join(bundleDir, "tests")+"/.", containerName+":"+"/tests")
-	if copyErr != nil || timedOut || code != 0 {
-		return false, out, false, false, terminalCommandError("verifier_failed", "Could not copy verifier tests into the task container.", "docker", []string{"cp", filepath.Join(bundleDir, "tests") + "/.", containerName + ":/tests"}, code, out, timedOut)
+	out, code, timedOut, err := runCommand(ctx, 120*time.Second, "docker", "cp", filepath.Join(bundleDir, "tests")+"/.", containerName+":/tests")
+	if err != nil || timedOut || code != 0 {
+		return false, out, terminalCommandError("verifier_failed", "Could not copy verifier tests into the task container.", "docker", []string{"cp", filepath.Join(bundleDir, "tests") + "/.", containerName + ":/tests"}, code, out, timedOut)
 	}
 	cmdArgs := []string{"exec"}
 	if task.Verifier.User != "" {
@@ -5396,7 +3579,7 @@ func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, cont
 	out, code, timedOut, _ = runCommand(ctx, time.Duration(firstPositive(task.Verifier.TimeoutSec, 900))*time.Second, "docker", cmdArgs...)
 	if timedOut {
 		printStatus(cfg.args, "terminal_verifier", map[string]any{"taskId": task.ID, "reward": "", "exitCode": code, "timedOut": true})
-		return false, out + "\n[verifier timed out]", false, false, cliError{"verifier_failed", "Verifier timed out; no canonical reward was parsed.", []string{"Raise [verifier].timeout_sec in the task if legitimate verifications need longer."}, map[string]any{"taskId": task.ID, "timeoutSec": firstPositive(task.Verifier.TimeoutSec, 900), "output": truncateString(out, 4096)}}
+		return false, out + "\n[verifier timed out]", cliError{"verifier_failed", "Verifier timed out; the task is scored as failed.", []string{"Raise [verifier].timeout_sec in the task if legitimate verifications need longer."}, map[string]any{"taskId": task.ID, "timeoutSec": firstPositive(task.Verifier.TimeoutSec, 900), "output": truncateString(out, 4096)}}
 	}
 	rewardFile := firstNonEmpty(task.Verifier.RewardFile, "/logs/verifier/reward.txt")
 	rewardJSONFile := path.Join(path.Dir(rewardFile), "reward.json")
@@ -5411,15 +3594,59 @@ func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, cont
 			rewardRaw = strings.TrimSpace(txtText)
 		}
 	}
-	output = out + "\n[verifier exit=" + strconv.Itoa(code) + "]\nreward: " + rewardRaw
+	output := out + "\n[verifier exit=" + strconv.Itoa(code) + "]\nreward: " + rewardRaw
 	printStatus(cfg.args, "terminal_verifier", map[string]any{"taskId": task.ID, "reward": rewardRaw, "exitCode": code})
 	if !rewardOK {
-		return false, output, true, false, cliError{"verifier_failed", "Verifier did not produce a parseable canonical reward file.", []string{"Harbor verifiers must write /logs/verifier/reward.txt (float) or reward.json ({\"reward\": <num>})."}, map[string]any{"taskId": task.ID, "rewardFile": rewardFile, "exitCode": code, "output": truncateString(out, 4096)}}
+		return false, output, cliError{"verifier_failed", "Verifier did not produce a parseable reward file; the task is scored as failed.", []string{"Harbor verifiers must write /logs/verifier/reward.txt (float) or reward.json ({\"reward\": <num>})."}, map[string]any{"taskId": task.ID, "rewardFile": rewardFile, "exitCode": code, "output": truncateString(out, 4096)}}
 	}
-	return reward >= 1.0, output, true, true, nil
+	return reward >= 1.0, output, nil
+}
+
+type terminalModelCallResult struct {
+	content   string
+	reasoning string
+	usage     terminalTokenUsage
+	err       error
+}
+
+func callTerminalModelWithHeartbeat(cfg terminalConfig, taskID string, turn int, attempt string, deadline time.Time, call func() (string, string, terminalTokenUsage, error)) (string, string, terminalTokenUsage, error) {
+	return callTerminalModelWithHeartbeatContext(context.Background(), cfg, taskID, turn, attempt, deadline, call)
+}
+
+func callTerminalModelWithHeartbeatContext(ctx context.Context, cfg terminalConfig, taskID string, turn int, attempt string, deadline time.Time, call func() (string, string, terminalTokenUsage, error)) (string, string, terminalTokenUsage, error) {
+	started := time.Now()
+	result := make(chan terminalModelCallResult, 1)
+	go func() {
+		content, reasoning, usage, err := call()
+		result <- terminalModelCallResult{content: content, reasoning: reasoning, usage: usage, err: err}
+	}()
+	heartbeatInterval := cfg.modelHeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = time.Minute
+	}
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case completed := <-result:
+			return completed.content, completed.reasoning, completed.usage, completed.err
+		case <-ctx.Done():
+			return "", "", terminalTokenUsage{}, ctx.Err()
+		case now := <-ticker.C:
+			remaining := int(time.Until(deadline).Seconds())
+			if remaining < 0 {
+				remaining = 0
+			}
+			printStatus(cfg.args, "terminal_model_call_heartbeat", map[string]any{"taskId": taskID, "turn": turn, "attempt": attempt, "elapsedSec": int(now.Sub(started).Seconds()), "agentTimeRemainingSec": remaining})
+		}
+	}
 }
 
 func callOpenAIChatMessages(baseURL, model string, messages []map[string]any, apiKey string, maxTokens int, temperature, topP float64, stop []string, timeout time.Duration) (content, reasoning string, usage terminalTokenUsage, err error) {
+	return callOpenAIChatMessagesContext(context.Background(), baseURL, model, messages, apiKey, maxTokens, temperature, topP, stop, timeout)
+}
+
+func callOpenAIChatMessagesContext(parent context.Context, baseURL, model string, messages []map[string]any, apiKey string, maxTokens int, temperature, topP float64, stop []string, timeout time.Duration) (content, reasoning string, usage terminalTokenUsage, err error) {
 	body := map[string]any{"model": model, "messages": messages, "temperature": temperature, "top_p": topP}
 	if terminalDisablesTemplateThinking(model) {
 		body["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
@@ -5431,7 +3658,7 @@ func callOpenAIChatMessages(baseURL, model string, messages []map[string]any, ap
 		body["stop"] = stop
 	}
 	data, _ := json.Marshal(body)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "POST", openAIBaseURL(baseURL)+"/v1/chat/completions", bytes.NewReader(data))
 	if err != nil {
@@ -5499,8 +3726,33 @@ func extractBashCommand(reply string) (cmd string, found bool) {
 	return "", false
 }
 
+func cleanupTerminalRunContainers(ctx context.Context, runLabel string) error {
+	if runLabel == "" {
+		return nil
+	}
+	filter := "label=localmaxxing.run=" + runLabel
+	out, code, timedOut, err := runCommand(ctx, 30*time.Second, "docker", "ps", "-aq", "--filter", filter)
+	if err != nil || timedOut || code != 0 {
+		return terminalCommandError("container_cleanup_failed", "Could not inspect containers left by this terminal run.", "docker", []string{"ps", "-aq", "--filter", filter}, code, out, timedOut)
+	}
+	ids := strings.Fields(out)
+	if len(ids) == 0 {
+		return nil
+	}
+	args := append([]string{"rm", "-f"}, ids...)
+	out, code, timedOut, err = runCommand(context.Background(), 30*time.Second, "docker", args...)
+	if err != nil || timedOut || code != 0 {
+		return terminalCommandError("container_cleanup_failed", "Could not remove containers left by this terminal run.", "docker", args, code, out, timedOut)
+	}
+	return nil
+}
+
 func dockerPreflight() error {
-	out, code, timedOut, err := runCommand(context.Background(), 15*time.Second, "docker", "version")
+	return dockerPreflightContext(context.Background())
+}
+
+func dockerPreflightContext(ctx context.Context) error {
+	out, code, timedOut, err := runCommand(ctx, 15*time.Second, "docker", "version")
 	if err != nil || timedOut || code != 0 {
 		return terminalCommandError("docker_unavailable", "Docker is not available.", "docker", []string{"version"}, code, out, timedOut)
 	}
@@ -5512,13 +3764,20 @@ func runCommand(ctx context.Context, timeout time.Duration, name string, args ..
 	defer cancel()
 	cmd := exec.CommandContext(cctx, name, args...)
 	configureCommandProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		killCommandProcessGroup(cmd)
+		return nil
+	}
+	cmd.WaitDelay = 2 * time.Second
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	err := cmd.Run()
 	if cctx.Err() == context.DeadlineExceeded {
-		killCommandProcessGroup(cmd)
 		return output.String(), 124, true, err
+	}
+	if cctx.Err() != nil {
+		return output.String(), 130, false, cctx.Err()
 	}
 	code := 0
 	if err != nil {
@@ -5537,7 +3796,7 @@ func terminalCommandError(code, message, cmd string, args []string, exitCode int
 func terminalHint(code string) string {
 	switch code {
 	case "docker_unavailable":
-		return "Install Docker, start the Docker daemon, and ensure this user can run docker commands."
+		return "Start Docker and ensure this user can access its socket. On Linux, run `sudo usermod -aG docker $USER`, then start a new login session."
 	case "image_build_failed":
 		return "Inspect the Dockerfile and build context in the task environment/."
 	case "image_pull_failed":
@@ -5786,7 +4045,7 @@ func writeTerminalTaskTrace(task terminalTask, result terminalTaskResult, cfg te
 			return cliError{"trace_write_failed", "Could not write terminal trace file.", []string{"Check --trace-dir permissions and available disk space."}, map[string]any{"taskId": task.ID, "file": name, "error": err.Error()}}
 		}
 	}
-	resultJSON := map[string]any{"question_id": task.ID, "pass": result.pass, "scored": result.scored, "error": result.errText, "errorCode": result.errCode, "latencyMs": result.wallTimeMs, "wallTimeMs": result.wallTimeMs, "tokenUsage": result.usage.toMap(), "turns": result.turns}
+	resultJSON := map[string]any{"question_id": task.ID, "pass": result.pass, "scored": result.scored, "error": result.errText, "errorCode": result.errCode, "latencyMs": result.wallTimeMs, "wallTimeMs": result.wallTimeMs, "tokenUsage": result.usage.toMap(), "turns": terminalTaskTurnsValue(result)}
 	data, err := json.MarshalIndent(resultJSON, "", "  ")
 	if err != nil {
 		return err
@@ -5907,14 +4166,28 @@ func externalAgentTraceText(traceDir string) string {
 	}
 	return b.String()
 }
+func terminalTaskTurnsValue(result terminalTaskResult) any {
+	if result.turnsUnreported {
+		return (*int)(nil)
+	}
+	return result.turns
+}
+
+func terminalMaxTurnsEnforcement(cfg terminalConfig) string {
+	if cfg.oracle {
+		return "not-applicable"
+	}
+	if opt(cfg.args, "agent") == "terminus-2" {
+		return "bundled-adapter"
+	}
+	if cfg.agentCommand != "" {
+		return "not-enforced"
+	}
+	return "cli-agent-loop"
+}
+
 func terminalAgentMaxTurns(cfg terminalConfig, task terminalTask) int {
-	if cfg.maxTurns > 0 {
-		return cfg.maxTurns
-	}
-	if task.Agent.MaxTurns > 100 {
-		return task.Agent.MaxTurns
-	}
-	return 100
+	return firstPositive(cfg.maxTurns, task.Agent.MaxTurns, defaultTerminalMaxTurns)
 }
 
 func firstPositive(values ...int) int {
@@ -5935,13 +4208,17 @@ func firstPositiveFloat(values ...float64) float64 {
 }
 
 func terminalAgentTimeoutSec(cfg terminalConfig, task terminalTask) int {
-	if cfg.agentTimeoutSec > 0 {
-		return cfg.agentTimeoutSec
+	return firstPositive(cfg.agentTimeoutSec, task.Agent.TimeoutSec, defaultTerminalTaskTimeoutSec)
+}
+
+func terminalLimitSource(explicit, manifest int) string {
+	if explicit > 0 {
+		return "cli"
 	}
-	if task.Agent.TimeoutSec > defaultTerminalTaskTimeoutSec {
-		return task.Agent.TimeoutSec
+	if manifest > 0 {
+		return "task-manifest"
 	}
-	return defaultTerminalTaskTimeoutSec
+	return "fallback"
 }
 
 func terminalCommandTimeoutSec(cfg terminalConfig) int {

@@ -82,6 +82,7 @@ Control output length with `--max-tokens` (default 256) and sampling with `--tem
 - `--dry-run`: write plans or validate without submitting, depending on command.
 - `lmx context --out ...`: fetch live enum values and schemas from the site.
 - `lmx <command> --help`: show examples and relevant flags for a command.
+- Long Terminal-Bench jobs: preflight first, then launch with a unique `--run-dir ... --detach`; poll with `lmx eval terminal status <run-dir> --json`, consume `logs <run-dir> [--follow]` as JSONL, and cancel with `cancel <run-dir>`. Resume by repeating the exact run identity with the same directory and `--resume auto`; see `references/evals.md`.
 
 ## Reference docs
 

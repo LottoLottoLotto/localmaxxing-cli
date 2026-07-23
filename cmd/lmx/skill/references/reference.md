@@ -26,23 +26,23 @@ Global/auth/output:
 - `--api-key <key>`: API key; defaults to `LMX_API_KEY`, then saved config.
 - `--no-browser`: do not open the device-login browser automatically.
 - `--profile <name>`: load saved defaults from `lmx profile save`.
-- `--json-status`: emit progress events as JSON lines on stderr.
+- `--json-status`: machine mode with progress/errors as JSONL on stderr. Terminal-run human prose is suppressed; stdout is empty unless `--json` requests one final JSON document.
 - `--quiet`: suppress progress events.
-- `--out <path>`: write computed payload/result JSON. Terminal run also writes an atomic sibling `<out>.checkpoint` unless `--checkpoint-dir` selects another directory.
+- `--out <path>`: write computed payload/result JSON, or write `SKILL.md` for `lmx skill print`.
 - `--dir <dir>`: target skills directory for `lmx skill install`; default `.claude/skills`.
-- `--submit`: upload a completed run. Terminal `run` without it emits `local_execution_results_not_submitted`; execution still occurred.
-- `--dry-run`: deferred Terminal `submit` emits `offline_submit_validation_no_execution` and only validates/packages saved work. It is never a no-execution mode for Terminal `run`.
+- `--submit`: upload run to LocalMaxxing.
+- `--dry-run`: for benchmark run, write a measurement plan; for submit commands, authenticated API validation without creating a run.
 
 Model/eval:
 
-- `--model <hfId>`: HuggingFace model ID. Terminal run rejects it when it conflicts with a source repo unambiguously verified from the live loaded filename.
+- `--model <hfId>`: HuggingFace model ID.
 - `--backend <name>`: lm-eval backend name; default `hf`.
 - `--model-args <args>`: lm-eval `--model_args` value.
 - `--num-fewshot <n>`: lm-eval `--num_fewshot` override.
 - `--lm-eval-bin <path>`: lm-eval executable; default `lm_eval`.
 - `--results <path>`: existing lm-eval output JSON for run upload.
 - `--kind <kind>`: storage upload kind, usually `artifact` or `dataset`.
-- `--format <format>`: storage file format, e.g. `json`, `jsonl`, `parquet`, `zip`.
+- `--format <format>`: output/storage format. `benchmark runs show` and `benchmark runs compare` support `table`, `ascii`, or `json`; storage uploads use `json`, `jsonl`, `parquet`, or `zip`.
 - `--item-count <n>`: optional record/sample count for storage metadata.
 - `--limit <n>`: optional search/list result limit.
 
@@ -64,29 +64,29 @@ Eval shards and Terminal-Bench:
 - `--quant-format <label>`: quantization container format for eval-shard submit.
 - `--model-revision <rev>`: model revision for eval-shard submit; default `main`.
 - `--task-dir <dir>`: Terminal eval bundle directory.
+- `--run-dir <dir>`: durable live Terminal eval checkpoint containing `run.json`, atomic per-task results, default traces, and final `result.json`.
+- `--resume <mode>`: Terminal live-run mode `auto` or `none`; defaults to `auto` with `--run-dir`. Auto reuses matching scored tasks and reruns unscored tasks.
+- `--detach`: launch `eval terminal run` as a durable background worker. Requires an explicit `--run-dir`; incompatible with `--dry-run`.
+- `lmx eval terminal status <run-dir> [--json]`: print one persisted lifecycle/progress snapshot. JSON mode writes exactly one document to stdout.
+- `lmx eval terminal logs <run-dir> [--follow]`: replay `events.jsonl` as one complete JSON object per stdout line; follow until durable terminal state plus EOF.
+- `lmx eval terminal cancel <run-dir> [--json] [--force]`: request idempotent cooperative cancellation; `--force` skips the grace period and should be reserved for a stuck worker.
 - `--dataset <slug>`: Terminal eval dataset slug.
 - `--hf-id <hfId>`: canonical HuggingFace model ID for deferred terminal submit.
-- `--endpoint-file <path>`: JSON written by `lmx endpoint discover --out endpoint.json`; Terminal run requires exactly one `ok:true` endpoint, uses the file only to select its URL, and re-probes live identity metadata. Mutually exclusive with `--base-url`.
-- `--shard-index <n>`: explicit shard for an isolated deferred artifact or legacy checkpoint directory; required for noncanonical datasets. Omit only for a complete canonical Terminal-Bench 2.1 checkpoint, which is validated and partitioned into 10 submissions.
-- `--max-turns <n>`: Terminal eval agent turn cap.
+- `--shard-index <n>`: explicit shard for an isolated deferred checkpoint; required for noncanonical datasets. Omit only for a complete canonical Terminal-Bench 2.1 checkpoint, which is validated and partitioned into 10 submissions.
+- `--max-turns <n>`: resolved Terminal eval turn cap. The built-in loop and Terminus-2 enforce it; arbitrary `--agent-cmd` wrappers only receive `LMX_TERMINAL_MAX_TURNS`, with enforcement reported as `not-enforced`.
 - `--max-tokens <n>`: Terminal model completion cap; default 16,384 and 8,192 on retry. An explicit value applies to both attempts.
 - `--agent-timeout <sec>`: Terminal eval whole-agent timeout.
 - `--agent <name>`: built-in terminal agent backend; `terminus-2` uses the embedded Harbor adapter.
-- `--agent-cmd <cmd>`: external agent command with `LMX_TERMINAL_*` env vars.
+- `--agent-cmd <cmd>`: external agent command with `LMX_TERMINAL_*` task, routing, model-auth, requested-turn-cap, and enforced-timeout environment variables.
 - `--agent-execution <m>`: `host`, `container`, or `routed-shell`; default `host`.
 - `--agent-name <name>`: external terminal agent label; default `external-agent`.
 - `--container-base-url <url>`: base URL visible from task containers.
-- `--command-timeout-seconds <sec>`: harness shell-command timeout (default remaining task budget, up to 4h); legacy `--command-timeout` remains accepted. It is distinct from task/verifier and HTTP timeouts. A built-in timeout stops only that command, restarts the persistent shell, preserves durable container files, and gives the agent another turn to inspect or resume. Routed external agents may still exit with `command_timeout`.
-- `--endpoint-timeout-seconds <n>`: model HTTP request timeout only; default 600 seconds with retry reserve.
-- `--resume <none|auto|dir>`: initialize a clean private checkpoint (default), resume the default checkpoint, or resume an explicit v3 checkpoint. Dataset/shard, complete manifest and canonical IDs, selected order/bundle digests, model identities/resolution/revision, quantization, hardware hash, runner/harness, and run configuration must match exactly. Incomplete, unscored, and verifier-incomplete wrappers rerun.
-- `--checkpoint-dir <dir>`: private `checkpoint.json` + `summary.json` + per-task wrapper destination. A process lock rejects concurrent writers; wrappers, metadata, and the final summary commit use synced same-directory atomic file transactions.
-- `--repeat-batch-limit <n>`: no-progress identical/near-identical batch limit (default 3); the harness nudges before `agent_protocol_exhausted`.
-- `--trace-dir <dir>`: save per-task transcript, verifier output, prompt/instruction, result, and external agent logs.
+- `--command-timeout <sec>`: terminal per-shell-command timeout; default 300 seconds, capped by the remaining whole-agent time.
+- `--endpoint-timeout-seconds <n>`: Terminal model request timeout; default 600 seconds. The first attempt reserves part of the remaining task budget for retry.
+- `--trace-dir <dir>`: save per-task `transcript.md`, `verifier.txt`, `prompt.txt`, `instruction.txt`, `result.json` with `wallTimeMs`/`tokenUsage`, and external agent logs.
 - `--cleanup-images`: remove locally built terminal task images after each task.
 - `--shell-mode <mode>`: `persistent` or `stateless`; default `persistent`.
 - `--oracle`: run terminal task `solution/solve.sh` instead of the model agent.
-- `eval terminal recover <checkpoint> --task-id <id> --container <name> --bundle <dir> [--result <wrapper>]`: validate exact v3 provenance and bundle identity, rerun the canonical verifier against the existing container, and atomically persist only its fresh reward-derived score. Optional result input is incomplete-task telemetry only and never score evidence; completed tasks cannot be overwritten.
-- Terminal v3 artifacts retain complete secret-free provenance in checkpoint metadata, every nested summary entry, every task wrapper, monolithic output, and deferred submission. Partial checkpoints advertise only the exact resume command; submit is advertised only when complete. Legacy checkpoint submit remains supported; legacy resume/recover does not.
 - `--llama-scorer <path>`: local helper for `llama_cpp_loglikelihood` scoring.
 - `--sandbox-image <name>`: code sandbox image; default `lmx-sandbox`.
 - `--sandbox-runtime <bin>`: container runtime for code execution; default `docker`.
@@ -97,12 +97,24 @@ Eval shards and Terminal-Bench:
 - `--k <n>`: pass@k value over `--n-samples`; default 1.
 - `--few-shot <n>`: few-shot examples for MBPP-family code evals.
 
+Eval-derived training:
+
+- `lmx eval train rl prepare <imported-bundle-or-parent> --out <rl-dir> --base-model <id-or-path> --environment-factory <module:callable> --allow-benchmark-training`: write prompt-only `prompts.jsonl` and a typed online-GRPO `manifest.json`; completed results and historical pass/fail/reward labels are not accepted.
+- `--environment-config <json-file>`: JSON object passed as `config` to the required trusted environment factory; default `{}`.
+- `--grpo-config <json-file>`: JSON object of validated GRPO overrides.
+- `--environment-factory <module:callable>`: required importable plugin whose factory accepts keyword arguments `bundle_root` and `config`; training is not runnable without it. The environment resets isolated task state, exposes typed/documented tools, and supplies fresh-rollout reward through `get_reward()` while keeping verifier and solution data from the policy.
+- `lmx eval train rl run <manifest> [--output-dir <dir>] [--resume auto|none|<checkpoint>] [--python-bin <path>] [--execute]`: validate and print the embedded trainer's direct argv by default; `--execute` runs it and `--trainer-cmd` is unsupported.
+- `--output-dir <dir>`: override the manifest's `grpo-output`; it cannot be within the imported source bundles.
+- `--resume <selector>`: `auto` (default) starts fresh for empty output or selects the highest valid `checkpoint-N`; `none` requires empty output; an explicit checkpoint must contain `trainer_state.json`.
+- `--python-bin <path>`: Python executable for RL run; default `python3`.
+- RL prerequisites: install hardware-appropriate PyTorch first, then `python -m pip install 'trl==1.8.0' 'transformers>=5.2.0,<6'`. The environment plugin is trusted code and must sandbox policy tools/verifier execution. `--allow-benchmark-training` acknowledges contamination; report on a separate unseen holdout.
+
 Remote benchmark / endpoint:
 
-- `--base-url <url>`: explicit OpenAI-compatible endpoint; accepts host or host plus `/v1`. Mutually exclusive with Terminal `--endpoint-file`. With neither selector, uncredentialed Terminal runs auto-probe supported localhost endpoints and require one unambiguous match.
+- `--base-url <url>`: OpenAI-compatible endpoint; accepts host or host plus `/v1`.
 - `--mode <mode>`: `remote` endpoint or `local` host command.
-- `--served-model <name>`: exact live model selector for Terminal run; it must match `/v1/models`.
-- `--model-api-key <key>`: optional endpoint bearer token. For Terminal run it requires explicit `--base-url` or trusted `--endpoint-file`; credentials are never sent during broad auto-probing.
+- `--served-model <name>`: model name served by endpoint.
+- `--model-api-key <key>`: optional bearer token for remote endpoint benchmarking.
 - `--prompt <text>`: prompt for remote endpoint benchmark.
 - `--max-tokens <n>`: max generated tokens; remote benchmark default 256.
 - `--endpoint-timeout-seconds <n>`: remote endpoint timeout; default 600.
@@ -117,7 +129,7 @@ Local benchmark / server:
 - `--command-timeout-seconds <n>`: local benchmark command timeout; default unlimited.
 - `--host <addr>`: local model server host.
 - `--port <n>`: local model server port.
-- `--model-path <path>`: llama.cpp model artifact path. Terminal run reconciles an explicit value with the live loaded path and rejects conflicts. Canonical `hfId` auto-resolution is accepted only when the exact loaded filename is verified in one unambiguous HuggingFace source repo.
+- `--model-path <path>`: llama.cpp model path.
 - `--depth <n>`: llama-bench `-d` depth; KV sweeps use `--levels`.
 - `--batch-size <n>`: llama-bench batch size.
 - `--micro-batch-size <n>`: llama-bench micro-batch size.
@@ -159,7 +171,7 @@ KV-cache and saved runs:
 Hardware and submission metadata:
 
 - `--hardware <path>`: JSON hardware object required when submitting.
-- `--quantization <label>`: explicit quantization assertion; Terminal run reconciles it with the live loaded filename/endpoint metadata and rejects conflicts. Common values are exposed by `lmx context` (`commonSchemas.benchmarkFields.quantization.commonValues`) and include GGUF (`Q4_K_M`, `IQ4_XS`), NVIDIA (`NVFP4`), Unsloth (`Unsloth-Dynamic-Q4_K_M`), bitsandbytes (`bnb-nf4`), AWQ/GPTQ/EXL2/FP8 variants.
+- `--quantization <label>`: quantization label; free-form but common values are exposed by `lmx context` (`commonSchemas.benchmarkFields.quantization.commonValues`) and include GGUF (`Q4_K_M`, `IQ4_XS`), NVIDIA (`NVFP4`), Unsloth (`Unsloth-Dynamic-Q4_K_M`), bitsandbytes (`bnb-nf4`), AWQ/GPTQ/EXL2/FP8 variants. Auto-detected for some remote benchmark/eval-shard paths when omitted.
 - `--gpu-name <name>`: hardware template GPU name.
 - `--gpu-count <n>`: hardware template GPU count.
 - `--vram-gb <gb>`: hardware template VRAM in GB.
@@ -180,5 +192,4 @@ Hardware and submission metadata:
 - `missing_remote_hardware`: run `lmx hardware --out hardware.json` on the server and pass that file when submitting.
 - `lm-eval` not found: install it with `pip install lm-eval`, or pass `--lm-eval-bin <path>`.
 - Missing API key: run `lmx auth --key bhk_...`, set `LMX_API_KEY`, or pass `--api-key bhk_...`.
-- Terminal failures: the human summary lists task, outcome, turns, reason, and an `--out` result pointer or `--trace-dir` path; `--json-status` emits categorized `terminal_failure_summary` data.
 - Unknown enum or schema mismatch: refresh live metadata with `lmx context --out localmaxxing-agent-context.json`.
