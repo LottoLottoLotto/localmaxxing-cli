@@ -1133,7 +1133,7 @@ func handleProfile(action, name string, args cliArgs) error {
 			return errors.New("profile save requires a profile name")
 		}
 		profileOpts := map[string]any{}
-		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "prefill-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len", "output-len", "num-prompts", "tensor-parallel", "context-length", "gpu-layers", "depth", "context-depth", "batch-size", "micro-batch-size", "ubatch-size", "repetitions", "runs", "benchmark-format", "bench-format", "output-format", "cache-type-k", "cache-type-v", "extra-server-args", "extra-bench-args"} {
+		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "prefill-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len", "output-len", "num-prompts", "request-rate", "max-concurrency", "num-parallel", "max-running-seqs", "max-running-requests", "max-num-seqs", "tensor-parallel", "context-length", "gpu-layers", "depth", "context-depth", "batch-size", "micro-batch-size", "ubatch-size", "repetitions", "runs", "benchmark-format", "bench-format", "output-format", "cache-type-k", "cache-type-v", "extra-server-args", "extra-bench-args"} {
 			if value := opt(args, key); value != "" {
 				profileOpts[key] = value
 			}
@@ -4773,6 +4773,9 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		}
 		printStatus(args, "benchmark_metrics_detected", metricStatusFields(parsed))
 	}
+	if err := applyBenchmarkConcurrencyMetadata(metrics, args, mode); err != nil {
+		return nil, err
+	}
 
 	hardware, hardwareSource, err := benchmarkHardware(mode, args)
 	if err != nil {
@@ -5287,7 +5290,7 @@ func applyBenchmarkPlanMetrics(metrics map[string]any, mode, engineName string, 
 		if sb := opt(args, "server-bin"); sb != "" {
 			cmdSnippet = sb + " " + strings.TrimPrefix(cmdSnippet, "llama-server ")
 		}
-		metrics["engineFlags"] = map[string]any{"commandSnippet": cmdSnippet, "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel}
+		metrics["engineFlags"] = map[string]any{"commandSnippet": cmdSnippet, "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "concurrency": 1}
 		return
 	}
 	if commandSnippet := localBenchmarkCommand(engineName, args); commandSnippet != "" {
@@ -5407,6 +5410,74 @@ func localBenchmarkEngineFlags(engineName, commandSnippet string) map[string]any
 		}
 	}
 	return flags
+}
+
+func applyBenchmarkConcurrencyMetadata(metrics map[string]any, args cliArgs, mode string) error {
+	flags := asObject(metrics["engineFlags"])
+	if flags == nil {
+		return nil
+	}
+	if mode == "remote" {
+		flags["concurrency"] = 1
+		return nil
+	}
+
+	command := stringValue(flags["commandSnippet"])
+	if concurrency := positiveCommandFlagInt(command, "--max-concurrency", "--concurrency"); concurrency > 0 {
+		flags["concurrency"] = concurrency
+	}
+	if parallel := positiveCommandFlagInt(command, "--parallel", "--num-parallel", "-np"); parallel > 0 {
+		flags["numParallel"] = parallel
+		if numberField(flags, "concurrency") == 0 {
+			flags["concurrency"] = parallel
+		}
+	}
+	if maxRunning := positiveCommandFlagInt(command, "--max-running-requests", "--max-num-seqs"); maxRunning > 0 {
+		flags["maxRunningSeqs"] = maxRunning
+	}
+
+	if concurrency, present, err := positiveBenchmarkIntOption(args, "max-concurrency", "concurrency"); err != nil {
+		return err
+	} else if present {
+		flags["concurrency"] = concurrency
+	}
+	if parallel, present, err := positiveBenchmarkIntOption(args, "num-parallel", "parallel"); err != nil {
+		return err
+	} else if present {
+		flags["numParallel"] = parallel
+		if numberField(flags, "concurrency") == 0 {
+			flags["concurrency"] = parallel
+		}
+	}
+	if maxRunning, present, err := positiveBenchmarkIntOption(args, "max-running-seqs", "max-running-requests", "max-num-seqs"); err != nil {
+		return err
+	} else if present {
+		flags["maxRunningSeqs"] = maxRunning
+	}
+	return nil
+}
+
+func positiveCommandFlagInt(command string, names ...string) int {
+	value := commandFlagNumber(command, names...)
+	if value < 1 || math.Trunc(value) != value {
+		return 0
+	}
+	return int(value)
+}
+
+func positiveBenchmarkIntOption(args cliArgs, names ...string) (int, bool, error) {
+	for _, name := range names {
+		raw := opt(args, name)
+		if raw == "" {
+			continue
+		}
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 {
+			return 0, true, cliError{"invalid_option", "--" + name + " must be a positive integer", []string{"Pass --" + name + " <number>."}, nil}
+		}
+		return value, true, nil
+	}
+	return 0, false, nil
 }
 
 func appendLlamaBenchArgs(cmd *[]string, args cliArgs, includeDepth bool) {
@@ -5851,7 +5922,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		"prompt":       prompt,
 		"outputText":   outputText,
 		"promptTokens": float64(promptTokens),
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations},
+		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": 1},
 		"tokenSources": map[string]any{"prompt": promptTokenSource, "output": outputTokenSource},
 		"timingSource": "client_observed_http",
 		"metricSource": "remote_endpoint",
@@ -5996,7 +6067,7 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	metrics := map[string]any{
 		"prompt":       prompt,
 		"outputText":   outputText,
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations},
+		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": 1},
 		"tokenSources": map[string]any{"prompt": "ollama_prompt_eval_count", "output": "ollama_eval_count"},
 		"timingSource": "ollama_native_api",
 		"metricSource": "remote_endpoint",
@@ -11195,6 +11266,10 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --kv-cache-dtype <dtype> vLLM KV cache dtype for local latency sweeps
   --enable-prefix-caching  Enable vLLM prefix caching for local latency sweeps
   --num-prompts <n>        Number of prompts for vLLM serve/throughput benchmarks
+  --request-rate <rate>    Request arrival rate for vLLM/SGLang serving benchmarks
+  --max-concurrency <n>    Concurrent serving requests; submitted as engineFlags.concurrency
+  --num-parallel <n>       Engine parallel slots; submitted as engineFlags.numParallel and concurrency
+  --max-running-seqs <n>   Engine sequence capacity; submitted as engineFlags.maxRunningSeqs
   --runs-dir <dir>         Saved benchmark runs directory (default: runs)
   --group-by <field>       Group saved-run stats by field, e.g. quantization or hardware
   --by <field>             Group saved-run comparisons by field

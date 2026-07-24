@@ -384,8 +384,8 @@ func TestMeasureOpenAIEndpointMarksEstimatedPrefillAndStringEngineFlags(t *testi
 	if !ok {
 		t.Fatalf("engineFlags type = %T, want map[string]any", metrics["engineFlags"])
 	}
-	if engineFlags["stream"] != true || engineFlags["maxTokens"] != 16 || engineFlags["servedModel"] != "served-model" {
-		t.Fatalf("engineFlags = %#v", engineFlags)
+	if engineFlags["stream"] != true || engineFlags["maxTokens"] != 16 || engineFlags["servedModel"] != "served-model" || engineFlags["concurrency"] != 1 {
+		t.Fatalf("engineFlags = %#v, want single-stream remote metadata", engineFlags)
 	}
 	if metrics["tokSPrefill"] == nil || metrics["ttftMs"] == nil {
 		t.Fatalf("expected tokSPrefill and ttftMs, got %#v", metrics)
@@ -1006,6 +1006,57 @@ func TestLlamaBenchmarkCommandUsesResolvedBinaryAndReportsWarmup(t *testing.T) {
 	flags = localBenchmarkEngineFlags("llama.cpp", command+" --no-warmup")
 	if flags["warmup"] != "disabled" {
 		t.Fatalf("warmup = %v, want disabled", flags["warmup"])
+	}
+}
+
+func TestBenchmarkDryRunSubmitsBackendConcurrencyFields(t *testing.T) {
+	payload, err := benchmarkPayloadFromFlags("vllm", cliArgs{
+		opts: map[string]string{
+			"mode":             "local",
+			"hf-id":            "Qwen/Qwen3-8B",
+			"quantization":     "fp16",
+			"base-url":         "http://localhost:8000",
+			"max-concurrency":  "8",
+			"max-running-seqs": "256",
+			"tok-s-out":        "400",
+			"prompt-tokens":    "512",
+			"output-tokens":    "128",
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	flags := asObject(payload["engineFlags"])
+	if flags["concurrency"] != 8 || flags["maxRunningSeqs"] != 256 {
+		t.Fatalf("local engine flags = %#v", flags)
+	}
+	submitFlags := asObject(toBenchmarkSubmit(payload)["engineFlags"])
+	if submitFlags["concurrency"] != 8 || submitFlags["maxRunningSeqs"] != 256 {
+		t.Fatalf("submitted engine flags = %#v", submitFlags)
+	}
+	if !strings.Contains(stringValue(submitFlags["commandSnippet"]), "--max-concurrency 8") {
+		t.Fatalf("submitted command = %q, want max concurrency", submitFlags["commandSnippet"])
+	}
+}
+
+func TestBenchmarkConcurrencyMetadataParsesEngineAliases(t *testing.T) {
+	metrics := map[string]any{"engineFlags": localBenchmarkEngineFlags("llama.cpp", "llama-server -m model.gguf -np 4 --max-num-seqs 32")}
+	if err := applyBenchmarkConcurrencyMetadata(metrics, cliArgs{}, "local"); err != nil {
+		t.Fatalf("applyBenchmarkConcurrencyMetadata returned error: %v", err)
+	}
+	flags := asObject(metrics["engineFlags"])
+	if flags["concurrency"] != 4 || flags["numParallel"] != 4 || flags["maxRunningSeqs"] != 32 {
+		t.Fatalf("parsed engine flags = %#v", flags)
+	}
+}
+
+func TestBenchmarkConcurrencyMetadataRejectsInvalidValue(t *testing.T) {
+	metrics := map[string]any{"engineFlags": localBenchmarkEngineFlags("vllm", "vllm bench serve")}
+	err := applyBenchmarkConcurrencyMetadata(metrics, cliArgs{opts: map[string]string{"max-concurrency": "0"}}, "local")
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "invalid_option" {
+		t.Fatalf("applyBenchmarkConcurrencyMetadata error = %#v, want invalid_option", err)
 	}
 }
 
