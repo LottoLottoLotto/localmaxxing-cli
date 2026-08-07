@@ -15,7 +15,7 @@ Validate a hardware file against the live LocalMaxxing hardware schema and allow
 lmx hardware validate hardware.json
 ```
 
-`benchmark submit` and `benchmark dry-run` sanitize generated hardware before posting, including converting detector GPU slots from `{ "name": ... }` to API slots shaped as `{ "gpuName": ... }`. Validation still checks the current allowlist; choose a GPU name from `lmx context` if the detector reports a vendor-specific marketing string.
+`speed-test submit` and `speed-test dry-run` sanitize generated hardware before posting, including converting detector GPU slots from `{ "name": ... }` to API slots shaped as `{ "gpuName": ... }`. Validation still checks the current allowlist; choose a GPU name from `lmx context` if the detector reports a vendor-specific marketing string.
 
 
 ## Hardware templates

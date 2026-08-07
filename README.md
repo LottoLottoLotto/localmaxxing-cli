@@ -144,12 +144,12 @@ lmx setups pull --id <setupId> --out hardware.json
 
 `setups pull` selects by `--id`, case-insensitive `--name`, or `--default`; with no selector it uses your default setup, or the only setup when you have exactly one. Without `--out` it prints the hardware JSON to stdout.
 
-## Benchmarks
+## Speed tests
 
 ### Remote Endpoint (vLLM, SGLang, Ollama, custom OpenAI-compatible)
 
 ```bash
-lmx benchmark run vllm \
+lmx speed-test run vllm \
   --mode remote \
   --base-url http://server:8000 \
   --hf-id Qwen/Qwen3-8B \
@@ -160,14 +160,14 @@ lmx benchmark run vllm \
   --dry-run
 ```
 
-For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server. If a remote run already has metrics but lacks hardware, attach it without rerunning: `lmx benchmark add-hardware runs/Model/run.json --hardware hardware.json`.
+For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server. If a remote run already has metrics but lacks hardware, attach it without rerunning: `lmx speed-test add-hardware runs/Model/run.json --hardware hardware.json`.
 
 Remote endpoint runs issue one untimed warmup request and three timed iterations by default, reporting the median of each metric plus per-iteration `samples` and `sampleStats` (min/p50/mean/max/stddev). Tune with `--warmup <n>` and `--iterations <n>`; `--warmup 0 --iterations 1` restores single-shot measurement. Decode throughput is measured over the inter-token window (first to last streamed token) when more than one token arrives.
 
 Ollama uses the native `/api/generate` endpoint:
 
 ```bash
-lmx benchmark run ollama \
+lmx speed-test run ollama \
   --mode remote \
   --base-url http://localhost:11434 \
   --hf-id Qwen/Qwen3-8B \
@@ -180,7 +180,7 @@ lmx benchmark run ollama \
 ### Local llama.cpp
 
 ```bash
-lmx benchmark run llama.cpp \
+lmx speed-test run llama.cpp \
   --mode local \
   --hf-id Qwen/Qwen3-8B \
   --quantization Q4_K_M \
@@ -194,14 +194,14 @@ lmx benchmark run llama.cpp \
 ### Validate and Submit
 
 ```bash
-lmx benchmark validate-local benchmark.json
-lmx benchmark dry-run benchmark.json
-lmx benchmark submit benchmark.json
+lmx speed-test validate-local speed-test.json
+lmx speed-test dry-run speed-test.json
+lmx speed-test submit speed-test.json
 ```
 
-`bench` is a shorter alias for `benchmark`. Use `--out <path>` to set the output file, `--json-status` for machine-readable progress, and `--quiet` to suppress output.
+Use `--out <path>` to set the output file, `--json-status` for machine-readable progress, and `--quiet` to suppress output.
 
-Local benchmark commands run without a time limit by default; pass `--command-timeout-seconds <n>` to abort hung runs.
+Local speed-test commands run without a time limit by default; pass `--command-timeout-seconds <n>` to abort hung runs.
 
 ## Saved Profiles and Runs
 
@@ -214,36 +214,36 @@ lmx profile save my-4090 \
   --quantization Q4_K_M \
   --hardware hardware.json
 
-lmx benchmark run llama.cpp --profile my-4090 --model-path model.gguf --dry-run
+lmx speed-test run llama.cpp --profile my-4090 --model-path model.gguf --dry-run
 ```
 
 Manage saved run files:
 
 ```bash
-lmx benchmark runs list
-lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json
-lmx benchmark runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'
-lmx benchmark runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run
-lmx benchmark runs submit runs/Qwen-Qwen3-8B/run.json
-lmx benchmark runs delete runs/Qwen-Qwen3-8B/run.json --yes
+lmx speed-test runs list
+lmx speed-test runs show runs/Qwen-Qwen3-8B/run.json
+lmx speed-test runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'
+lmx speed-test runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run
+lmx speed-test runs submit runs/Qwen-Qwen3-8B/run.json
+lmx speed-test runs delete runs/Qwen-Qwen3-8B/run.json --yes
 ```
 
 Inspect a saved run for post-run fixes before submission:
 
 ```bash
-lmx benchmark fixup runs/Qwen-Qwen3-8B/run.json
-lmx benchmark add-hardware runs/Qwen-Qwen3-8B/run.json --hardware hardware.json
+lmx speed-test fixup runs/Qwen-Qwen3-8B/run.json
+lmx speed-test add-hardware runs/Qwen-Qwen3-8B/run.json --hardware hardware.json
 ```
 
 
 Analyze and export runs:
 
 ```bash
-lmx benchmark runs show runs/Qwen-Qwen3-8B/run.json --format table
-lmx benchmark runs stats --group-by quantization --metric tokSOut
-lmx benchmark runs compare --by quantization --metric tokSOut --format table
-lmx benchmark runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs --format table
-lmx benchmark runs export --format csv --out runs.csv
+lmx speed-test runs show runs/Qwen-Qwen3-8B/run.json --format table
+lmx speed-test runs stats --group-by quantization --metric tokSOut
+lmx speed-test runs compare --by quantization --metric tokSOut --format table
+lmx speed-test runs compare runs/base.json runs/candidate.json --metrics tokSOut,ttftMs --format table
+lmx speed-test runs export --format csv --out runs.csv
 ```
 
 `stats`, `show`, `compare`, and `export` accept `--runs-dir`, plus filters such as `--model`, `--engine`, `--mode`, `--quantization`, `--kind`, and `--hardware-name`. Group stats report min/p50/mean/max/p95/stddev and the best single run; group comparisons rank by the median (`p50`) so a single outlier run cannot win. `show --format table` prints every field from a single run as a flattened ASCII field/value table. `compare` defaults to an ASCII table with baseline, candidate/value, deltas, percent deltas, and a better/worse column; pass `--format json` for machine-readable output. `export` defaults to JSON and supports `--fields path,hfId,hardware,tokSOut` for custom extraction.

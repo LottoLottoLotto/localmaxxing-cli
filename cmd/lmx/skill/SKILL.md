@@ -34,19 +34,19 @@ lmx hardware --out hardware.json
 
 ## Decision tree
 
-- Already-running OpenAI-compatible / vLLM / SGLang / Ollama endpoint: use a **remote** benchmark with `--mode remote --base-url ...`. This is the path where you control the prompt.
-- Raw llama.cpp throughput on the host: use a **local** benchmark with `--mode local --model-path model.gguf`; it runs `llama-bench` with synthetic token counts.
+- Already-running OpenAI-compatible / vLLM / SGLang / Ollama endpoint: use a **remote speed test** with `--mode remote --base-url ...`. This is the path where you control the prompt.
+- Raw llama.cpp throughput on the host: use a **local speed test** with `--mode local --model-path model.gguf`; it runs `llama-bench` with synthetic token counts.
 - Quality / accuracy instead of speed: use evals; see `skill://localmaxxing-cli/references/evals.md`.
 - Speed vs context depth: use a KV-cache sweep with `lmx kvcache run`.
 
-## Canonical benchmark workflow
+## Canonical speed-test workflow
 
 1. Run with `--dry-run --out plan.json` to write a measurement plan without adding managed run history.
 2. Run again without `--dry-run` to measure.
-3. Validate with `lmx benchmark dry-run <file>` (authenticated API validation, no write).
-4. Submit with `lmx benchmark submit <file>`.
+3. Validate with `lmx speed-test dry-run <file>` (authenticated API validation, no write).
+4. Submit with `lmx speed-test submit <file>`.
 
-Submissions require `hfId`, `hardware`, `engineName`, `quantization`, and `tokSOut` plus at least one secondary metric: `tokSPrefill`, `tokSTotal`, `ttftMs`, or `peakVramGb`. Optionally include `gpuPowerWatts`: an array of measured watts, one entry per physical GPU (heterogeneous rigs list each card, e.g. `[285.5, 310.2]`; 1–64 entries, each positive and ≤10000). Pass it to `benchmark run` as `--gpu-power-watts 285.5,310.2`; the server computes and returns `totalPowerWatts`. For remote endpoints, the `hardware` object must describe the server running the model, not the client running `lmx`. Benchmark submissions are rate-limited to 30 per rolling hour, or 300 for Pro users.
+Submissions require `hfId`, `hardware`, `engineName`, `quantization`, and `tokSOut` plus at least one secondary metric: `tokSPrefill`, `tokSTotal`, `ttftMs`, or `peakVramGb`. Optionally include `gpuPowerWatts`: an array of measured watts, one entry per physical GPU (heterogeneous rigs list each card, e.g. `[285.5,310.2]`; 1–64 entries, each positive and ≤10000). Pass it to `speed-test run` as `--gpu-power-watts 285.5,310.2`; the server computes and returns `totalPowerWatts`. For remote endpoints, the hardware must describe the server running the endpoint, not the machine running `lmx`; run `lmx hardware --out hardware.json` on the server or provide an equivalent reviewed file, then pass `--hardware hardware.json`. Remote mode never auto-detects client hardware. If a completed remote run lacks hardware, repair the saved JSON without rerunning: `lmx speed-test add-hardware <run.json> --hardware hardware.json`.
 
 `quantization` is free-form; prefer labels from `lmx context` → `commonSchemas.benchmarkFields.quantization.commonValues` when possible. The common list includes GGUF (`Q4_K_M`, `IQ4_XS`), NVIDIA (`NVFP4`), Unsloth dynamic (`Unsloth-Dynamic-Q4_K_M`), bitsandbytes (`bnb-nf4`), AWQ/GPTQ/EXL2/FP8 variants, and engine-specific strings.
 
@@ -55,10 +55,10 @@ Hardware purchase metadata is optional and personal to the submitting user/setup
 ```bash
 lmx context --out localmaxxing-agent-context.json
 
-lmx benchmark run llama.cpp \
+lmx speed-test run llama.cpp \
   --hardware-cost "NVIDIA GeForce RTX 3090|used|2021|700|USD;NVIDIA GeForce RTX 4090|new|2024|1599|USD"
 
-lmx benchmark run llama.cpp \
+lmx speed-test run llama.cpp \
   --hardware-cost '[{"component":"NVIDIA GeForce RTX 3090","condition":"USED","yearPurchased":2021,"price":700,"currency":"USD"}]'
 ```
 
@@ -69,7 +69,7 @@ Compact format is `component|condition|year|price|currency` separated by semicol
 Remote benchmarks send a real prompt. Set it with:
 
 ```bash
-lmx benchmark run vllm --mode remote --base-url http://server:8000 --prompt "<text>"
+lmx speed-test run vllm --mode remote --base-url http://server:8000 --prompt "<text>"
 ```
 
 The default prompt is:
@@ -84,7 +84,7 @@ Control output length with `--max-tokens` (default 256) and sampling with `--tem
 - `--json-status`: emit JSONL progress and errors on stderr.
 - `--quiet`: suppress progress events and human status text, but not a requested final JSON result.
 - `--out <path>`: write output payloads/files.
-- `--dry-run`: plan or validate without submitting. Benchmark dry-runs do not add managed run history unless `--save-run` is passed.
+- `--dry-run`: plan or validate without submitting. Speed-test dry-runs do not add managed run history unless `--save-run` is passed.
 - `lmx commands --json`: inspect the versioned machine-readable command schema.
 - `lmx context list`: list live context sections.
 - `lmx context get <dotted.path> --compact`: fetch only the needed live enum or schema.
@@ -93,7 +93,7 @@ Control output length with `--max-tokens` (default 256) and sampling with `--tem
 
 ## Reference docs
 
-- `skill://localmaxxing-cli/references/benchmarks.md`: benchmark modes, flags, saved runs, profiles, and KV-cache sweeps.
+- `skill://localmaxxing-cli/references/speed-tests.md`: speed-test modes, flags, saved runs, profiles, and KV-cache sweeps.
 - `skill://localmaxxing-cli/references/evals.md`: suite management, eval runs, lm-eval, LM-judge, shards, Terminal-Bench, and storage.
 - `skill://localmaxxing-cli/references/hardware-and-setups.md`: hardware detection/templates and saved setup pulls.
 - `skill://localmaxxing-cli/references/reference.md`: command list, flag glossary, and troubleshooting.

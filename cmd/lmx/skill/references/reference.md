@@ -14,7 +14,7 @@ Raw HTTP API docs are available from the site through `GET /api/agent-context` a
 - `lmx server`: build or run local model server commands.
 - `lmx endpoint`: discover OpenAI-compatible endpoints.
 - `lmx kvcache` / `lmx kv-cache` / `lmx context-sweep`: run KV-cache/context sweeps.
-- `lmx benchmark` / `lmx bench`: create, manage, validate, and submit benchmarks.
+- `lmx speed-test`: create, manage, validate, and submit inference speed tests.
 - `lmx eval`: discover, run, and submit evaluation suites.
 - `lmx skill`: print or install the bundled agent skill.
 
@@ -35,8 +35,8 @@ Global/auth/output:
 - `--out <path>`: write computed payload/result JSON, or write `SKILL.md` for `lmx skill print`.
 - `--dir <dir>`: target skills directory for `lmx skill install`; default `.claude/skills`.
 - `--submit`: upload run to LocalMaxxing.
-- `--dry-run`: plan or validate without submission. Benchmark dry-runs do not create managed run history unless `--save-run` is passed.
-- `--save-run`: explicitly add a benchmark dry-run to managed run history.
+- `--dry-run`: plan or validate without submission. Speed-test dry-runs do not create managed run history unless `--save-run` is passed.
+- `--save-run`: explicitly add a speed-test dry-run to managed run history.
 
 Model/eval:
 
@@ -47,7 +47,7 @@ Model/eval:
 - `--lm-eval-bin <path>`: lm-eval executable; default `lm_eval`.
 - `--results <path>`: existing lm-eval output JSON for run upload.
 - `--kind <kind>`: storage upload kind, usually `artifact` or `dataset`.
-- `--format <format>`: output/storage format. `benchmark runs show` and `benchmark runs compare` support `table`, `ascii`, or `json`; storage uploads use `json`, `jsonl`, `parquet`, or `zip`.
+- `--format <format>`: output/storage format. `speed-test runs show` and `speed-test runs compare` support `table`, `ascii`, or `json`; storage uploads use `json`, `jsonl`, `parquet`, or `zip`.
 - `--item-count <n>`: optional record/sample count for storage metadata.
 - `--limit <n>`: optional search/list result limit.
 
@@ -130,8 +130,8 @@ Remote benchmark / endpoint:
 
 Local benchmark / server:
 
-- `--command <cmd>`: local benchmark command, e.g. `llama-bench`.
-- `--command-timeout-seconds <n>`: local benchmark command timeout; default unlimited.
+- `--command <cmd>`: local speed-test command, e.g. `llama-bench`.
+- `--command-timeout-seconds <n>`: local speed-test command timeout; default unlimited.
 - `--host <addr>`: local model server host.
 - `--port <n>`: local model server port.
 - `--model-path <path>`: llama.cpp model path.
@@ -149,8 +149,8 @@ Local benchmark / server:
 - `--benchmark-output <p>`: engine benchmark JSON output path.
 - `--benchmark-bin <path>`: benchmark executable; default `vllm` for vLLM.
 - `--python-bin <path>`: Python executable for SGLang commands.
-- `--input-len <n>`: prompt/input tokens for built-in benchmark commands.
-- `--output-len <n>`: generated/output tokens for built-in benchmark commands.
+- `--input-len <n>`: prompt/input tokens for built-in speed-test commands.
+- `--output-len <n>`: generated/output tokens for built-in speed-test commands.
 - `--num-prompts <n>`: number of prompts for vLLM serve/throughput benchmarks.
 
 KV-cache and saved runs:
@@ -161,17 +161,17 @@ KV-cache and saved runs:
 - `--filler-token <text>`: repeated token used for remote context filler.
 - `--kv-cache-dtype <dtype>`: vLLM KV cache dtype for local latency sweeps.
 - `--enable-prefix-caching`: enable vLLM prefix caching.
-- `--runs-dir <dir>`: saved benchmark runs directory; default `runs`.
+- `--runs-dir <dir>`: saved speed-test runs directory; default `runs`.
 - `--group-by <field>`: group saved-run stats by field.
 - `--by <field>`: group saved-run comparisons by field.
 - `--metric <field>`: saved-run metric for stats/compare; default `tokSOut`.
 - `--metrics <fields>`: comma-separated metrics for comparing two run files.
 - `--fields <fields>`: comma-separated saved-run export fields.
 - `--hardware-name <text>`: filter saved runs by hardware label substring.
-- `--set field=value`: edit one field in a saved benchmark run.
-- `--set-json <json>`: merge JSON object into a saved benchmark run.
-- `--patch <path>`: merge JSON object file into a saved benchmark run.
-- `--unset <fields>`: remove fields from a saved benchmark run.
+- `--set field=value`: edit one field in a saved speed-test run.
+- `--set-json <json>`: merge JSON object into a saved speed-test run.
+- `--patch <path>`: merge JSON object file into a saved speed-test run.
+- `--unset <fields>`: remove fields from a saved speed-test run.
 - `--yes`: confirm saved-run deletion.
 
 Hardware and submission metadata:

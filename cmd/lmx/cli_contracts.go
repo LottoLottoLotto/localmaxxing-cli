@@ -262,8 +262,8 @@ func commandSideEffects(name string) []string {
 		return []string{"may persist or remove credentials"}
 	case name == "skill" || strings.HasPrefix(name, "skill "):
 		return []string{"may write skill files"}
-	case name == "benchmark" || strings.HasPrefix(name, "benchmark "):
-		return []string{"may execute workloads, write run files, or submit results; --dry-run does not persist unless --save-run"}
+	case name == "speed-test" || strings.HasPrefix(name, "speed-test "):
+		return []string{"may execute speed tests, write run files, or submit results; --dry-run does not persist unless --save-run"}
 	case name == "eval" || strings.HasPrefix(name, "eval "):
 		return []string{"may execute workloads, write checkpoints, or submit results"}
 	case name == "hardware" || strings.HasPrefix(name, "hardware "):

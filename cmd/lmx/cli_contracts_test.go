@@ -32,6 +32,31 @@ func TestVersionCommandsAreRecognized(t *testing.T) {
 	}
 }
 
+func TestSpeedTestCommandReplacesBenchmarkAliases(t *testing.T) {
+	if !knownTopLevel("speed-test") {
+		t.Fatal("speed-test command is not registered")
+	}
+	for _, old := range []string{"benchmark", "bench"} {
+		if knownTopLevel(old) {
+			t.Fatalf("legacy command %q is still registered", old)
+		}
+	}
+	schema := commandSchema()
+	commands := schema["commands"].([]commandSchemaEntry)
+	found := false
+	for _, command := range commands {
+		if command.Name == "benchmark" || strings.HasPrefix(command.Name, "benchmark ") {
+			t.Fatalf("machine-readable schema still exposes %q", command.Name)
+		}
+		if command.Name == "speed-test" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("machine-readable schema does not expose speed-test")
+	}
+}
+
 func TestContextProjectionListsAndGetsSections(t *testing.T) {
 	value := map[string]any{"hardwareOptions": map[string]any{"gpuNames": []any{"RTX 3090"}}, "requiredFields": map[string]any{}}
 	listed, err := projectContext(value, parseArgs([]string{"context", "list"}))

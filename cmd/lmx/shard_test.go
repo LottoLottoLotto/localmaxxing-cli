@@ -692,7 +692,7 @@ func TestHandleEvalShardArtifactLimitCapsBalancedSample(t *testing.T) {
 
 func TestHandleEvalShardPullsQuantFromEndpoint(t *testing.T) {
 	// With no --quantization, the runner pulls the quant from the endpoint like
-	// `benchmark run`: the llama.cpp /props model_path filename yields Q4_K_M, and
+	// `speed-test run`: the llama.cpp /props model_path filename yields Q4_K_M, and
 	// the .gguf extension yields the container format.
 	rows := []map[string]any{
 		{"question_id": "gsm8k:1", "input": "5 + 5?", "gold": "10"},

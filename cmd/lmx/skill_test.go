@@ -22,7 +22,7 @@ func TestSkillEmbedContainsSkillAndReferences(t *testing.T) {
 	}
 
 	for _, path := range []string{
-		"skill/references/benchmarks.md",
+		"skill/references/speed-tests.md",
 		"skill/references/evals.md",
 		"skill/references/hardware-and-setups.md",
 		"skill/references/reference.md",
@@ -52,13 +52,13 @@ func TestSkillInstallWritesTree(t *testing.T) {
 	}
 
 	installedSkill := filepath.Join(dir, skillName, "SKILL.md")
-	installedRef := filepath.Join(dir, skillName, "references", "benchmarks.md")
+	installedRef := filepath.Join(dir, skillName, "references", "speed-tests.md")
 	data, err := os.ReadFile(installedSkill)
 	if err != nil {
 		t.Fatalf("installed SKILL.md unreadable: %v", err)
 	}
 	if _, err := os.ReadFile(installedRef); err != nil {
-		t.Fatalf("installed benchmarks.md unreadable: %v", err)
+		t.Fatalf("installed speed-tests.md unreadable: %v", err)
 	}
 	embedded, err := skillFS.ReadFile("skill/SKILL.md")
 	if err != nil {

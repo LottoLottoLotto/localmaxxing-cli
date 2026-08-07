@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -389,6 +390,58 @@ func TestMeasureOpenAIEndpointMarksEstimatedPrefillAndStringEngineFlags(t *testi
 	}
 	if metrics["tokSPrefill"] == nil || metrics["ttftMs"] == nil {
 		t.Fatalf("expected tokSPrefill and ttftMs, got %#v", metrics)
+	}
+}
+
+func TestMeasureOpenAIEndpointHonorsConcurrency(t *testing.T) {
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[{"id":"served-model","quantization":"fp16"}]}`)
+		case "/v1/chat/completions":
+			current := active.Add(1)
+			defer active.Add(-1)
+			for {
+				observed := maxActive.Load()
+				if current <= observed || maxActive.CompareAndSwap(observed, current) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			fmt.Fprint(w, `{"choices":[{"message":{"content":"hello world"}}],"usage":{"prompt_tokens":8,"completion_tokens":2}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	metrics, err := measureOpenAIEndpoint(cliArgs{
+		opts: map[string]string{
+			"base-url":     server.URL,
+			"served-model": "served-model",
+			"warmup":       "0",
+			"iterations":   "1",
+			"concurrency":  "3",
+		},
+		flags: map[string]bool{"quiet": true, "no-stream": true},
+	}, "org/model")
+	if err != nil {
+		t.Fatalf("measureOpenAIEndpoint returned error: %v", err)
+	}
+	if maxActive.Load() < 3 {
+		t.Fatalf("maximum active requests = %d, want 3", maxActive.Load())
+	}
+	engineFlags := asObject(metrics["engineFlags"])
+	if engineFlags["concurrency"] != 3 {
+		t.Fatalf("engineFlags.concurrency = %v, want 3", engineFlags["concurrency"])
+	}
+	if metrics["tokSOutSource"] != "concurrent_request_window" {
+		t.Fatalf("tokSOutSource = %v, want concurrent_request_window", metrics["tokSOutSource"])
+	}
+	if len(anySlice(metrics["samples"])) != 3 {
+		t.Fatalf("samples = %#v, want one per concurrent request", metrics["samples"])
 	}
 }
 
@@ -1040,6 +1093,76 @@ func TestBenchmarkDryRunSubmitsBackendConcurrencyFields(t *testing.T) {
 	}
 }
 
+func TestPersistBenchmarkSubmissionStoresServerReceipt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "run.json")
+	linkedPath := filepath.Join(dir, "managed-run.json")
+	payload := map[string]any{
+		"hfId":          "org/model",
+		"agentFeedback": map[string]any{"submissionStatus": "submitting", "savedRunPath": linkedPath},
+	}
+	if err := writeJSON(path, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(linkedPath, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistBenchmarkSubmission(path, map[string]any{
+		"id":        "run_123",
+		"status":    "PENDING",
+		"createdAt": "2026-08-07T12:00:00Z",
+	}); err != nil {
+		t.Fatalf("persistBenchmarkSubmission returned error: %v", err)
+	}
+	value, err := readJSON(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := asObject(value)
+	if run["id"] != "run_123" || run["submissionId"] != "run_123" || run["submissionStatus"] != "pending" {
+		t.Fatalf("persisted receipt = %#v", run)
+	}
+	feedback := asObject(run["agentFeedback"])
+	if feedback["submissionId"] != "run_123" || feedback["submissionStatus"] != "pending" {
+		t.Fatalf("agent feedback = %#v", feedback)
+	}
+	linkedValue, err := readJSON(linkedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked := asObject(linkedValue)
+	if linked["submissionId"] != "run_123" || linked["submissionStatus"] != "pending" {
+		t.Fatalf("linked managed run receipt = %#v", linked)
+	}
+}
+
+func TestSpeedTestDryRunUsesSpeedTestsEndpoint(t *testing.T) {
+	requestPath := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"valid":true,"parsed":{}}`)
+	}))
+	defer server.Close()
+
+	path := filepath.Join(t.TempDir(), "speed-test.json")
+	if err := writeJSON(path, map[string]any{
+		"hfId": "org/model", "engineName": "vllm", "quantization": "fp16", "tokSOut": 100.0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := handleBenchmark("dry-run", path, cliArgs{
+		opts:  map[string]string{"api-url": server.URL, "api-key": "bhk_test"},
+		flags: map[string]bool{"quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("speed-test dry-run returned error: %v", err)
+	}
+	if requestPath != "/api/speed-tests/dry-run" {
+		t.Fatalf("request path = %q, want /api/speed-tests/dry-run", requestPath)
+	}
+}
+
 func TestBenchmarkConcurrencyMetadataParsesEngineAliases(t *testing.T) {
 	metrics := map[string]any{"engineFlags": localBenchmarkEngineFlags("llama.cpp", "llama-server -m model.gguf -np 4 --max-num-seqs 32")}
 	if err := applyBenchmarkConcurrencyMetadata(metrics, cliArgs{}, "local"); err != nil {
@@ -1074,7 +1197,7 @@ func TestBenchmarkFeedbackBlocksSubmitWithoutAuth(t *testing.T) {
 	if feedback["submitCommand"] != nil {
 		t.Fatalf("submitCommand = %v, want omitted while auth is missing", feedback["submitCommand"])
 	}
-	if feedback["validationCommand"] != "lmx benchmark validate-local run.json" {
+	if feedback["validationCommand"] != "lmx speed-test validate-local run.json" {
 		t.Fatalf("validationCommand = %v, want local validation next", feedback["validationCommand"])
 	}
 }
@@ -1382,7 +1505,7 @@ func TestBenchmarkRunEditAppliesAgentPatch(t *testing.T) {
 		t.Fatalf("payload = %#v", payload)
 	}
 	feedback := payload["agentFeedback"].(map[string]any)
-	if feedback["canSubmit"] != true || feedback["submitCommand"] != "lmx benchmark submit "+path {
+	if feedback["canSubmit"] != true || feedback["submitCommand"] != "lmx speed-test submit "+path {
 		t.Fatalf("feedback = %#v", feedback)
 	}
 }
@@ -1988,7 +2111,7 @@ func TestBenchmarkAgentFeedbackDistinguishesPlanFromReadyPayload(t *testing.T) {
 	if ready["status"] != "ready_for_api_validation" {
 		t.Fatalf("ready status = %v, want ready_for_api_validation", ready["status"])
 	}
-	if ready["canApiValidate"] != true || ready["submitCommand"] != "lmx benchmark submit ready.json" {
+	if ready["canApiValidate"] != true || ready["submitCommand"] != "lmx speed-test submit ready.json" {
 		t.Fatalf("ready feedback = %#v", ready)
 	}
 
@@ -1998,7 +2121,7 @@ func TestBenchmarkAgentFeedbackDistinguishesPlanFromReadyPayload(t *testing.T) {
 	if unauthenticated["authRequired"] != true || unauthenticated["blockedByAuth"] != true || unauthenticated["nextCommand"] != "lmx auth --key bhk_..." {
 		t.Fatalf("unauthenticated feedback = %#v", unauthenticated)
 	}
-	if unauthenticated["validationCommand"] != "lmx benchmark validate-local ready.json" {
+	if unauthenticated["validationCommand"] != "lmx speed-test validate-local ready.json" {
 		t.Fatalf("validationCommand = %v", unauthenticated["validationCommand"])
 	}
 
@@ -2575,7 +2698,7 @@ func TestBenchmarkAgentFeedbackSplitsStatus(t *testing.T) {
 	if fb["submissionStatus"] != "needs_remote_hardware" {
 		t.Fatalf("submissionStatus = %v, want needs_remote_hardware", fb["submissionStatus"])
 	}
-	if fb["attachHardwareCommand"] != "lmx benchmark add-hardware out.json --hardware hardware.json" {
+	if fb["attachHardwareCommand"] != "lmx speed-test add-hardware out.json --hardware hardware.json" {
 		t.Fatalf("attachHardwareCommand = %v", fb["attachHardwareCommand"])
 	}
 	if fb["status"] != "needs_remote_hardware" {
