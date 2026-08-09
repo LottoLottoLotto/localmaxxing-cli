@@ -2057,7 +2057,7 @@ func candidateID(candidates []any) string {
 func handleSuite(action, target string, args cliArgs) error {
 	switch action {
 	case "list":
-		value, err := fetchJSON("GET", apiURL(args)+"/api/evals/suites", "", nil)
+		value, err := fetchJSON("GET", apiURL(args)+"/api/benchmarks/suites", "", nil)
 		if err != nil {
 			return err
 		}
@@ -2066,7 +2066,7 @@ func handleSuite(action, target string, args cliArgs) error {
 		if target == "" {
 			return errors.New("eval suite show requires a suite slug")
 		}
-		value, err := fetchJSON("GET", apiURL(args)+"/api/evals/suites/"+url.PathEscape(target), "", nil)
+		value, err := fetchJSON("GET", apiURL(args)+"/api/benchmarks/suites/"+url.PathEscape(target), "", nil)
 		if err != nil {
 			return err
 		}
@@ -2103,7 +2103,7 @@ func handleSuite(action, target string, args cliArgs) error {
 		if err := validateSuite(payload); err != nil {
 			return err
 		}
-		value, err := fetchJSON("POST", apiURL(args)+"/api/evals/suites", key, payload)
+		value, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/suites", key, payload)
 		if err != nil {
 			return err
 		}
@@ -2122,7 +2122,7 @@ func handleSuiteSearch(target string, args cliArgs) error {
 	if query == "" {
 		return cliError{"missing_query", "eval suite search requires a query", []string{"Run lmx eval suite search reasoning."}, nil}
 	}
-	raw, err := fetchJSON("GET", apiURL(args)+"/api/evals/suites", "", nil)
+	raw, err := fetchJSON("GET", apiURL(args)+"/api/benchmarks/suites", "", nil)
 	if err != nil {
 		return err
 	}
@@ -2365,14 +2365,14 @@ func handleStorage(action, target string, args cliArgs, forcedKind string) error
 				metadata["itemCount"] = n
 			}
 		}
-		upload, err := fetchJSON("POST", apiURL(args)+"/api/evals/storage/upload-url", key, metadata)
+		upload, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/storage/upload-url", key, metadata)
 		if err != nil {
 			return err
 		}
 		uploadObj := asObject(upload)
 		uploadURL := firstString(uploadObj, "uploadUrl", "url")
 		if uploadURL == "" {
-			return cliError{"storage_upload_url_missing", "Storage upload-url response did not include uploadUrl", []string{"Check that the LocalMaxxing API supports /api/evals/storage/upload-url."}, upload}
+			return cliError{"storage_upload_url_missing", "Storage upload-url response did not include uploadUrl", []string{"Check that the LocalMaxxing API supports /api/benchmarks/storage/upload-url."}, upload}
 		}
 		putReq, _ := http.NewRequest("PUT", uploadURL, bytes.NewReader(data))
 		hasContentType := false
@@ -2398,7 +2398,7 @@ func handleStorage(action, target string, args cliArgs, forcedKind string) error
 		if storageRef == "" {
 			return cliError{"storage_ref_missing", "Storage upload-url response did not include storageRef or key", nil, upload}
 		}
-		completed, err := fetchJSON("POST", apiURL(args)+"/api/evals/storage/complete", key, map[string]any{"storageRef": storageRef})
+		completed, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/storage/complete", key, map[string]any{"storageRef": storageRef})
 		if err != nil {
 			return err
 		}
@@ -2411,7 +2411,7 @@ func handleStorage(action, target string, args cliArgs, forcedKind string) error
 		if out == "" {
 			return cliError{"missing_option", "--out is required for storage download", []string{"Pass --out <path> to write the downloaded object."}, nil}
 		}
-		signed, err := fetchJSON("GET", apiURL(args)+"/api/evals/storage/download-url?key="+url.QueryEscape(target), apiKey(args), nil)
+		signed, err := fetchJSON("GET", apiURL(args)+"/api/benchmarks/storage/download-url?key="+url.QueryEscape(target), apiKey(args), nil)
 		if err != nil {
 			return err
 		}
@@ -7550,12 +7550,12 @@ func handleExecute(suiteSlug string, args cliArgs) error {
 		}
 		payload["hardware"] = hardware
 	}
-	value, err := fetchJSON("POST", apiURL(args)+"/api/evals/execute", key, payload)
+	value, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/execute", key, payload)
 	if err != nil {
 		return err
 	}
 	printJSON(args, value)
-	printInfo(args, "execute_submitted", map[string]any{"suite": suiteSlug, "endpoint": "/api/evals/execute", "autoSubmit": payload["autoSubmit"]})
+	printInfo(args, "execute_submitted", map[string]any{"suite": suiteSlug, "endpoint": "/api/benchmarks/execute", "autoSubmit": payload["autoSubmit"]})
 	return nil
 }
 
@@ -7665,9 +7665,9 @@ func handleEvalRun(suiteSlug string, args cliArgs) error {
 		if opt(args, "model") == "" {
 			return cliError{"missing_model", "--model is required for submit/dry-run", []string{"Pass --model <HuggingFace model id>."}, nil}
 		}
-		endpoint := "/api/evals/runs"
+		endpoint := "/api/benchmarks/runs"
 		if hasFlag(args, "dry-run") {
-			endpoint = "/api/evals/runs/dry-run"
+			endpoint = "/api/benchmarks/runs/dry-run"
 		}
 		return submitPayload(endpoint, hasFlag(args, "dry-run"), "run", args, payload, "")
 	}
@@ -7813,9 +7813,9 @@ func handleEvalSubmit(runFile string, args cliArgs) error {
 	if payload["hardware"] == nil {
 		return cliError{"missing_hardware", "Run payload has no hardware; pass --hardware hardware.json", []string{"Create a hardware JSON file matching /api/agent-context hardwareSchemas and pass --hardware."}, nil}
 	}
-	endpoint := "/api/evals/runs"
+	endpoint := "/api/benchmarks/runs"
 	if hasFlag(args, "dry-run") {
-		endpoint = "/api/evals/runs/dry-run"
+		endpoint = "/api/benchmarks/runs/dry-run"
 	}
 	return submitPayload(endpoint, hasFlag(args, "dry-run"), "run", args, payload, "")
 }
@@ -8050,7 +8050,7 @@ func fetchEvalShardCoverage(dataset, hfID, quantization, quantFormat string, arg
 	if quantFormat != "" {
 		query.Set("quantFormat", quantFormat)
 	}
-	value, err := fetchJSON("GET", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/coverage?"+query.Encode(), apiKey(args), nil)
+	value, err := fetchJSON("GET", apiURL(args)+"/api/benchmarks/"+url.PathEscape(dataset)+"/coverage?"+query.Encode(), apiKey(args), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -8122,7 +8122,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	metaURL := apiURL(args) + "/api/evals/" + url.PathEscape(dataset) + "/shard"
+	metaURL := apiURL(args) + "/api/benchmarks/" + url.PathEscape(dataset) + "/shard"
 	query := url.Values{}
 	if shard := opt(args, "shard"); shard != "" {
 		query.Set("shard", shard)
@@ -8497,7 +8497,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	if notes := opt(args, "notes"); notes != "" {
 		payload["notes"] = notes
 	}
-	value, err := fetchJSON("POST", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/submit", key, payload)
+	value, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/"+url.PathEscape(dataset)+"/submit", key, payload)
 	if err != nil {
 		return err
 	}
@@ -9687,7 +9687,7 @@ func loadSuiteForEvalRun(suiteSlug string, args cliArgs) (map[string]any, error)
 	}
 	key := apiKey(args)
 	if key != "" {
-		bundle, err := fetchJSON("GET", apiURL(args)+"/api/evals/suites/"+url.PathEscape(suiteSlug)+"/run-bundle", key, nil)
+		bundle, err := fetchJSON("GET", apiURL(args)+"/api/benchmarks/suites/"+url.PathEscape(suiteSlug)+"/run-bundle", key, nil)
 		if err == nil {
 			return suiteFromRunBundle(bundle, suiteSlug)
 		}
@@ -9696,7 +9696,7 @@ func loadSuiteForEvalRun(suiteSlug string, args cliArgs) (map[string]any, error)
 		}
 		printStatus(args, "run_bundle_unavailable", map[string]any{"suite": suiteSlug, "reason": err.Error()})
 	}
-	value, err := fetchJSON("GET", apiURL(args)+"/api/evals/suites/"+url.PathEscape(suiteSlug), key, nil)
+	value, err := fetchJSON("GET", apiURL(args)+"/api/benchmarks/suites/"+url.PathEscape(suiteSlug), key, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -1088,7 +1088,7 @@ func TestRunTerminalEvalRejectsIncompleteShardBeforeSubmit(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "served-model"}}})
 		case "/v1/chat/completions":
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "TASK_COMPLETE"}}}})
-		case "/api/evals/terminal-fixture/submit":
+		case "/api/benchmarks/terminal-fixture/submit":
 			submitCalls.Add(1)
 			t.Fatal("incomplete shard reached submission endpoint")
 		default:
@@ -1133,7 +1133,7 @@ func TestRunTerminalEvalSelectsFirstModelCoverageMissingShard(t *testing.T) {
 	var requestedShards []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/evals/terminal-fixture/coverage":
+		case "/api/benchmarks/terminal-fixture/coverage":
 			coverageCalls.Add(1)
 			query := r.URL.Query()
 			if query.Get("hfId") != "fixture/model" || query.Get("quantization") != "Q4_K_M" || query.Get("quantFormat") != "gguf" {
@@ -1146,7 +1146,7 @@ func TestRunTerminalEvalSelectsFirstModelCoverageMissingShard(t *testing.T) {
 				"dataset":  map[string]any{"slug": "terminal-fixture", "shardCount": 3},
 				"coverage": map[string]any{"shardsCovered": []any{1, 3}},
 			})
-		case "/api/evals/terminal-fixture/shard":
+		case "/api/benchmarks/terminal-fixture/shard":
 			requestedShards = append(requestedShards, r.URL.Query().Get("shard"))
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"shard":       map[string]any{"shardIndex": numberFromString(r.URL.Query().Get("shard")), "itemCount": 1},
@@ -1154,7 +1154,7 @@ func TestRunTerminalEvalSelectsFirstModelCoverageMissingShard(t *testing.T) {
 			})
 		case "/manifest":
 			_ = json.NewEncoder(w).Encode(map[string]any{"question_id": "coverage-task", "bundle_key": "fixtures/coverage-task.tar.gz"})
-		case "/api/evals/storage/download-url":
+		case "/api/benchmarks/storage/download-url":
 			_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": terminalFixtureServerURL(r) + "/bundle"})
 		case "/bundle":
 			_, _ = w.Write(archive)
@@ -1206,11 +1206,11 @@ func TestRunTerminalEvalOutIncludesSubmissionReceiptAndEffectiveLimits(t *testin
 	var submitted map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/evals/terminal-fixture/shard":
+		case "/api/benchmarks/terminal-fixture/shard":
 			_ = json.NewEncoder(w).Encode(map[string]any{"shard": map[string]any{"shardIndex": 2, "itemCount": 1}, "downloadUrl": terminalFixtureServerURL(r) + "/manifest"})
 		case "/manifest":
 			_ = json.NewEncoder(w).Encode(map[string]any{"question_id": "receipt-task", "bundle_key": "fixtures/receipt-task.tar.gz"})
-		case "/api/evals/storage/download-url":
+		case "/api/benchmarks/storage/download-url":
 			_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": terminalFixtureServerURL(r) + "/bundle"})
 		case "/bundle":
 			_, _ = w.Write(archive)
@@ -1218,7 +1218,7 @@ func TestRunTerminalEvalOutIncludesSubmissionReceiptAndEffectiveLimits(t *testin
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "served-model"}}})
 		case "/v1/chat/completions":
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "TASK_COMPLETE"}}}})
-		case "/api/evals/terminal-fixture/submit":
+		case "/api/benchmarks/terminal-fixture/submit":
 			if err := json.NewDecoder(r.Body).Decode(&submitted); err != nil {
 				t.Errorf("decode terminal submission: %v", err)
 				return
@@ -1840,7 +1840,7 @@ func TestTerminalManifestAndBundleDownloadsCancelBlockedRequests(t *testing.T) {
 				switch {
 				case strings.HasSuffix(r.URL.Path, "/shard"):
 					_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": serverURL + test.blockedURL})
-				case r.URL.Path == "/api/evals/storage/download-url":
+				case r.URL.Path == "/api/benchmarks/storage/download-url":
 					_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": serverURL + test.blockedURL})
 				case r.URL.Path == test.blockedURL:
 					select {

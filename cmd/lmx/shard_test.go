@@ -303,7 +303,7 @@ func shardTestServer(t *testing.T, rows []map[string]any, reply string, posted *
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/api/evals/gsm8k/shard":
+		case r.URL.Path == "/api/benchmarks/gsm8k/shard":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"shard":       map[string]any{"shardIndex": 1, "itemCount": len(rows), "selectedQuestionCount": len(rows)},
 				"sampling":    map[string]any{"recommendations": map[string]any{"margin05": len(rows)}},
@@ -317,12 +317,12 @@ func shardTestServer(t *testing.T, rows []map[string]any, reply string, posted *
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []any{map[string]any{"message": map[string]any{"content": reply}}},
 			})
-		case r.URL.Path == "/api/evals/gsm8k/coverage":
+		case r.URL.Path == "/api/benchmarks/gsm8k/coverage":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"dataset":  map[string]any{"slug": "gsm8k", "shardCount": 3},
 				"coverage": map[string]any{"uniqueQuestionCount": 0, "questionsNeeded": len(rows), "shardsCovered": []any{}},
 			})
-		case r.URL.Path == "/api/evals/gsm8k/submit":
+		case r.URL.Path == "/api/benchmarks/gsm8k/submit":
 			m := map[string]any{}
 			_ = json.NewDecoder(r.Body).Decode(&m)
 			*posted = m
@@ -446,7 +446,7 @@ func TestHandleEvalShardRejectsCoveredShardWithoutRerun(t *testing.T) {
 	var posted map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/evals/gsm8k/shard":
+		case "/api/benchmarks/gsm8k/shard":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"shard":       map[string]any{"shardIndex": 1, "itemCount": len(rows)},
 				"sampling":    map[string]any{"recommendations": map[string]any{"margin05": len(rows)}},
@@ -454,14 +454,14 @@ func TestHandleEvalShardRejectsCoveredShardWithoutRerun(t *testing.T) {
 			})
 		case "/blob":
 			_, _ = w.Write([]byte(blob.String()))
-		case "/api/evals/gsm8k/coverage":
+		case "/api/benchmarks/gsm8k/coverage":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"dataset":  map[string]any{"slug": "gsm8k", "shardCount": 1},
 				"coverage": map[string]any{"uniqueQuestionCount": 1, "questionsNeeded": 0, "shardsCovered": []any{1}},
 			})
 		case "/v1/chat/completions":
 			t.Fatal("duplicate guard should run before model calls")
-		case "/api/evals/gsm8k/submit":
+		case "/api/benchmarks/gsm8k/submit":
 			_ = json.NewDecoder(r.Body).Decode(&posted)
 		default:
 			http.NotFound(w, r)
@@ -489,7 +489,7 @@ func TestHandleEvalShardMissingOnlySelectsUncoveredShard(t *testing.T) {
 	var shardRequests []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/evals/gsm8k/shard":
+		case "/api/benchmarks/gsm8k/shard":
 			shard := r.URL.Query().Get("shard")
 			shardRequests = append(shardRequests, shard)
 			if shard == "" {
@@ -506,14 +506,14 @@ func TestHandleEvalShardMissingOnlySelectsUncoveredShard(t *testing.T) {
 			})
 		case "/blob":
 			_, _ = w.Write([]byte(blob.String()))
-		case "/api/evals/gsm8k/coverage":
+		case "/api/benchmarks/gsm8k/coverage":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"dataset":  map[string]any{"slug": "gsm8k", "shardCount": 2},
 				"coverage": map[string]any{"uniqueQuestionCount": 1, "questionsNeeded": 1, "shardsCovered": []any{1}},
 			})
 		case "/v1/chat/completions":
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "The final answer is 10."}}}})
-		case "/api/evals/gsm8k/submit":
+		case "/api/benchmarks/gsm8k/submit":
 			_ = json.NewDecoder(r.Body).Decode(&posted)
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"run": map[string]any{"id": "run_2", "status": "APPROVED"}, "aggregate": map[string]any{"shardsCovered": []any{1, 2}}})
@@ -534,7 +534,7 @@ func TestHandleEvalShardMissingOnlySelectsUncoveredShard(t *testing.T) {
 
 func TestHandleEvalShardStatusReadsCoverage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/evals/gsm8k/coverage" {
+		if r.URL.Path != "/api/benchmarks/gsm8k/coverage" {
 			http.NotFound(w, r)
 			return
 		}
@@ -567,7 +567,7 @@ func TestHandleEvalShardDryRunReportsPreservedExplicitIdentity(t *testing.T) {
 	const candidate = "Jiunsong/supergemma4-26b-uncensored-gguf-v2"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/evals/gsm8k/shard":
+		case "/api/benchmarks/gsm8k/shard":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"shard":       map[string]any{"shardIndex": 1, "itemCount": 1},
 				"sampling":    map[string]any{"recommendations": map[string]any{"margin05": 1}},
@@ -707,7 +707,7 @@ func TestHandleEvalShardPullsQuantFromEndpoint(t *testing.T) {
 	var posted map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/evals/gsm8k/shard":
+		case "/api/benchmarks/gsm8k/shard":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"shard":       map[string]any{"shardIndex": 1, "itemCount": len(rows)},
 				"sampling":    map[string]any{"recommendations": map[string]any{"margin05": len(rows)}},
@@ -719,12 +719,12 @@ func TestHandleEvalShardPullsQuantFromEndpoint(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"model_path": "/models/gemma-4-12b-it-Q4_K_M.gguf"})
 		case "/v1/chat/completions":
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "The final answer is 10."}}}})
-		case "/api/evals/gsm8k/coverage":
+		case "/api/benchmarks/gsm8k/coverage":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"dataset":  map[string]any{"slug": "gsm8k", "shardCount": 3},
 				"coverage": map[string]any{"uniqueQuestionCount": 0, "questionsNeeded": len(rows), "shardsCovered": []any{}},
 			})
-		case "/api/evals/gsm8k/submit":
+		case "/api/benchmarks/gsm8k/submit":
 			m := map[string]any{}
 			_ = json.NewDecoder(r.Body).Decode(&m)
 			posted = m

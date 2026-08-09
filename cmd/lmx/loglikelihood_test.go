@@ -201,7 +201,7 @@ func TestHandleEvalPullWritesOfflineCopyWithGold(t *testing.T) {
 func TestHandleEvalSubmitPostsSavedRun(t *testing.T) {
 	var posted map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/evals/runs/dry-run" {
+		if r.URL.Path != "/api/benchmarks/runs/dry-run" {
 			http.NotFound(w, r)
 			return
 		}
@@ -335,7 +335,7 @@ func TestHandleEvalRunSubmitsScoresAndArtifactsForExtractedMath(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []any{map[string]any{"message": map[string]any{"content": "We compute 48 + 24 = 72, so the final answer is 72."}}},
 			})
-		case "/api/evals/runs/dry-run":
+		case "/api/benchmarks/runs/dry-run":
 			_ = json.NewDecoder(r.Body).Decode(&posted)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "status": "valid"})
 		default:
@@ -429,7 +429,7 @@ func TestEvalSubmitResolvesServedModelAliasToHFID(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"models": []any{map[string]any{"hfId": "google/gemma-3-12b-it"}},
 			})
-		case "/api/evals/runs/dry-run":
+		case "/api/benchmarks/runs/dry-run":
 			_ = json.NewDecoder(r.Body).Decode(&posted)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "status": "valid"})
 		default:

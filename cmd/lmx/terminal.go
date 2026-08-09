@@ -856,7 +856,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if notes := opt(args, "notes"); notes != "" {
 		payload["notes"] = notes
 	}
-	value, err := fetchJSONContext(ctx, "POST", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/submit", apiKey(args), payload)
+	value, err := fetchJSONContext(ctx, "POST", apiURL(args)+"/api/benchmarks/"+url.PathEscape(dataset)+"/submit", apiKey(args), payload)
 	if err != nil {
 		if ctx.Err() != nil {
 			return terminalCancelledError(ctx)
@@ -1697,7 +1697,7 @@ func submitTerminalEval(args cliArgs) error {
 	receipts := make([]any, 0, len(payloads))
 	for i, rawPayload := range payloads {
 		currentShard := shardIndexes[i]
-		value, err := fetchJSON("POST", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/submit", key, rawPayload)
+		value, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/"+url.PathEscape(dataset)+"/submit", key, rawPayload)
 		if err != nil {
 			return cliError{"terminal_submit_shard_failed", fmt.Sprintf("Terminal submission stopped after shard %d failed.", currentShard), []string{"Fix the server error, then submit the remaining already-isolated shard checkpoints explicitly with --shard-index."}, map[string]any{"failedShardIndex": currentShard, "completedShardIndexes": completed, "error": err.Error()}}
 		}
@@ -2431,7 +2431,7 @@ func fetchTerminalManifestItems(ctx context.Context, args cliArgs, dataset strin
 	if q := opt(args, "questions"); q != "" {
 		params.Set("questions", q)
 	}
-	metaURL := apiURL(args) + "/api/evals/" + url.PathEscape(dataset) + "/shard"
+	metaURL := apiURL(args) + "/api/benchmarks/" + url.PathEscape(dataset) + "/shard"
 	if enc := params.Encode(); enc != "" {
 		metaURL += "?" + enc
 	}
@@ -2577,7 +2577,7 @@ func selectMissingTerminalShard(ctx context.Context, args cliArgs, dataset, hfID
 	if quantFormat != "" {
 		query.Set("quantFormat", quantFormat)
 	}
-	value, err := fetchJSONContext(ctx, "GET", apiURL(args)+"/api/evals/"+url.PathEscape(dataset)+"/coverage?"+query.Encode(), apiKey(args), nil)
+	value, err := fetchJSONContext(ctx, "GET", apiURL(args)+"/api/benchmarks/"+url.PathEscape(dataset)+"/coverage?"+query.Encode(), apiKey(args), nil)
 	if err != nil {
 		if ctx.Err() != nil {
 			return args, nil, terminalCancelledError(ctx)
@@ -2598,7 +2598,7 @@ func selectMissingTerminalShard(ctx context.Context, args cliArgs, dataset, hfID
 }
 
 func downloadTerminalBundle(ctx context.Context, args cliArgs, tmp, id, key, wantHash string) (string, error) {
-	value, err := fetchJSONContext(ctx, "GET", apiURL(args)+"/api/evals/storage/download-url?key="+url.QueryEscape(key), apiKey(args), nil)
+	value, err := fetchJSONContext(ctx, "GET", apiURL(args)+"/api/benchmarks/storage/download-url?key="+url.QueryEscape(key), apiKey(args), nil)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", terminalCancelledError(ctx)
