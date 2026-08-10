@@ -114,21 +114,21 @@ Eval-derived training:
 - `--python-bin <path>`: Python executable for RL run; default `python3`.
 - RL prerequisites: install hardware-appropriate PyTorch first, then `python -m pip install 'trl==1.8.0' 'transformers>=5.2.0,<6'`. The environment plugin is trusted code and must sandbox policy tools/verifier execution. `--allow-benchmark-training` acknowledges contamination; report on a separate unseen holdout.
 
-Remote benchmark / endpoint:
+Remote speed test / endpoint:
 
 - `--base-url <url>`: OpenAI-compatible endpoint; accepts host or host plus `/v1`.
 - `--mode <mode>`: `remote` endpoint or `local` host command.
 - `--served-model <name>`: model name served by endpoint.
-- `--model-api-key <key>`: optional bearer token for remote endpoint benchmarking.
-- `--prompt <text>`: prompt for remote endpoint benchmark.
-- `--max-tokens <n>`: max generated tokens; remote benchmark default 256.
+- `--model-api-key <key>`: optional bearer token for a remote speed-test endpoint.
+- `--prompt <text>`: prompt for the remote endpoint speed test.
+- `--max-tokens <n>`: max generated tokens; remote speed-test default 256.
 - `--endpoint-timeout-seconds <n>`: remote endpoint timeout; default 600.
 - `--warmup <n>`: untimed warmup requests; default 1.
 - `--iterations <n>`: timed remote iterations; median is reported; default 3.
-- `--no-stream`: disable streaming for remote endpoint benchmark.
+- `--no-stream`: disable streaming for the remote endpoint speed test.
 - `--include-server-metadata`: probe optional endpoint `/props` and `/hardware` during discover.
 
-Local benchmark / server:
+Local speed test / server:
 
 - `--command <cmd>`: local speed-test command, e.g. `llama-bench`.
 - `--command-timeout-seconds <n>`: local speed-test command timeout; default unlimited.
@@ -177,7 +177,7 @@ KV-cache and saved runs:
 Hardware and submission metadata:
 
 - `--hardware <path>`: JSON hardware object required when submitting.
-- `--quantization <label>`: quantization label; free-form but common values are exposed by `lmx context` (`commonSchemas.benchmarkFields.quantization.commonValues`) and include GGUF (`Q4_K_M`, `IQ4_XS`), NVIDIA (`NVFP4`), Unsloth (`Unsloth-Dynamic-Q4_K_M`), bitsandbytes (`bnb-nf4`), AWQ/GPTQ/EXL2/FP8 variants. Auto-detected for some remote benchmark/eval-shard paths when omitted.
+- `--quantization <label>`: quantization label; free-form but common values are exposed by `lmx context` (`commonSchemas.benchmarkFields.quantization.commonValues`) and include GGUF (`Q4_K_M`, `IQ4_XS`), NVIDIA (`NVFP4`), Unsloth (`Unsloth-Dynamic-Q4_K_M`), bitsandbytes (`bnb-nf4`), AWQ/GPTQ/EXL2/FP8 variants. Auto-detected for some remote speed-test and eval-shard paths when omitted.
 - `--gpu-name <name>`: hardware template GPU name.
 - `--gpu-count <n>`: hardware template GPU count.
 - `--vram-gb <gb>`: hardware template VRAM in GB.
@@ -185,8 +185,8 @@ Hardware and submission metadata:
 - `--ram-gb <gb>`: hardware template system RAM in GB.
 - `--os <name>`: hardware template OS name; default runtime OS.
 - `--power-watts <n>`: hardware template power draw in watts.
-- `--gpu-power-watts <list>`: benchmark submission per-GPU measured watts, e.g. `285.5,310.2`.
-- `--hardware-cost <entries|json>`: benchmark submission purchase records. Component names must come from `lmx context` → `hardwareOptions.hardwareCostComponentNames`. Compact entries use `component|condition|year|price|currency` separated by semicolons; JSON uses an array of objects with `component`, `condition`, optional `yearPurchased`, `price`, and `currency`.
+- `--gpu-power-watts <list>`: speed-test submission per-GPU measured watts, e.g. `285.5,310.2`.
+- `--hardware-cost <entries|json>`: speed-test submission purchase records. Component names must come from `lmx context` → `hardwareOptions.hardwareCostComponentNames`. Compact entries use `component|condition|year|price|currency` separated by semicolons; JSON uses an array of objects with `component`, `condition`, optional `yearPurchased`, `price`, and `currency`.
 - `--hw-class <class>`: hardware template class, e.g. `DISCRETE_GPU` or `CPU_ONLY`.
 - `--name <name>`: saved setup name to pull, case-insensitive.
 - `--id <id>`: saved setup id to pull.

@@ -1233,7 +1233,7 @@ func handleHardware(action string, args cliArgs) error {
 		fields := map[string]any{"path": out, "hwClass": hardware["hwClass"], "gpuName": hardware["gpuName"], "vramGb": hardware["vramGb"]}
 		if gpuCount := numberField(hardware, "gpuCount"); gpuCount > 1 {
 			fields["gpuCount"] = gpuCount
-			fields["note"] = "Multiple GPUs detected; verify the benchmark runtime used the intended GPU count before submitting."
+			fields["note"] = "Multiple GPUs detected; verify the speed-test runtime used the intended GPU count before submitting."
 		}
 		printInfo(args, "hardware_written", fields)
 		if humanOutput(args) {
@@ -1347,7 +1347,7 @@ func handleSetups(action string, args cliArgs) error {
 	switch action {
 	case "list":
 		if len(setups) == 0 {
-			printInfo(args, "no_setups", map[string]any{"next": "Save a setup from a benchmark submission or the dashboard."})
+			printInfo(args, "no_setups", map[string]any{"next": "Save a setup from a speed-test submission or the dashboard."})
 			return nil
 		}
 		if hasFlag(args, "json") {
@@ -1404,7 +1404,7 @@ func setupNames(setups []map[string]any) []string {
 
 func selectSetup(setups []map[string]any, args cliArgs) (map[string]any, error) {
 	if len(setups) == 0 {
-		return nil, cliError{"setup_not_found", "No saved setups found for this API key.", []string{"Save a setup from a benchmark submission or the dashboard."}, nil}
+		return nil, cliError{"setup_not_found", "No saved setups found for this API key.", []string{"Save a setup from a speed-test submission or the dashboard."}, nil}
 	}
 	if id := opt(args, "id"); id != "" {
 		for _, setup := range setups {
@@ -1692,7 +1692,7 @@ func detectLlamaCPP(args cliArgs) detectedEngine {
 		engine.ServerCommand = localServerCommand("llama.cpp", args)
 		engine.BenchmarkCommand = localBenchmarkCommand("llama.cpp", args)
 		if _, ok := binaries["llama-bench"]; !ok {
-			engine.Notes = append(engine.Notes, "llama-bench was not found; benchmark run needs --command or explicit metrics.")
+			engine.Notes = append(engine.Notes, "llama-bench was not found; speed-test run needs --command or explicit metrics.")
 		}
 	}
 	return engine
@@ -2818,7 +2818,7 @@ func benchmarkRunRecordFromPath(path string) (benchmarkRunRecord, error) {
 	}
 	payload := benchmarkPayloadObject(value)
 	if payload == nil {
-		return benchmarkRunRecord{}, cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+		return benchmarkRunRecord{}, cliError{"invalid_benchmark_run", "Saved speed-test run must be a JSON object or { payload: object }.", nil, value}
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -3734,7 +3734,7 @@ func editBenchmarkRun(path string, args cliArgs) error {
 	}
 	payload := benchmarkPayloadObject(value)
 	if payload == nil {
-		return cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+		return cliError{"invalid_benchmark_run", "Saved speed-test run must be a JSON object or { payload: object }.", nil, value}
 	}
 	changed := false
 	if patchPath := opt(args, "patch"); patchPath != "" {
@@ -3803,7 +3803,7 @@ func addHardwareToRun(target string, args cliArgs) error {
 	}
 	payload := benchmarkPayloadObject(value)
 	if payload == nil {
-		return cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+		return cliError{"invalid_benchmark_run", "Saved speed-test run must be a JSON object or { payload: object }.", nil, value}
 	}
 	hardwarePath := opt(args, "hardware")
 	if hardwarePath == "" {
@@ -3861,7 +3861,7 @@ func fixupBenchmarkRun(target string, args cliArgs) error {
 	}
 	payload := benchmarkPayloadObject(value)
 	if payload == nil {
-		return cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+		return cliError{"invalid_benchmark_run", "Saved speed-test run must be a JSON object or { payload: object }.", nil, value}
 	}
 	return writeOrPrintJSON("speed_test_fixup", args, benchmarkFixupReport(payload, path, args))
 }
@@ -3891,7 +3891,7 @@ func rerunBenchmarkRun(path string, args cliArgs) error {
 	}
 	payload := benchmarkPayloadObject(value)
 	if payload == nil {
-		return cliError{"invalid_benchmark_run", "Saved benchmark run must be a JSON object or { payload: object }.", nil, value}
+		return cliError{"invalid_benchmark_run", "Saved speed-test run must be a JSON object or { payload: object }.", nil, value}
 	}
 	runArgs := benchmarkArgsFromPayload(payload, args)
 	return handleBenchmark("run", stringValue(payload["engineName"]), runArgs)
@@ -4712,7 +4712,7 @@ func kvCachePromptForRemote(args cliArgs, hfID, revision string, targetTokens in
 func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, error) {
 	model := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
 	if model == "" {
-		return nil, cliError{"missing_model", "benchmark run requires --hf-id or --model", []string{"Pass --hf-id <HuggingFace model id>."}, nil}
+		return nil, cliError{"missing_model", "speed-test run requires --hf-id or --model", []string{"Pass --hf-id <HuggingFace model id>."}, nil}
 	}
 	engineName, err := resolveEngineName(engine, args, true)
 	if err != nil {
@@ -4731,10 +4731,10 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	mode := benchmarkMode(args)
 	printStatus(args, "speed_test_mode_selected", map[string]any{"mode": mode, "engine": engineName, "model": model})
 	if mode == "remote" && opt(args, "command") != "" {
-		return nil, cliError{"invalid_benchmark_mode", "Remote benchmark mode cannot run local commands.", []string{"Use --mode local when running llama-bench on the host server.", "Use --mode remote --base-url <url> for OpenAI-compatible endpoint TPS measurement."}, nil}
+		return nil, cliError{"invalid_benchmark_mode", "Remote speed-test mode cannot run local commands.", []string{"Use --mode local when running llama-bench on the host server.", "Use --mode remote --base-url <url> for OpenAI-compatible endpoint TPS measurement."}, nil}
 	}
 	if mode == "local" && opt(args, "base-url") != "" && opt(args, "command") == "" && opt(args, "results") == "" && localBenchmarkCommand(engineName, args) == "" {
-		return nil, cliError{"invalid_benchmark_mode", "Local benchmark mode needs --command, --results, or explicit metric flags.", []string{"Use --mode remote with --base-url when benchmarking an endpoint from another machine.", "Use --mode local --command \"llama-bench ...\" when running on the host server."}, nil}
+		return nil, cliError{"invalid_benchmark_mode", "Local speed-test mode needs --command, --results, or explicit metric flags.", []string{"Use --mode remote with --base-url when measuring an endpoint from another machine.", "Use --mode local --command \"llama-bench ...\" when running on the host server."}, nil}
 	}
 	var outputLayers []string
 	if hasFlag(args, "dry-run") {
@@ -4865,7 +4865,7 @@ func validateBenchmarkSubmitPayload(payload map[string]any) error {
 		return cliError{"invalid_benchmark_payload", "Benchmark payload must be a JSON object.", nil, nil}
 	}
 	if stringValue(payload["benchmarkMode"]) == "remote" && asObject(payload["hardware"]) == nil {
-		return cliError{"missing_remote_hardware", "Remote benchmark submission requires explicit server hardware metadata.", []string{"Run lmx hardware --out hardware.json on the machine running the endpoint, or create an equivalent hardware JSON for that server.", "Rerun the remote benchmark with --hardware hardware.json before dry-run or submit.", "Do not rely on client auto-detected hardware for endpoint benchmarks."}, nil}
+		return cliError{"missing_remote_hardware", "Remote speed-test submission requires explicit server hardware metadata.", []string{"Run lmx hardware --out hardware.json on the machine running the endpoint, or create an equivalent hardware JSON for that server.", "Rerun the remote speed test with --hardware hardware.json before dry-run or submit.", "Do not rely on client auto-detected hardware for endpoint speed tests."}, nil}
 	}
 	return nil
 }
@@ -5438,7 +5438,7 @@ func applyBenchmarkConcurrencyMetadata(metrics map[string]any, args cliArgs, mod
 			return err
 		}
 		if present && numberField(flags, "concurrency") != float64(requested) {
-			return cliError{"unsupported_concurrency", "This remote engine did not execute the requested concurrency.", []string{"Use vLLM, SGLang, or another OpenAI-compatible endpoint for concurrent remote benchmarking.", "Do not submit single-stream measurements as concurrent throughput."}, nil}
+			return cliError{"unsupported_concurrency", "This remote engine did not execute the requested concurrency.", []string{"Use vLLM, SGLang, or another OpenAI-compatible endpoint for concurrent remote speed tests.", "Do not submit single-stream measurements as concurrent throughput."}, nil}
 		}
 		return nil
 	}
@@ -5853,7 +5853,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	} else if _, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), servedModel); err == nil {
 		servedModelInfo = info
 	}
-	prompt := firstNonEmpty(opt(args, "prompt"), "Explain why local inference benchmarks should report prompt prefill throughput, decode throughput, and time to first token.")
+	prompt := firstNonEmpty(opt(args, "prompt"), "Explain why local inference speed tests should report prompt prefill throughput, decode throughput, and time to first token.")
 	maxTokens := 256
 	if value := opt(args, "max-tokens"); value != "" {
 		parsed, err := strconv.Atoi(value)
@@ -6042,7 +6042,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	baseURL := ollamaBaseURL(args)
 	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), hfID)
-	prompt := firstNonEmpty(opt(args, "prompt"), "Explain why local inference benchmarks should report prompt prefill throughput, decode throughput, and time to first token.")
+	prompt := firstNonEmpty(opt(args, "prompt"), "Explain why local inference speed tests should report prompt prefill throughput, decode throughput, and time to first token.")
 	maxTokens := 256
 	if value := opt(args, "max-tokens"); value != "" {
 		parsed, err := strconv.Atoi(value)
@@ -11356,16 +11356,16 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --quant-format <label>   Quantization container format for eval-shard submit (auto-detected as "gguf" from the model path; override if needed)
   --model-revision <rev>   Model revision for eval-shard submit (default: main)
   --base-url <url>         OpenAI-compatible model endpoint; accepts host or host/v1
-  --mode <mode>            Benchmark mode: remote endpoint or local host command
+  --mode <mode>            Speed-test mode: remote endpoint or local host command
   --served-model <name>    Model name served by the OpenAI-compatible endpoint
-  --model-api-key <key>    Optional bearer token for remote endpoint benchmarking
-  --prompt <text>          Prompt for remote endpoint benchmark
+  --model-api-key <key>    Optional bearer token for the remote speed-test endpoint
+  --prompt <text>          Prompt for the remote endpoint speed test
   --max-tokens <n>         Max generated tokens (eval shard default: 0 = no cap, let the model finish)
-  --endpoint-timeout-seconds <n> Timeout for remote endpoint benchmark (default: 600)
+  --endpoint-timeout-seconds <n> Timeout for remote endpoint speed tests (default: 600)
   --warmup <n>             Untimed warmup requests before remote endpoint measurement (default: 1)
   --iterations <n>         Timed remote endpoint measurement iterations; median is reported (default: 3)
   --command-timeout-seconds <n> Timeout for local speed-test commands (default: unlimited)
-  --no-stream              Disable streaming for remote endpoint benchmark
+  --no-stream              Disable streaming for remote endpoint speed tests
   --command <cmd>          Local speed-test command, e.g. llama-bench
   --host <addr>            Local model server host for generated server commands
   --port <n>               Local model server port for generated server/speed-test commands
@@ -11417,9 +11417,9 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --metrics <fields>       Comma-separated metrics for comparing two run files
   --fields <fields>        Comma-separated saved-run export fields
   --hardware-name <text>   Filter saved runs by hardware label substring
-  --set field=value        Edit one field in a saved benchmark run
-  --set-json <json>        Merge JSON object into a saved benchmark run
-  --patch <path>           Merge JSON object file into a saved benchmark run
+  --set field=value        Edit one field in a saved speed-test run
+  --set-json <json>        Merge JSON object into a saved speed-test run
+  --patch <path>           Merge JSON object file into a saved speed-test run
   --unset <fields>         Comma-separated saved-run fields to remove
   --yes                    Confirm saved-run deletion
   --capacity-gb <gb>       Decode calculator memory capacity (default: 128)
@@ -11457,7 +11457,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --key-stdin              Read and persist an API key from stdin
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
   --hardware <path>        JSON hardware object required when submitting
-  --quantization <label>   Quantization label (auto-detected from the endpoint for remote benchmark and eval-shard runs when omitted)
+  --quantization <label>   Quantization label (auto-detected from the endpoint for remote speed-test and eval-shard runs when omitted)
   --results <path>         Existing lm-eval output JSON for run upload
   --kind <kind>            Storage upload kind, usually artifact or dataset
   --format <format>        Output/storage format; run show/compare support table/ascii/json, export supports json/csv, storage supports json/jsonl/parquet/zip

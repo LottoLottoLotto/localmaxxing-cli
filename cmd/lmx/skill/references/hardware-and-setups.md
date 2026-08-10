@@ -2,7 +2,7 @@
 
 ## Detect hardware
 
-Run hardware detection on the machine that actually serves the model. For remote benchmarks, that means the server, not the client running `lmx`.
+Run hardware detection on the machine that actually serves the model. For remote speed tests, that means the server, not the client running `lmx`.
 
 ```bash
 lmx hardware --out hardware.json
@@ -60,5 +60,5 @@ Selection flags:
 
 Pulled setup JSON may include:
 
-- `gpuPowerWatts`: measured watts per physical GPU, used to prefill benchmark submissions.
+- `gpuPowerWatts`: measured watts per physical GPU, used to prefill speed-test submissions.
 - `hardwareCost`: purchase records used to prefill submissions, e.g. `[{ "component": "NVIDIA GeForce RTX 3090", "condition": "USED", "yearPurchased": 2021, "price": 700, "currency": "USD" }]`.

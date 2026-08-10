@@ -1,11 +1,11 @@
 ---
 name: localmaxxing-cli
-description: Use the LocalMaxxing CLI (the `lmx` binary) to calculate model memory fit and decode upper bounds, benchmark local and remote LLM inference (tokens/sec, TTFT, peak VRAM), run quality evals, generate hardware metadata, run KV-cache context sweeps, and submit results to localmaxxing.com. Covers agent-readable calculator output, authentication, local vs remote benchmark modes, speculative decoding, dry-run validation, saved runs, profiles, and live enums via `lmx context`.
+description: Use the LocalMaxxing CLI (the `lmx` binary) to calculate model memory fit and decode upper bounds, run local and remote LLM inference speed tests (tokens/sec, TTFT, peak VRAM), run quality benchmarks, generate hardware metadata, run KV-cache context sweeps, and submit results to localmaxxing.com. Covers agent-readable calculator output, authentication, local vs remote speed-test modes, speculative decoding, dry-run validation, saved runs, profiles, and live enums via `lmx context`.
 ---
 
 # LocalMaxxing CLI
 
-Use `lmx` when an agent needs to estimate model fit, calculate a memory-bandwidth decode ceiling, or measure and submit local LLM performance and quality results. It covers deterministic planning calculations, benchmark throughput, TTFT, VRAM, eval scores, hardware metadata, saved runs, and API validation.
+Use `lmx` when an agent needs to estimate model fit, calculate a memory-bandwidth decode ceiling, or measure and submit local LLM performance and quality results. It covers deterministic planning calculations, speed-test throughput, TTFT, VRAM, quality benchmark scores, hardware metadata, saved runs, and API validation.
 
 ## Quickstart
 
@@ -97,7 +97,7 @@ Compact format is `component|condition|year|price|currency` separated by semicol
 
 ## Prompt control for spec decoding
 
-Remote benchmarks send a real prompt. Set it with:
+Remote speed tests send a real prompt. Set it with:
 
 ```bash
 lmx speed-test run vllm --mode remote --base-url http://server:8000 --prompt "<text>"
@@ -105,7 +105,7 @@ lmx speed-test run vllm --mode remote --base-url http://server:8000 --prompt "<t
 
 The default prompt is:
 
-> Explain why local inference benchmarks should report prompt prefill throughput, decode throughput, and time to first token.
+> Explain why local inference speed tests should report prompt prefill throughput, decode throughput, and time to first token.
 
 Control output length with `--max-tokens` (default 256) and sampling with `--temperature` (default 0). Speculative-decoding acceptance depends on prompt and output distribution, so use a representative workload prompt and realistic `--max-tokens` for comparable spec-decode numbers. The local `llama-bench` path only accepts synthetic `--prompt-tokens` / `--output-tokens` counts, not semantic text, so it does not reflect spec-decode behavior on real content.
 

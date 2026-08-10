@@ -1,6 +1,6 @@
 # LocalMaxxing CLI
 
-The official CLI for [localmaxxing.com](https://localmaxxing.com) — benchmark and evaluate local LLM inference and submit results from your terminal.
+The official CLI for [localmaxxing.com](https://localmaxxing.com) — run local LLM inference speed tests and quality benchmarks, then submit results from your terminal.
 
 ## Install
 
@@ -123,7 +123,7 @@ Add `--decoding speculative --draft-tokens <n> --acceptance-percent <p>` plus th
 
 ## Hardware Metadata
 
-Submissions require a hardware JSON object. Generate one on the machine running the benchmark:
+Submissions require a hardware JSON object. Generate one on the machine running the speed test:
 
 ```bash
 lmx hardware --out hardware.json
@@ -146,7 +146,7 @@ Example output:
 }
 ```
 
-> For remote endpoint benchmarks, run `lmx hardware` on the **server** hosting the model, not your local machine.
+> For remote endpoint speed tests, run `lmx hardware` on the **server** hosting the model, not your local machine.
 
 ### Pull a saved setup
 
