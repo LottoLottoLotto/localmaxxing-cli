@@ -104,6 +104,23 @@ lmx context list
 lmx context get hardwareOptions.hardwareCostComponentNames --compact
 ```
 
+### Decode upper-bound calculator
+
+Agents can check whether a model fits and estimate its memory-bandwidth decode ceiling without authentication, downloads, or a running inference server:
+
+```bash
+lmx calculate decode \
+  --capacity-gb 24 \
+  --bandwidth-gbps 936.2 \
+  --total-params-b 32 \
+  --weight-bits 4.5 \
+  --allocated-context 32768 \
+  --read-context 16000 \
+  --json
+```
+
+Add `--decoding speculative --draft-tokens <n> --acceptance-percent <p>` plus the draft model’s `--draft-resident-gb` and `--draft-traffic-gb` to model speculative decoding. Machine output reports `result.state`, the best usable batch and throughput when viable, or a structured `constraint` with the exact blocking resource and suggested flag changes.
+
 ## Hardware Metadata
 
 Submissions require a hardware JSON object. Generate one on the machine running the benchmark:

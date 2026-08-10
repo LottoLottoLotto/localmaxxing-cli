@@ -42,6 +42,15 @@ var extraOptionNames = map[string]bool{
 	"tasks": true, "tensor-parallel": true, "threads": true, "timeout-seconds": true,
 	"tok-s-out": true, "tok-s-prefill": true, "tok-s-total": true, "ttft-ms": true,
 	"peak-vram-gb": true, "ubatch-size": true, "verbose": true, "version": true,
+	"capacity-gb": true, "bandwidth-gbps": true, "overhead-gb": true,
+	"architecture": true, "total-params-b": true, "active-params-b": true,
+	"weight-bits": true, "draft-resident-gb": true, "draft-traffic-gb": true,
+	"expert-count": true, "experts-per-token": true, "moe-routing": true,
+	"global-layers": true, "local-layers": true, "kv-heads": true, "head-dim": true,
+	"kv-store-bits": true, "kv-read-bits": true, "sliding-window": true,
+	"fixed-state-store-gb": true, "fixed-state-read-gb": true,
+	"allocated-context": true, "read-context": true, "min-tok-s": true,
+	"decoding": true, "draft-tokens": true, "acceptance-percent": true,
 }
 
 func knownOptionName(name string) bool {

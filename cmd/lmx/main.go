@@ -268,6 +268,14 @@ func runWithArgs(args cliArgs) error {
 		return handleSkill(positional(args, 1), args)
 	case "context", "agent-context":
 		return handleContext(args)
+	case "calculate", "calculator":
+		sub := positional(args, 1)
+		if sub == "" || sub == "decode" {
+			return handleDecodeCalculator(args)
+		}
+		return cliError{"unknown_subcommand", "Unknown calculator subcommand: " + sub, []string{"Use lmx calculate decode."}, map[string]any{"subcommand": sub}}
+	case "decode-calculator":
+		return handleDecodeCalculator(args)
 	case "model":
 		return handleModel(positional(args, 1), positional(args, 2), args)
 	case "profile":
@@ -318,7 +326,7 @@ func runWithArgs(args cliArgs) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "speed-test", "auth", "hardware", "setups", "context", "agent-context", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill", "update", "upgrade", "version", "commands":
+	case "eval", "speed-test", "auth", "hardware", "setups", "context", "agent-context", "calculate", "calculator", "decode-calculator", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill", "update", "upgrade", "version", "commands":
 		return true
 	default:
 		return false
@@ -11208,6 +11216,8 @@ var usageExamples = []string{
 	`lmx context --out localmaxxing-agent-context.json`,
 	`lmx context list`,
 	`lmx context get hardwareOptions.hardwareCostComponentNames --compact`,
+	`lmx calculate decode --capacity-gb 24 --bandwidth-gbps 936.2 --total-params-b 32 --weight-bits 4.5 --json`,
+	`lmx calculate decode --decoding speculative --draft-tokens 4 --acceptance-percent 80 --draft-resident-gb 1.8 --draft-traffic-gb 1.8 --json`,
 	`lmx auth --key-stdin`,
 	`lmx auth login`,
 	`lmx auth logout`,
@@ -11412,6 +11422,33 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --patch <path>           Merge JSON object file into a saved benchmark run
   --unset <fields>         Comma-separated saved-run fields to remove
   --yes                    Confirm saved-run deletion
+  --capacity-gb <gb>       Decode calculator memory capacity (default: 128)
+  --bandwidth-gbps <gb/s>  Decode calculator sustained memory bandwidth (default: 800)
+  --overhead-gb <gb>       Runtime and allocator memory reserve (default: 6)
+  --architecture <kind>    Model architecture: dense or moe (default: dense)
+  --total-params-b <b>     Total model parameters in billions (default: 32)
+  --active-params-b <b>    Active parameters per token for MoE models
+  --weight-bits <bits>     Average stored bits per model parameter (default: 4.5)
+  --expert-count <n>       Total routed experts for MoE models (default: 256)
+  --experts-per-token <n>  Experts selected per token for MoE models (default: 8)
+  --moe-routing <mode>     MoE batch routing: expected or minimum
+  --global-layers <n>      Full-context attention layers (default: 64)
+  --local-layers <n>       Sliding-window attention layers (default: 0)
+  --kv-heads <n>           Key/value heads per attention layer (default: 8)
+  --head-dim <n>           Key/value head dimension (default: 128)
+  --kv-store-bits <bits>   KV-cache reservation precision (default: 16)
+  --kv-read-bits <bits>    KV-cache read precision (default: 16)
+  --sliding-window <n>     Context read by local-attention layers (default: 4096)
+  --fixed-state-store-gb <gb> Additional per-session recurrent state
+  --fixed-state-read-gb <gb>  Additional recurrent state read per token
+  --allocated-context <n>  KV-cache tokens reserved per session (default: 32768)
+  --read-context <n>       Context tokens read during decode (default: 16000)
+  --min-tok-s <rate>       Minimum acceptable speed per session (default: 20)
+  --decoding <mode>        standard or speculative decoding (default: standard)
+  --draft-tokens <n>       Speculative tokens proposed per verification pass
+  --acceptance-percent <p> Per-token speculative acceptance percentage
+  --draft-resident-gb <gb> Additional resident draft-model footprint
+  --draft-traffic-gb <gb>  Additional draft-model traffic per proposal pass
   --json                   Emit a final JSON result on stdout
   --json-status            Emit JSONL progress/errors on stderr
   --quiet                  Suppress progress and human status output
@@ -11448,6 +11485,10 @@ var commandDescriptions = map[string]string{
 	"version":                 "Print CLI build version and platform metadata.",
 	"commands":                "Print the machine-readable command and option schema.",
 	"context":                 "Fetch complete or selected live agent context.",
+	"calculate":               "Run local, deterministic hardware and model calculations.",
+	"calculate decode":        "Calculate memory fit and a bandwidth-limited decode upper bound.",
+	"calculator":              "Alias for calculate.",
+	"decode-calculator":       "Alias for calculate decode.",
 	"update":                  "Download the newest LocalMaxxing CLI release and replace the current binary.",
 	"upgrade":                 "Alias for update.",
 	"endpoint discover":       "Discover an OpenAI-compatible endpoint and speed-test command hints.",
@@ -11533,6 +11574,7 @@ Command groups:
   auth        Authentication and API keys
   speed-test  Run, validate, manage, and submit inference speed tests
   context     Fetch live agent schemas and enums
+  calculate   Run agent-friendly model and hardware calculations
   engines     Detect local inference engines
   eval        Run and submit quality evaluations
   hardware    Detect, validate, and template hardware
@@ -11547,6 +11589,7 @@ Agent and discovery commands:
   lmx version [--json]
   lmx commands --json
   lmx context list [--compact]
+  lmx calculate decode --capacity-gb 24 --bandwidth-gbps 936.2 --total-params-b 32 --json
   lmx context get <dotted.path> [--compact]
   lmx skill install --dir <skills-dir>
 

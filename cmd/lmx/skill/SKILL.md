@@ -1,11 +1,11 @@
 ---
 name: localmaxxing-cli
-description: Use the LocalMaxxing CLI (the `lmx` binary) to benchmark local and remote LLM inference (tokens/sec, TTFT, peak VRAM), run quality evals (custom suites, lm-eval harness, LM-judge, eval shards, Terminal-Bench), generate hardware metadata, run KV-cache context sweeps, and submit results to localmaxxing.com. Covers authentication, choosing local vs remote benchmark mode, controlling the benchmark prompt for spec-decode-representative numbers, dry-run validation, saved runs and profiles, and reading live enums via `lmx context`.
+description: Use the LocalMaxxing CLI (the `lmx` binary) to calculate model memory fit and decode upper bounds, benchmark local and remote LLM inference (tokens/sec, TTFT, peak VRAM), run quality evals, generate hardware metadata, run KV-cache context sweeps, and submit results to localmaxxing.com. Covers agent-readable calculator output, authentication, local vs remote benchmark modes, speculative decoding, dry-run validation, saved runs, profiles, and live enums via `lmx context`.
 ---
 
 # LocalMaxxing CLI
 
-Use `lmx` when an agent needs to measure and submit local LLM performance or quality results to the LocalMaxxing public leaderboard. It covers benchmark throughput, TTFT, VRAM, eval scores, hardware metadata, saved runs, and API validation.
+Use `lmx` when an agent needs to estimate model fit, calculate a memory-bandwidth decode ceiling, or measure and submit local LLM performance and quality results. It covers deterministic planning calculations, benchmark throughput, TTFT, VRAM, eval scores, hardware metadata, saved runs, and API validation.
 
 ## Quickstart
 
@@ -38,6 +38,37 @@ lmx hardware --out hardware.json
 - Raw llama.cpp throughput on the host: use a **local speed test** with `--mode local --model-path model.gguf`; it runs `llama-bench` with synthetic token counts.
 - Quality / accuracy instead of speed: use evals; see `skill://localmaxxing-cli/references/evals.md`.
 - Speed vs context depth: use a KV-cache sweep with `lmx kvcache run`.
+- Planning a model/hardware configuration without running inference: use `lmx calculate decode --json`.
+
+## Agent-run decode calculator
+
+Use the local deterministic calculator before downloading a model or launching a server. It requires no authentication or network request. Always request `--json` when another agent will consume the result:
+
+```bash
+lmx calculate decode \
+  --capacity-gb 24 \
+  --bandwidth-gbps 936.2 \
+  --total-params-b 32 \
+  --weight-bits 4.5 \
+  --allocated-context 32768 \
+  --read-context 16000 \
+  --min-tok-s 20 \
+  --json
+```
+
+For speculative decoding, include the draft acceptance and cost instead of treating draft work as free:
+
+```bash
+lmx calculate decode \
+  --decoding speculative \
+  --draft-tokens 4 \
+  --acceptance-percent 80 \
+  --draft-resident-gb 1.8 \
+  --draft-traffic-gb 1.8 \
+  --json
+```
+
+Read `result.state` first. `usable` includes `result.optimum` with aggregate and per-session throughput. `resident-fail`, `session-fail`, and `floor-fail` include a structured `constraint` with the blocking resource, measured shortfall, and suggested flag changes. The estimate is a memory-side roofline, not a measured benchmark; use `speed-test` to verify real performance.
 
 ## Canonical speed-test workflow
 
