@@ -3155,7 +3155,7 @@ func TestSubmitCRUDbenchCanonicalCheckpointDryRunPartitionsExactTaskSet(t *testi
 		"--dry-run", "--quiet",
 	}))
 	if err != nil {
-		t.Fatalf("submit CRUD-Bench dry-run: %v", err)
+		t.Fatalf("submit CRUDbench dry-run: %v", err)
 	}
 
 	batch := readTerminalSubmitBatch(t, payloadPath)
@@ -3275,7 +3275,7 @@ func TestSubmitCRUDbenchExplicitCanonicalShardWritesIsolatedCheckpointPayload(t 
 		"--dry-run", "--quiet",
 	}))
 	if err != nil {
-		t.Fatalf("submit CRUD-Bench shard: %v", err)
+		t.Fatalf("submit CRUDbench shard: %v", err)
 	}
 	shards := anySlice(readTerminalSubmitBatch(t, payloadPath)["shards"])
 	if len(shards) != 1 {

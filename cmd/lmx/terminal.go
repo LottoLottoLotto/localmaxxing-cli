@@ -1504,7 +1504,7 @@ func canonicalTerminalDatasetFor(slug string) (canonicalTerminalDataset, bool) {
 	case terminalBench21Dataset:
 		return canonicalTerminalDataset{name: "Terminal-Bench 2.1", shardCount: terminalBench21ShardCount, taskIDs: terminalBench21CanonicalTaskIDs}, true
 	case crudBenchDataset:
-		return canonicalTerminalDataset{name: "CRUD-Bench", shardCount: crudBenchShardCount, taskIDs: crudBenchCanonicalTaskIDs}, true
+		return canonicalTerminalDataset{name: "CRUDbench", shardCount: crudBenchShardCount, taskIDs: crudBenchCanonicalTaskIDs}, true
 	default:
 		return canonicalTerminalDataset{}, false
 	}
@@ -1548,7 +1548,7 @@ func submitTerminalEval(args cliArgs) error {
 	}
 	canonicalDataset, canonical := canonicalTerminalDatasetFor(dataset)
 	if !canonical && !explicitShard {
-		return cliError{"missing_shard_index", "Deferred submission for this dataset requires --shard-index <n>.", []string{"Pass the registered shard index for this already-isolated checkpoint.", "Automatic full-checkpoint partitioning is available for Terminal-Bench 2.1 and CRUD-Bench."}, map[string]any{"dataset": dataset}}
+		return cliError{"missing_shard_index", "Deferred submission for this dataset requires --shard-index <n>.", []string{"Pass the registered shard index for this already-isolated checkpoint.", "Automatic full-checkpoint partitioning is available for Terminal-Bench 2.1 and CRUDbench."}, map[string]any{"dataset": dataset}}
 	}
 	hfID := opt(args, "hf-id")
 	if hfID == "" {
