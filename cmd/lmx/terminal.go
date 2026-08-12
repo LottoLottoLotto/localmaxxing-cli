@@ -1447,6 +1447,69 @@ write-compressor`
 
 var terminalBench21CanonicalTaskIDs = strings.Fields(terminalBench21CanonicalTaskIDsText)
 
+const crudBenchDataset = "crud-bench"
+const crudBenchShardCount = 5
+
+const crudBenchCanonicalTaskIDsText = `create-bulk-atomic
+create-default-fields
+create-idempotency-key
+create-parent-with-children
+create-tenant-scoped-unique
+customer-create-normalized-email
+customer-patch-null-semantics
+delete-cascade-children
+delete-hard-unreferenced
+delete-restore-conflict
+delete-restrict-children
+delete-soft-hide
+delete-soft-idempotent
+read-active-by-id
+read-cursor-pagination
+read-deterministic-sort
+read-filter-status-tenant
+read-offset-pagination
+read-parent-child-aggregate
+robust-concurrent-version
+robust-reject-unknown-fields
+robust-restart-persistence
+robust-transaction-rollback
+update-immutable-fields
+update-optimistic-version
+update-put-replacement
+update-status-transition
+update-unique-email-atomic
+workflow-archive-tenant
+workflow-audit-log
+workflow-batch-status
+workflow-cancel-restores-value
+workflow-clone-with-children
+workflow-customer-lifecycle
+workflow-import-partial-report
+workflow-legacy-migration
+workflow-merge-duplicates
+workflow-reserve-value
+workflow-tenant-isolation
+workflow-transfer-record`
+
+var crudBenchCanonicalTaskIDs = strings.Fields(crudBenchCanonicalTaskIDsText)
+
+type canonicalTerminalDataset struct {
+	name       string
+	shardCount int
+	taskIDs    []string
+}
+
+func canonicalTerminalDatasetFor(slug string) (canonicalTerminalDataset, bool) {
+	switch slug {
+	case terminalBench21Dataset:
+		return canonicalTerminalDataset{name: "Terminal-Bench 2.1", shardCount: terminalBench21ShardCount, taskIDs: terminalBench21CanonicalTaskIDs}, true
+	case crudBenchDataset:
+		return canonicalTerminalDataset{name: "CRUD-Bench", shardCount: crudBenchShardCount, taskIDs: crudBenchCanonicalTaskIDs}, true
+	default:
+		return canonicalTerminalDataset{}, false
+	}
+}
+
 type terminalSubmissionRecord struct {
 	questionID string
 	pass       bool
@@ -1483,8 +1546,9 @@ func submitTerminalEval(args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	if dataset != terminalBench21Dataset && !explicitShard {
-		return cliError{"missing_shard_index", "Deferred submission for this dataset requires --shard-index <n>.", []string{"Pass the registered shard index for this already-isolated checkpoint.", "The CLI only performs automatic batching for terminal-bench-2-1 because its exact canonical task set is built in."}, map[string]any{"dataset": dataset}}
+	canonicalDataset, canonical := canonicalTerminalDatasetFor(dataset)
+	if !canonical && !explicitShard {
+		return cliError{"missing_shard_index", "Deferred submission for this dataset requires --shard-index <n>.", []string{"Pass the registered shard index for this already-isolated checkpoint.", "Automatic full-checkpoint partitioning is available for Terminal-Bench 2.1 and CRUD-Bench."}, map[string]any{"dataset": dataset}}
 	}
 	hfID := opt(args, "hf-id")
 	if hfID == "" {
@@ -1511,15 +1575,15 @@ func submitTerminalEval(args cliArgs) error {
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Task < entries[j].Task })
-	if dataset == terminalBench21Dataset {
+	if canonical {
 		if explicitShard {
-			if terminalCheckpointHasCanonicalTaskSet(entries) {
-				return cliError{"full_checkpoint_with_shard_index", "A full canonical Terminal-Bench 2.1 checkpoint cannot be labeled as one shard.", []string{"Remove --shard-index to partition all 89 tasks into the 10 canonical shards."}, map[string]any{"tasks": len(entries), "shardIndex": shardIndex}}
+			if terminalCheckpointHasCanonicalTaskSet(entries, canonicalDataset.taskIDs) {
+				return cliError{"full_checkpoint_with_shard_index", fmt.Sprintf("A full canonical %s checkpoint cannot be labeled as one shard.", canonicalDataset.name), []string{"Remove --shard-index to partition the full checkpoint into canonical shards."}, map[string]any{"tasks": len(entries), "shardIndex": shardIndex}}
 			}
-			if err := validateTerminalBench21ShardTaskSet(entries, shardIndex); err != nil {
+			if err := validateCanonicalTerminalShardTaskSet(entries, canonicalDataset, shardIndex); err != nil {
 				return err
 			}
-		} else if err := validateTerminalBench21FullTaskSet(entries); err != nil {
+		} else if err := validateTerminalTaskSet(entries, canonicalDataset.taskIDs, "canonical "+canonicalDataset.name+" checkpoint", 0); err != nil {
 			return err
 		}
 	}
@@ -1630,14 +1694,14 @@ func submitTerminalEval(args cliArgs) error {
 			"fullCheckpointAvgLatencyMs":        fullAvgLatencyMs,
 			"fullCheckpointTokenUsage":          totalUsage.toMap(),
 			"fullCheckpointTaskSetSha256":       hex.EncodeToString(fullTaskSetHash[:]),
-			"fullCheckpointCanonicalShardCount": terminalBench21ShardCount,
+			"fullCheckpointCanonicalShardCount": canonicalDataset.shardCount,
 		}
 	}
 
 	recordShards := [][]terminalSubmissionRecord{records}
 	shardIndexes := []int{shardIndex}
 	if !explicitShard {
-		recordShards = partitionTerminalSubmissionRecords(records, terminalBench21ShardCount)
+		recordShards = partitionTerminalSubmissionRecords(records, canonicalDataset.shardCount)
 		shardIndexes = make([]int, len(recordShards))
 		for i := range shardIndexes {
 			shardIndexes[i] = i + 1
@@ -1736,14 +1800,13 @@ func terminalSubmitShardIndex(args cliArgs, dataset string) (int, bool, error) {
 	if err != nil || index < 1 {
 		return 0, true, cliError{"invalid_shard_index", "--shard-index must be a positive integer.", nil, map[string]any{"value": raw}}
 	}
-	if dataset == terminalBench21Dataset && index > terminalBench21ShardCount {
-		return 0, true, cliError{"invalid_shard_index", fmt.Sprintf("--shard-index for Terminal-Bench 2.1 must be between 1 and %d.", terminalBench21ShardCount), nil, map[string]any{"value": index}}
+	if canonical, ok := canonicalTerminalDatasetFor(dataset); ok && index > canonical.shardCount {
+		return 0, true, cliError{"invalid_shard_index", fmt.Sprintf("--shard-index for %s must be between 1 and %d.", canonical.name, canonical.shardCount), nil, map[string]any{"value": index}}
 	}
 	return index, true, nil
 }
 
-func terminalCheckpointHasCanonicalTaskSet(entries []terminalCheckpointEntry) bool {
-	canonical := terminalBench21CanonicalTaskIDs
+func terminalCheckpointHasCanonicalTaskSet(entries []terminalCheckpointEntry, canonical []string) bool {
 	if len(entries) != len(canonical) {
 		return false
 	}
@@ -1755,15 +1818,10 @@ func terminalCheckpointHasCanonicalTaskSet(entries []terminalCheckpointEntry) bo
 	return true
 }
 
-func validateTerminalBench21FullTaskSet(entries []terminalCheckpointEntry) error {
-	return validateTerminalTaskSet(entries, terminalBench21CanonicalTaskIDs, "canonical Terminal-Bench 2.1 checkpoint", 0)
-}
-
-func validateTerminalBench21ShardTaskSet(entries []terminalCheckpointEntry, shardIndex int) error {
-	canonical := terminalBench21CanonicalTaskIDs
-	start := ((shardIndex - 1) * len(canonical)) / terminalBench21ShardCount
-	end := (shardIndex * len(canonical)) / terminalBench21ShardCount
-	return validateTerminalTaskSet(entries, canonical[start:end], fmt.Sprintf("canonical Terminal-Bench 2.1 shard %d", shardIndex), shardIndex)
+func validateCanonicalTerminalShardTaskSet(entries []terminalCheckpointEntry, canonical canonicalTerminalDataset, shardIndex int) error {
+	start := ((shardIndex - 1) * len(canonical.taskIDs)) / canonical.shardCount
+	end := (shardIndex * len(canonical.taskIDs)) / canonical.shardCount
+	return validateTerminalTaskSet(entries, canonical.taskIDs[start:end], fmt.Sprintf("canonical %s shard %d", canonical.name, shardIndex), shardIndex)
 }
 
 func validateTerminalTaskSet(entries []terminalCheckpointEntry, expected []string, label string, shardIndex int) error {

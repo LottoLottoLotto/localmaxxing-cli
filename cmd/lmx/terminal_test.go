@@ -3141,6 +3141,42 @@ func TestSubmitTerminalEvalCanonicalCheckpointDryRunPartitionsExactTaskSet(t *te
 	}
 }
 
+func TestSubmitCRUDbenchCanonicalCheckpointDryRunPartitionsExactTaskSet(t *testing.T) {
+	canonicalIDs := append([]string(nil), crudBenchCanonicalTaskIDs...)
+	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
+	payloadPath := filepath.Join(t.TempDir(), "crud-bench-batch.json")
+
+	err := submitTerminalEval(parseArgs([]string{
+		"eval", "terminal", "submit", runDir,
+		"--dataset", crudBenchDataset,
+		"--hf-id", "fixture/model",
+		"--hardware", hardwarePath,
+		"--out", payloadPath,
+		"--dry-run", "--quiet",
+	}))
+	if err != nil {
+		t.Fatalf("submit CRUD-Bench dry-run: %v", err)
+	}
+
+	batch := readTerminalSubmitBatch(t, payloadPath)
+	if batch["dataset"] != crudBenchDataset {
+		t.Fatalf("batch dataset = %#v, want %q", batch["dataset"], crudBenchDataset)
+	}
+	shards := anySlice(batch["shards"])
+	if len(shards) != crudBenchShardCount {
+		t.Fatalf("batch contains %d shards, want %d", len(shards), crudBenchShardCount)
+	}
+	offset := 0
+	for i, rawShard := range shards {
+		wantIDs := canonicalIDs[offset : offset+8]
+		assertTerminalShardPayload(t, asObject(rawShard), i+1, wantIDs)
+		offset += 8
+	}
+	if offset != len(canonicalIDs) {
+		t.Fatalf("partitioned task total = %d, want %d", offset, len(canonicalIDs))
+	}
+}
+
 func TestSubmitTerminalEvalRejectsNonCanonicalTerminalBench21TaskSets(t *testing.T) {
 	canonicalIDs := terminalBench21CanonicalTestTaskIDs(t)
 	tests := []struct {
@@ -3223,6 +3259,29 @@ func TestSubmitTerminalEvalExplicitCanonicalShardWritesIsolatedCheckpointPayload
 	if got := asObject(payload["runConfig"])["fullCheckpoint"]; got != false {
 		t.Fatalf("explicit shard fullCheckpoint = %#v, want false", got)
 	}
+}
+
+func TestSubmitCRUDbenchExplicitCanonicalShardWritesIsolatedCheckpointPayload(t *testing.T) {
+	wantIDs := crudBenchCanonicalTaskIDs[:8]
+	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, wantIDs, true)
+	payloadPath := filepath.Join(t.TempDir(), "crud-bench-shard.json")
+	err := submitTerminalEval(parseArgs([]string{
+		"eval", "terminal", "submit", runDir,
+		"--dataset", crudBenchDataset,
+		"--shard-index", "1",
+		"--hf-id", "fixture/model",
+		"--hardware", hardwarePath,
+		"--out", payloadPath,
+		"--dry-run", "--quiet",
+	}))
+	if err != nil {
+		t.Fatalf("submit CRUD-Bench shard: %v", err)
+	}
+	shards := anySlice(readTerminalSubmitBatch(t, payloadPath)["shards"])
+	if len(shards) != 1 {
+		t.Fatalf("explicit checkpoint payload count = %d, want one", len(shards))
+	}
+	assertTerminalShardPayload(t, asObject(shards[0]), 1, wantIDs)
 }
 
 func TestSubmitTerminalEvalCustomDatasetRequiresShardIndex(t *testing.T) {
