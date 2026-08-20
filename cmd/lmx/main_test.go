@@ -272,6 +272,26 @@ func TestValidateHardwareAgainstContextRejectsUnsupportedGpu(t *testing.T) {
 	}
 }
 
+func TestValidateHardwareAgainstContextAcceptsUnlockedCMP170HX(t *testing.T) {
+	hardware := normalizeHardwareForSubmit(map[string]any{
+		"hwClass": "DISCRETE_GPU",
+		"gpuName": "NVIDIA CMP 170HX",
+		"vramGb":  64.0,
+	})
+	context := map[string]any{
+		"hardwareOptions": map[string]any{
+			"discreteGpuNames": []any{"NVIDIA CMP 170HX"},
+		},
+	}
+
+	if err := validateHardwareAgainstContext(hardware, context); err != nil {
+		t.Fatalf("validateHardwareAgainstContext rejected unlocked CMP 170HX: %v", err)
+	}
+	if got := numberField(hardware, "vramGb"); got != 64 {
+		t.Fatalf("vramGb = %v, want detected unlocked capacity 64", got)
+	}
+}
+
 func TestEndpointTimeout(t *testing.T) {
 	defaultTimeout, err := endpointTimeout(cliArgs{opts: map[string]string{}, flags: map[string]bool{}})
 	if err != nil {
