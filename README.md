@@ -161,6 +161,36 @@ lmx setups pull --id <setupId> --out hardware.json
 
 `setups pull` selects by `--id`, case-insensitive `--name`, or `--default`; with no selector it uses your default setup, or the only setup when you have exactly one. Without `--out` it prints the hardware JSON to stdout.
 
+## Model reports
+
+Agents and users edit the same standardized GitHub Flavored Markdown document. Fetch the live machine-readable contract, generate a template, and create a private draft for browser review:
+
+```bash
+lmx report format --json
+lmx report init --out report.md
+lmx report create \
+  --model Qwen/Qwen3.8-27B \
+  --title "Qwen local inference report" \
+  --summary "Reproducible setup, measurements, and observations." \
+  --content-file report.md \
+  --draft \
+  --json
+```
+
+Continue through either the CLI or the web report studio:
+
+```bash
+lmx report list --model Qwen/Qwen3.8-27B
+lmx report show <reportId>
+lmx report edit <reportId> --content-file revised-report.md
+lmx report image upload <reportId> --file evidence.png --caption "Measured output"
+lmx report publish <reportId>
+lmx report unpublish <reportId>
+lmx report delete <reportId> --yes
+```
+
+The API, CLI, and web editor all use `contentFormat: "gfm"` and format version `1`; no rich-text conversion is required. Use `lmx skill print` for the embedded agent workflow and image-token syntax.
+
 ## Speed tests
 
 ### Remote Endpoint (vLLM, SGLang, Ollama, custom OpenAI-compatible)

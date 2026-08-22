@@ -276,6 +276,8 @@ func runWithArgs(args cliArgs) error {
 		return cliError{"unknown_subcommand", "Unknown calculator subcommand: " + sub, []string{"Use lmx calculate decode."}, map[string]any{"subcommand": sub}}
 	case "decode-calculator":
 		return handleDecodeCalculator(args)
+	case "report", "reports":
+		return handleReport(positional(args, 1), positional(args, 2), args)
 	case "model":
 		return handleModel(positional(args, 1), positional(args, 2), args)
 	case "profile":
@@ -326,7 +328,7 @@ func runWithArgs(args cliArgs) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "speed-test", "auth", "hardware", "setups", "context", "agent-context", "calculate", "calculator", "decode-calculator", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill", "update", "upgrade", "version", "commands":
+	case "eval", "speed-test", "report", "reports", "auth", "hardware", "setups", "context", "agent-context", "calculate", "calculator", "decode-calculator", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill", "update", "upgrade", "version", "commands":
 		return true
 	default:
 		return false
@@ -341,7 +343,7 @@ func isBooleanOption(key string) bool {
 		"no-stream", "missing-only", "all-missing", "cleanup-images", "oracle",
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
-		"save-run", "key-stdin":
+		"save-run", "key-stdin", "draft":
 		return true
 	default:
 		return false
@@ -11216,6 +11218,17 @@ var usageExamples = []string{
 	`lmx context --out localmaxxing-agent-context.json`,
 	`lmx context list`,
 	`lmx context get hardwareOptions.hardwareCostComponentNames --compact`,
+	`lmx report format --json`,
+	`lmx report init --out report.md`,
+	`lmx report create --model Qwen/Qwen3.8-27B --title "Inference report" --summary "Reproducible local inference results." --content-file report.md`,
+	`lmx report create --model Qwen/Qwen3.8-27B --title "Draft report" --summary "Agent draft for browser review." --content-file report.md --draft`,
+	`lmx report list --model Qwen/Qwen3.8-27B`,
+	`lmx report show <reportId>`,
+	`lmx report edit <reportId> --content-file revised-report.md`,
+	`lmx report image upload <reportId> --file evidence.png --caption "Measured output"`,
+	`lmx report publish <reportId>`,
+	`lmx report unpublish <reportId>`,
+	`lmx report delete <reportId> --yes`,
 	`lmx calculate decode --capacity-gb 24 --bandwidth-gbps 936.2 --total-params-b 32 --weight-bits 4.5 --json`,
 	`lmx calculate decode --decoding speculative --draft-tokens 4 --acceptance-percent 80 --draft-resident-gb 1.8 --draft-traffic-gb 1.8 --json`,
 	`lmx auth --key-stdin`,
@@ -11481,12 +11494,34 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --name <name>            Saved setup name to pull (case-insensitive) for setups pull
   --id <id>                Saved setup id to pull for setups pull
   --default                Pull the default saved setup for setups pull
+  --title <text>           Report title (3-120 characters)
+  --summary <text>         Report summary (10-500 characters)
+  --content <gfm>          Inline GitHub Flavored Markdown report content
+  --content-file <path>    Read GFM report content from a file; use - for stdin
+  --benchmark-run-ids <ids> Comma-separated benchmark run IDs to attach
+  --eval-run-ids <ids>     Comma-separated evaluation run IDs to attach
+  --draft                  Create a private report draft instead of publishing
+  --file <path>            Report image file to upload
+  --caption <text>         Report image caption/alt text
+  --sort-order <n>         Report image ordering index
   --out <path>             Write computed payload/result JSON`
 
 var commandDescriptions = map[string]string{
 	"version":                 "Print CLI build version and platform metadata.",
 	"commands":                "Print the machine-readable command and option schema.",
 	"context":                 "Fetch complete or selected live agent context.",
+	"report":                  "Create and manage standardized GFM model reports.",
+	"report format":           "Fetch the machine-readable GFM report format contract.",
+	"report init":             "Write an agent-friendly GFM report template.",
+	"report list":             "List reports for a HuggingFace model.",
+	"report show":             "Fetch a model report by ID.",
+	"report create":           "Create a public report or private draft from GFM.",
+	"report edit":             "Edit the same GFM document used by the web report studio.",
+	"report image upload":     "Upload evidence and return an inline report image ID.",
+	"report image delete":     "Delete an uploaded report image.",
+	"report publish":          "Publish a private report draft.",
+	"report unpublish":        "Return a published report to private draft state.",
+	"report delete":           "Permanently delete a report, comments, and images.",
 	"calculate":               "Run local, deterministic hardware and model calculations.",
 	"calculate decode":        "Calculate memory fit and a bandwidth-limited decode upper bound.",
 	"calculator":              "Alias for calculate.",

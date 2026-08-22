@@ -1,11 +1,11 @@
 ---
 name: localmaxxing-cli
-description: Use the LocalMaxxing CLI (the `lmx` binary) to calculate model memory fit and decode upper bounds, run local and remote LLM inference speed tests (tokens/sec, TTFT, peak VRAM), run quality benchmarks, generate hardware metadata, run KV-cache context sweeps, and submit results to localmaxxing.com. Covers agent-readable calculator output, authentication, local vs remote speed-test modes, speculative decoding, dry-run validation, saved runs, profiles, and live enums via `lmx context`.
+description: Use the LocalMaxxing CLI (the `lmx` binary) to calculate model memory fit and decode upper bounds, run local and remote LLM inference speed tests, run quality benchmarks, create standardized GFM model reports, generate hardware metadata, and submit results to localmaxxing.com. Covers agent-readable output, authentication, report authoring/editing/images/publication, local vs remote speed-test modes, dry-run validation, saved runs, profiles, and live schemas via `lmx context`.
 ---
 
 # LocalMaxxing CLI
 
-Use `lmx` when an agent needs to estimate model fit, calculate a memory-bandwidth decode ceiling, or measure and submit local LLM performance and quality results. It covers deterministic planning calculations, speed-test throughput, TTFT, VRAM, quality benchmark scores, hardware metadata, saved runs, and API validation.
+Use `lmx` when an agent needs to estimate model fit, measure and submit local LLM performance, run quality evaluations, or author a model report that a user can continue editing in the web studio. Reports use the same standardized GitHub Flavored Markdown document in CLI, API, and web workflows.
 
 ## Quickstart
 
@@ -37,6 +37,7 @@ lmx hardware --out hardware.json
 - Already-running OpenAI-compatible / vLLM / SGLang / Ollama endpoint: use a **remote speed test** with `--mode remote --base-url ...`. This is the path where you control the prompt.
 - Raw llama.cpp throughput on the host: use a **local speed test** with `--mode local --model-path model.gguf`; it runs `llama-bench` with synthetic token counts.
 - Quality / accuracy instead of speed: use evals; see `skill://localmaxxing-cli/references/evals.md`.
+- Long-form findings or analysis that a user should edit in the web report studio: use `lmx report`; see `skill://localmaxxing-cli/references/reports.md`.
 - Speed vs context depth: use a KV-cache sweep with `lmx kvcache run`.
 - Planning a model/hardware configuration without running inference: use `lmx calculate decode --json`.
 
@@ -124,6 +125,7 @@ Control output length with `--max-tokens` (default 256) and sampling with `--tem
 
 ## Reference docs
 
+- `skill://localmaxxing-cli/references/reports.md`: standardized GFM authoring, API-compatible editing, inline images, and publication lifecycle.
 - `skill://localmaxxing-cli/references/speed-tests.md`: speed-test modes, flags, saved runs, profiles, and KV-cache sweeps.
 - `skill://localmaxxing-cli/references/evals.md`: suite management, eval runs, lm-eval, LM-judge, shards, Terminal-Bench, and storage.
 - `skill://localmaxxing-cli/references/hardware-and-setups.md`: hardware detection/templates and saved setup pulls.

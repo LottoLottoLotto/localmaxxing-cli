@@ -51,6 +51,9 @@ var extraOptionNames = map[string]bool{
 	"fixed-state-store-gb": true, "fixed-state-read-gb": true,
 	"allocated-context": true, "read-context": true, "min-tok-s": true,
 	"decoding": true, "draft-tokens": true, "acceptance-percent": true,
+	"title": true, "summary": true, "content": true, "content-file": true,
+	"benchmark-run-ids": true, "eval-run-ids": true, "draft": true,
+	"file": true, "caption": true, "sort-order": true,
 }
 
 func knownOptionName(name string) bool {
@@ -254,9 +257,11 @@ func optionNamesFromExamples(examples []string) []string {
 
 func commandAuthentication(name string) string {
 	switch {
+	case strings.HasPrefix(name, "report create"), strings.HasPrefix(name, "report edit"), strings.HasPrefix(name, "report image"), strings.HasPrefix(name, "report publish"), strings.HasPrefix(name, "report unpublish"), strings.HasPrefix(name, "report delete"):
+		return "required"
 	case strings.HasPrefix(name, "auth keys"), strings.Contains(name, "submit"), name == "setups", strings.HasPrefix(name, "setups "):
 		return "required"
-	case name == "auth":
+	case name == "auth", name == "report", name == "report list", name == "report show":
 		return "optional"
 	default:
 		return "none"
@@ -271,6 +276,8 @@ func commandSideEffects(name string) []string {
 		return []string{"may persist or remove credentials"}
 	case name == "skill" || strings.HasPrefix(name, "skill "):
 		return []string{"may write skill files"}
+	case name == "report" || strings.HasPrefix(name, "report "):
+		return []string{"may create, edit, publish, unpublish, or delete reports and images; format, init, list, and show are read-only"}
 	case name == "speed-test" || strings.HasPrefix(name, "speed-test "):
 		return []string{"may execute speed tests, write run files, or submit results; --dry-run does not persist unless --save-run"}
 	case name == "eval" || strings.HasPrefix(name, "eval "):
