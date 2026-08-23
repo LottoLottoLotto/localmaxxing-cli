@@ -50,6 +50,7 @@ Model/eval:
 - `--format <format>`: output/storage format. `speed-test runs show` and `speed-test runs compare` support `table`, `ascii`, or `json`; storage uploads use `json`, `jsonl`, `parquet`, or `zip`.
 - `--item-count <n>`: optional record/sample count for storage metadata.
 - `--limit <n>`: optional search/list result limit.
+- `--offset <n>`: pagination offset for authenticated remote speed-test submissions.
 
 Eval shards and Terminal-Bench:
 
@@ -168,9 +169,9 @@ KV-cache and saved runs:
 - `--metrics <fields>`: comma-separated metrics for comparing two run files.
 - `--fields <fields>`: comma-separated saved-run export fields.
 - `--hardware-name <text>`: filter saved runs by hardware label substring.
-- `--set field=value`: edit one field in a saved speed-test run.
-- `--set-json <json>`: merge JSON object into a saved speed-test run.
-- `--patch <path>`: merge JSON object file into a saved speed-test run.
+- `--set field=value`: edit one field in a saved or remote speed-test run.
+- `--set-json <json>`: merge a JSON object into a saved or remote speed-test run.
+- `--patch <path>`: merge a JSON object file into a saved or remote speed-test run.
 - `--unset <fields>`: remove fields from a saved speed-test run.
 - `--yes`: confirm saved-run deletion.
 

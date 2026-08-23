@@ -275,6 +275,18 @@ lmx speed-test runs submit runs/Qwen-Qwen3-8B/run.json
 lmx speed-test runs delete runs/Qwen-Qwen3-8B/run.json --yes
 ```
 
+List every submission owned by the authenticated account, including pending and
+rejected runs, or patch a recent submission by its server run ID:
+
+```bash
+lmx speed-test submissions list --limit 20 --offset 0
+lmx speed-test submissions edit <runId> --set-json '{"prefillTokens":4096,"notes":"corrected"}'
+```
+
+Remote edits use `PATCH /api/runs/{id}`. The API limits non-admin owners to the
+first 24 hours after submission and enforces a five-minute edit cooldown.
+
+
 Inspect a saved run for post-run fixes before submission:
 
 ```bash

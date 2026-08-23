@@ -2464,6 +2464,9 @@ func defaultContentType(format string) string {
 }
 
 func handleBenchmark(action, target string, args cliArgs) error {
+	if action == "submissions" || action == "remote" {
+		return handleBenchmarkSubmissions(target, positional(args, 3), args)
+	}
 	if action == "validate-local" || action == "local-validate" {
 		return validateBenchmarkFileLocally(target, args)
 	}
@@ -2577,6 +2580,91 @@ func handleBenchmark(action, target string, args cliArgs) error {
 	}
 	apiPayload := toBenchmarkSubmit(payload)
 	return submitPayload(endpoint, action == "dry-run", "speed_test", args, apiPayload, target)
+}
+
+func handleBenchmarkSubmissions(action, runID string, args cliArgs) error {
+	if action == "" {
+		action = "list"
+	}
+	key := apiKey(args)
+	if key == "" {
+		return missingAPIKey("--api-key or LMX_API_KEY is required to manage your speed-test submissions")
+	}
+	switch action {
+	case "list", "ls":
+		limit, err := intOption(args, 20, 1, "limit")
+		if err != nil {
+			return err
+		}
+		if limit > 100 {
+			return cliError{"invalid_option", "--limit must not exceed 100", []string{"Pass --limit <n> where n is between 1 and 100."}, nil}
+		}
+		offset, err := intOption(args, 0, 0, "offset")
+		if err != nil {
+			return err
+		}
+		query := url.Values{}
+		query.Set("mine", "true")
+		query.Set("limit", strconv.Itoa(limit))
+		query.Set("offset", strconv.Itoa(offset))
+		value, err := fetchJSON("GET", apiURL(args)+"/api/runs?"+query.Encode(), key, nil)
+		if err != nil {
+			return err
+		}
+		return writeOrPrintJSON("speed_test_submissions", args, value)
+	case "edit", "patch":
+		if runID == "" {
+			return cliError{"missing_run_id", "Remote speed-test run ID is required.", []string{"Run lmx speed-test submissions list, then pass the run ID to submissions edit."}, nil}
+		}
+		patch, err := benchmarkSubmissionPatch(args)
+		if err != nil {
+			return err
+		}
+		value, err := fetchJSON("PATCH", apiURL(args)+"/api/runs/"+url.PathEscape(runID), key, patch)
+		if err != nil {
+			return err
+		}
+		return writeOrPrintJSON("speed_test_submission_edited", args, value)
+	default:
+		return errors.New("Unknown speed-test submissions command. Use list or edit.")
+	}
+}
+
+func benchmarkSubmissionPatch(args cliArgs) (map[string]any, error) {
+	patch := map[string]any{}
+	if patchPath := opt(args, "patch"); patchPath != "" {
+		value, err := readJSON(patchPath)
+		if err != nil {
+			return nil, err
+		}
+		obj := asObject(value)
+		if obj == nil {
+			return nil, cliError{"invalid_patch", "--patch must point to a JSON object.", nil, value}
+		}
+		mergeObject(patch, obj)
+	}
+	if patchText := opt(args, "set-json"); patchText != "" {
+		var value any
+		if err := json.Unmarshal([]byte(patchText), &value); err != nil {
+			return nil, cliError{"json_parse_error", "--set-json must be a JSON object.", nil, err.Error()}
+		}
+		obj := asObject(value)
+		if obj == nil {
+			return nil, cliError{"invalid_patch", "--set-json must be a JSON object.", nil, value}
+		}
+		mergeObject(patch, obj)
+	}
+	if set := opt(args, "set"); set != "" {
+		field, raw, ok := strings.Cut(set, "=")
+		if !ok || strings.TrimSpace(field) == "" {
+			return nil, cliError{"invalid_option", "--set must be field=value", []string{"Example: --set prefillTokens=4096", "For multiple fields, use --set-json '{\"prefillTokens\":4096,\"notes\":\"corrected\"}'."}, nil}
+		}
+		patch[strings.TrimSpace(field)] = parseEditValue(raw)
+	}
+	if len(patch) == 0 {
+		return nil, cliError{"missing_edit", "No remote edit was provided.", []string{"Use --set field=value, --set-json '{...}', or --patch patch.json."}, nil}
+	}
+	return patch, nil
 }
 
 func writeBenchmarkPayloadFiles(payload map[string]any, out, runPath string) error {
@@ -11256,6 +11344,8 @@ var usageExamples = []string{
 	`lmx speed-test run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run`,
 	`lmx speed-test run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --model-path model.gguf --dry-run`,
 	`lmx speed-test runs list`,
+	`lmx speed-test submissions list --api-key bhk_...`,
+	`lmx speed-test submissions edit <runId> --set-json '{"prefillTokens":4096,"notes":"corrected"}'`,
 	`lmx speed-test runs show runs/Qwen-Qwen3-8B/run.json --format table`,
 	`lmx speed-test runs edit runs/Qwen-Qwen3-8B/run.json --set-json '{"tokSOut":120}'`,
 	`lmx speed-test runs rerun runs/Qwen-Qwen3-8B/run.json --dry-run`,
@@ -11432,10 +11522,11 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --metrics <fields>       Comma-separated metrics for comparing two run files
   --fields <fields>        Comma-separated saved-run export fields
   --hardware-name <text>   Filter saved runs by hardware label substring
-  --set field=value        Edit one field in a saved speed-test run
-  --set-json <json>        Merge JSON object into a saved speed-test run
-  --patch <path>           Merge JSON object file into a saved speed-test run
+  --set field=value        Edit one field in a saved or remote speed-test run
+  --set-json <json>        Merge a JSON object into a saved or remote speed-test run
+  --patch <path>           Merge a JSON object file into a saved or remote speed-test run
   --unset <fields>         Comma-separated saved-run fields to remove
+  --offset <n>             Pagination offset for remote speed-test submissions
   --yes                    Confirm saved-run deletion
   --capacity-gb <gb>       Decode calculator memory capacity (default: 128)
   --bandwidth-gbps <gb/s>  Decode calculator sustained memory bandwidth (default: 800)

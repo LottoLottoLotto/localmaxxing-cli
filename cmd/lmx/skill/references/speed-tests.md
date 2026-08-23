@@ -84,6 +84,17 @@ lmx speed-test runs compare runs/base.json runs/candidate.json --metrics tokSOut
 lmx speed-test runs export --format csv --out runs.csv
 ```
 
+Authenticated remote submission commands:
+
+```bash
+lmx speed-test submissions list --limit 20 --offset 0
+lmx speed-test submissions edit <runId> --set-json '{"prefillTokens":4096,"notes":"corrected"}'
+```
+
+The list includes pending, approved, and rejected runs owned by the API key.
+Remote edits are limited by the API's owner edit window and cooldown.
+
+
 Profiles and repair helpers:
 
 ```bash

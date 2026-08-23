@@ -1183,6 +1183,78 @@ func TestSpeedTestDryRunUsesSpeedTestsEndpoint(t *testing.T) {
 	}
 }
 
+func TestSpeedTestSubmissionsListRequestsAuthenticatedOwnedRuns(t *testing.T) {
+	var request *http.Request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request = r.Clone(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"runs":[{"id":"run_123","status":"PENDING"}],"total":1}`)
+	}))
+	defer server.Close()
+
+	err := handleBenchmark("submissions", "list", cliArgs{
+		opts: map[string]string{
+			"api-url": server.URL,
+			"api-key": "bhk_test",
+			"limit":   "25",
+			"offset":  "5",
+		},
+		flags: map[string]bool{"quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("speed-test submissions list returned error: %v", err)
+	}
+	if request == nil || request.Method != http.MethodGet || request.URL.Path != "/api/runs" {
+		t.Fatalf("request = %#v, want GET /api/runs", request)
+	}
+	if request.URL.Query().Get("mine") != "true" || request.URL.Query().Get("limit") != "25" || request.URL.Query().Get("offset") != "5" {
+		t.Fatalf("request query = %q, want mine=true, limit=25, offset=5", request.URL.RawQuery)
+	}
+	if request.Header.Get("Authorization") != "Bearer bhk_test" {
+		t.Fatalf("Authorization = %q, want bearer API key", request.Header.Get("Authorization"))
+	}
+}
+
+func TestSpeedTestSubmissionsEditPatchesRun(t *testing.T) {
+	var requestPath, authorization string
+	var posted map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Errorf("method = %q, want PATCH", r.Method)
+		}
+		requestPath = r.URL.Path
+		authorization = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+			t.Errorf("decode patch: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"run_123","status":"PENDING","prefillTokens":4096}`)
+	}))
+	defer server.Close()
+
+	err := handleBenchmark("submissions", "edit", cliArgs{
+		positional: []string{"speed-test", "submissions", "edit", "run_123"},
+		opts: map[string]string{
+			"api-url":  server.URL,
+			"api-key":  "bhk_test",
+			"set-json": `{"prefillTokens":4096,"notes":"corrected"}`,
+		},
+		flags: map[string]bool{"quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("speed-test submissions edit returned error: %v", err)
+	}
+	if requestPath != "/api/runs/run_123" {
+		t.Fatalf("request path = %q, want /api/runs/run_123", requestPath)
+	}
+	if authorization != "Bearer bhk_test" {
+		t.Fatalf("Authorization = %q, want bearer API key", authorization)
+	}
+	if posted["prefillTokens"] != float64(4096) || posted["notes"] != "corrected" || len(posted) != 2 {
+		t.Fatalf("patch = %#v, want only requested fields", posted)
+	}
+}
+
 func TestBenchmarkConcurrencyMetadataParsesEngineAliases(t *testing.T) {
 	metrics := map[string]any{"engineFlags": localBenchmarkEngineFlags("llama.cpp", "llama-server -m model.gguf -np 4 --max-num-seqs 32")}
 	if err := applyBenchmarkConcurrencyMetadata(metrics, cliArgs{}, "local"); err != nil {
