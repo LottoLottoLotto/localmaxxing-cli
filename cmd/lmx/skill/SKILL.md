@@ -110,6 +110,18 @@ The default prompt is:
 
 Control output length with `--max-tokens` (default 256) and sampling with `--temperature` (default 0). Speculative-decoding acceptance depends on prompt and output distribution, so use a representative workload prompt and realistic `--max-tokens` for comparable spec-decode numbers. The local `llama-bench` path only accepts synthetic `--prompt-tokens` / `--output-tokens` counts, not semantic text, so it does not reflect spec-decode behavior on real content.
 
+Describe the speculative configuration using engine-neutral submission fields:
+
+```bash
+lmx speed-test run sglang \
+  --spec-method dflash \
+  --spec-draft-model z-lab/Qwen3.8-27B-DFlash2 \
+  --spec-num-tokens 8 \
+  --spec-draft-window-size 16
+```
+
+Available fields are `--spec-decoding`, `--spec-method`, `--spec-draft-model`, `--spec-num-tokens`, `--spec-draft-tp`, and `--spec-draft-window-size`. `dflash`/`draft-dflash` and `mtp`/`draft-mtp` are canonicalized to `DFlash` and `MTP`.
+
 ## Agent-friendly flags
 
 - `--json`: request a final JSON result on stdout.

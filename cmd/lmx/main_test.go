@@ -3036,3 +3036,97 @@ func TestModelNameFromGGUFFilenameStripsVendorFPQuant(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyBenchmarkSpeculativeMetadataFromExplicitOptions(t *testing.T) {
+	args := parseArgs([]string{
+		"speed-test", "run", "sglang",
+		"--spec-method", "dflash",
+		"--spec-draft-model", "z-lab/Qwen3.8-27B-DFlash2",
+		"--spec-num-tokens", "8",
+		"--spec-draft-tp", "2",
+		"--spec-draft-window-size", "16",
+	})
+	metrics := map[string]any{}
+	if err := applyBenchmarkSpeculativeMetadata(metrics, args); err != nil {
+		t.Fatal(err)
+	}
+	flags := asObject(metrics["engineFlags"])
+	if flags["specDecoding"] != true || flags["specMethod"] != "DFlash" {
+		t.Fatalf("spec metadata = %#v, want enabled DFlash", flags)
+	}
+	if flags["specDraftModel"] != "z-lab/Qwen3.8-27B-DFlash2" ||
+		flags["specNumTokens"] != 8 || flags["specDraftTp"] != 2 || flags["specDraftWindowSize"] != 16 {
+		t.Fatalf("spec metadata = %#v, want explicit DFlash fields", flags)
+	}
+}
+
+func TestApplyBenchmarkSpeculativeMetadataParsesEngineCommands(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		model   string
+		tokens  int
+		window  int
+	}{
+		{
+			name:    "llama.cpp",
+			command: "llama-server -m target.gguf -md draft.gguf --spec-type draft-dflash --spec-draft-n-max 7",
+			model:   "draft.gguf",
+			tokens:  7,
+		},
+		{
+			name:    "vllm",
+			command: `vllm serve target --speculative-config '{"method":"dflash","model":"z-lab/draft","num_speculative_tokens":6}'`,
+			model:   "z-lab/draft",
+			tokens:  6,
+		},
+		{
+			name:    "sglang",
+			command: "python -m sglang.launch_server --speculative-algorithm DFLASH --speculative-draft-model-path z-lab/draft --speculative-dflash-block-size 8 --speculative-dflash-draft-window-size 16",
+			model:   "z-lab/draft",
+			tokens:  8,
+			window:  16,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			metrics := map[string]any{"engineFlags": map[string]any{"commandSnippet": test.command}}
+			if err := applyBenchmarkSpeculativeMetadata(metrics, parseArgs(nil)); err != nil {
+				t.Fatal(err)
+			}
+			flags := asObject(metrics["engineFlags"])
+			if flags["specMethod"] != "DFlash" || flags["specDraftModel"] != test.model || flags["specNumTokens"] != test.tokens {
+				t.Fatalf("parsed flags = %#v", flags)
+			}
+			if test.window > 0 && flags["specDraftWindowSize"] != test.window {
+				t.Fatalf("parsed window = %v, want %d", flags["specDraftWindowSize"], test.window)
+			}
+		})
+	}
+}
+
+func TestDFlashFieldsSurviveSubmissionRemapAndRerun(t *testing.T) {
+	engineFlags := map[string]any{
+		"commandSnippet":      "# remote DFlash server",
+		"specDecoding":        true,
+		"specMethod":          "DFlash",
+		"specDraftModel":      "z-lab/draft",
+		"specNumTokens":       float64(8),
+		"specDraftWindowSize": float64(16),
+	}
+	remapped := remapEngineFlags(engineFlags, map[string]any{"engineName": "sglang"})
+	if remapped["specDraftWindowSize"] != float64(16) {
+		t.Fatalf("remapped flags = %#v", remapped)
+	}
+	args := benchmarkArgsFromPayload(map[string]any{
+		"benchmarkMode": "remote",
+		"hfId":          "target/model",
+		"quantization":  "fp16",
+		"engineFlags":   engineFlags,
+	}, cliArgs{opts: map[string]string{}, flags: map[string]bool{}})
+	if opt(args, "spec-method") != "DFlash" || opt(args, "spec-draft-model") != "z-lab/draft" ||
+		opt(args, "spec-num-tokens") != "8" || opt(args, "spec-draft-window-size") != "16" ||
+		!hasFlag(args, "spec-decoding") {
+		t.Fatalf("rerun args = %#v", args)
+	}
+}

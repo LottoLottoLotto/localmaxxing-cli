@@ -211,6 +211,23 @@ For remote endpoint submissions, `--hardware` must describe the server running t
 
 Remote endpoint runs issue one untimed warmup request and three timed iterations by default, reporting the median of each metric plus per-iteration `samples` and `sampleStats` (min/p50/mean/max/stddev). Tune with `--warmup <n>` and `--iterations <n>`; `--warmup 0 --iterations 1` restores single-shot measurement. Decode throughput is measured over the inter-token window (first to last streamed token) when more than one token arrives.
 
+Record speculative decoding with normalized fields so runs remain comparable across engines:
+
+```bash
+lmx speed-test run sglang \
+  --mode remote \
+  --base-url http://server:30000 \
+  --hf-id Qwen/Qwen3.8-27B \
+  --quantization bf16 \
+  --hardware hardware.json \
+  --spec-method dflash \
+  --spec-draft-model z-lab/Qwen3.8-27B-DFlash2 \
+  --spec-num-tokens 8 \
+  --spec-draft-window-size 16
+```
+
+Use `--spec-method`, `--spec-draft-model`, `--spec-num-tokens`, `--spec-draft-tp`, and `--spec-draft-window-size` for DFlash, MTP, EAGLE, n-gram, or other speculative methods. DFlash spellings from llama.cpp, vLLM `--speculative-config` JSON, and SGLang server commands are normalized when present in a recorded command; explicit CLI fields take precedence and survive saved-run reruns.
+
 Ollama uses the native `/api/generate` endpoint:
 
 ```bash

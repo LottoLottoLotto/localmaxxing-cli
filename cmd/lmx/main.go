@@ -1143,12 +1143,21 @@ func handleProfile(action, name string, args cliArgs) error {
 			return errors.New("profile save requires a profile name")
 		}
 		profileOpts := map[string]any{}
-		for _, key := range []string{"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware", "model-path", "command", "max-tokens", "prompt-tokens", "prefill-tokens", "output-tokens", "engine", "backend", "bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len", "output-len", "num-prompts", "request-rate", "max-concurrency", "num-parallel", "max-running-seqs", "max-running-requests", "max-num-seqs", "tensor-parallel", "context-length", "gpu-layers", "depth", "context-depth", "batch-size", "micro-batch-size", "ubatch-size", "repetitions", "runs", "benchmark-format", "bench-format", "output-format", "cache-type-k", "cache-type-v", "extra-server-args", "extra-bench-args"} {
+		for _, key := range []string{
+			"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware",
+			"model-path", "command", "max-tokens", "prompt-tokens", "prefill-tokens", "output-tokens", "engine", "backend",
+			"bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len",
+			"output-len", "num-prompts", "request-rate", "max-concurrency", "num-parallel", "max-running-seqs",
+			"max-running-requests", "max-num-seqs", "tensor-parallel", "context-length", "gpu-layers", "depth",
+			"context-depth", "batch-size", "micro-batch-size", "ubatch-size", "repetitions", "runs", "benchmark-format",
+			"bench-format", "output-format", "cache-type-k", "cache-type-v", "extra-server-args", "extra-bench-args",
+			"spec-method", "spec-draft-model", "spec-num-tokens", "spec-draft-tp", "spec-draft-window-size",
+		} {
 			if value := opt(args, key); value != "" {
 				profileOpts[key] = value
 			}
 		}
-		for _, key := range []string{"no-stream", "flash-attn", "no-flash-attn"} {
+		for _, key := range []string{"no-stream", "flash-attn", "no-flash-attn", "spec-decoding"} {
 			if hasFlag(args, key) {
 				profileOpts[key] = true
 			}
@@ -4006,6 +4015,27 @@ func benchmarkArgsFromPayload(payload map[string]any, overrides cliArgs) cliArgs
 				args.opts[field] = text
 			}
 		}
+		for key, field := range map[string]string{
+			"specMethod":     "spec-method",
+			"specDraftModel": "spec-draft-model",
+			"specModel":      "spec-draft-model",
+		} {
+			if text := stringValue(engineFlags[key]); text != "" {
+				args.opts[field] = text
+			}
+		}
+		for key, field := range map[string]string{
+			"specNumTokens":       "spec-num-tokens",
+			"specDraftTp":         "spec-draft-tp",
+			"specDraftWindowSize": "spec-draft-window-size",
+		} {
+			if value := positiveAnyInt(engineFlags[key]); value > 0 {
+				args.opts[field] = strconv.Itoa(value)
+			}
+		}
+		if enabled, _ := engineFlags["specDecoding"].(bool); enabled {
+			args.flags["spec-decoding"] = true
+		}
 	}
 	for key, value := range overrides.opts {
 		if key == "path" || key == "run" || key == "set" || key == "set-json" || key == "patch" || key == "unset" {
@@ -4878,6 +4908,9 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	if err := applyBenchmarkConcurrencyMetadata(metrics, args, mode); err != nil {
 		return nil, err
 	}
+	if err := applyBenchmarkSpeculativeMetadata(metrics, args); err != nil {
+		return nil, err
+	}
 
 	hardware, hardwareSource, err := benchmarkHardware(mode, args)
 	if err != nil {
@@ -5189,6 +5222,7 @@ func remapEngineFlags(ef map[string]any, payload map[string]any) map[string]any 
 		"concurrency", "numParallel", "maxRunningSeqs", "gpuMemUtil",
 		"specDecoding", "specModel", "specDraftModel", "specNgramSize",
 		"specNumTokens", "specDraftTp", "specMethod", "mtpEnabled", "mtpDraftLayers",
+		"specDraftWindowSize",
 		"temperature", "topP", "topK", "minP", "repeatPenalty", "mirostat",
 		"ropeScale", "ropeScaling", "yarnExtFactor", "schedulerDelayFactor",
 		"attentionBackend", "sglangQuant", "engineQuant", "splitMode", "warmup",
@@ -5568,6 +5602,114 @@ func applyBenchmarkConcurrencyMetadata(metrics map[string]any, args cliArgs, mod
 	return nil
 }
 
+func applyBenchmarkSpeculativeMetadata(metrics map[string]any, args cliArgs) error {
+	flags := asObject(metrics["engineFlags"])
+	if flags == nil {
+		flags = map[string]any{"commandSnippet": "# Server configuration supplied through lmx speed-test options"}
+		metrics["engineFlags"] = flags
+	}
+
+	command := stringValue(flags["commandSnippet"])
+	if configValue := commandFlagString(command, "--speculative-config"); configValue != "" {
+		var config map[string]any
+		if err := json.Unmarshal([]byte(configValue), &config); err == nil {
+			if method := canonicalSpecMethod(stringValue(config["method"])); method != "" {
+				flags["specMethod"] = method
+				flags["specDecoding"] = true
+			}
+			if model := firstNonEmpty(stringValue(config["model"]), stringValue(config["draft_model"])); model != "" {
+				flags["specDraftModel"] = model
+				flags["specDecoding"] = true
+			}
+			if tokens := positiveAnyInt(config["num_speculative_tokens"]); tokens > 0 {
+				flags["specNumTokens"] = tokens
+				flags["specDecoding"] = true
+			}
+		}
+	}
+	if method := canonicalSpecMethod(commandFlagString(command, "--spec-type", "--speculative-algorithm")); method != "" {
+		flags["specMethod"] = method
+		flags["specDecoding"] = true
+	}
+	if model := commandFlagString(command, "--model-draft", "-md", "--spec-draft-model", "--speculative-draft-model-path"); model != "" {
+		flags["specDraftModel"] = model
+		flags["specDecoding"] = true
+	}
+	if tokens := positiveCommandFlagInt(command, "--spec-draft-n-max", "--num-speculative-tokens", "--speculative-num-draft-tokens", "--speculative-dflash-block-size"); tokens > 0 {
+		flags["specNumTokens"] = tokens
+		flags["specDecoding"] = true
+	}
+	if window := positiveCommandFlagInt(command, "--speculative-dflash-draft-window-size"); window > 0 {
+		flags["specDraftWindowSize"] = window
+		flags["specDecoding"] = true
+	}
+
+	if hasFlag(args, "spec-decoding") {
+		flags["specDecoding"] = true
+	}
+	if method := canonicalSpecMethod(opt(args, "spec-method")); method != "" {
+		flags["specMethod"] = method
+		flags["specDecoding"] = true
+	}
+	if model := opt(args, "spec-draft-model"); model != "" {
+		flags["specDraftModel"] = model
+		flags["specDecoding"] = true
+	}
+	for option, field := range map[string]string{
+		"spec-num-tokens":        "specNumTokens",
+		"spec-draft-tp":          "specDraftTp",
+		"spec-draft-window-size": "specDraftWindowSize",
+	} {
+		if value, present, err := positiveBenchmarkIntOption(args, option); err != nil {
+			return err
+		} else if present {
+			flags[field] = value
+			flags["specDecoding"] = true
+		}
+	}
+	if stringValue(flags["specMethod"]) == "MTP" {
+		flags["mtpEnabled"] = true
+	}
+	return nil
+}
+
+func canonicalSpecMethod(value string) string {
+	switch strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), "_", "-")) {
+	case "dflash", "draft-dflash":
+		return "DFlash"
+	case "mtp", "draft-mtp":
+		return "MTP"
+	default:
+		return strings.TrimSpace(value)
+	}
+}
+
+func positiveAnyInt(value any) int {
+	var number float64
+	switch typed := value.(type) {
+	case float64:
+		number = typed
+	case float32:
+		number = float64(typed)
+	case int:
+		number = float64(typed)
+	case int64:
+		number = float64(typed)
+	case string:
+		parsed, err := strconv.ParseFloat(typed, 64)
+		if err != nil {
+			return 0
+		}
+		number = parsed
+	default:
+		return 0
+	}
+	if number < 1 || math.Trunc(number) != number {
+		return 0
+	}
+	return int(number)
+}
+
 func positiveCommandFlagInt(command string, names ...string) int {
 	value := commandFlagNumber(command, names...)
 	if value < 1 || math.Trunc(value) != value {
@@ -5669,6 +5811,22 @@ func commandFlagNumber(command string, flags ...string) float64 {
 		}
 	}
 	return 0
+}
+
+func commandFlagString(command string, flags ...string) string {
+	for _, flag := range flags {
+		pattern := `(?:^|\s)` + regexp.QuoteMeta(flag) + `(?:=|\s+)(?:"([^"]*)"|'([^']*)'|(\S+))`
+		match := regexp.MustCompile(pattern).FindStringSubmatch(command)
+		if len(match) == 0 {
+			continue
+		}
+		for _, value := range match[1:] {
+			if value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func benchmarkKind(args cliArgs, fallback string) string {
@@ -11515,6 +11673,13 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --concurrency <n>        Concurrent remote requests (alias: --max-concurrency); submitted as engineFlags.concurrency
   --num-parallel <n>       Engine parallel slots; submitted as engineFlags.numParallel and concurrency
   --max-running-seqs <n>   Engine sequence capacity; submitted as engineFlags.maxRunningSeqs
+  --spec-decoding          Mark the run as speculative decoding
+  --spec-method <method>   Speculative method, e.g. dflash, MTP, EAGLE, ngram
+  --spec-draft-model <id>  Draft model Hugging Face ID or local path
+  --spec-num-tokens <n>    Draft/speculative tokens proposed per verification step
+  --spec-draft-tp <n>      Draft model tensor-parallel degree
+  --spec-draft-window-size <n>
+                           DFlash draft KV sliding-window size
   --runs-dir <dir>         Saved speed-test runs directory (default: runs)
   --group-by <field>       Group saved-run stats by field, e.g. quantization or hardware
   --by <field>             Group saved-run comparisons by field
