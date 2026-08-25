@@ -40,6 +40,7 @@ const defaultEndpointTimeout = 10 * time.Minute
 const remoteKVCacheColdMethodology = "Single streaming request with inline filler padded to target context size; measures cold prefill + decode at that context depth."
 const remoteKVCacheReuseMethodology = "Two-step remote cache-reuse probe: pre-warm target context, then time a streaming request with the same prefix plus probe; measures cached-prefix decode at that context depth."
 const remoteKVCacheFallbackWarning = "Remote OpenAI-compatible endpoints do not provide a portable persistent KV-cache session API; this sweep resends the full prefix at each depth and can only verify cache reuse when backend-specific cache metrics are exposed. Results may fall back to cold depth TPS instead of retained KV-cache TPS."
+const defaultRemoteSpeedTestPrompt = "Explain why local inference speed tests should report prompt prefill throughput, decode throughput, and time to first token."
 
 var apiHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
@@ -6077,6 +6078,63 @@ func decodeThroughput(probe chatProbe, outputTokens int) (float64, string, bool)
 	return round1(float64(outputTokens) / (generationMs / 1000)), "request_window", true
 }
 
+func remoteSpeedTestPrompt(args cliArgs) (string, string, error) {
+	inline := opt(args, "prompt")
+	path := opt(args, "prompt-file")
+	if inline != "" && path != "" {
+		return "", "", cliError{"invalid_option", "--prompt and --prompt-file cannot be used together", []string{"Pass prompt text with --prompt or load it with --prompt-file, not both."}, nil}
+	}
+	if path != "" {
+		var (
+			data []byte
+			err  error
+		)
+		if path == "-" {
+			data, err = io.ReadAll(os.Stdin)
+		} else {
+			data, err = os.ReadFile(path)
+		}
+		if err != nil {
+			return "", "", cliError{"prompt_file_unreadable", "Could not read remote speed-test prompt.", []string{"Check --prompt-file and file permissions, or pass --prompt-file - to read stdin."}, errString(err)}
+		}
+		if len(data) == 0 {
+			return "", "", cliError{"prompt_file_empty", "Remote speed-test prompt file is empty.", []string{"Provide a non-empty prompt file."}, nil}
+		}
+		if path == "-" {
+			return string(data), "stdin", nil
+		}
+		return string(data), "file", nil
+	}
+	if inline != "" {
+		return inline, "inline", nil
+	}
+	if value := opt(args, "prompt-tokens"); value != "" {
+		target, err := strconv.Atoi(value)
+		if err != nil || target <= 0 {
+			return "", "", cliError{"invalid_option", "--prompt-tokens must be a positive integer", []string{"Pass --prompt-tokens <number>."}, nil}
+		}
+		fillerWords := max(1, target-32)
+		return kvCachePromptWords(args, fillerWords) + "\n\n" + defaultRemoteSpeedTestPrompt, "synthesized_prompt_tokens", nil
+	}
+	return defaultRemoteSpeedTestPrompt, "default", nil
+}
+
+func promptTokenCountOption(args cliArgs) (int, error) {
+	value := opt(args, "prompt-tokens")
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 0, cliError{"invalid_option", "--prompt-tokens must be a positive integer", []string{"Pass --prompt-tokens <number>."}, nil}
+	}
+	return parsed, nil
+}
+
+// Remote endpoint usage is authoritative. Explicit token counts remain a
+// fallback for endpoints that omit usage, and are checked against usage when
+// both are available.
+
 func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	baseURL, err := requireOpt(args, "base-url")
 	if err != nil {
@@ -6101,7 +6159,14 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	} else if _, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), servedModel); err == nil {
 		servedModelInfo = info
 	}
-	prompt := firstNonEmpty(opt(args, "prompt"), "Explain why local inference speed tests should report prompt prefill throughput, decode throughput, and time to first token.")
+	prompt, promptSource, err := remoteSpeedTestPrompt(args)
+	if err != nil {
+		return nil, err
+	}
+	declaredPromptTokens, err := promptTokenCountOption(args)
+	if err != nil {
+		return nil, err
+	}
 	maxTokens := 256
 	if value := opt(args, "max-tokens"); value != "" {
 		parsed, err := strconv.Atoi(value)
@@ -6165,6 +6230,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	tokSTotalValues := []float64{}
 	tokSPrefillValues := []float64{}
 	outputTokenValues := []float64{}
+	warnings := []string{}
 	for i := range iterations {
 		probes, err := timedChatCompletionBatch(args, baseURL, body, timeout, "endpoint_benchmark_failed", concurrency)
 		if err != nil {
@@ -6185,12 +6251,18 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 				groupFirstToken = probe.firstTokenAt
 			}
 			if promptTokens == 0 {
-				result, err := tokenCount(args, hfID, revision, prompt, usageToken(probe.usage, "prompt_tokens"), "prompt")
+				usagePromptTokens := usageToken(probe.usage, "prompt_tokens")
+				result, err := tokenCount(args, hfID, revision, prompt, usagePromptTokens, "prompt")
 				if err != nil {
 					return nil, err
 				}
 				promptTokens = result.Count
 				promptTokenSource = result.Source
+				if declaredPromptTokens > 0 && usagePromptTokens > 0 && declaredPromptTokens != usagePromptTokens {
+					warning := fmt.Sprintf("Endpoint usage reported %d prompt tokens; using it instead of --prompt-tokens %d.", usagePromptTokens, declaredPromptTokens)
+					warnings = append(warnings, warning)
+					printStatus(args, "prompt_token_count_adjusted", map[string]any{"declared": declaredPromptTokens, "observed": usagePromptTokens, "source": "endpoint_usage"})
+				}
 			}
 			outputResult, err := tokenCount(args, hfID, revision, probe.outputText, firstNonZero(usageToken(probe.usage, "completion_tokens"), usageToken(probe.usage, "output_tokens")), "output")
 			if err != nil {
@@ -6246,11 +6318,14 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		"prompt":       prompt,
 		"outputText":   outputText,
 		"promptTokens": float64(promptTokens),
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": concurrency},
+		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": concurrency, "promptSource": promptSource, "promptFile": opt(args, "prompt-file")},
 		"tokenSources": map[string]any{"prompt": promptTokenSource, "output": outputTokenSource},
 		"timingSource": "client_observed_http",
 		"metricSource": "remote_endpoint",
 		"ttftSource":   "unavailable_no_stream",
+	}
+	if len(warnings) > 0 {
+		metrics["warnings"] = warnings
 	}
 	if len(outputTokenValues) > 0 {
 		metrics["outputTokens"] = medianOf(outputTokenValues)
@@ -6290,7 +6365,10 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	baseURL := ollamaBaseURL(args)
 	servedModel := firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), hfID)
-	prompt := firstNonEmpty(opt(args, "prompt"), "Explain why local inference speed tests should report prompt prefill throughput, decode throughput, and time to first token.")
+	prompt, promptSource, err := remoteSpeedTestPrompt(args)
+	if err != nil {
+		return nil, err
+	}
 	maxTokens := 256
 	if value := opt(args, "max-tokens"); value != "" {
 		parsed, err := strconv.Atoi(value)
@@ -6391,7 +6469,7 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	metrics := map[string]any{
 		"prompt":       prompt,
 		"outputText":   outputText,
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": 1},
+		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": 1, "promptSource": promptSource, "promptFile": opt(args, "prompt-file")},
 		"tokenSources": map[string]any{"prompt": "ollama_prompt_eval_count", "output": "ollama_eval_count"},
 		"timingSource": "ollama_native_api",
 		"metricSource": "remote_endpoint",
@@ -7212,15 +7290,15 @@ func tokenCount(args cliArgs, hfID, revision, text string, known int, kind strin
 	if kind == "prompt" {
 		flag = "prompt-tokens"
 	}
+	if known > 0 {
+		return tokenCountResult{Count: known, Source: "endpoint_usage"}, nil
+	}
 	if value := opt(args, flag); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed <= 0 {
 			return tokenCountResult{}, cliError{"invalid_option", "--" + flag + " must be a positive integer", []string{"Pass --" + flag + " <number>."}, nil}
 		}
 		return tokenCountResult{Count: parsed, Source: "explicit_flag"}, nil
-	}
-	if known > 0 {
-		return tokenCountResult{Count: known, Source: "endpoint_usage"}, nil
 	}
 	count, err := pythonTokenCount(hfID, revision, text)
 	if err == nil && count > 0 {
@@ -11622,7 +11700,8 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --mode <mode>            Speed-test mode: remote endpoint or local host command
   --served-model <name>    Model name served by the OpenAI-compatible endpoint
   --model-api-key <key>    Optional bearer token for the remote speed-test endpoint
-  --prompt <text>          Prompt for the remote endpoint speed test
+  --prompt <text>          Inline prompt for the remote endpoint speed test
+  --prompt-file <path>     Read the remote prompt from a file; use - for stdin
   --max-tokens <n>         Max generated tokens (eval shard default: 0 = no cap, let the model finish)
   --endpoint-timeout-seconds <n> Timeout for remote endpoint speed tests (default: 600)
   --warmup <n>             Untimed warmup requests before remote endpoint measurement (default: 1)
@@ -11645,7 +11724,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --n-samples <n>           Samples per question for code evals (default: 1 greedy; >1 enables pass@k sampling)
   --k <n>                   k for pass@k over --n-samples (default: 1)
   --few-shot <n>            Few-shot examples for MBPP-family code evals (default: 3 for mbpp*, 0 otherwise)
-  --prompt-tokens <n>       llama-bench -p prompt tokens; submitted as promptTokens
+  --prompt-tokens <n>       Remote target prompt size when prompt text is omitted; endpoint usage wins if counts differ. Local llama-bench: -p
   --prefill-tokens <n>      llama-bench -d cached depth; submitted as prefillTokens (alias: --depth)
   --depth <n>               llama-bench -d cached depth; submitted as prefillTokens; KV sweeps use --levels
   --batch-size <n>         llama-bench -b batch size

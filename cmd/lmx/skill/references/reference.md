@@ -121,7 +121,8 @@ Remote speed test / endpoint:
 - `--mode <mode>`: `remote` endpoint or `local` host command.
 - `--served-model <name>`: model name served by endpoint.
 - `--model-api-key <key>`: optional bearer token for a remote speed-test endpoint.
-- `--prompt <text>`: prompt for the remote endpoint speed test.
+- `--prompt <text>` / `--prompt-file <path>`: prompt for the remote endpoint speed test; `--prompt-file -` reads stdin. The two flags are mutually exclusive.
+- `--prompt-tokens <n>`: remote target prompt size when prompt text is omitted; endpoint usage is authoritative when counts differ. In local llama.cpp mode, this remains `-p` fresh prompt tokens.
 - `--max-tokens <n>`: max generated tokens; remote speed-test default 256.
 - `--endpoint-timeout-seconds <n>`: remote endpoint timeout; default 600.
 - `--warmup <n>`: untimed warmup requests; default 1.

@@ -18,14 +18,15 @@ lmx speed-test run ollama --mode remote --base-url http://server:11434 --served-
 
 Defaults: 1 untimed warmup and 3 timed iterations. The submitted summary reports the median, and per-iteration details appear in `samples` / `sampleStats`. Tune with `--warmup` and `--iterations`; `--warmup 0 --iterations 1` is a single shot.
 
-Remote decode throughput is measured over the inter-token window from first streamed token to last streamed token. `tokSPrefill` is estimated from prompt tokens divided by TTFT.
+Remote decode throughput is measured over the inter-token window from first streamed token to last streamed token. `tokSPrefill` is estimated from the endpoint's `usage.prompt_tokens` divided by TTFT. When usage is unavailable, the CLI falls back to the declared or locally estimated prompt count and marks the source accordingly.
 
 Important remote flags:
 
 - `--base-url <url>`: model server base URL; accepts host or host plus `/v1`.
 - `--served-model <name>`: model name served by the endpoint.
 - `--model-api-key <key>`: bearer token for the model endpoint.
-- `--prompt <text>`: semantic prompt sent to the endpoint.
+- `--prompt <text>` / `--prompt-file <path>`: semantic prompt sent to the endpoint; use `--prompt-file -` for stdin. These inputs are mutually exclusive.
+- `--prompt-tokens <n>`: target prompt size when prompt text is omitted; the CLI synthesizes deterministic text of approximately that many tokens. Endpoint usage remains authoritative and a mismatch is recorded in `warnings`.
 - `--max-tokens <n>`: max generated tokens; remote speed-test default is 256.
 - `--temperature <f>`: sampling temperature; default is 0.
 - `--no-stream`: disable streaming.

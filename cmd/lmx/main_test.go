@@ -413,6 +413,80 @@ func TestMeasureOpenAIEndpointMarksEstimatedPrefillAndStringEngineFlags(t *testi
 	}
 }
 
+func TestMeasureOpenAIEndpointReadsPromptFileAndTrustsUsage(t *testing.T) {
+	prompt := strings.Repeat("context window ", 4096)
+	promptPath := filepath.Join(t.TempDir(), "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte(prompt), 0o644); err != nil {
+		t.Fatalf("write prompt file: %v", err)
+	}
+	receivedPrompt := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[{"id":"served-model","quantization":"fp16"}]}`)
+		case "/v1/chat/completions":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			messages := anySlice(body["messages"])
+			receivedPrompt = stringValue(asObject(messages[0])["content"])
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":8201,"completion_tokens":2}}`)
+			fmt.Fprintln(w, `data: [DONE]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	metrics, err := measureOpenAIEndpoint(cliArgs{
+		opts: map[string]string{
+			"base-url":      server.URL,
+			"served-model":  "served-model",
+			"prompt-file":   promptPath,
+			"prompt-tokens": "8192",
+			"max-tokens":    "16",
+			"warmup":        "0",
+			"iterations":    "1",
+		},
+		flags: map[string]bool{"quiet": true},
+	}, "org/model")
+	if err != nil {
+		t.Fatalf("measureOpenAIEndpoint returned error: %v", err)
+	}
+	if receivedPrompt != prompt {
+		t.Fatalf("received prompt length = %d, want %d", len(receivedPrompt), len(prompt))
+	}
+	if metrics["promptTokens"] != 8201.0 || asObject(metrics["tokenSources"])["prompt"] != "endpoint_usage" {
+		t.Fatalf("prompt accounting = %#v / %#v, want endpoint usage 8201", metrics["promptTokens"], metrics["tokenSources"])
+	}
+	warnings, ok := metrics["warnings"].([]string)
+	if !ok || len(warnings) != 1 {
+		t.Fatalf("warnings = %#v, want declared/observed mismatch warning", metrics["warnings"])
+	}
+	engineFlags := asObject(metrics["engineFlags"])
+	if engineFlags["promptSource"] != "file" || engineFlags["promptFile"] != promptPath {
+		t.Fatalf("prompt engine flags = %#v", engineFlags)
+	}
+}
+
+func TestRemoteSpeedTestPromptSynthesizesTargetAndRejectsConflicts(t *testing.T) {
+	prompt, source, err := remoteSpeedTestPrompt(cliArgs{opts: map[string]string{"prompt-tokens": "128"}, flags: map[string]bool{}})
+	if err != nil {
+		t.Fatalf("remoteSpeedTestPrompt returned error: %v", err)
+	}
+	if source != "synthesized_prompt_tokens" || len(strings.Fields(prompt)) < 100 || !strings.Contains(prompt, defaultRemoteSpeedTestPrompt) {
+		t.Fatalf("synthesized prompt source/content = %q/%q", source, prompt)
+	}
+	_, _, err = remoteSpeedTestPrompt(cliArgs{opts: map[string]string{"prompt": "inline", "prompt-file": "prompt.txt"}, flags: map[string]bool{}})
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "invalid_option" {
+		t.Fatalf("prompt conflict error = %#v, want invalid_option", err)
+	}
+}
+
 func TestMeasureOpenAIEndpointHonorsConcurrency(t *testing.T) {
 	var active atomic.Int32
 	var maxActive atomic.Int32
