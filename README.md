@@ -173,6 +173,9 @@ lmx report create \
   --title "Qwen local inference report" \
   --summary "Reproducible setup, measurements, and observations." \
   --content-file report.md \
+  --engine FreeToken \
+  --quantization BF16 \
+  --tags moe,bf16,throughput \
   --draft \
   --json
 ```
@@ -220,13 +223,13 @@ lmx speed-test run sglang \
   --hf-id Qwen/Qwen3.8-27B \
   --quantization bf16 \
   --hardware hardware.json \
-  --spec-method dflash \
+  --spec-method dflash2 \
   --spec-draft-model z-lab/Qwen3.8-27B-DFlash2 \
   --spec-num-tokens 8 \
   --spec-draft-window-size 16
 ```
 
-Use `--spec-method`, `--spec-draft-model`, `--spec-num-tokens`, `--spec-draft-tp`, and `--spec-draft-window-size` for DFlash, MTP, EAGLE, n-gram, or other speculative methods. DFlash spellings from llama.cpp, vLLM `--speculative-config` JSON, and SGLang server commands are normalized when present in a recorded command; explicit CLI fields take precedence and survive saved-run reruns.
+Use `--spec-method`, `--spec-draft-model`, `--spec-num-tokens`, `--spec-draft-tp`, and `--spec-draft-window-size` for DFlash2, DFlash, MTP, EAGLE, n-gram, or other speculative methods. `dflash2`/`draft-dflash2`, `dflash`/`draft-dflash`, and `mtp`/`draft-mtp` are canonicalized to `DFlash2`, `DFlash`, and `MTP`. A DFlash method paired with a draft-model name containing `DFlash2` is recorded as `DFlash2`. Engine commands from llama.cpp, vLLM `--speculative-config` JSON, and SGLang are normalized when present; explicit CLI fields take precedence and survive saved-run reruns.
 
 Ollama uses the native `/api/generate` endpoint:
 
@@ -240,6 +243,8 @@ lmx speed-test run ollama \
   --hardware hardware.json \
   --max-tokens 256
 ```
+
+Use `--kv-cache-tokens <n>` to record how many tokens were already held in KV cache before the measured request. Omit it for a fresh run; the CLI records `0`. `--prefill-tokens` and `--depth` remain aliases for local `llama-bench -d` compatibility.
 
 ### Local llama.cpp
 
@@ -397,6 +402,27 @@ lmx eval run my-judge-suite \
   --submit
 ```
 
+### Publish a Terminal-Bench 2.1 style dataset
+
+Publishing executable terminal bundles requires LocalMaxxing Pro. The publisher
+oracle-verifies every task by default, creates deterministic `.tar.gz` bundles,
+uploads them with SHA-256 metadata, validates the complete manifest, and submits
+the dataset for admin review. Upload state is saved under `.localmaxxing/` so an
+interrupted publish reuses completed objects.
+
+```bash
+lmx eval terminal import ./harbor-tasks --out ./tb-bundles --version 2.1
+lmx eval terminal publish ./tb-bundles \
+  --slug my-terminal-bench \
+  --name "My Terminal Benchmark" \
+  --source-url https://github.com/org/repo \
+  --shard-count 5
+```
+
+Use `--dry-run` to stop after authenticated object and manifest verification.
+`--skip-oracle` is available for a previously verified collection, but does not
+bypass server policy or admin approval.
+
 ### Train from verified eval trajectories
 
 Prepare conversational SFT data from scored passing OMP trajectories. Failed
@@ -502,18 +528,24 @@ lmx endpoint discover --base-url http://server:8080 --include-server-metadata
 ## Eval Suite Authoring
 
 ```bash
-lmx eval suite init \
-  --slug my-reasoning-eval \
-  --name "My Reasoning Eval" \
-  --category reasoning \
-  --kind multiple_choice \
-  --out my-reasoning-eval.json
+# Scaffold or import questions from CSV, JSONL, or JSON.
+lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --kind multiple_choice --out my-eval.json
+lmx eval suite import questions.jsonl --slug my-eval --name "My Eval" --kind multiple_choice \
+  --input-column question --gold-column answer --choices-column choices --out my-eval.json
 
-lmx eval suite validate my-reasoning-eval.json
-lmx eval suite submit my-reasoning-eval.json
+# Validate, inspect quality, and run a small endpoint smoke test.
+lmx eval suite validate my-eval.json
+lmx eval suite audit my-eval.json
+lmx eval suite check my-eval.json --model Qwen/Qwen3-8B --base-url http://localhost:8000 --samples 5
+
+# Upload large inline datasets automatically and submit for review.
+lmx eval suite submit my-eval.json --upload-datasets
+
+# Track status and admin feedback.
+lmx eval suite submissions
 ```
 
-Submitted suites start as `PENDING` and appear publicly after admin approval.
+Submitted suites start as `PENDING`. Rejected suites can be corrected with `lmx eval suite resubmit <id> --file my-eval.json`.
 
 ## Development
 

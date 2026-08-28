@@ -352,11 +352,12 @@ func TestReadJSONAcceptsUTF8BOM(t *testing.T) {
 	}
 }
 
-func TestReadOpenAIStreamParsesContentAndUsage(t *testing.T) {
+func TestReadOpenAIStreamParsesGeneratedContentAndUsage(t *testing.T) {
 	stream := strings.Join([]string{
-		`data: {"choices":[{"delta":{"content":"hello"}}]}`,
-		`data: {"choices":[{"delta":{"reasoning_content":" world"}}]}`,
-		`data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}`,
+		`data: {"choices":[{"delta":{"reasoning":"think"}}]}`,
+		`data: {"choices":[{"delta":{"reasoning_content":" deeper"}}]}`,
+		`data: {"choices":[{"delta":{"content":" answer"}}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":3}}`,
 		`data: [DONE]`,
 		``,
 	}, "\n")
@@ -364,14 +365,21 @@ func TestReadOpenAIStreamParsesContentAndUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readOpenAIStream returned error: %v", err)
 	}
-	if result.outputText != "hello world" {
-		t.Fatalf("outputText = %q, want hello world", result.outputText)
+	if result.outputText != "think deeper answer" {
+		t.Fatalf("outputText = %q, want think deeper answer", result.outputText)
 	}
 	if result.firstTokenAt.IsZero() {
-		t.Fatal("firstTokenAt was not set")
+		t.Fatal("firstTokenAt was not set by reasoning content")
 	}
-	if usageToken(result.usage, "prompt_tokens") != 3 || usageToken(result.usage, "completion_tokens") != 2 {
+	if usageToken(result.usage, "prompt_tokens") != 3 || usageToken(result.usage, "completion_tokens") != 3 {
 		t.Fatalf("usage = %#v", result.usage)
+	}
+}
+
+func TestGeneratedContentIncludesReasoningAndAnswerWithoutDuplicateAliases(t *testing.T) {
+	got := generatedContent("think ", "think ", "answer")
+	if got != "think answer" {
+		t.Fatalf("generatedContent() = %q, want think answer", got)
 	}
 }
 
@@ -2109,6 +2117,47 @@ func TestBenchmarkPrefillTokensReachSubmitPayload(t *testing.T) {
 	}
 }
 
+func TestBenchmarkKVCacheTokensOptionReachesSubmitPayload(t *testing.T) {
+	payload, err := benchmarkPayloadFromFlags("vllm", cliArgs{
+		opts: map[string]string{
+			"mode":            "remote",
+			"hf-id":           "Qwen/Qwen3-8B",
+			"quantization":    "fp16",
+			"hardware":        writeBenchmarkHardwareForTest(t),
+			"tok-s-out":       "42",
+			"prompt-tokens":   "512",
+			"kv-cache-tokens": "4096",
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	submit := toBenchmarkSubmit(payload)
+	if submit["promptTokens"] != float64(512) || submit["prefillTokens"] != float64(4096) {
+		t.Fatalf("submit token fields = prompt:%#v prefill:%#v", submit["promptTokens"], submit["prefillTokens"])
+	}
+}
+
+func TestBenchmarkFreshRunDefaultsKVCacheTokensToZero(t *testing.T) {
+	payload, err := benchmarkPayloadFromFlags("vllm", cliArgs{
+		opts: map[string]string{
+			"mode":         "remote",
+			"hf-id":        "Qwen/Qwen3-8B",
+			"quantization": "fp16",
+			"hardware":     writeBenchmarkHardwareForTest(t),
+			"tok-s-out":    "42",
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	if payload["prefillTokens"] != float64(0) || toBenchmarkSubmit(payload)["prefillTokens"] != float64(0) {
+		t.Fatalf("fresh run prefillTokens = payload:%#v submit:%#v, want 0", payload["prefillTokens"], toBenchmarkSubmit(payload)["prefillTokens"])
+	}
+}
+
 func TestKVCacheDryRunBuildsVLLMLatencyCommandsPerLevel(t *testing.T) {
 	tmp := t.TempDir()
 	out := filepath.Join(tmp, "sweep.json")
@@ -3111,10 +3160,10 @@ func TestModelNameFromGGUFFilenameStripsVendorFPQuant(t *testing.T) {
 	}
 }
 
-func TestApplyBenchmarkSpeculativeMetadataFromExplicitOptions(t *testing.T) {
+func TestApplyBenchmarkDFlash2MetadataFromExplicitOptions(t *testing.T) {
 	args := parseArgs([]string{
 		"speed-test", "run", "sglang",
-		"--spec-method", "dflash",
+		"--spec-method", "dflash2",
 		"--spec-draft-model", "z-lab/Qwen3.8-27B-DFlash2",
 		"--spec-num-tokens", "8",
 		"--spec-draft-tp", "2",
@@ -3125,12 +3174,12 @@ func TestApplyBenchmarkSpeculativeMetadataFromExplicitOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	flags := asObject(metrics["engineFlags"])
-	if flags["specDecoding"] != true || flags["specMethod"] != "DFlash" {
-		t.Fatalf("spec metadata = %#v, want enabled DFlash", flags)
+	if flags["specDecoding"] != true || flags["specMethod"] != "DFlash2" {
+		t.Fatalf("spec metadata = %#v, want enabled DFlash2", flags)
 	}
 	if flags["specDraftModel"] != "z-lab/Qwen3.8-27B-DFlash2" ||
 		flags["specNumTokens"] != 8 || flags["specDraftTp"] != 2 || flags["specDraftWindowSize"] != 16 {
-		t.Fatalf("spec metadata = %#v, want explicit DFlash fields", flags)
+		t.Fatalf("spec metadata = %#v, want explicit DFlash2 fields", flags)
 	}
 }
 
@@ -3139,6 +3188,7 @@ func TestApplyBenchmarkSpeculativeMetadataParsesEngineCommands(t *testing.T) {
 		name    string
 		command string
 		model   string
+		method  string
 		tokens  int
 		window  int
 	}{
@@ -3146,18 +3196,21 @@ func TestApplyBenchmarkSpeculativeMetadataParsesEngineCommands(t *testing.T) {
 			name:    "llama.cpp",
 			command: "llama-server -m target.gguf -md draft.gguf --spec-type draft-dflash --spec-draft-n-max 7",
 			model:   "draft.gguf",
+			method:  "DFlash",
 			tokens:  7,
 		},
 		{
-			name:    "vllm",
-			command: `vllm serve target --speculative-config '{"method":"dflash","model":"z-lab/draft","num_speculative_tokens":6}'`,
-			model:   "z-lab/draft",
+			name:    "vllm DFlash2 model inference",
+			command: `vllm serve target --speculative-config '{"method":"dflash","model":"syvai/Qwen3.8-27B-DFlash2-W4A16","num_speculative_tokens":6}'`,
+			model:   "syvai/Qwen3.8-27B-DFlash2-W4A16",
+			method:  "DFlash2",
 			tokens:  6,
 		},
 		{
 			name:    "sglang",
 			command: "python -m sglang.launch_server --speculative-algorithm DFLASH --speculative-draft-model-path z-lab/draft --speculative-dflash-block-size 8 --speculative-dflash-draft-window-size 16",
 			model:   "z-lab/draft",
+			method:  "DFlash",
 			tokens:  8,
 			window:  16,
 		},
@@ -3169,7 +3222,7 @@ func TestApplyBenchmarkSpeculativeMetadataParsesEngineCommands(t *testing.T) {
 				t.Fatal(err)
 			}
 			flags := asObject(metrics["engineFlags"])
-			if flags["specMethod"] != "DFlash" || flags["specDraftModel"] != test.model || flags["specNumTokens"] != test.tokens {
+			if flags["specMethod"] != test.method || flags["specDraftModel"] != test.model || flags["specNumTokens"] != test.tokens {
 				t.Fatalf("parsed flags = %#v", flags)
 			}
 			if test.window > 0 && flags["specDraftWindowSize"] != test.window {
@@ -3179,12 +3232,12 @@ func TestApplyBenchmarkSpeculativeMetadataParsesEngineCommands(t *testing.T) {
 	}
 }
 
-func TestDFlashFieldsSurviveSubmissionRemapAndRerun(t *testing.T) {
+func TestDFlash2FieldsSurviveSubmissionRemapAndRerun(t *testing.T) {
 	engineFlags := map[string]any{
-		"commandSnippet":      "# remote DFlash server",
+		"commandSnippet":      "# remote DFlash2 server",
 		"specDecoding":        true,
-		"specMethod":          "DFlash",
-		"specDraftModel":      "z-lab/draft",
+		"specMethod":          "DFlash2",
+		"specDraftModel":      "syvai/Qwen3.8-27B-DFlash2-W4A16",
 		"specNumTokens":       float64(8),
 		"specDraftWindowSize": float64(16),
 	}
@@ -3198,7 +3251,7 @@ func TestDFlashFieldsSurviveSubmissionRemapAndRerun(t *testing.T) {
 		"quantization":  "fp16",
 		"engineFlags":   engineFlags,
 	}, cliArgs{opts: map[string]string{}, flags: map[string]bool{}})
-	if opt(args, "spec-method") != "DFlash" || opt(args, "spec-draft-model") != "z-lab/draft" ||
+	if opt(args, "spec-method") != "DFlash2" || opt(args, "spec-draft-model") != "syvai/Qwen3.8-27B-DFlash2-W4A16" ||
 		opt(args, "spec-num-tokens") != "8" || opt(args, "spec-draft-window-size") != "16" ||
 		!hasFlag(args, "spec-decoding") {
 		t.Fatalf("rerun args = %#v", args)

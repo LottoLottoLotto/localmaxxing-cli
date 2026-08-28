@@ -341,7 +341,7 @@ func isBooleanOption(key string) bool {
 	case "help", "json-status", "dry-run", "quiet", "logout", "no-browser", "default",
 		"submit", "print", "json", "verbose", "yes", "force", "rerun",
 		"include-server-metadata", "enable-prefix-caching", "flash-attn", "no-flash-attn",
-		"no-stream", "missing-only", "all-missing", "cleanup-images", "oracle",
+		"no-stream", "missing-only", "all-missing", "cleanup-images", "native-tools", "oracle",
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
 		"save-run", "key-stdin", "draft":
@@ -1146,7 +1146,7 @@ func handleProfile(action, name string, args cliArgs) error {
 		profileOpts := map[string]any{}
 		for _, key := range []string{
 			"mode", "api-url", "base-url", "model", "hf-id", "served-model", "model-name", "quantization", "hardware",
-			"model-path", "command", "max-tokens", "prompt-tokens", "prefill-tokens", "output-tokens", "engine", "backend",
+			"model-path", "command", "max-tokens", "prompt-tokens", "kv-cache-tokens", "prefill-tokens", "output-tokens", "engine", "backend",
 			"bench-kind", "benchmark-output", "benchmark-bin", "server-bin", "python-bin", "host", "port", "input-len",
 			"output-len", "num-prompts", "request-rate", "max-concurrency", "num-parallel", "max-running-seqs",
 			"max-running-requests", "max-num-seqs", "tensor-parallel", "context-length", "gpu-layers", "depth",
@@ -2104,9 +2104,14 @@ func handleSuite(action, target string, args cliArgs) error {
 		if err := validateSuite(payload); err != nil {
 			return err
 		}
+		if hasFlag(args, "remote") {
+			if err := validateSuiteRemote(payload, args); err != nil {
+				return err
+			}
+		}
 		obj := asObject(payload)
 		suiteDoc := asObject(obj["suiteDoc"])
-		printInfo(args, "suite_valid", map[string]any{"slug": obj["slug"], "runner": obj["runner"], "scoringMethod": suiteDoc["scoringMethod"], "submit": "lmx eval suite submit " + target + " --api-key bhk_..."})
+		printInfo(args, "suite_valid", map[string]any{"slug": obj["slug"], "runner": obj["runner"], "scoringMethod": suiteDoc["scoringMethod"], "authoritative": hasFlag(args, "remote"), "submit": "lmx eval suite submit " + target})
 		return nil
 	case "submit":
 		if target == "" {
@@ -2123,6 +2128,15 @@ func handleSuite(action, target string, args cliArgs) error {
 		if err := validateSuite(payload); err != nil {
 			return err
 		}
+		if hasFlag(args, "upload-datasets") {
+			payload, err = uploadSuiteInlineDatasets(payload, args)
+			if err != nil {
+				return err
+			}
+		}
+		if err := validateSuiteRemote(payload, args); err != nil {
+			return err
+		}
 		value, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/suites", key, payload)
 		if err != nil {
 			return err
@@ -2132,8 +2146,22 @@ func handleSuite(action, target string, args cliArgs) error {
 		return nil
 	case "init":
 		return handleSuiteInit(args)
+	case "import":
+		return handleSuiteImport(target, args)
+	case "audit":
+		return handleSuiteAudit(target, args)
+	case "check":
+		return handleSuiteCheck(target, args)
+	case "submissions":
+		return handleSuiteSubmissions(args)
+	case "withdraw":
+		return handleSuiteWithdraw(target, args)
+	case "resubmit":
+		return handleSuiteResubmit(target, args)
+	case "clone":
+		return handleSuiteClone(target, args)
 	default:
-		return errors.New("Unknown suite command. Use init, list, search, show, validate, or submit.")
+		return errors.New("Unknown suite command. Use init, import, audit, check, clone, list, search, show, validate, submit, submissions, resubmit, or withdraw.")
 	}
 }
 
@@ -2280,7 +2308,7 @@ func validateSuite(value any) error {
 			errs = append(errs, "suiteDoc.runner must be "+expectedRunner)
 		}
 		scoring := stringValue(doc["scoringMethod"])
-		if !containsString([]string{"exact_match", "f1", "pass_at_k", "perplexity", "llm_judge", "loglikelihood"}, scoring) {
+		if !containsString([]string{"exact_match", "f1", "pass_at_k", "perplexity", "llm_judge", "user_rating", "loglikelihood"}, scoring) {
 			errs = append(errs, "suiteDoc.scoringMethod is invalid")
 		}
 		if scoring == "perplexity" {
@@ -2312,8 +2340,8 @@ func validateSuite(value any) error {
 					errs = append(errs, prefix+".promptTemplate is required for CUSTOM suites")
 				}
 				if ext := stringValue(task["answerExtraction"]); ext != "" {
-					if !containsString([]string{"none", "final_answer", "last_number", "regex"}, ext) {
-						errs = append(errs, prefix+".answerExtraction must be none, final_answer, last_number, or regex")
+					if !containsString([]string{"none", "last_number", "regex"}, ext) {
+						errs = append(errs, prefix+".answerExtraction must be none, last_number, or regex")
 					}
 					if ext == "regex" {
 						pattern := stringValue(task["answerRegex"])
@@ -2414,8 +2442,13 @@ func handleStorage(action, target string, args cliArgs, forcedKind string) error
 		if putRes.StatusCode < 200 || putRes.StatusCode >= 300 {
 			return cliError{"storage_put_failed", fmt.Sprintf("Storage PUT failed: %s", putRes.Status), []string{"Retry the upload; signed upload URLs can expire.", "Check --content-type and file size."}, string(putBody)}
 		}
-		storageRef := firstString(uploadObj, "storageRef", "key")
-		if storageRef == "" {
+		storageRef := asObject(uploadObj["storageRef"])
+		if storageRef == nil {
+			if storageKey := firstString(uploadObj, "key"); storageKey != "" {
+				storageRef = map[string]any{"storageKey": storageKey, "format": format, "contentType": metadata["contentType"], "byteSize": info.Size(), "sha256": metadata["sha256"]}
+			}
+		}
+		if storageRef == nil {
 			return cliError{"storage_ref_missing", "Storage upload-url response did not include storageRef or key", nil, upload}
 		}
 		completed, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/storage/complete", key, map[string]any{"storageRef": storageRef})
@@ -4931,7 +4964,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		Extra:           metrics,
 	}
 	payload := builder.ToMap()
-	setNumericFlagFields(payload, args, map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "prompt-tokens": "promptTokens", "prefill-tokens": "prefillTokens", "depth": "prefillTokens", "output-tokens": "outputTokens", "num-prompts": "numPrompts"})
+	setNumericFlagFields(payload, args, map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "prompt-tokens": "promptTokens", "output-tokens": "outputTokens", "num-prompts": "numPrompts"})
 	if raw := opt(args, "gpu-power-watts"); raw != "" {
 		watts, err := parseGpuPowerWatts(raw)
 		if err != nil {
@@ -4947,6 +4980,16 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		payload["hardwareCost"] = cost
 	}
 	applyCommandTokenHints(payload)
+	prefillRaw := firstNonEmpty(opt(args, "kv-cache-tokens"), opt(args, "prefill-tokens"), opt(args, "depth"))
+	if prefillRaw != "" {
+		prefillTokens, parseErr := strconv.Atoi(prefillRaw)
+		if parseErr != nil || prefillTokens < 0 {
+			return nil, cliError{"invalid_option", "--kv-cache-tokens must be a non-negative integer", []string{"Pass --kv-cache-tokens 0 for a fresh run or the number of tokens already held in KV cache."}, nil}
+		}
+		payload["prefillTokens"] = float64(prefillTokens)
+	} else if _, reported := payload["prefillTokens"]; !reported {
+		payload["prefillTokens"] = float64(0)
+	}
 	if notes := opt(args, "notes"); notes != "" {
 		payload["notes"] = notes
 	}
@@ -5009,7 +5052,7 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 		"ttftMs", "tokSOut", "tokSPrefill", "tokSTotal",
 		"peakVramGb", "gpuPowerWatts", "hardwareCost", "prefillTokens", "notes",
 	} {
-		if v, ok := payload[key]; ok && submitValuePresent(v) {
+		if v, ok := payload[key]; ok && (submitValuePresent(v) || (key == "prefillTokens" && v != nil)) {
 			out[key] = v
 		}
 	}
@@ -5668,20 +5711,33 @@ func applyBenchmarkSpeculativeMetadata(metrics map[string]any, args cliArgs) err
 			flags["specDecoding"] = true
 		}
 	}
+	if method := canonicalSpecMethod(stringValue(flags["specMethod"]), stringValue(flags["specDraftModel"])); method != "" {
+		flags["specMethod"] = method
+	}
 	if stringValue(flags["specMethod"]) == "MTP" {
 		flags["mtpEnabled"] = true
 	}
 	return nil
 }
 
-func canonicalSpecMethod(value string) string {
-	switch strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), "_", "-")) {
+func canonicalSpecMethod(value string, draftModel ...string) string {
+	trimmed := strings.TrimSpace(value)
+	normalized := strings.ToLower(strings.ReplaceAll(trimmed, "_", "-"))
+	switch normalized {
+	case "dflash2", "dflash-2", "draft-dflash2", "draft-dflash-2":
+		return "DFlash2"
 	case "dflash", "draft-dflash":
+		if len(draftModel) > 0 {
+			normalizedModel := strings.ToLower(strings.ReplaceAll(draftModel[0], "_", "-"))
+			if strings.Contains(normalizedModel, "dflash2") || strings.Contains(normalizedModel, "dflash-2") {
+				return "DFlash2"
+			}
+		}
 		return "DFlash"
 	case "mtp", "draft-mtp":
 		return "MTP"
 	default:
-		return strings.TrimSpace(value)
+		return trimmed
 	}
 }
 
@@ -5736,7 +5792,7 @@ func positiveBenchmarkIntOption(args cliArgs, names ...string) (int, bool, error
 
 func appendLlamaBenchArgs(cmd *[]string, args cliArgs, includeDepth bool) {
 	if includeDepth {
-		appendShellArg(cmd, "-d", firstNonEmpty(opt(args, "depth"), opt(args, "prefill-tokens"), opt(args, "context-depth")))
+		appendShellArg(cmd, "-d", firstNonEmpty(opt(args, "kv-cache-tokens"), opt(args, "depth"), opt(args, "prefill-tokens"), opt(args, "context-depth")))
 	}
 	appendShellArg(cmd, "-b", opt(args, "batch-size"))
 	appendShellArg(cmd, "-ub", firstNonEmpty(opt(args, "micro-batch-size"), opt(args, "ubatch-size")))
@@ -5775,7 +5831,7 @@ func applyCommandTokenHints(payload map[string]any) {
 		}
 	}
 	if numberField(payload, "prefillTokens") == 0 {
-		if value := commandFlagNumber(command, "-d", "--depth", "--prefill-tokens", "--context-depth"); value > 0 {
+		if value := commandFlagNumber(command, "-d", "--depth", "--kv-cache-tokens", "--prefill-tokens", "--context-depth"); value > 0 {
 			payload["prefillTokens"] = value
 		}
 	}
@@ -7266,7 +7322,7 @@ func streamingContent(chunk map[string]any) string {
 	if delta == nil {
 		return ""
 	}
-	return firstNonEmpty(stringValue(delta["content"]), stringValue(delta["reasoning_content"]))
+	return generatedContent(delta["reasoning"], delta["reasoning_content"], delta["content"])
 }
 
 func nonStreamingContent(response map[string]any) string {
@@ -7282,7 +7338,11 @@ func nonStreamingContent(response map[string]any) string {
 	if message == nil {
 		return ""
 	}
-	return firstNonEmpty(stringValue(message["content"]), stringValue(message["reasoning_content"]))
+	return generatedContent(message["reasoning"], message["reasoning_content"], message["content"])
+}
+
+func generatedContent(reasoning, reasoningContent, content any) string {
+	return firstNonEmpty(stringValue(reasoning), stringValue(reasoningContent)) + stringValue(content)
 }
 
 func tokenCount(args cliArgs, hfID, revision, text string, known int, kind string) (tokenCountResult, error) {
@@ -11604,8 +11664,13 @@ var usageExamples = []string{
 	`lmx eval storage download <storageKey> --out traces.jsonl`,
 	`lmx eval lm-eval hellaswag --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run`,
 	`lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --out my-eval.json`,
+	`lmx eval suite import questions.jsonl --slug my-eval --name "My Eval" --kind qa --out my-eval.json`,
+	`lmx eval suite audit my-eval.json`,
+	`lmx eval suite check my-eval.json --model Qwen/Qwen3-8B --base-url http://localhost:8000 --samples 5`,
 	`lmx eval suite validate my-eval.json`,
-	`lmx eval suite submit my-eval.json --api-key bhk_...`,
+	`lmx eval suite submit my-eval.json --upload-datasets`,
+	`lmx eval suite submissions`,
+	`lmx eval suite resubmit <id> --file my-eval.json`,
 	`lmx eval execute <suiteSlug> --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --submit`,
 	`lmx eval shard gsm8k --base-url http://localhost:8000 --questions 200 --dry-run`,
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --questions 200 --dry-run`,
@@ -11614,6 +11679,7 @@ var usageExamples = []string{
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --missing-only --submit`,
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --all-missing --submit`,
 	`lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1`,
+	`lmx eval terminal publish ./tb-bundles --slug my-terminal-bench --name "My Terminal Benchmark" --source-url https://github.com/org/repo --shard-count 5`,
 	`lmx eval terminal verify ./tb-bundles/smoke --oracle`,
 	`lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --run-dir ./runs/tb21-qwen --resume auto --json-status --json --submit`,
 	`lmx eval terminal run crud-bench --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --run-dir ./runs/crud-bench-qwen --resume auto --json-status --submit`,
@@ -11668,11 +11734,13 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --agent-cmd <cmd>       Terminal eval external agent command; gets LMX_TERMINAL_* env vars
   --agent-execution <m>   External agent execution: host (default), container, or routed-shell
   --agent-name <name>     Label for external terminal agent submissions (default: external-agent)
+  --thinking-level <level> Thinking used by the evaluated model: off, on, low, medium, high, xhigh, or auto; inferred or prompted when omitted
   --container-base-url <url> Base URL visible from task containers for container-native agents
   --command-timeout <sec> Terminal per-shell-command timeout (default: 300 seconds, capped by remaining agent time)
   --endpoint-timeout-seconds <n> Terminal model request timeout (default: 600; first attempt reserves retry time)
   --trace-dir <dir>       Save per-terminal-task traces locally: transcript.md, verifier.txt, prompt.txt, result.json, and external agent logs
   --cleanup-images        Remove locally built terminal task images after each task
+  --native-tools          Send the built-in shell function to compatible chat endpoints and execute returned tool calls
   --shell-mode <mode>     Terminal eval built-in harness shell: persistent (default, one shared shell) or stateless (fresh shell per command)
   --oracle                Run terminal task solution/solve.sh instead of the model agent
   --base-model <hfId>      Loadable HuggingFace base checkpoint for eval-derived adapter training
@@ -11725,8 +11793,9 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --k <n>                   k for pass@k over --n-samples (default: 1)
   --few-shot <n>            Few-shot examples for MBPP-family code evals (default: 3 for mbpp*, 0 otherwise)
   --prompt-tokens <n>       Remote target prompt size when prompt text is omitted; endpoint usage wins if counts differ. Local llama-bench: -p
-  --prefill-tokens <n>      llama-bench -d cached depth; submitted as prefillTokens (alias: --depth)
-  --depth <n>               llama-bench -d cached depth; submitted as prefillTokens; KV sweeps use --levels
+  --kv-cache-tokens <n>     Tokens already held in KV cache before the test; defaults to 0 for a fresh run
+  --prefill-tokens <n>      Alias for --kv-cache-tokens; llama-bench -d cached depth
+  --depth <n>               Alias for --kv-cache-tokens; KV sweeps use --levels
   --batch-size <n>         llama-bench -b batch size
   --micro-batch-size <n>   llama-bench -ub micro-batch size
   --repetitions <n>        llama-bench -r repetitions
@@ -11753,12 +11822,12 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --num-parallel <n>       Engine parallel slots; submitted as engineFlags.numParallel and concurrency
   --max-running-seqs <n>   Engine sequence capacity; submitted as engineFlags.maxRunningSeqs
   --spec-decoding          Mark the run as speculative decoding
-  --spec-method <method>   Speculative method, e.g. dflash, MTP, EAGLE, ngram
+  --spec-method <method>   Speculative method, e.g. DFlash2, DFlash, MTP, EAGLE, ngram
   --spec-draft-model <id>  Draft model Hugging Face ID or local path
   --spec-num-tokens <n>    Draft/speculative tokens proposed per verification step
   --spec-draft-tp <n>      Draft model tensor-parallel degree
   --spec-draft-window-size <n>
-                           DFlash draft KV sliding-window size
+                           DFlash / DFlash2 draft KV sliding-window size
   --runs-dir <dir>         Saved speed-test runs directory (default: runs)
   --group-by <field>       Group saved-run stats by field, e.g. quantization or hardware
   --by <field>             Group saved-run comparisons by field
@@ -11835,6 +11904,10 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --content-file <path>    Read GFM report content from a file; use - for stdin
   --benchmark-run-ids <ids> Comma-separated benchmark run IDs to attach
   --eval-run-ids <ids>     Comma-separated evaluation run IDs to attach
+  --engine <name>          Report inference engine metadata
+  --quantization <format>  Report model quantization metadata
+  --hardware-id <id>       Owned hardware profile associated with this model
+  --tags <values>          Comma-separated report discovery tags
   --draft                  Create a private report draft instead of publishing
   --file <path>            Report image file to upload
   --caption <text>         Report image caption/alt text
@@ -11883,13 +11956,21 @@ var commandDescriptions = map[string]string{
 	"model search":            "Search LocalMaxxing model records.",
 	"model resolve-remote":    "Resolve a remote endpoint alias to likely HF candidates.",
 	"eval":                    "Discover, run, and submit evaluation suites.",
-	"eval suite":              "List, inspect, initialize, and submit eval suites.",
+	"eval suite":              "Import, audit, sample-check, submit, and manage eval suites.",
+	"eval suite import":       "Convert CSV, JSONL, or a JSON array into a runnable suite manifest.",
+	"eval suite audit":        "Check dataset duplicates, gold values, leakage, balance, provenance, and size.",
+	"eval suite check":        "Execute representative suite samples against an OpenAI-compatible endpoint.",
+	"eval suite submissions":  "List your suite and sharded-dataset review status and admin notes.",
+	"eval suite resubmit":     "Replace and return a pending or rejected suite to review.",
+	"eval suite withdraw":     "Permanently remove an unused pending or rejected submission.",
 	"eval run":                "Run an approved suite locally and write/submit a run payload.",
 	"eval pull":               "Download a suite + datasets for offline runs and inspection.",
 	"eval submit":             "Submit a previously saved run payload (deferred submit).",
 	"eval shard":              "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
 	"eval shard status":       "Print aggregate shard coverage and missing shard indexes for a model.",
 	"eval terminal":           "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
+	"eval terminal import":    "Convert Harbor or Terminal-Bench 2.1 task directories into canonical local bundles.",
+	"eval terminal publish":   "Oracle-verify, package, upload, and submit a Pro terminal benchmark for review.",
 	"eval terminal run":       "Preflight, run, resume, or detach a Terminal-Bench task selection.",
 	"eval terminal status":    "Read a durable terminal run snapshot, including worker and task progress.",
 	"eval terminal logs":      "Replay canonical terminal JSONL events; --follow waits through job completion.",

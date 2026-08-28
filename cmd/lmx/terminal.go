@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -35,12 +36,18 @@ const terminalSystemPrompt = "You control a Linux terminal. Each reply MUST cont
 
 const terminalSessionSystemPrompt = "You control a persistent Linux shell session inside a container. State persists across replies: your working directory, environment variables, and background jobs carry over from one command block to the next. Each reply MUST contain exactly one ```bash fenced block containing one or more non-interactive shell commands, which are executed in that same shell; stdout/stderr and exit code are returned. Prefer batching related inspection/edit/test commands instead of spending one model turn per tiny command. When the task is complete, reply with the single token TASK_COMPLETE and no code block. If you need Python/Ruby/Node/etc., run it from bash with a heredoc (for example: python3 <<'PY' ... PY). Avoid dumping huge files; inspect with head/tail/grep/scripts. Bound password crackers and deliberately long-running commands yourself with timeout, but do not prematurely cap package installs, builds, or tests unless they are clearly stuck. Never run foreground servers; start them in the background and verify them."
 
+const terminalNativeSystemPrompt = "You control a Linux terminal through the available tools read_file, edit_file, write_file, and terminal. Use read_file with a path argument to inspect files. Prefer edit_file with path, old_text, and new_text arguments for a unique surgical replacement. Use write_file with path and content arguments only when replacing a complete file is appropriate. Use terminal with a command argument for tests, directory listings, and other non-interactive shell commands. Do not emit bash code blocks and do not call any unlisted tool. Keep explanations outside tool arguments. Tool results, including stdout, stderr, and exit code, are returned after each call. Prefer completing the next concrete action instead of repeatedly reading an unchanged file. When the task is complete, reply with the single token TASK_COMPLETE and do not call a tool. Never run foreground servers; start them in the background and verify them."
+
+const terminalNativeSessionSystemPrompt = "You control a persistent Linux shell session inside a container through the available tools read_file, edit_file, write_file, and terminal. State persists across tool calls: your working directory, environment variables, and background jobs carry over. Use read_file with a path argument to inspect files. Prefer edit_file with path, old_text, and new_text arguments for a unique surgical replacement. Use write_file with path and content arguments only when replacing a complete file is appropriate. Use terminal with a command argument for tests, directory listings, and other non-interactive shell commands. Do not emit bash code blocks and do not call any unlisted tool. Keep explanations outside tool arguments. Tool results, including stdout, stderr, and exit code, are returned after each call. Prefer completing the next concrete action instead of repeatedly reading an unchanged file. When the task is complete, reply with the single token TASK_COMPLETE and do not call a tool. Never run foreground servers; start them in the background and verify them."
+
+const terminalNativeContinuePrompt = "Your previous reply did not call an available tool. Continue with read_file(path=...), edit_file(path=..., old_text=..., new_text=...), write_file(path=..., content=...), or terminal(command=...). If the task is already complete, reply with only TASK_COMPLETE."
+
 const defaultTerminalTaskTimeoutSec = 4 * 60 * 60
 const defaultTerminalCommandTimeoutSec = 30 * 60
 const defaultTerminalMaxTurns = 200
-const terminalModelObservationLimit = 2500
-const terminalMessageBudgetBytes = 60_000
-const terminalRecentMessageKeep = 12
+const terminalModelObservationLimit = 12_000
+const terminalMessageBudgetBytes = 180_000
+const terminalRecentMessageKeep = 24
 const defaultTerminalModelMaxTokens = 16_384
 const defaultTerminalRetryMaxTokens = 8_192
 const defaultTerminalEndpointTimeout = 10 * time.Minute
@@ -161,12 +168,131 @@ type terminalConfig struct {
 	oracle                         bool
 	agentCommand                   string
 	agentExecution                 string
+	nativeTools                    bool
 	shellMode                      string
 	traceRoot                      string
 	endpointTimeout                time.Duration
 	modelHeartbeatInterval         time.Duration
 	externalAgentHeartbeatInterval time.Duration
 	runLabel                       string
+	thinkingLevel                  string
+	thinkingSource                 string
+}
+
+var (
+	terminalThinkingOffPattern    = regexp.MustCompile(`(?i)(^|[^a-z0-9])(no[-_ ]?think(?:ing)?|non[-_ ]?think(?:ing)?|think(?:ing)?[-_ ]?off)([^a-z0-9]|$)`)
+	terminalThinkingLevelPattern  = regexp.MustCompile(`(?i)(^|[^a-z0-9])(xhigh|high|medium|low|auto)([^a-z0-9]|$)`)
+	terminalThinkingDefaultEffort = regexp.MustCompile(`(?i)reasoning_effort\s*\|\s*default\(\s*['"](xhigh|high|medium|low|auto)['"]\s*\)`)
+)
+
+func normalizeTerminalThinkingLevel(value string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.NewReplacer("_", "-", " ", "-").Replace(normalized)
+	switch normalized {
+	case "off", "disabled", "none", "no-think", "nothink", "non-thinking", "nonthinking":
+		return "off", true
+	case "on", "enabled", "thinking":
+		return "on", true
+	case "low", "medium", "high", "xhigh", "auto":
+		return normalized, true
+	default:
+		return "", false
+	}
+}
+
+func inferTerminalThinkingLevel(text string) string {
+	if terminalThinkingOffPattern.MatchString(text) {
+		return "off"
+	}
+	match := terminalThinkingLevelPattern.FindStringSubmatch(text)
+	if len(match) >= 3 {
+		return strings.ToLower(match[2])
+	}
+	return ""
+}
+
+func inferTerminalThinkingLevelFromProps(props map[string]any) string {
+	for _, key := range []string{"model_alias", "model_path"} {
+		if level := inferTerminalThinkingLevel(stringValue(props[key])); level != "" {
+			return level
+		}
+	}
+	template := stringValue(props["chat_template"])
+	if match := terminalThinkingDefaultEffort.FindStringSubmatch(template); len(match) == 2 {
+		return strings.ToLower(match[1])
+	}
+	if strings.Contains(template, "enable_thinking") && strings.Contains(template, "<think>") {
+		return "on"
+	}
+	return ""
+}
+
+func promptTerminalThinkingLevel(reader io.Reader, writer io.Writer) (string, error) {
+	fmt.Fprintln(writer, "The model's thinking level could not be inferred from its endpoint metadata.")
+	fmt.Fprintln(writer, "Choose the level actually used: off, on, low, medium, high, xhigh, or auto.")
+	scanner := bufio.NewScanner(reader)
+	for {
+		fmt.Fprint(writer, "Thinking level: ")
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return "", err
+			}
+			return "", cliError{"missing_thinking_level", "No thinking level was provided.", []string{"Pass --thinking-level off|on|low|medium|high|xhigh|auto."}, nil}
+		}
+		if level, ok := normalizeTerminalThinkingLevel(scanner.Text()); ok {
+			return level, nil
+		}
+		fmt.Fprintln(writer, "Invalid level. Use off, on, low, medium, high, xhigh, or auto.")
+	}
+}
+
+func terminalThinkingPromptAllowed(args cliArgs) bool {
+	if hasFlag(args, "detach") || hasFlag(args, "detached-child") || hasFlag(args, "dry-run") || hasFlag(args, "json") || hasFlag(args, "json-status") || hasFlag(args, "quiet") {
+		return false
+	}
+	info, err := os.Stdin.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func resolveTerminalThinkingLevel(ctx context.Context, args cliArgs, baseURL, model string, cfg terminalConfig, reader io.Reader, writer io.Writer, allowPrompt bool) (string, string, error) {
+	explicitLevel := ""
+	if raw := opt(args, "thinking-level"); raw != "" {
+		level, ok := normalizeTerminalThinkingLevel(raw)
+		if !ok {
+			return "", "", cliError{"invalid_thinking_level", "Unsupported terminal thinking level.", []string{"Pass --thinking-level off|on|low|medium|high|xhigh|auto."}, map[string]any{"thinkingLevel": raw}}
+		}
+		explicitLevel = level
+	}
+	if cfg.oracle {
+		return "not-applicable", "oracle", nil
+	}
+	// The built-in terminal harness explicitly sends enable_thinking=false for
+	// Qwen models. External agents own their request configuration, so their
+	// served model or endpoint metadata must identify the effective level.
+	if cfg.agentCommand == "" && terminalDisablesTemplateThinking(model) {
+		if explicitLevel != "" && explicitLevel != "off" {
+			return "", "", cliError{"thinking_level_conflict", "The built-in terminal harness disables Qwen template thinking.", []string{"Use --thinking-level off.", "Use an external agent configured for the desired thinking level."}, map[string]any{"model": model, "thinkingLevel": explicitLevel}}
+		}
+		return "off", "harness", nil
+	}
+	if explicitLevel != "" {
+		return explicitLevel, "cli", nil
+	}
+	if level := inferTerminalThinkingLevel(model); level != "" {
+		return level, "served-model", nil
+	}
+	if baseURL != "" {
+		if raw, err := fetchEndpointJSONContext(ctx, baseURL+"/props", cfg.apiKey); err == nil {
+			if level := inferTerminalThinkingLevelFromProps(asObject(raw)); level != "" {
+				return level, "endpoint", nil
+			}
+		}
+	}
+	if allowPrompt {
+		level, err := promptTerminalThinkingLevel(reader, writer)
+		return level, "prompt", err
+	}
+	return "not-provided", "unresolved", nil
 }
 
 type terminalJSONCommand struct {
@@ -296,6 +422,8 @@ func handleEvalTerminal(sub string, args cliArgs) error {
 	switch sub {
 	case "import":
 		return runTerminalImport(args)
+	case "publish":
+		return publishTerminalDataset(args)
 	case "run":
 		return runTerminalEval(args, false)
 	case "submit":
@@ -309,7 +437,7 @@ func handleEvalTerminal(sub string, args cliArgs) error {
 	case "cancel":
 		return terminalCancel(args)
 	default:
-		return cliError{"unknown_subcommand", "Unknown eval terminal subcommand.", []string{"Use one of: import, run, submit, verify, status, logs, cancel."}, map[string]any{"subcommand": sub}}
+		return cliError{"unknown_subcommand", "Unknown eval terminal subcommand.", []string{"Use one of: import, publish, run, submit, verify, status, logs, cancel."}, map[string]any{"subcommand": sub}}
 	}
 }
 
@@ -579,7 +707,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if err != nil {
 		return err
 	}
-	cfg := terminalConfig{apiKey: opt(args, "model-api-key"), args: args, maxTokens: maxTokens, temperature: floatOption(args, "temperature", 0), topP: floatOption(args, "top-p", 1), commandTimeoutSec: commandTimeout, cleanupImages: hasFlag(args, "cleanup-images"), oracle: forceOracle || hasFlag(args, "oracle"), agentCommand: agentCommand, agentExecution: firstNonEmpty(opt(args, "agent-execution"), map[bool]string{true: "routed-shell"}[agentBackend == "terminus-2"], "host"), traceRoot: opt(args, "trace-dir")}
+	cfg := terminalConfig{apiKey: opt(args, "model-api-key"), args: args, maxTokens: maxTokens, temperature: floatOption(args, "temperature", 0), topP: floatOption(args, "top-p", 1), commandTimeoutSec: commandTimeout, cleanupImages: hasFlag(args, "cleanup-images"), oracle: forceOracle || hasFlag(args, "oracle"), agentCommand: agentCommand, agentExecution: firstNonEmpty(opt(args, "agent-execution"), map[bool]string{true: "routed-shell"}[agentBackend == "terminus-2"], "host"), nativeTools: hasFlag(args, "native-tools"), traceRoot: opt(args, "trace-dir")}
 	cfg.maxTurns, err = intOption(args, 0, 0, "max-turns")
 	if err != nil {
 		return err
@@ -603,6 +731,14 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	}
 	if cfg.traceRoot == "" && opt(args, "run-dir") != "" {
 		cfg.traceRoot = filepath.Join(opt(args, "run-dir"), "traces")
+	}
+
+	cfg.thinkingLevel, cfg.thinkingSource, err = resolveTerminalThinkingLevel(ctx, args, baseURL, callModel, cfg, os.Stdin, os.Stderr, terminalThinkingPromptAllowed(args))
+	if err != nil {
+		return err
+	}
+	if submit && !dryRun && cfg.thinkingLevel == "not-provided" {
+		return cliError{"missing_thinking_level", "Terminal benchmark submission requires a known thinking level.", []string{"Pass --thinking-level off|on|low|medium|high|xhigh|auto.", "Interactive terminal runs prompt when endpoint metadata is ambiguous."}, map[string]any{"model": callModel}}
 	}
 
 	var hardware any
@@ -658,7 +794,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 			}
 			taskCount, shardIndex = len(items), selectedShard
 		}
-		plan := map[string]any{"dryRun": true, "dataset": firstNonEmpty(dataset, "local"), "tasks": taskCount, "shardIndex": shardIndex, "apiUrl": apiURL(args), "baseUrl": baseURL, "model": hfID, "servedModel": callModel, "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "harnessKey": terminalHarnessKey(args, cfg), "agentTimeoutDefaultSec": defaultTerminalTaskTimeoutSec, "commandTimeoutDefaultSec": defaultTerminalCommandTimeoutSec, "coverageBefore": coverageBefore, "canSubmit": apiKey(args) != "" && hfID != "" && hardware != nil}
+		plan := map[string]any{"dryRun": true, "dataset": firstNonEmpty(dataset, "local"), "tasks": taskCount, "shardIndex": shardIndex, "apiUrl": apiURL(args), "baseUrl": baseURL, "model": hfID, "servedModel": callModel, "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "thinkingLevel": cfg.thinkingLevel, "thinkingLevelSource": cfg.thinkingSource, "harnessKey": terminalHarnessKey(args, cfg), "agentTimeoutDefaultSec": defaultTerminalTaskTimeoutSec, "commandTimeoutDefaultSec": defaultTerminalCommandTimeoutSec, "coverageBefore": coverageBefore, "canSubmit": apiKey(args) != "" && hfID != "" && hardware != nil}
 		return writeOrPrintJSON("terminal_eval_preflight", args, plan)
 	}
 
@@ -690,7 +826,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 			}
 		}
 	}
-	startFields := map[string]any{"dataset": firstNonEmpty(dataset, "local"), "tasks": len(bundles), "resumedTasks": len(resumed), "pendingTasks": len(bundles) - len(resumed), "model": firstNonEmpty(callModel, "oracle"), "baseUrl": baseURL, "concurrency": concurrency, "oracle": cfg.oracle}
+	startFields := map[string]any{"dataset": firstNonEmpty(dataset, "local"), "tasks": len(bundles), "resumedTasks": len(resumed), "pendingTasks": len(bundles) - len(resumed), "model": firstNonEmpty(callModel, "oracle"), "baseUrl": baseURL, "concurrency": concurrency, "oracle": cfg.oracle, "thinkingLevel": cfg.thinkingLevel, "thinkingLevelSource": cfg.thinkingSource}
 	if checkpoint != nil {
 		startFields["runDir"] = checkpoint.root
 	}
@@ -738,7 +874,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if len(results) > 0 {
 		avgLatency = stats.totalLatencyMs / int64(len(results))
 	}
-	summary := map[string]any{"dataset": firstNonEmpty(dataset, "local"), "shardIndex": shardIndex, "tasks": len(results), "correct": stats.correct, "scored": stats.scored, "errors": stats.errors, "accuracyPct": roundMetric(accuracy * 100), "avgWallTimeMs": avgLatency, "wallTimeMs": stats.totalLatencyMs, "tokenUsage": totalUsage.toMap(), "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "errorCodes": errorCodes}
+	summary := map[string]any{"dataset": firstNonEmpty(dataset, "local"), "shardIndex": shardIndex, "tasks": len(results), "correct": stats.correct, "scored": stats.scored, "errors": stats.errors, "accuracyPct": roundMetric(accuracy * 100), "avgWallTimeMs": avgLatency, "wallTimeMs": stats.totalLatencyMs, "tokenUsage": totalUsage.toMap(), "quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "thinkingLevel": cfg.thinkingLevel, "thinkingLevelSource": cfg.thinkingSource, "errorCodes": errorCodes}
 	records := make([]any, len(results))
 	for i, r := range results {
 		records[i] = map[string]any{"question_id": bundles[i].Task.ID, "pass": r.pass, "scored": r.scored, "error": r.errText, "errorCode": r.errCode, "latencyMs": r.wallTimeMs, "wallTimeMs": r.wallTimeMs, "tokenUsage": r.usage.toMap(), "turns": terminalTaskTurnsValue(r), "question": bundles[i].Task.Instruction, "prompt": r.prompt, "response": r.transcript, "verifierOutput": r.verifierOutput}
@@ -834,7 +970,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 			"commandTimeoutSource": terminalLimitSource(cfg.commandTimeoutSec, 0),
 		})
 	}
-	runConfig := map[string]any{"accuracy": accuracy, "tasksRun": len(results), "errors": stats.errors, "avgLatencyMs": avgLatency, "protocol": protocol, "agent": agentName, "maxTurnsPolicy": map[bool]string{true: "cli-override", false: "per-task-manifest-or-fallback"}[cfg.maxTurns > 0], "maxTurnsEnforcement": maxTurnsEnforcement, "agentTimeoutPolicy": map[bool]string{true: "cli-override", false: "per-task-manifest-or-fallback"}[cfg.agentTimeoutSec > 0], "commandTimeoutSec": terminalCommandTimeoutSec(cfg), "taskLimits": taskLimits, "concurrency": concurrency, "modelResolution": modelResolution, "quantizationResolution": quantResolution}
+	runConfig := map[string]any{"accuracy": accuracy, "tasksRun": len(results), "errors": stats.errors, "avgLatencyMs": avgLatency, "protocol": protocol, "agent": agentName, "thinkingLevel": cfg.thinkingLevel, "thinkingLevelSource": cfg.thinkingSource, "maxTurnsPolicy": map[bool]string{true: "cli-override", false: "per-task-manifest-or-fallback"}[cfg.maxTurns > 0], "maxTurnsEnforcement": maxTurnsEnforcement, "agentTimeoutPolicy": map[bool]string{true: "cli-override", false: "per-task-manifest-or-fallback"}[cfg.agentTimeoutSec > 0], "commandTimeoutSec": terminalCommandTimeoutSec(cfg), "taskLimits": taskLimits, "concurrency": concurrency, "modelResolution": modelResolution, "quantizationResolution": quantResolution}
 	if commonMaxTurns > 0 {
 		runConfig["maxTurns"] = commonMaxTurns
 	}
@@ -963,6 +1099,8 @@ type terminalLiveCheckpoint struct {
 	State             string                   `json:"state"`
 	Fingerprint       string                   `json:"fingerprint"`
 	FingerprintFields map[string]string        `json:"fingerprintFields,omitempty"`
+	ThinkingLevel     string                   `json:"thinkingLevel"`
+	ThinkingSource    string                   `json:"thinkingLevelSource"`
 	Dataset           string                   `json:"dataset"`
 	ShardIndex        int                      `json:"shardIndex"`
 	TaskIDs           []string                 `json:"taskIds"`
@@ -995,6 +1133,7 @@ func terminalLiveCheckpointIdentity(args cliArgs, dataset string, shardIndex int
 		"oracle": cfg.oracle, "agentCommand": cfg.agentCommand,
 		"agentExecution": cfg.agentExecution, "shellMode": cfg.shellMode,
 		"containerBaseUrl": opt(args, "container-base-url"),
+		"thinkingLevel":    cfg.thinkingLevel,
 	}
 }
 
@@ -1086,6 +1225,8 @@ func openTerminalLiveCheckpoint(args cliArgs, dataset string, shardIndex int, bu
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	store := &terminalLiveCheckpointStore{root: root, lock: lock, state: terminalLiveCheckpoint{Version: terminalLiveCheckpointVersion, State: "running", Fingerprint: fingerprint, FingerprintFields: fingerprintFields, Dataset: firstNonEmpty(dataset, "local"), ShardIndex: shardIndex, TaskIDs: taskIDs, CreatedAt: now, UpdatedAt: now}}
+	store.state.ThinkingLevel = cfg.thinkingLevel
+	store.state.ThinkingSource = cfg.thinkingSource
 	statePath := filepath.Join(root, "run.json")
 	resuming := false
 	if data, readErr := os.ReadFile(statePath); readErr == nil {
@@ -1707,6 +1848,15 @@ func submitTerminalEval(args cliArgs) error {
 			shardIndexes[i] = i + 1
 		}
 	}
+	thinkingLevel, thinkingSource, err := resolveTerminalThinkingLevel(context.Background(), args, "", hfID, terminalConfig{agentCommand: "deferred-submit"}, os.Stdin, os.Stderr, terminalThinkingPromptAllowed(args))
+	if err != nil {
+		return err
+	}
+	if thinkingLevel == "not-provided" {
+		return cliError{"missing_thinking_level", "Deferred terminal submission requires the thinking level used by the completed run.", []string{"Pass --thinking-level off|on|low|medium|high|xhigh|auto."}, map[string]any{"model": hfID}}
+	}
+	args.opts["thinking-level"] = thinkingLevel
+	args.opts["thinking-level-source"] = thinkingSource
 	payloads := make([]any, 0, len(recordShards))
 	shardSizes := make([]int, 0, len(recordShards))
 	for i, shardRecords := range recordShards {
@@ -1885,14 +2035,16 @@ func terminalSubmissionPayload(args cliArgs, hfID string, hardware any, shardInd
 		usage.add(record.usage)
 	}
 	runConfig := map[string]any{
-		"accuracy":       float64(passed) / float64(len(records)),
-		"tasksRun":       len(records),
-		"errors":         0,
-		"avgLatencyMs":   latencyMs / int64(len(records)),
-		"protocol":       "deferred-saved-terminal-run",
-		"agent":          firstNonEmpty(opt(args, "agent-name"), "external-agent"),
-		"deferredSubmit": true,
-		"tokenUsage":     usage.toMap(),
+		"accuracy":            float64(passed) / float64(len(records)),
+		"tasksRun":            len(records),
+		"errors":              0,
+		"avgLatencyMs":        latencyMs / int64(len(records)),
+		"protocol":            "deferred-saved-terminal-run",
+		"agent":               firstNonEmpty(opt(args, "agent-name"), "external-agent"),
+		"deferredSubmit":      true,
+		"tokenUsage":          usage.toMap(),
+		"thinkingLevel":       opt(args, "thinking-level"),
+		"thinkingLevelSource": firstNonEmpty(opt(args, "thinking-level-source"), "cli"),
 	}
 	for key, value := range fullProvenance {
 		runConfig[key] = value
@@ -3180,7 +3332,7 @@ func terminalTraceHeader(b *strings.Builder, turn int, reasoning, content string
 	if reasoning != "" {
 		b.WriteString("## Reasoning\n" + reasoning + "\n")
 	}
-	b.WriteString("## Assistant\n" + content + "\n")
+	b.WriteString("## Assistant\n" + stripTerminalNativeCallMetadata(content) + "\n")
 }
 
 func terminalJSONPrompt(instruction, terminalState string) string {
@@ -3189,6 +3341,13 @@ func terminalJSONPrompt(instruction, terminalState string) string {
 
 func terminalJSONContinuePrompt(terminalState string) string {
 	return "Current terminal state:\n" + terminalState + "\n\nContinue with the same JSON response format: analysis, plan, commands, and optional task_complete."
+}
+
+func parseTerminalAgentResponse(content string, nativeTools bool) (terminalJSONResponse, bool) {
+	if nativeTools {
+		return terminalJSONResponse{}, false
+	}
+	return parseTerminalJSONResponse(content)
 }
 func parseTerminalJSONResponse(content string) (terminalJSONResponse, bool) {
 	var response terminalJSONResponse
@@ -3240,7 +3399,11 @@ func (tracker *terminalStagnationTracker) observe(command, observation string) (
 }
 
 func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName, baseURL, model string, cfg terminalConfig) (int, string, terminalTokenUsage, error) {
-	messages := []map[string]any{{"role": "system", "content": terminalSystemPrompt}, {"role": "user", "content": task.Instruction}}
+	systemPrompt := terminalSystemPrompt
+	if cfg.nativeTools {
+		systemPrompt = terminalNativeSystemPrompt
+	}
+	messages := []map[string]any{{"role": "system", "content": systemPrompt}, {"role": "user", "content": task.Instruction}}
 	maxTurns := firstPositive(cfg.maxTurns, task.Agent.MaxTurns, 50)
 	timeoutSec := terminalAgentTimeoutSec(cfg, task)
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
@@ -3255,7 +3418,7 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 		messages = trimTerminalMessages(messages)
 		requestTimeout := terminalModelRequestTimeout(cfg, deadline, true)
 		content, reasoning, callUsage, err := callTerminalModelWithHeartbeatContext(ctx, cfg, task.ID, turn, "initial", deadline, func() (string, string, terminalTokenUsage, error) {
-			return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, requestTimeout)
+			return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, cfg.nativeTools, requestTimeout)
 		})
 		usage.add(callUsage)
 		if err != nil {
@@ -3263,14 +3426,17 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 			messages = trimTerminalMessagesForRetry(messages)
 			retryTimeout := terminalModelRequestTimeout(cfg, deadline, false)
 			content, reasoning, callUsage, err = callTerminalModelWithHeartbeatContext(ctx, cfg, task.ID, turn, "retry", deadline, func() (string, string, terminalTokenUsage, error) {
-				return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, retryTimeout)
+				return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, cfg.nativeTools, retryTimeout)
 			})
 			usage.add(callUsage)
 			if err != nil {
 				return turn - 1, transcript.String(), usage, terminalModelCallFailure(task.ID, deadline, firstErr, err)
 			}
 		}
-		cmdText, found := extractBashCommand(content)
+		cmdText, found := extractTerminalCommand(content)
+		if cfg.nativeTools {
+			cmdText, found = extractNativeTerminalCommand(content, reasoning)
+		}
 		if !found {
 			if strings.Contains(content, "TASK_COMPLETE") {
 				terminalTraceHeader(&transcript, turn, reasoning, content)
@@ -3279,8 +3445,13 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 			}
 			nonConforming++
 			terminalTraceHeader(&transcript, turn, reasoning, content)
-			transcript.WriteString("## Note\nNo bash block found; asked the model to emit one command or TASK_COMPLETE.\n")
-			messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, "")}, map[string]any{"role": "user", "content": "Your previous reply was not executable. Reply with exactly one ```bash fenced block. If you meant to run Python, wrap it as: python3 <<'PY'\n...\nPY"})
+			if cfg.nativeTools {
+				transcript.WriteString("## Note\nNo shell tool call found; asked the model to call shell or return TASK_COMPLETE.\n")
+				messages = append(messages, terminalAssistantMessage(compactAssistantForModel(content, ""), reasoning), map[string]any{"role": "user", "content": terminalNativeContinuePrompt})
+			} else {
+				transcript.WriteString("## Note\nNo executable command found; asked the model to emit one command or TASK_COMPLETE.\n")
+				messages = append(messages, terminalAssistantMessage(compactAssistantForModel(content, ""), reasoning), map[string]any{"role": "user", "content": "Your previous reply was not executable. Reply with exactly one ```bash fenced block. If you meant to run Python, wrap it as: python3 <<'PY'\n...\nPY"})
+			}
 			if nonConforming >= 3 {
 				transcript.WriteString("## Note\nStopping after repeated non-executable replies.\n")
 				return turn - 1, transcript.String(), usage, nil
@@ -3288,40 +3459,89 @@ func runTerminalAgentLoop(ctx context.Context, task terminalTask, containerName,
 			continue
 		}
 		nonConforming = 0
-		messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, cmdText)})
 		terminalTraceHeader(&transcript, turn, reasoning, content)
-		transcript.WriteString("## Command\n$ " + cmdText + "\n")
-		execArgs := []string{"exec"}
-		if task.Agent.User != "" {
-			execArgs = append(execArgs, "--user", task.Agent.User)
+		if cfg.nativeTools {
+			calls := terminalNativeCallsForTurn(content, cmdText, reasoning, turn)
+			messages = append(messages, terminalNativeAssistantMessage(content, cmdText, reasoning, turn))
+			var combinedObservation strings.Builder
+			var combinedCommands []string
+			for index, call := range calls {
+				callCommand := call.Command
+				if callCommand == "" {
+					callCommand = cmdText
+				}
+				combinedCommands = append(combinedCommands, callCommand)
+				transcript.WriteString("## Command\n$ " + callCommand + "\n")
+				execArgs := []string{"exec"}
+				if task.Agent.User != "" {
+					execArgs = append(execArgs, "--user", task.Agent.User)
+				}
+				execArgs = append(execArgs, containerName, "bash", "-lc", callCommand)
+				out, code, timedOut, _ := runCommand(ctx, terminalCommandExecutionTimeout(callCommand, time.Duration(terminalCommandTimeoutSec(cfg))*time.Second, deadline), "docker", execArgs...)
+				if timedOut {
+					out += "\n[command timed out]"
+					code = 124
+				}
+				shown := truncateString(out, 8192)
+				callObservation := terminalObservationForModel(out, code, timedOut)
+				transcript.WriteString(shown + "\n[exit=" + strconv.Itoa(code) + "]\n")
+				messages = append(messages, terminalNativeToolMessage(callObservation, call.ID))
+				combinedObservation.WriteString("$ " + callCommand + "\n" + callObservation + "\n")
+				fields := map[string]any{"taskId": task.ID, "turn": turn, "commandIndex": index + 1, "exitCode": code, "cmdPreview": truncateString(strings.ReplaceAll(callCommand, "\n", " "), 160)}
+				if timedOut {
+					fields["timedOut"] = true
+					fields["timeoutSec"] = terminalCommandTimeoutSec(cfg)
+				}
+				printStatus(cfg.args, "terminal_turn", fields)
+			}
+			cmdText = strings.Join(combinedCommands, "\n")
+			observation := truncateString(combinedObservation.String(), terminalModelObservationLimit)
+			warn, stop := stagnation.observe(cmdText, observation)
+			if warn {
+				messages = append(messages, map[string]any{"role": "user", "content": "No progress: you have repeated the same command and received the same result three times. Do not repeat it again; change your approach or finish the task."})
+				transcript.WriteString("## Note\nRepeated command and result detected; instructed the model to change approach.\n")
+				printStatus(cfg.args, "terminal_agent_stagnation_warning", map[string]any{"taskId": task.ID, "turn": turn})
+			}
+			if stop {
+				transcript.WriteString("## Note\nStopping after six identical command/result turns; proceeding to verification.\n")
+				printStatus(cfg.args, "terminal_agent_stagnation_stopped", map[string]any{"taskId": task.ID, "turn": turn})
+				return turn, transcript.String(), usage, nil
+			}
+		} else {
+			messages = append(messages, terminalAssistantMessage(compactAssistantForModel(content, cmdText), reasoning))
+			transcript.WriteString("## Command\n$ " + cmdText + "\n")
+			execArgs := []string{"exec"}
+			if task.Agent.User != "" {
+				execArgs = append(execArgs, "--user", task.Agent.User)
+			}
+			execArgs = append(execArgs, containerName, "bash", "-lc", cmdText)
+			out, code, timedOut, _ := runCommand(ctx, terminalCommandExecutionTimeout(cmdText, time.Duration(terminalCommandTimeoutSec(cfg))*time.Second, deadline), "docker", execArgs...)
+			if timedOut {
+				out += "\n[command timed out]"
+				code = 124
+			}
+			shown := truncateString(out, 8192)
+			observation := terminalObservationForModel(out, code, timedOut)
+			transcript.WriteString(shown + "\n[exit=" + strconv.Itoa(code) + "]\n")
+			messages = append(messages, map[string]any{"role": "user", "content": observation})
+			warn, stop := stagnation.observe(cmdText, observation)
+			if warn {
+				messages = append(messages, map[string]any{"role": "user", "content": "No progress: you have repeated the same command and received the same result three times. Do not repeat it again; change your approach or finish the task."})
+				transcript.WriteString("## Note\nRepeated command and result detected; instructed the model to change approach.\n")
+				printStatus(cfg.args, "terminal_agent_stagnation_warning", map[string]any{"taskId": task.ID, "turn": turn})
+			}
+			if stop {
+				transcript.WriteString("## Note\nStopping after six identical command/result turns; proceeding to verification.\n")
+				printStatus(cfg.args, "terminal_agent_stagnation_stopped", map[string]any{"taskId": task.ID, "turn": turn})
+				return turn, transcript.String(), usage, nil
+			}
+			fields := map[string]any{"taskId": task.ID, "turn": turn, "exitCode": code, "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)}
+			if timedOut {
+				fields["timedOut"] = true
+				fields["timeoutSec"] = terminalCommandTimeoutSec(cfg)
+			}
+			printStatus(cfg.args, "terminal_turn", fields)
 		}
-		execArgs = append(execArgs, containerName, "bash", "-lc", cmdText)
-		out, code, timedOut, _ := runCommand(ctx, terminalCommandExecutionTimeout(cmdText, time.Duration(terminalCommandTimeoutSec(cfg))*time.Second, deadline), "docker", execArgs...)
-		if timedOut {
-			out += "\n[command timed out]"
-			code = 124
-		}
-		shown := truncateString(out, 8192)
-		observation := terminalObservationForModel(out, code, timedOut)
-		transcript.WriteString(shown + "\n[exit=" + strconv.Itoa(code) + "]\n")
-		messages = append(messages, map[string]any{"role": "user", "content": observation})
-		warn, stop := stagnation.observe(cmdText, observation)
-		if warn {
-			messages = append(messages, map[string]any{"role": "user", "content": "No progress: you have repeated the same command and received the same result three times. Do not repeat it again; change your approach or finish the task."})
-			transcript.WriteString("## Note\nRepeated command and result detected; instructed the model to change approach.\n")
-			printStatus(cfg.args, "terminal_agent_stagnation_warning", map[string]any{"taskId": task.ID, "turn": turn})
-		}
-		if stop {
-			transcript.WriteString("## Note\nStopping after six identical command/result turns; proceeding to verification.\n")
-			printStatus(cfg.args, "terminal_agent_stagnation_stopped", map[string]any{"taskId": task.ID, "turn": turn})
-			return turn, transcript.String(), usage, nil
-		}
-		fields := map[string]any{"taskId": task.ID, "turn": turn, "exitCode": code, "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)}
-		if timedOut {
-			fields["timedOut"] = true
-			fields["timeoutSec"] = terminalCommandTimeoutSec(cfg)
-		}
-		printStatus(cfg.args, "terminal_turn", fields)
 	}
 	return maxTurns, transcript.String(), usage, nil
 }
@@ -3458,6 +3678,68 @@ func (s *terminalShell) execContext(ctx context.Context, command string, timeout
 	}
 }
 
+func terminalAssistantMessage(content, reasoning string) map[string]any {
+	message := map[string]any{"role": "assistant", "content": content}
+	if reasoning = strings.TrimSpace(reasoning); reasoning != "" {
+		message["reasoning_content"] = reasoning
+	}
+	return message
+}
+
+func terminalNativeCallsForTurn(content, command, reasoning string, turn int) []terminalNativeCallMetadata {
+	if calls, found := terminalNativeCallsFromContent(content); found {
+		for index := range calls {
+			if calls[index].ID == "" {
+				calls[index].ID = fmt.Sprintf("call_%d_%d", turn, index+1)
+			}
+		}
+		return calls
+	}
+	call, found := terminalNativeCallFromLFMText(content)
+	if !found {
+		call, found = terminalNativeCallFromLFMText(reasoning)
+	}
+	if !found {
+		arguments, _ := json.Marshal(map[string]string{"command": command})
+		call = terminalNativeCallMetadata{Name: "terminal", Arguments: string(arguments)}
+	}
+	call.ID = fmt.Sprintf("call_%d_1", turn)
+	call.Command = command
+	return []terminalNativeCallMetadata{call}
+}
+
+func terminalNativeAssistantMessage(content, command, reasoning string, turn int) map[string]any {
+	calls := terminalNativeCallsForTurn(content, command, reasoning, turn)
+	toolCalls := make([]any, 0, len(calls))
+	for _, call := range calls {
+		toolCalls = append(toolCalls, map[string]any{
+			"id":   call.ID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": call.Arguments,
+			},
+		})
+	}
+	message := map[string]any{
+		"role":       "assistant",
+		"content":    "",
+		"tool_calls": toolCalls,
+	}
+	if reasoning = strings.TrimSpace(reasoning); reasoning != "" {
+		message["reasoning_content"] = reasoning
+	}
+	return message
+}
+
+func terminalNativeToolMessage(observation, callID string) map[string]any {
+	return map[string]any{
+		"role":         "tool",
+		"tool_call_id": callID,
+		"content":      observation,
+	}
+}
+
 func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, containerName, baseURL, model string, cfg terminalConfig) (int, string, terminalTokenUsage, error) {
 	shell, err := startTerminalShell(containerName, task.Agent.User)
 	if err != nil {
@@ -3465,7 +3747,12 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 	}
 	defer shell.close()
 
-	messages := []map[string]any{{"role": "user", "content": terminalJSONPrompt(task.Instruction, "")}}
+	var messages []map[string]any
+	if cfg.nativeTools {
+		messages = []map[string]any{{"role": "system", "content": terminalNativeSessionSystemPrompt}, {"role": "user", "content": task.Instruction}}
+	} else {
+		messages = []map[string]any{{"role": "user", "content": terminalJSONPrompt(task.Instruction, "")}}
+	}
 	maxTurns := terminalAgentMaxTurns(cfg, task)
 	timeoutSec := terminalAgentTimeoutSec(cfg, task)
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
@@ -3482,7 +3769,7 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 		messages = trimTerminalMessages(messages)
 		requestTimeout := terminalModelRequestTimeout(cfg, deadline, true)
 		content, reasoning, callUsage, err := callTerminalModelWithHeartbeatContext(ctx, cfg, task.ID, turn, "initial", deadline, func() (string, string, terminalTokenUsage, error) {
-			return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, requestTimeout)
+			return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, false), cfg.temperature, cfg.topP, nil, cfg.nativeTools, requestTimeout)
 		})
 		usage.add(callUsage)
 		if err != nil {
@@ -3490,7 +3777,7 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 			messages = trimTerminalMessagesForRetry(messages)
 			retryTimeout := terminalModelRequestTimeout(cfg, deadline, false)
 			content, reasoning, callUsage, err = callTerminalModelWithHeartbeatContext(ctx, cfg, task.ID, turn, "retry", deadline, func() (string, string, terminalTokenUsage, error) {
-				return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, retryTimeout)
+				return callOpenAIChatMessagesContext(ctx, baseURL, model, messages, cfg.apiKey, terminalModelMaxTokens(cfg, true), cfg.temperature, cfg.topP, nil, cfg.nativeTools, retryTimeout)
 			})
 			usage.add(callUsage)
 			if err != nil {
@@ -3499,17 +3786,25 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 		}
 
 		terminalTraceHeader(&transcript, turn, reasoning, content)
-		response, foundJSON := parseTerminalJSONResponse(content)
+		response, foundJSON := parseTerminalAgentResponse(content, cfg.nativeTools)
 		if !foundJSON {
-			cmdText, foundBash := extractBashCommand(content)
+			cmdText, foundBash := extractTerminalCommand(content)
+			if cfg.nativeTools {
+				cmdText, foundBash = extractNativeTerminalCommand(content, reasoning)
+			}
 			if !foundBash {
 				if strings.Contains(content, "TASK_COMPLETE") {
 					transcript.WriteString("## Note\nModel signaled TASK_COMPLETE.\n")
 					return turn - 1, transcript.String(), usage, nil
 				}
 				nonConforming++
-				transcript.WriteString("## Note\nNo JSON command response or bash block found; asked the model to emit the required JSON.\n")
-				messages = append(messages, map[string]any{"role": "assistant", "content": compactAssistantForModel(content, "")}, map[string]any{"role": "user", "content": terminalJSONContinuePrompt(terminalState)})
+				if cfg.nativeTools {
+					transcript.WriteString("## Note\nNo shell tool call found; asked the model to call shell or return TASK_COMPLETE.\n")
+					messages = append(messages, terminalAssistantMessage(compactAssistantForModel(content, ""), reasoning), map[string]any{"role": "user", "content": terminalNativeContinuePrompt})
+				} else {
+					transcript.WriteString("## Note\nNo JSON command response or bash block found; asked the model to emit the required JSON.\n")
+					messages = append(messages, terminalAssistantMessage(compactAssistantForModel(content, ""), reasoning), map[string]any{"role": "user", "content": terminalJSONContinuePrompt(terminalState)})
+				}
 				if nonConforming >= 3 {
 					transcript.WriteString("## Note\nStopping after repeated non-executable replies.\n")
 					return turn - 1, transcript.String(), usage, nil
@@ -3524,13 +3819,35 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 		}
 
 		nonConforming = 0
-		messages = append(messages, map[string]any{"role": "assistant", "content": content})
+		if !cfg.nativeTools {
+			messages = append(messages, terminalAssistantMessage(content, reasoning))
+		}
 		if response.TaskComplete && len(response.Commands) == 0 {
 			transcript.WriteString("## Note\nModel marked task complete.\n")
 			return turn - 1, transcript.String(), usage, nil
 		}
 
+		var nativeCalls []terminalNativeCallMetadata
+		if cfg.nativeTools {
+			var fallbackCommands []string
+			for _, command := range response.Commands {
+				if cmdText, _ := terminalCommandFromKeystrokes(command.Keystrokes); cmdText != "" {
+					fallbackCommands = append(fallbackCommands, cmdText)
+				}
+			}
+			fallbackCommand := strings.Join(fallbackCommands, "\n")
+			nativeCalls = terminalNativeCallsForTurn(content, fallbackCommand, reasoning, turn)
+			if structuredCalls, found := terminalNativeCallsFromContent(content); found {
+				response.Commands = make([]terminalJSONCommand, 0, len(structuredCalls))
+				for _, call := range structuredCalls {
+					response.Commands = append(response.Commands, terminalJSONCommand{Keystrokes: call.Command + "\n", Duration: 1})
+				}
+			}
+		}
+
 		var observation strings.Builder
+		var nativeCommands []string
+		var nativeResults []string
 		for i, command := range response.Commands {
 			cmdText, _ := terminalCommandFromKeystrokes(command.Keystrokes)
 			if cmdText == "" {
@@ -3551,6 +3868,7 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 				continue
 			}
 			transcript.WriteString("## Command\n$ " + cmdText + "\n")
+			nativeCommands = append(nativeCommands, cmdText)
 			out, code, timedOut, restarted := shell.execContext(ctx, cmdText, terminalCommandExecutionTimeout(cmdText, cmdTimeout, deadline))
 			if timedOut {
 				out += "\n[command timed out]"
@@ -3559,6 +3877,9 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 			observation.WriteString("$ " + cmdText + "\n")
 			observation.WriteString(terminalObservationForModel(out, code, timedOut))
 			observation.WriteString("\n")
+			if cfg.nativeTools {
+				nativeResults = append(nativeResults, terminalObservationForModel(out, code, timedOut))
+			}
 			transcript.WriteString(shown + "\n[exit=" + strconv.Itoa(code) + "]\n")
 			fields := map[string]any{"taskId": task.ID, "turn": turn, "commandIndex": i + 1, "exitCode": code, "cmdPreview": truncateString(strings.ReplaceAll(cmdText, "\n", " "), 160)}
 			if timedOut {
@@ -3578,7 +3899,16 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 			transcript.WriteString("## Note\nRepeated command batch and result detected; instructed the model to change approach.\n")
 			printStatus(cfg.args, "terminal_agent_stagnation_warning", map[string]any{"taskId": task.ID, "turn": turn})
 		}
-		messages = append(messages, map[string]any{"role": "user", "content": nextPrompt})
+		if cfg.nativeTools {
+			messages = append(messages, terminalNativeAssistantMessage(content, strings.Join(nativeCommands, "\n"), reasoning, turn))
+			for index, result := range nativeResults {
+				if index < len(nativeCalls) {
+					messages = append(messages, terminalNativeToolMessage(result, nativeCalls[index].ID))
+				}
+			}
+		} else {
+			messages = append(messages, map[string]any{"role": "user", "content": nextPrompt})
+		}
 		if stop {
 			transcript.WriteString("## Note\nStopping after six identical command/result turns; proceeding to verification.\n")
 			printStatus(cfg.args, "terminal_agent_stagnation_stopped", map[string]any{"taskId": task.ID, "turn": turn})
@@ -3621,6 +3951,34 @@ func runOracleSolution(ctx context.Context, task terminalTask, bundleDir, contai
 	return transcript, nil
 }
 
+const terminalVerifierInfrastructureRetries = 2
+
+var terminalVerifierInfrastructureFailureMarkers = []string{
+	"failed to download https://github.com/",
+	"failed to download https://astral.sh/",
+	"curl: (22) the requested url returned error: 503",
+	"curl: (28) operation timed out",
+	"curl: (35) openssl ssl_connect",
+	"curl: (56) connection ",
+	"temporary failure resolving",
+	"could not resolve host",
+}
+
+func terminalVerifierInfrastructureFailure(output string) bool {
+	lower := strings.ToLower(output)
+	for _, marker := range terminalVerifierInfrastructureFailureMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func clearTerminalVerifierReward(ctx context.Context, containerName, rewardFile string) {
+	rewardJSONFile := path.Join(path.Dir(rewardFile), "reward.json")
+	_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "rm", "-f", rewardFile, rewardJSONFile)
+}
+
 // runTerminalVerifier follows harbor canonical semantics: tests/ is copied to
 // /tests, the verifier command runs in a non-login shell, and the reward file
 // is the sole pass signal — reward.json ({"reward": <num>}) takes precedence
@@ -3641,30 +3999,56 @@ func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, cont
 		cmdArgs = append(cmdArgs, "-e", k+"="+v)
 	}
 	cmdArgs = append(cmdArgs, containerName, "bash", "-c", task.Verifier.Command)
-	out, code, timedOut, _ = runCommand(ctx, time.Duration(firstPositive(task.Verifier.TimeoutSec, 900))*time.Second, "docker", cmdArgs...)
+	rewardFile := firstNonEmpty(task.Verifier.RewardFile, "/logs/verifier/reward.txt")
+	timeout := time.Duration(firstPositive(task.Verifier.TimeoutSec, 900)) * time.Second
+	attemptOutputs := make([]string, 0, terminalVerifierInfrastructureRetries+1)
+	for attempt := 1; ; attempt++ {
+		clearTerminalVerifierReward(ctx, containerName, rewardFile)
+		out, code, timedOut, _ = runCommand(ctx, timeout, "docker", cmdArgs...)
+		attemptOutputs = append(attemptOutputs, out)
+		reward, _, rewardOK := readTerminalVerifierReward(ctx, containerName, rewardFile)
+		if timedOut || rewardOK && reward >= 1.0 || !terminalVerifierInfrastructureFailure(out) || attempt > terminalVerifierInfrastructureRetries {
+			break
+		}
+		printStatus(cfg.args, "terminal_verifier_retry", map[string]any{"taskId": task.ID, "attempt": attempt, "nextAttempt": attempt + 1, "reason": "dependency_download_failed"})
+		select {
+		case <-ctx.Done():
+			return false, strings.Join(attemptOutputs, "\n\n[verifier infrastructure retry]\n\n"), ctx.Err()
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+	out = strings.Join(attemptOutputs, "\n\n[verifier infrastructure retry]\n\n")
 	if timedOut {
 		printStatus(cfg.args, "terminal_verifier", map[string]any{"taskId": task.ID, "reward": "", "exitCode": code, "timedOut": true})
 		return false, out + "\n[verifier timed out]", cliError{"verifier_failed", "Verifier timed out; the task is scored as failed.", []string{"Raise [verifier].timeout_sec in the task if legitimate verifications need longer."}, map[string]any{"taskId": task.ID, "timeoutSec": firstPositive(task.Verifier.TimeoutSec, 900), "output": truncateString(out, 4096)}}
 	}
-	rewardFile := firstNonEmpty(task.Verifier.RewardFile, "/logs/verifier/reward.txt")
-	rewardJSONFile := path.Join(path.Dir(rewardFile), "reward.json")
-	reward, rewardRaw, rewardOK := 0.0, "", false
-	if jsonText, jsonCode, _, _ := runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "cat", rewardJSONFile); jsonCode == 0 {
-		reward, rewardOK = parseRewardJSON(jsonText)
-		rewardRaw = strings.TrimSpace(jsonText)
+	if reward, _, rewardOK := readTerminalVerifierReward(ctx, containerName, rewardFile); (!rewardOK || reward < 1.0) && terminalVerifierInfrastructureFailure(attemptOutputs[len(attemptOutputs)-1]) {
+		output := out + "\n[verifier infrastructure failure after " + strconv.Itoa(len(attemptOutputs)) + " attempts]"
+		printStatus(cfg.args, "terminal_verifier_infrastructure_failed", map[string]any{"taskId": task.ID, "attempts": len(attemptOutputs), "reason": "dependency_download_failed"})
+		return false, output, cliError{"verifier_infrastructure_failed", "Verifier dependency bootstrap failed after retries; the task is unscored.", []string{"Retry verification when network access is stable.", "Preinstall verifier dependencies in the canonical task image to eliminate runtime downloads."}, map[string]any{"taskId": task.ID, "attempts": len(attemptOutputs), "output": truncateString(out, 4096)}}
 	}
-	if !rewardOK {
-		if txtText, txtCode, _, _ := runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "cat", rewardFile); txtCode == 0 {
-			reward, rewardOK = parseRewardText(txtText)
-			rewardRaw = strings.TrimSpace(txtText)
-		}
-	}
+	reward, rewardRaw, rewardOK := readTerminalVerifierReward(ctx, containerName, rewardFile)
 	output := out + "\n[verifier exit=" + strconv.Itoa(code) + "]\nreward: " + rewardRaw
 	printStatus(cfg.args, "terminal_verifier", map[string]any{"taskId": task.ID, "reward": rewardRaw, "exitCode": code})
 	if !rewardOK {
 		return false, output, cliError{"verifier_failed", "Verifier did not produce a parseable reward file; the task is scored as failed.", []string{"Harbor verifiers must write /logs/verifier/reward.txt (float) or reward.json ({\"reward\": <num>})."}, map[string]any{"taskId": task.ID, "rewardFile": rewardFile, "exitCode": code, "output": truncateString(out, 4096)}}
 	}
 	return reward >= 1.0, output, nil
+}
+
+func readTerminalVerifierReward(ctx context.Context, containerName, rewardFile string) (float64, string, bool) {
+	rewardJSONFile := path.Join(path.Dir(rewardFile), "reward.json")
+	if jsonText, jsonCode, _, _ := runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "cat", rewardJSONFile); jsonCode == 0 {
+		if reward, ok := parseRewardJSON(jsonText); ok {
+			return reward, strings.TrimSpace(jsonText), true
+		}
+	}
+	if txtText, txtCode, _, _ := runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "cat", rewardFile); txtCode == 0 {
+		if reward, ok := parseRewardText(txtText); ok {
+			return reward, strings.TrimSpace(txtText), true
+		}
+	}
+	return 0, "", false
 }
 
 type terminalModelCallResult struct {
@@ -3707,14 +4091,18 @@ func callTerminalModelWithHeartbeatContext(ctx context.Context, cfg terminalConf
 	}
 }
 
-func callOpenAIChatMessages(baseURL, model string, messages []map[string]any, apiKey string, maxTokens int, temperature, topP float64, stop []string, timeout time.Duration) (content, reasoning string, usage terminalTokenUsage, err error) {
-	return callOpenAIChatMessagesContext(context.Background(), baseURL, model, messages, apiKey, maxTokens, temperature, topP, stop, timeout)
+func callOpenAIChatMessages(baseURL, model string, messages []map[string]any, apiKey string, maxTokens int, temperature, topP float64, stop []string, nativeTools bool, timeout time.Duration) (content, reasoning string, usage terminalTokenUsage, err error) {
+	return callOpenAIChatMessagesContext(context.Background(), baseURL, model, messages, apiKey, maxTokens, temperature, topP, stop, nativeTools, timeout)
 }
 
-func callOpenAIChatMessagesContext(parent context.Context, baseURL, model string, messages []map[string]any, apiKey string, maxTokens int, temperature, topP float64, stop []string, timeout time.Duration) (content, reasoning string, usage terminalTokenUsage, err error) {
+func callOpenAIChatMessagesContext(parent context.Context, baseURL, model string, messages []map[string]any, apiKey string, maxTokens int, temperature, topP float64, stop []string, nativeTools bool, timeout time.Duration) (content, reasoning string, usage terminalTokenUsage, err error) {
 	body := map[string]any{"model": model, "messages": messages, "temperature": temperature, "top_p": topP}
 	if terminalDisablesTemplateThinking(model) {
 		body["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
+	}
+	if nativeTools {
+		body["tools"] = terminalNativeTools()
+		body["tool_choice"] = "auto"
 	}
 	if maxTokens > 0 {
 		body["max_tokens"] = maxTokens
@@ -3750,10 +4138,412 @@ func callOpenAIChatMessagesContext(parent context.Context, baseURL, model string
 	if choices, _ := response["choices"].([]any); len(choices) > 0 {
 		if message := asObject(asObject(choices[0])["message"]); message != nil {
 			content = strings.TrimSpace(stringValue(message["content"]))
-			reasoning = strings.TrimSpace(stringValue(message["reasoning_content"]))
+			if nativeTools {
+				content = appendNativeShellToolCalls(content, message)
+			}
+			reasoning = strings.TrimSpace(firstNonEmpty(stringValue(message["reasoning_content"]), stringValue(message["reasoning"])))
 		}
 	}
 	return content, reasoning, usage, nil
+}
+
+func terminalNativeTools() []map[string]any {
+	return []map[string]any{
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "read_file",
+				"description": "Read a text file from the task container.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string", "description": "Absolute or working-directory-relative file path."},
+					},
+					"required":             []string{"path"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "write_file",
+				"description": "Write content to a file, completely replacing its current contents.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path":    map[string]any{"type": "string", "description": "Absolute or working-directory-relative file path."},
+						"content": map[string]any{"type": "string", "description": "Complete replacement file content."},
+					},
+					"required":             []string{"path", "content"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "edit_file",
+				"description": "Replace one unique text fragment in an existing file without rewriting the rest of the file.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path":     map[string]any{"type": "string", "description": "Absolute or working-directory-relative file path."},
+						"old_text": map[string]any{"type": "string", "description": "Exact existing text to replace; it must occur exactly once."},
+						"new_text": map[string]any{"type": "string", "description": "Replacement text."},
+					},
+					"required":             []string{"path", "old_text", "new_text"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "terminal",
+				"description": "Run one or more non-interactive shell commands in the persistent task container.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command": map[string]any{"type": "string", "description": "Shell commands to execute."},
+					},
+					"required":             []string{"command"},
+					"additionalProperties": false,
+				},
+			},
+		},
+	}
+}
+
+const terminalNativeCallMetadataPrefix = "\n<!-- lmx-native-tool-call:"
+const terminalNativeCallMetadataSuffix = " -->"
+
+type terminalNativeCallMetadata struct {
+	ID        string `json:"id,omitempty"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+	Command   string `json:"command,omitempty"`
+}
+
+type terminalNativeCallEnvelope struct {
+	Calls []terminalNativeCallMetadata `json:"calls"`
+}
+
+func terminalNativeCallsFromContent(content string) ([]terminalNativeCallMetadata, bool) {
+	index := strings.LastIndex(content, terminalNativeCallMetadataPrefix)
+	if index < 0 {
+		return nil, false
+	}
+	encoded := strings.TrimSuffix(content[index+len(terminalNativeCallMetadataPrefix):], terminalNativeCallMetadataSuffix)
+	payload, err := hex.DecodeString(encoded)
+	if err != nil {
+		return nil, false
+	}
+	var envelope terminalNativeCallEnvelope
+	if err := json.Unmarshal(payload, &envelope); err != nil || len(envelope.Calls) == 0 {
+		var legacy terminalNativeCallMetadata
+		if legacyErr := json.Unmarshal(payload, &legacy); legacyErr != nil {
+			return nil, false
+		}
+		envelope.Calls = []terminalNativeCallMetadata{legacy}
+	}
+	for _, call := range envelope.Calls {
+		switch call.Name {
+		case "read_file", "edit_file", "write_file", "terminal":
+		default:
+			return nil, false
+		}
+		if !json.Valid([]byte(call.Arguments)) || strings.TrimSpace(call.Command) == "" {
+			return nil, false
+		}
+	}
+	return envelope.Calls, true
+}
+
+func terminalNativeCallFromContent(content string) (terminalNativeCallMetadata, bool) {
+	calls, found := terminalNativeCallsFromContent(content)
+	if !found || len(calls) != 1 {
+		return terminalNativeCallMetadata{}, false
+	}
+	return calls[0], true
+}
+
+func stripTerminalNativeCallMetadata(content string) string {
+	if index := strings.LastIndex(content, terminalNativeCallMetadataPrefix); index >= 0 {
+		return strings.TrimSpace(content[:index])
+	}
+	return content
+}
+
+func appendNativeShellToolCalls(content string, message map[string]any) string {
+	var commands []string
+	var metadata []terminalNativeCallMetadata
+	toolCalls, _ := message["tool_calls"].([]any)
+	for index, rawCall := range toolCalls {
+		call := asObject(rawCall)
+		function := asObject(call["function"])
+		name := strings.ToLower(strings.TrimSpace(stringValue(function["name"])))
+		rawArguments := stringValue(function["arguments"])
+		var arguments map[string]any
+		if err := json.Unmarshal([]byte(rawArguments), &arguments); err != nil {
+			continue
+		}
+		var command string
+		canonicalName := name
+		switch name {
+		case "shell", "terminal":
+			canonicalName = "terminal"
+			command = strings.TrimSpace(firstNonEmpty(stringValue(arguments["cmd"]), stringValue(arguments["command"]), stringValue(arguments["commands"]), stringValue(arguments["keystrokes"])))
+		case "read", "read_file":
+			canonicalName = "read_file"
+			command = terminalReadFileCommand(stringValue(arguments["path"]))
+		case "edit_file":
+			command = terminalEditFileCommand(stringValue(arguments["path"]), stringValue(arguments["old_text"]), stringValue(arguments["new_text"]))
+		case "write_file":
+			command = terminalWriteFileCommand(stringValue(arguments["path"]), stringValue(arguments["content"]))
+		}
+		if command != "" {
+			id := strings.TrimSpace(stringValue(call["id"]))
+			if id == "" {
+				id = fmt.Sprintf("call_response_%d", index+1)
+			}
+			commands = append(commands, command)
+			metadata = append(metadata, terminalNativeCallMetadata{ID: id, Name: canonicalName, Arguments: rawArguments, Command: command})
+		}
+	}
+	if len(commands) == 0 {
+		return content
+	}
+	if content != "" {
+		content += "\n"
+	}
+	content += "```bash\n" + strings.Join(commands, "\n") + "\n```"
+	payload, _ := json.Marshal(terminalNativeCallEnvelope{Calls: metadata})
+	content += terminalNativeCallMetadataPrefix + hex.EncodeToString(payload) + terminalNativeCallMetadataSuffix
+	return content
+}
+
+func terminalReadFileCommand(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	return "cat -- " + shellQuote(path)
+}
+
+func terminalEditFileCommand(path, oldText, newText string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || oldText == "" {
+		return ""
+	}
+	program := `import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+old, new = sys.argv[2], sys.argv[3]
+text = p.read_text()
+count = text.count(old)
+if count != 1:
+    print(json.dumps({"error": "old_text_not_unique", "matches": count, "resolved_path": str(p)}))
+    raise SystemExit(2)
+updated = text.replace(old, new, 1)
+p.write_text(updated)
+print(json.dumps({"bytes_written": len(updated.encode()), "files_modified": [str(p)], "resolved_path": str(p)}))`
+	return "python3 -c " + shellQuote(program) + " " + shellQuote(path) + " " + shellQuote(oldText) + " " + shellQuote(newText)
+}
+func terminalWriteFileCommand(path, content string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	confirmation, _ := json.Marshal(map[string]any{
+		"bytes_written":  len([]byte(content)),
+		"files_modified": []string{path},
+		"resolved_path":  path,
+	})
+	return "printf %s " + shellQuote(content) + " > " + shellQuote(path) +
+		" && printf '%s\\n' " + shellQuote(string(confirmation))
+}
+
+type terminalNativeCommandMatch struct {
+	index   int
+	command string
+}
+
+var (
+	terminalXMLToolCallPattern       = regexp.MustCompile(`(?s)<tool_call>\s*([A-Za-z0-9_.-]+)(.*?)</tool_call>`)
+	terminalXMLArgumentPattern       = regexp.MustCompile(`(?s)<arg_key>\s*([^<]+?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>`)
+	terminalLFMSimpleToolCallPattern = regexp.MustCompile(`(?s)(shell|terminal|read|read_file)\((cmd|command|commands|keystrokes|path)='((?:\\.|[^'])*)'(?:,\s*[^)]*)?\)`)
+	terminalLFMWriteFileCallPattern  = regexp.MustCompile(`(?s)write_file\(path='((?:\\.|[^'])*)',\s*content='(.*?)'\)(?:\s*\]|,\s*(?:shell|terminal|read|read_file|write_file)\()`)
+	terminalLFMToolCallMarkerPattern = regexp.MustCompile(`(?:^|[\[,\s])(?:shell|terminal|read|read_file|write_file)\(`)
+)
+
+func terminalNativeCallFromLFMText(reply string) (terminalNativeCallMetadata, bool) {
+	var calls []terminalNativeCallMetadata
+	for _, match := range terminalLFMSimpleToolCallPattern.FindAllStringSubmatchIndex(reply, -1) {
+		if len(match) != 8 {
+			continue
+		}
+		toolName := reply[match[2]:match[3]]
+		argumentName := reply[match[4]:match[5]]
+		value := unescapeLFMToolString(reply[match[6]:match[7]])
+		var name string
+		var arguments map[string]string
+		switch toolName {
+		case "shell", "terminal":
+			if argumentName == "path" || strings.TrimSpace(value) == "" {
+				continue
+			}
+			name = "terminal"
+			arguments = map[string]string{"command": value}
+		case "read", "read_file":
+			if argumentName != "path" || strings.TrimSpace(value) == "" {
+				continue
+			}
+			name = "read_file"
+			arguments = map[string]string{"path": value}
+		}
+		rawArguments, _ := json.Marshal(arguments)
+		calls = append(calls, terminalNativeCallMetadata{Name: name, Arguments: string(rawArguments)})
+	}
+	for _, match := range terminalLFMWriteFileCallPattern.FindAllStringSubmatchIndex(reply, -1) {
+		if len(match) != 6 {
+			continue
+		}
+		path := unescapeLFMToolString(reply[match[2]:match[3]])
+		content := unescapeLFMToolString(reply[match[4]:match[5]])
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		rawArguments, _ := json.Marshal(map[string]string{"path": path, "content": content})
+		calls = append(calls, terminalNativeCallMetadata{Name: "write_file", Arguments: string(rawArguments)})
+	}
+	if len(calls) != 1 {
+		return terminalNativeCallMetadata{}, false
+	}
+	return calls[0], true
+}
+
+func extractTerminalCommand(reply string) (string, bool) {
+	if command, found := extractLFMNativeShellCommand(reply); found {
+		return command, true
+	}
+	if command, found := extractXMLShellCommands(reply); found {
+		return command, true
+	}
+	if terminalLFMToolCallMarkerPattern.MatchString(reply) {
+		return "", false
+	}
+	return extractBashCommand(reply)
+}
+
+func extractNativeTerminalCommand(content, reasoning string) (string, bool) {
+	if command, found := extractLFMNativeShellCommand(content); found {
+		return command, true
+	}
+	if command, found := extractXMLShellCommands(content); found {
+		return command, true
+	}
+	if command, found := extractLFMNativeShellCommand(reasoning); found {
+		return command, true
+	}
+	if command, found := extractXMLShellCommands(reasoning); found {
+		return command, true
+	}
+	if terminalLFMToolCallMarkerPattern.MatchString(content) || terminalLFMToolCallMarkerPattern.MatchString(reasoning) {
+		return "", false
+	}
+	return extractBashCommand(content)
+}
+
+func extractLFMNativeShellCommand(reply string) (string, bool) {
+	var translated []terminalNativeCommandMatch
+	for _, match := range terminalLFMSimpleToolCallPattern.FindAllStringSubmatchIndex(reply, -1) {
+		if len(match) != 8 {
+			continue
+		}
+		toolName := reply[match[2]:match[3]]
+		argumentName := reply[match[4]:match[5]]
+		value := unescapeLFMToolString(reply[match[6]:match[7]])
+		var command string
+		switch toolName {
+		case "shell", "terminal":
+			if argumentName != "path" {
+				command = value
+			}
+		case "read", "read_file":
+			if argumentName == "path" {
+				command = terminalReadFileCommand(value)
+			}
+		}
+		if strings.TrimSpace(command) != "" {
+			translated = append(translated, terminalNativeCommandMatch{index: match[0], command: command})
+		}
+	}
+	for _, match := range terminalLFMWriteFileCallPattern.FindAllStringSubmatchIndex(reply, -1) {
+		if len(match) != 6 {
+			continue
+		}
+		path := unescapeLFMToolString(reply[match[2]:match[3]])
+		content := unescapeLFMToolString(reply[match[4]:match[5]])
+		if command := terminalWriteFileCommand(path, content); command != "" {
+			translated = append(translated, terminalNativeCommandMatch{index: match[0], command: command})
+		}
+	}
+	if len(translated) == 0 {
+		return "", false
+	}
+	sort.Slice(translated, func(i, j int) bool { return translated[i].index < translated[j].index })
+	commands := make([]string, 0, len(translated))
+	for _, match := range translated {
+		commands = append(commands, match.command)
+	}
+	return strings.Join(commands, "\n"), true
+}
+
+func unescapeLFMToolString(value string) string {
+	var result strings.Builder
+	result.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		if value[i] != '\\' || i+1 >= len(value) {
+			result.WriteByte(value[i])
+			continue
+		}
+		i++
+		switch value[i] {
+		case 'n':
+			result.WriteByte('\n')
+		case 'r':
+			result.WriteByte('\r')
+		case '\\', '\'':
+			result.WriteByte(value[i])
+		default:
+			result.WriteByte('\\')
+			result.WriteByte(value[i])
+		}
+	}
+	return result.String()
+}
+
+func extractXMLShellCommands(reply string) (string, bool) {
+	var commands []string
+	for _, toolCall := range terminalXMLToolCallPattern.FindAllStringSubmatch(reply, -1) {
+		if !strings.EqualFold(strings.TrimSpace(toolCall[1]), "shell") {
+			continue
+		}
+		for _, argument := range terminalXMLArgumentPattern.FindAllStringSubmatch(toolCall[2], -1) {
+			key := strings.ToLower(strings.TrimSpace(argument[1]))
+			if key != "cmd" && key != "commands" && key != "keystrokes" {
+				continue
+			}
+			command := strings.TrimSpace(html.UnescapeString(argument[2]))
+			if command != "" {
+				commands = append(commands, command)
+			}
+		}
+	}
+	if len(commands) == 0 {
+		return "", false
+	}
+	return strings.Join(commands, "\n"), true
 }
 
 func extractBashCommand(reply string) (cmd string, found bool) {
@@ -4339,8 +5129,10 @@ func trimTerminalMessagesTo(messages []map[string]any, budget, keep int) []map[s
 func terminalMessagesBytes(messages []map[string]any) int {
 	total := 0
 	for _, message := range messages {
-		total += len(stringValue(message["role"]))
-		total += len(stringValue(message["content"]))
+		encoded, err := json.Marshal(message)
+		if err == nil {
+			total += len(encoded)
+		}
 	}
 	return total
 }
@@ -4376,6 +5168,7 @@ func terminalModelMaxTokens(cfg terminalConfig, retry bool) int {
 	}
 	return defaultTerminalModelMaxTokens
 }
+
 func terminalDisablesTemplateThinking(model string) bool {
 	return strings.Contains(strings.ToLower(model), "qwen")
 }

@@ -570,6 +570,17 @@ and CLI/task-manifest/fallback source. When every task has the same resolved
 turn cap, `maxTurns` carries that nonzero value. External agents that do not
 report a turn count serialize `turns: null`, never a misleading zero.
 
+Terminal runs also record `thinkingLevel` and `thinkingLevelSource` in the
+checkpoint, result summary, configuration fingerprint, status events, and
+submitted `runConfig`. Use `--thinking-level
+off|on|low|medium|high|xhigh|auto` to declare the effective setting. When the
+flag is omitted, the CLI infers it from the served model name or llama.cpp
+`/props` metadata and otherwise prompts on an interactive run. Noninteractive
+local runs retain `not-provided`; submission requires a known level. The built-in
+Qwen terminal harness explicitly disables template thinking and is therefore
+recorded as `off`; use an externally configured agent to benchmark another
+Qwen thinking level.
+
 Repeat the command to publish each missing shard. A complete 89-task checkpoint
 produced by Harbor or another offline runner can instead be validated and
 partitioned into the same 10 shard submissions without rerunning tasks or
@@ -678,6 +689,66 @@ tools with open boolean JSON subschemas. A terminal model/provider error before
 the first completed tool execution makes the wrapper exit nonzero and leaves
 the task unscored. A provider error after useful tool execution, or an outer
 agent timeout, preserves Harbor semantics by proceeding to verification.
+
+For Hermes Agent, use the bundled routed-shell adapter. Hermes stays on the
+host for inference, but its only enabled model tool is the bundled
+`lmx-container` plugin. That tool invokes `LMX_TERMINAL_SHELL_COMMAND`
+directly, so shell and file operations occur in the existing task container
+and never in a host checkout. This follows Hermes' documented
+[`hermes chat -q`](https://hermes-agent.nousresearch.com/docs/user-guide/cli#running-the-cli)
+single-query interface and
+[user-plugin tool registration](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins).
+
+Install Hermes Agent first, ensure `hermes` is on `PATH`, then run imported
+CRUDBench bundles through the `AGENT_CMD` path:
+
+```bash
+AGENT_CMD="$PWD/examples/agents/hermes-container-shell.sh"
+lmx eval terminal run --task-dir ./crudbench-bundles \
+  --agent-cmd "$AGENT_CMD" \
+  --agent-name hermes-agent \
+  --agent-execution routed-shell \
+  --base-url http://localhost:8000 \
+  --model Qwen/Qwen3-8B \
+  --out crudbench-hermes.json
+```
+
+Run Terminal-Bench 2.1 with the same adapter:
+
+```bash
+lmx eval terminal run terminal-bench-2-1 \
+  --agent-cmd "$PWD/examples/agents/hermes-container-shell.sh" \
+  --agent-name hermes-agent \
+  --agent-execution routed-shell \
+  --base-url http://localhost:8000 \
+  --model Qwen/Qwen3-8B \
+  --hardware hardware.json \
+  --out tb21-hermes.json
+```
+
+The adapter passes `LMX_TERMINAL_MODEL` with `--model`, selects Hermes'
+OpenAI-compatible `custom` provider, and references the base URL and API key
+through environment substitutions in its private `config.yaml`. It also
+exports `CUSTOM_BASE_URL` for Hermes' bare-custom runtime and the
+`OPENAI_BASE_URL` / `OPENAI_API_KEY` compatibility variables. The credential
+value exists only in the child environment, never in the config file.
+Override the executable, provider, model, base URL, or API key with
+`HERMES_BIN`, `HERMES_PROVIDER`, `HERMES_MODEL`, `HERMES_BASE_URL`, or
+`HERMES_API_KEY` when required.
+
+Each invocation creates a private `HOME` and `HERMES_HOME` beneath
+`LMX_TERMINAL_TRACE_DIR`, enables only the copied `lmx-container` plugin, and
+uses `--ignore-rules` to exclude ambient rules, memory, and skills. It
+intentionally does not use Hermes' `--ignore-user-config`: plugin enablement is
+itself config-driven, and the per-task config is already isolated from the
+user's global `~/.hermes`. The wrapper enforces `LMX_TERMINAL_MAX_TURNS` and an
+inner deadline just shorter than `LMX_TERMINAL_AGENT_TIMEOUT_SEC`, records the
+Hermes session, output, tool calls, and usage under the trace directory, and
+redacts credential-shaped values from text artifacts. A provider failure
+before any routed tool completes remains a nonzero infrastructure failure. If
+at least one routed container tool completed before Hermes later failed or
+timed out, the wrapper exits successfully so the modified task container
+remains eligible for verification.
 
 ### Prepare eval-derived adapter training
 

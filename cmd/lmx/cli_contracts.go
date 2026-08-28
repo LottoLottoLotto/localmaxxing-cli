@@ -53,7 +53,13 @@ var extraOptionNames = map[string]bool{
 	"decoding": true, "draft-tokens": true, "acceptance-percent": true,
 	"title": true, "summary": true, "content": true, "content-file": true,
 	"benchmark-run-ids": true, "eval-run-ids": true, "draft": true,
+	"hardware-id": true, "tags": true,
 	"file": true, "caption": true, "sort-order": true,
+	"input-column": true, "gold-column": true, "choices-column": true,
+	"choices-separator": true, "reference-column": true, "rubric-column": true,
+	"source-url": true, "samples": true, "remote": true, "upload-datasets": true,
+	"name": true, "kind": true, "shard-count": true, "shards": true, "state": true,
+	"skip-oracle": true,
 }
 
 func knownOptionName(name string) bool {

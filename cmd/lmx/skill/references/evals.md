@@ -9,11 +9,15 @@ lmx eval suite list --out suites.json
 lmx eval suite search reasoning --out reasoning-suites.json
 lmx eval suite show hellaswag --out hellaswag-suite.json
 lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --out my-eval.json
+lmx eval suite import questions.jsonl --slug my-eval --name "My Eval" --kind qa --out my-eval.json
 lmx eval suite validate my-eval.json
-lmx eval suite submit my-eval.json --api-key bhk_...
+lmx eval suite audit my-eval.json
+lmx eval suite check my-eval.json --model Qwen/Qwen3-8B --base-url http://localhost:8000 --samples 5
+lmx eval suite submit my-eval.json --upload-datasets
+lmx eval suite submissions
 ```
 
-User-submitted suites start `PENDING` and appear publicly after admin approval.
+User-submitted suites start `PENDING`. Use `submissions` to read admin feedback, `resubmit <id> --file <suite.json>` to correct a submission, and `withdraw <id> --yes` to remove an unused pending or rejected suite.
 
 ## Run a LocalMaxxing suite
 
@@ -73,10 +77,18 @@ Useful shard flags include `--questions`, `--shard`, `--missing-only`, `--all-mi
 
 ```bash
 lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1
+lmx eval terminal publish ./tb-bundles --slug my-terminal-bench --name "My Terminal Benchmark" --source-url https://github.com/org/repo --shard-count 5
 lmx eval terminal verify ./tb-bundles/smoke --oracle
 lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --run-dir ./runs/tb21-qwen --resume auto --json-status --json --submit
 lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-payload.json
 ```
+
+Terminal dataset publishing requires LocalMaxxing Pro. `publish` oracle-verifies
+tasks by default, rejects symlinks, creates deterministic task archives, uploads
+each archive through a signed `terminal-task` URL, runs the authenticated
+manifest dry-run, and creates a `PENDING` dataset. Its state file under
+`.localmaxxing/` makes retries resumable. Use `--dry-run` to verify uploads and
+the manifest without creating the dataset.
 
 For an unattended run, use this sequence:
 
@@ -135,8 +147,10 @@ Useful Terminal-Bench flags include `--task-dir`, `--run-dir`, `--resume`,
 `--dataset`, `--hf-id`, `--shard-index`, `--max-turns`, `--agent-timeout`,
 `--agent`, `--agent-cmd`, `--agent-execution`, `--agent-name`,
 `--container-base-url`, `--command-timeout`, `--endpoint-timeout-seconds`,
-`--trace-dir`, `--cleanup-images`, `--shell-mode`, `--json-status`, `--json`, and
-`--oracle`. `--agent terminus-2` uses the release-binary-embedded Harbor adapter.
+`--trace-dir`, `--cleanup-images`, `--shell-mode`, `--native-tools`,
+`--json-status`, `--json`, and `--oracle`. `--native-tools` sends the built-in
+shell function to compatible chat endpoints. `--agent terminus-2` uses the
+release-binary-embedded Harbor adapter.
 
 
 ## Eval-derived training

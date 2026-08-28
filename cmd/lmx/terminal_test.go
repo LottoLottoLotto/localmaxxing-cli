@@ -145,6 +145,487 @@ func TestExtractBashCommand(t *testing.T) {
 	}
 }
 
+func TestExtractXMLShellCommands(t *testing.T) {
+	reply := `I'll inspect the files.
+<tool_call>shell<arg_key>commands</arg_key><arg_value>ls -la /app/</arg_value><arg_key>duration</arg_key><arg_value>0.1</arg_value></tool_call>
+<tool_call>shell<arg_key>cmd</arg_key><arg_value>cat /app/crud.py &amp;&amp; echo done</arg_value><arg_key>duration</arg_key><arg_value>0.1</arg_value></tool_call>`
+	got, found := extractTerminalCommand(reply)
+	want := "ls -la /app/\ncat /app/crud.py && echo done"
+	if !found || got != want {
+		t.Fatalf("extractTerminalCommand() = (%q, %v), want (%q, true)", got, found, want)
+	}
+}
+
+func TestExtractXMLShellCommandsRejectsUnsupportedCalls(t *testing.T) {
+	cases := []string{
+		`<tool_call>python<arg_key>cmd</arg_key><arg_value>print("unsafe")</arg_value></tool_call>`,
+		`<tool_call>shell<arg_key>duration</arg_key><arg_value>0.1</arg_value></tool_call>`,
+		`<tool_call>shell<arg_value>echo missing-key</arg_value></tool_call>`,
+	}
+	for _, reply := range cases {
+		if got, found := extractTerminalCommand(reply); found {
+			t.Fatalf("extractTerminalCommand(%q) = (%q, true), want not found", reply, got)
+		}
+	}
+}
+
+func TestExtractLFMNativeShellCommand(t *testing.T) {
+	reply := "```json\n{\"example\": true}\n```\n</think>[read_file(path='/app/schema.sql'), write_file(path='/app/solution.py', content='print(\\'ok\\')\\n'), terminal(command='python3 /app/solution.py')]"
+	got, found := extractTerminalCommand(reply)
+	want := terminalReadFileCommand("/app/schema.sql") + "\n" + terminalWriteFileCommand("/app/solution.py", "print('ok')\n") + "\npython3 /app/solution.py"
+	if !found || got != want {
+		t.Fatalf("extractTerminalCommand() = (%q, %v), want (%q, true)", got, found, want)
+	}
+}
+
+func TestExtractLFMNativeWriteFileAllowsUnescapedContentQuotes(t *testing.T) {
+	reply := `</think>[write_file(path='/app/solution.py', content='cursor.execute("status = 'active'")` + `\n` + `f"{','.join(columns)}"` + `\n')]`
+	got, found := extractTerminalCommand(reply)
+	want := terminalWriteFileCommand("/app/solution.py", "cursor.execute(\"status = 'active'\")\nf\"{','.join(columns)}\"\n")
+	if !found || got != want {
+		t.Fatalf("extractTerminalCommand() = (%q, %v), want (%q, true)", got, found, want)
+	}
+}
+
+func TestExtractTerminalCommandRejectsMalformedLFMCallInsteadOfExecutingProse(t *testing.T) {
+	reply := "I will update it.</think>[write_file(content='print(1)')]\n```bash\nWait, this is explanatory prose, not a command.\n```"
+	if got, found := extractTerminalCommand(reply); found {
+		t.Fatalf("extractTerminalCommand() = (%q, true), want malformed native call rejected", got)
+	}
+	if got, found := extractNativeTerminalCommand(reply, ""); found {
+		t.Fatalf("extractNativeTerminalCommand() = (%q, true), want malformed native call rejected", got)
+	}
+}
+
+func TestTerminalNativeAssistantMessageUsesAdvertisedTerminalTool(t *testing.T) {
+	message := terminalNativeAssistantMessage("", "echo READY", "checking", 7)
+	toolCalls, _ := message["tool_calls"].([]any)
+	if len(toolCalls) != 1 {
+		t.Fatalf("tool_calls = %#v, want one call", message["tool_calls"])
+	}
+	function := asObject(asObject(toolCalls[0])["function"])
+	if got := stringValue(function["name"]); got != "terminal" {
+		t.Fatalf("native history tool name = %q, want terminal", got)
+	}
+	var arguments map[string]any
+	rawArguments, ok := function["arguments"].(string)
+	if !ok {
+		t.Fatalf("native history arguments = %#v, want JSON string", function["arguments"])
+	}
+	if err := json.Unmarshal([]byte(rawArguments), &arguments); err != nil {
+		t.Fatalf("decode native history arguments: %v", err)
+	}
+	if got := stringValue(arguments["command"]); got != "echo READY" {
+		t.Fatalf("native history command = %q, want echo READY", got)
+	}
+}
+
+func TestTerminalNativeAssistantMessagePreservesStructuredWriteFileCall(t *testing.T) {
+	rawArguments := `{"path":"/app/solution.py","content":"print('ready')\n"}`
+	content := appendNativeShellToolCalls("", map[string]any{
+		"tool_calls": []any{map[string]any{
+			"function": map[string]any{
+				"name":      "write_file",
+				"arguments": rawArguments,
+			},
+		}},
+	})
+	message := terminalNativeAssistantMessage(content, "translated command", "", 8)
+	toolCalls, _ := message["tool_calls"].([]any)
+	function := asObject(asObject(toolCalls[0])["function"])
+	if got := stringValue(function["name"]); got != "write_file" {
+		t.Fatalf("native history tool name = %q, want write_file", got)
+	}
+	if got := stringValue(function["arguments"]); got != rawArguments {
+		t.Fatalf("native history arguments = %q, want %q", got, rawArguments)
+	}
+	if strings.Contains(stripTerminalNativeCallMetadata(content), terminalNativeCallMetadataPrefix) {
+		t.Fatalf("native metadata leaked into visible assistant content: %q", stripTerminalNativeCallMetadata(content))
+	}
+}
+
+func TestTerminalNativeAssistantMessagePreservesMultipleStructuredCalls(t *testing.T) {
+	content := appendNativeShellToolCalls("", map[string]any{
+		"tool_calls": []any{
+			map[string]any{
+				"id": "read_schema",
+				"function": map[string]any{
+					"name":      "read_file",
+					"arguments": `{"path":"/app/schema.sql"}`,
+				},
+			},
+			map[string]any{
+				"id": "read_solution",
+				"function": map[string]any{
+					"name":      "read_file",
+					"arguments": `{"path":"/app/solution.py"}`,
+				},
+			},
+		},
+	})
+	message := terminalNativeAssistantMessage(content, "translated commands", "", 8)
+	toolCalls, _ := message["tool_calls"].([]any)
+	if len(toolCalls) != 2 {
+		t.Fatalf("tool_calls = %#v, want two preserved calls", message["tool_calls"])
+	}
+	for index, wantID := range []string{"read_schema", "read_solution"} {
+		call := asObject(toolCalls[index])
+		if got := stringValue(call["id"]); got != wantID {
+			t.Fatalf("tool call %d id = %q, want %q", index, got, wantID)
+		}
+		function := asObject(call["function"])
+		if got := stringValue(function["name"]); got != "read_file" {
+			t.Fatalf("tool call %d name = %q, want read_file", index, got)
+		}
+	}
+	firstResult := terminalNativeToolMessage("schema", "read_schema")
+	secondResult := terminalNativeToolMessage("solution", "read_solution")
+	if stringValue(firstResult["tool_call_id"]) != "read_schema" || stringValue(secondResult["tool_call_id"]) != "read_solution" {
+		t.Fatalf("tool result ids = (%q, %q), want preserved call ids", firstResult["tool_call_id"], secondResult["tool_call_id"])
+	}
+}
+
+func TestTerminalNativeAssistantMessagePreservesTextualLFMCalls(t *testing.T) {
+	tests := []struct {
+		name          string
+		content       string
+		reasoning     string
+		wantTool      string
+		wantArguments map[string]string
+	}{
+		{
+			name:          "write file in content",
+			content:       `Working.</think>[write_file(path='/app/solution.py', content='print(\'ready\')\n')]`,
+			wantTool:      "write_file",
+			wantArguments: map[string]string{"path": "/app/solution.py", "content": "print('ready')\n"},
+		},
+		{
+			name:          "read file in reasoning",
+			content:       "I will inspect it.",
+			reasoning:     `Planning.</think>[read_file(path='/app/schema.sql')]`,
+			wantTool:      "read_file",
+			wantArguments: map[string]string{"path": "/app/schema.sql"},
+		},
+		{
+			name:          "terminal in content",
+			content:       `Testing.</think>[terminal(command='python3 -m pytest')]`,
+			wantTool:      "terminal",
+			wantArguments: map[string]string{"command": "python3 -m pytest"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			message := terminalNativeAssistantMessage(tc.content, "translated command", tc.reasoning, 9)
+			toolCalls, _ := message["tool_calls"].([]any)
+			function := asObject(asObject(toolCalls[0])["function"])
+			if got := stringValue(function["name"]); got != tc.wantTool {
+				t.Fatalf("native history tool name = %q, want %q", got, tc.wantTool)
+			}
+			var gotArguments map[string]string
+			if err := json.Unmarshal([]byte(stringValue(function["arguments"])), &gotArguments); err != nil {
+				t.Fatalf("decode native history arguments: %v", err)
+			}
+			if !reflect.DeepEqual(gotArguments, tc.wantArguments) {
+				t.Fatalf("native history arguments = %#v, want %#v", gotArguments, tc.wantArguments)
+			}
+		})
+	}
+}
+
+func TestTerminalNativeAssistantMessageCollapsesMultipleTextualLFMCalls(t *testing.T) {
+	content := `</think>[read_file(path='/app/schema.sql'), read_file(path='/app/solution.py')]`
+	message := terminalNativeAssistantMessage(content, "cat -- /app/schema.sql\ncat -- /app/solution.py", "", 10)
+	toolCalls, _ := message["tool_calls"].([]any)
+	function := asObject(asObject(toolCalls[0])["function"])
+	if got := stringValue(function["name"]); got != "terminal" {
+		t.Fatalf("multi-call native history tool name = %q, want terminal", got)
+	}
+}
+
+func TestTerminalEditFileCommandReplacesOneUniqueFragment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "solution.py")
+	if err := os.WriteFile(path, []byte("before\nold value\nafter\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command("bash", "-c", terminalEditFileCommand(path, "old value", "new value")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("execute edit command: %v\n%s", err, output)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "before\nnew value\nafter\n" {
+		t.Fatalf("edited content = %q", got)
+	}
+}
+
+func TestTerminalEditFileCommandRejectsNonUniqueFragment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "solution.py")
+	original := "same\nsame\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command("bash", "-c", terminalEditFileCommand(path, "same", "changed")).CombinedOutput()
+	if err == nil {
+		t.Fatalf("non-unique edit succeeded: %s", output)
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != original {
+		t.Fatalf("rejected edit changed file: %q", got)
+	}
+}
+
+func TestTerminalWriteFileCommandReportsHermesConfirmation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "solution.py")
+	content := "print('ready')\n"
+	output, err := exec.Command("bash", "-c", terminalWriteFileCommand(path, content)).Output()
+	if err != nil {
+		t.Fatalf("execute write command: %v", err)
+	}
+	gotContent, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read written file: %v", err)
+	}
+	if string(gotContent) != content {
+		t.Fatalf("written content = %q, want %q", gotContent, content)
+	}
+	var confirmation map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(output), &confirmation); err != nil {
+		t.Fatalf("decode write confirmation %q: %v", output, err)
+	}
+	if got := int(confirmation["bytes_written"].(float64)); got != len(content) {
+		t.Fatalf("bytes_written = %d, want %d", got, len(content))
+	}
+	if got := stringValue(confirmation["resolved_path"]); got != path {
+		t.Fatalf("resolved_path = %q, want %q", got, path)
+	}
+}
+
+func TestExtractLFMReadToolShellQuotesPath(t *testing.T) {
+	path := "/tmp/file; printf unsafe"
+	got, found := extractTerminalCommand("[read(path='" + path + "')]")
+	want := "cat -- " + shellQuote(path)
+	if !found || got != want {
+		t.Fatalf("extractTerminalCommand() = (%q, %v), want (%q, true)", got, found, want)
+	}
+}
+
+func TestExtractNativeTerminalCommandFromReasoning(t *testing.T) {
+	content := "I will inspect the files before editing."
+	reasoning := "Planning.</think>[shell(cmd='cat /app/schema.sql')]"
+	got, found := extractNativeTerminalCommand(content, reasoning)
+	if !found || got != "cat /app/schema.sql" {
+		t.Fatalf("extractNativeTerminalCommand() = (%q, %v), want (%q, true)", got, found, "cat /app/schema.sql")
+	}
+}
+
+func TestParseTerminalAgentResponseSkipsJSONInNativeToolContent(t *testing.T) {
+	content := "Example payload: `{\"name\":\"New\"}`.</think>[shell(cmd='cat /app/schema.sql')]"
+	if _, found := parseTerminalAgentResponse(content, true); found {
+		t.Fatal("native tool content was misclassified as a terminal JSON protocol response")
+	}
+}
+
+func TestTerminalNativePromptsAdvertiseHermesTools(t *testing.T) {
+	for name, prompt := range map[string]string{
+		"stateless":  terminalNativeSystemPrompt,
+		"persistent": terminalNativeSessionSystemPrompt,
+		"correction": terminalNativeContinuePrompt,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, toolName := range []string{"read_file", "edit_file", "write_file", "terminal"} {
+				if !strings.Contains(prompt, toolName) {
+					t.Fatalf("native prompt %q does not name the %s tool", prompt, toolName)
+				}
+			}
+			if strings.Contains(prompt, "```bash") {
+				t.Fatalf("native prompt requests a conflicting bash code block: %q", prompt)
+			}
+		})
+	}
+}
+
+func TestCallOpenAIChatMessagesUsesNativeShellTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		tools, _ := request["tools"].([]any)
+		if len(tools) != 4 || request["tool_choice"] != "auto" {
+			t.Fatalf("native tool request = %#v, want file edit and terminal tools with automatic selection", request)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{
+				"content":   "Inspecting.",
+				"reasoning": "Inspect the files before editing.",
+				"tool_calls": []any{
+					map[string]any{
+						"type": "function",
+						"function": map[string]any{
+							"name":      "read_file",
+							"arguments": `{"path":"/app/schema.sql"}`,
+						},
+					},
+					map[string]any{
+						"type": "function",
+						"function": map[string]any{
+							"name":      "write_file",
+							"arguments": `{"path":"/app/solution.py","content":"print('ok')\n"}`,
+						},
+					},
+					map[string]any{
+						"type": "function",
+						"function": map[string]any{
+							"name":      "terminal",
+							"arguments": `{"command":"python3 /app/solution.py"}`,
+						},
+					},
+				},
+			}}},
+		})
+	}))
+	defer server.Close()
+
+	content, reasoning, _, err := callOpenAIChatMessages(server.URL, "fixture-model", []map[string]any{{"role": "user", "content": "run it"}}, "", 128, 0, 1, nil, true, time.Second)
+	if err != nil {
+		t.Fatalf("callOpenAIChatMessages: %v", err)
+	}
+	if reasoning != "Inspect the files before editing." {
+		t.Fatalf("native tool response reasoning = %q, want vLLM reasoning field", reasoning)
+	}
+	command, found := extractTerminalCommand(content)
+	want := terminalReadFileCommand("/app/schema.sql") + "\n" + terminalWriteFileCommand("/app/solution.py", "print('ok')\n") + "\npython3 /app/solution.py"
+	if !found || command != want {
+		t.Fatalf("native tool response command = (%q, %v), want (%q, true)", command, found, want)
+	}
+}
+
+func TestParseArgsRecognizesNativeToolsFlag(t *testing.T) {
+	args := parseArgs([]string{"eval", "terminal", "run", "--native-tools", "fixture-dataset"})
+	if !hasFlag(args, "native-tools") {
+		t.Fatal("parseArgs did not preserve --native-tools as a boolean flag")
+	}
+	if got := positional(args, 3); got != "fixture-dataset" {
+		t.Fatalf("dataset positional = %q, want fixture-dataset", got)
+	}
+}
+
+func TestTerminalAssistantMessagePreservesReasoning(t *testing.T) {
+	message := terminalAssistantMessage("run the command", "  inspect first  ")
+	want := map[string]any{
+		"role":              "assistant",
+		"content":           "run the command",
+		"reasoning_content": "inspect first",
+	}
+	if !reflect.DeepEqual(message, want) {
+		t.Fatalf("terminalAssistantMessage() = %#v, want %#v", message, want)
+	}
+	if message := terminalAssistantMessage("done", " \n "); len(message) != 2 {
+		t.Fatalf("empty reasoning message = %#v, want role and content only", message)
+	}
+}
+
+func TestTerminalDisablesTemplateThinkingOnlyForQwen(t *testing.T) {
+	if !terminalDisablesTemplateThinking("Qwen3.5-9B") {
+		t.Fatal("terminalDisablesTemplateThinking(Qwen3.5-9B) = false, want true")
+	}
+	for _, model := range []string{"Laguna-S-2.1-IQ4", "fixture-model"} {
+		if terminalDisablesTemplateThinking(model) {
+			t.Fatalf("terminalDisablesTemplateThinking(%q) = true, want false", model)
+		}
+	}
+}
+
+func TestTerminalThinkingLevelInference(t *testing.T) {
+	cases := map[string]string{
+		"Qwen3.8-27B-thinking-xhigh":    "xhigh",
+		"Qwen3.8-27B-nothink-official":  "off",
+		"model-reasoning_medium-Q4_K_M": "medium",
+		"plain-model":                   "",
+	}
+	for model, want := range cases {
+		if got := inferTerminalThinkingLevel(model); got != want {
+			t.Errorf("inferTerminalThinkingLevel(%q) = %q, want %q", model, got, want)
+		}
+	}
+	props := map[string]any{
+		"model_alias":   "Qwen3.8-27B",
+		"chat_template": `{% set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}<think>`,
+	}
+	if got := inferTerminalThinkingLevelFromProps(props); got != "xhigh" {
+		t.Fatalf("inferTerminalThinkingLevelFromProps() = %q, want xhigh", got)
+	}
+}
+
+func TestResolveTerminalThinkingLevelUsesEndpointThenPrompt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/props" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"model_alias":"Qwen3.8-27B-thinking-xhigh"}`)
+	}))
+	defer server.Close()
+
+	cfg := terminalConfig{agentCommand: "external-agent"}
+	level, source, err := resolveTerminalThinkingLevel(context.Background(), parseArgs(nil), server.URL, "plain-model", cfg, strings.NewReader(""), io.Discard, false)
+	if err != nil || level != "xhigh" || source != "endpoint" {
+		t.Fatalf("endpoint resolution = (%q, %q, %v), want (xhigh, endpoint, nil)", level, source, err)
+	}
+
+	level, source, err = resolveTerminalThinkingLevel(context.Background(), parseArgs(nil), "", "plain-model", cfg, strings.NewReader(""), io.Discard, false)
+	if err != nil || level != "not-provided" || source != "unresolved" {
+		t.Fatalf("noninteractive resolution = (%q, %q, %v), want (not-provided, unresolved, nil)", level, source, err)
+	}
+
+	var prompt bytes.Buffer
+	level, source, err = resolveTerminalThinkingLevel(context.Background(), parseArgs(nil), "", "plain-model", cfg, strings.NewReader("invalid\nmedium\n"), &prompt, true)
+	if err != nil || level != "medium" || source != "prompt" {
+		t.Fatalf("prompt resolution = (%q, %q, %v), want (medium, prompt, nil)", level, source, err)
+	}
+	if !strings.Contains(prompt.String(), "Invalid level") {
+		t.Fatalf("prompt did not explain invalid input: %q", prompt.String())
+	}
+}
+
+func TestResolveTerminalThinkingLevelHonorsHarnessReality(t *testing.T) {
+	args := parseArgs([]string{"--thinking-level", "high"})
+	_, _, err := resolveTerminalThinkingLevel(context.Background(), args, "", "Qwen3.8-27B", terminalConfig{}, strings.NewReader(""), io.Discard, false)
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "thinking_level_conflict" {
+		t.Fatalf("error = %#v, want thinking_level_conflict", err)
+	}
+
+	level, source, err := resolveTerminalThinkingLevel(context.Background(), parseArgs(nil), "", "Qwen3.8-27B", terminalConfig{}, strings.NewReader(""), io.Discard, false)
+	if err != nil || level != "off" || source != "harness" {
+		t.Fatalf("built-in Qwen resolution = (%q, %q, %v), want (off, harness, nil)", level, source, err)
+	}
+}
+
+func TestTerminalThinkingLevelIsFingerprintAndSubmissionMetadata(t *testing.T) {
+	identity := terminalLiveCheckpointIdentity(parseArgs(nil), "crud-bench", 1, nil, "http://localhost", "model", "org/model", "Q4_K_M", "gguf", nil, terminalConfig{thinkingLevel: "low"})
+	if identity["thinkingLevel"] != "low" {
+		t.Fatalf("checkpoint identity thinkingLevel = %v, want low", identity["thinkingLevel"])
+	}
+	payload := terminalSubmissionPayload(
+		parseArgs([]string{"--thinking-level", "low"}),
+		"org/model",
+		map[string]any{"gpu": "fixture"},
+		1,
+		[]terminalSubmissionRecord{{questionID: "task", pass: true, result: map[string]any{"question_id": "task", "pass": true}, artifact: map[string]any{"question_id": "task"}}},
+		nil,
+	)
+	runConfig := asObject(payload["runConfig"])
+	if runConfig["thinkingLevel"] != "low" || runConfig["thinkingLevelSource"] != "cli" {
+		t.Fatalf("submission thinking metadata = %#v", runConfig)
+	}
+}
+
 func TestRunTerminalEvalEmptyTaskDirIsBundleInvalid(t *testing.T) {
 	empty := t.TempDir()
 	args := parseArgs([]string{"eval", "terminal", "run", "--task-dir", empty, "--base-url", "http://127.0.0.1:9", "--model", "x", "--json-status", "--dry-run"})
@@ -235,6 +716,28 @@ func TestParseReward(t *testing.T) {
 		}
 		if ok != c.ok || (ok && got != c.want) {
 			t.Fatalf("parseReward(json=%q txt=%q) = (%v, %v), want (%v, %v)", c.json, c.txt, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestTerminalVerifierInfrastructureFailure(t *testing.T) {
+	for _, output := range []string{
+		"curl: (22) The requested URL returned error: 503",
+		"curl: (56) Connection died, tried 5 times before giving up",
+		"Caused by: Failed to download https://github.com/astral-sh/python-build-standalone/archive.tar.gz",
+		"curl: (6) Could not resolve host: github.com",
+	} {
+		if !terminalVerifierInfrastructureFailure(output) {
+			t.Fatalf("expected infrastructure failure for %q", output)
+		}
+	}
+	for _, output := range []string{
+		"FAILED test_outputs.py::test_contract - AssertionError",
+		"File /app/program.py does not exist",
+		"uvx: command not found",
+	} {
+		if terminalVerifierInfrastructureFailure(output) {
+			t.Fatalf("model/test failure must not be retried: %q", output)
 		}
 	}
 }
@@ -337,6 +840,131 @@ func TestRunTerminalTaskHarborSemantics(t *testing.T) {
 	}
 	if !res.scored || !res.pass {
 		t.Fatalf("expected scored pass (agent ran, reward.json=1 wins over exit 3): %+v", res)
+	}
+}
+
+func TestRunTerminalVerifierRetriesDependencyDownloadFailure(t *testing.T) {
+	if dockerPreflight() != nil {
+		t.Skip("docker unavailable")
+	}
+	bundle := t.TempDir()
+	mustMkdir(t, filepath.Join(bundle, "tests"))
+	mustWrite(t, filepath.Join(bundle, "tests", "test.sh"), `#!/bin/bash
+set -eu
+mkdir -p /logs/verifier
+attempt_file=/tmp/verifier-attempt
+attempt=0
+if [ -f "$attempt_file" ]; then attempt=$(cat "$attempt_file"); fi
+attempt=$((attempt + 1))
+echo "$attempt" > "$attempt_file"
+if [ "$attempt" -eq 1 ]; then
+  echo 0 > /logs/verifier/reward.txt
+  echo "curl: (22) The requested URL returned error: 503"
+  exit 0
+fi
+if [ -e /logs/verifier/reward.txt ]; then
+  echo "stale reward was not cleared"
+  exit 2
+fi
+echo 1 > /logs/verifier/reward.txt
+`)
+	task := terminalTask{
+		ID:       "verifier-retry",
+		Verifier: terminalVerifierConfig{TimeoutSec: 60, Command: "bash /tests/test.sh", RewardFile: "/logs/verifier/reward.txt"},
+	}
+	containerName := "lmx-verifier-retry-" + shortHash(t.Name())
+	_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
+	out, code, timedOut, err := runCommand(context.Background(), 60*time.Second, "docker", "run", "-d", "--name", containerName, "ubuntu:24.04", "sleep", "infinity")
+	if err != nil || timedOut || code != 0 {
+		t.Fatalf("start verifier fixture container: code=%d timedOut=%v err=%v out=%s", code, timedOut, err, out)
+	}
+	t.Cleanup(func() {
+		_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
+	})
+
+	pass, output, err := runTerminalVerifier(context.Background(), task, bundle, containerName, terminalConfig{args: parseArgs([]string{"eval", "terminal", "run", "--quiet"})})
+	if err != nil || !pass {
+		t.Fatalf("expected retry recovery pass: pass=%v err=%v output=%s", pass, err, output)
+	}
+	if !strings.Contains(output, "[verifier infrastructure retry]") {
+		t.Fatalf("retry boundary missing from output: %s", output)
+	}
+	attempts, readCode, _, _ := runCommand(context.Background(), 30*time.Second, "docker", "exec", containerName, "cat", "/tmp/verifier-attempt")
+	if readCode != 0 || strings.TrimSpace(attempts) != "2" {
+		t.Fatalf("verifier attempts = %q code=%d, want 2", attempts, readCode)
+	}
+}
+
+func TestRunTerminalVerifierAcceptsPassingRewardDespiteBootstrapWarning(t *testing.T) {
+	if dockerPreflight() != nil {
+		t.Skip("docker unavailable")
+	}
+	bundle := t.TempDir()
+	mustMkdir(t, filepath.Join(bundle, "tests"))
+	mustWrite(t, filepath.Join(bundle, "tests", "test.sh"), "#!/bin/bash\nmkdir -p /logs/verifier\necho \"Temporary failure resolving 'deb.debian.org'\"\necho 1 > /logs/verifier/reward.txt\n")
+	task := terminalTask{
+		ID:       "verifier-cached-dependencies",
+		Verifier: terminalVerifierConfig{TimeoutSec: 60, Command: "bash /tests/test.sh", RewardFile: "/logs/verifier/reward.txt"},
+	}
+	containerName := "lmx-verifier-cached-" + shortHash(t.Name())
+	_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
+	out, code, timedOut, err := runCommand(context.Background(), 60*time.Second, "docker", "run", "-d", "--name", containerName, "ubuntu:24.04", "sleep", "infinity")
+	if err != nil || timedOut || code != 0 {
+		t.Fatalf("start verifier fixture container: code=%d timedOut=%v err=%v out=%s", code, timedOut, err, out)
+	}
+	t.Cleanup(func() {
+		_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
+	})
+
+	pass, output, err := runTerminalVerifier(context.Background(), task, bundle, containerName, terminalConfig{args: parseArgs([]string{"eval", "terminal", "run", "--quiet"})})
+	if err != nil || !pass {
+		t.Fatalf("passing reward must win over nonfatal bootstrap warning: pass=%v err=%v output=%s", pass, err, output)
+	}
+	if strings.Contains(output, "[verifier infrastructure retry]") {
+		t.Fatalf("passing verifier was retried: %s", output)
+	}
+}
+
+func TestRunTerminalVerifierLeavesPersistentDownloadFailureUnscored(t *testing.T) {
+	if dockerPreflight() != nil {
+		t.Skip("docker unavailable")
+	}
+	bundle := t.TempDir()
+	mustMkdir(t, filepath.Join(bundle, "tests"))
+	mustWrite(t, filepath.Join(bundle, "tests", "test.sh"), `#!/bin/bash
+mkdir -p /logs/verifier
+attempt_file=/tmp/verifier-attempt
+attempt=0
+if [ -f "$attempt_file" ]; then attempt=$(cat "$attempt_file"); fi
+echo $((attempt + 1)) > "$attempt_file"
+echo 0 > /logs/verifier/reward.txt
+echo "curl: (56) Connection died, tried 5 times before giving up"
+`)
+	task := terminalTask{
+		ID:       "verifier-persistent-outage",
+		Verifier: terminalVerifierConfig{TimeoutSec: 60, Command: "bash /tests/test.sh", RewardFile: "/logs/verifier/reward.txt"},
+	}
+	containerName := "lmx-verifier-outage-" + shortHash(t.Name())
+	_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
+	out, code, timedOut, err := runCommand(context.Background(), 60*time.Second, "docker", "run", "-d", "--name", containerName, "ubuntu:24.04", "sleep", "infinity")
+	if err != nil || timedOut || code != 0 {
+		t.Fatalf("start verifier fixture container: code=%d timedOut=%v err=%v out=%s", code, timedOut, err, out)
+	}
+	t.Cleanup(func() {
+		_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
+	})
+
+	pass, output, err := runTerminalVerifier(context.Background(), task, bundle, containerName, terminalConfig{args: parseArgs([]string{"eval", "terminal", "run", "--quiet"})})
+	if err == nil || pass {
+		t.Fatalf("persistent outage must remain unscored: pass=%v err=%v output=%s", pass, err, output)
+	}
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "verifier_infrastructure_failed" {
+		t.Fatalf("error = %v, want verifier_infrastructure_failed", err)
+	}
+	attempts, readCode, _, _ := runCommand(context.Background(), 30*time.Second, "docker", "exec", containerName, "cat", "/tmp/verifier-attempt")
+	if readCode != 0 || strings.TrimSpace(attempts) != "3" {
+		t.Fatalf("verifier attempts = %q code=%d, want 3", attempts, readCode)
 	}
 }
 
@@ -509,6 +1137,25 @@ func TestTrimTerminalMessagesCompactsOldTranscriptButKeepsInitialContext(t *test
 		if got[i+3]["content"] != want {
 			t.Fatalf("recent message %d = %q, want %q", i, got[i+3]["content"], want)
 		}
+	}
+}
+
+func TestTerminalMessagesBytesCountsStructuredToolArguments(t *testing.T) {
+	payload := strings.Repeat("x", 4096)
+	message := map[string]any{
+		"role":    "assistant",
+		"content": "",
+		"tool_calls": []any{map[string]any{
+			"id":   "call_1",
+			"type": "function",
+			"function": map[string]any{
+				"name":      "write_file",
+				"arguments": `{"path":"/app/solution.py","content":"` + payload + `"}`,
+			},
+		}},
+	}
+	if got := terminalMessagesBytes([]map[string]any{message}); got < len(payload) {
+		t.Fatalf("message size = %d, want at least %d bytes of tool arguments counted", got, len(payload))
 	}
 }
 
@@ -1105,6 +1752,7 @@ func TestRunTerminalEvalRejectsIncompleteShardBeforeSubmit(t *testing.T) {
 		"--base-url", server.URL,
 		"--served-model", "served-model",
 		"--model", "fixture/model",
+		"--thinking-level", "off",
 		"--quantization", "Q4_K_M",
 		"--quant-format", "gguf",
 		"--hardware", hardwarePath,
@@ -1242,6 +1890,7 @@ func TestRunTerminalEvalOutIncludesSubmissionReceiptAndEffectiveLimits(t *testin
 		"--base-url", server.URL,
 		"--served-model", "served-model",
 		"--model", "fixture/model",
+		"--thinking-level", "off",
 		"--quantization", "Q4_K_M",
 		"--quant-format", "gguf",
 		"--hardware", hardwarePath,
@@ -1263,6 +1912,9 @@ func TestRunTerminalEvalOutIncludesSubmissionReceiptAndEffectiveLimits(t *testin
 	if summary["pooledScore"] != float64(1) || summary["ciLower"] != float64(0.25) || summary["ciUpper"] != float64(1) || !reflect.DeepEqual(anySlice(summary["coverage"]), []any{float64(2)}) {
 		t.Fatalf("summary aggregate receipt = %#v, want pooled score/CI/coverage", summary)
 	}
+	if summary["thinkingLevel"] != "off" || summary["thinkingLevelSource"] != "cli" {
+		t.Fatalf("summary thinking metadata = %#v, want explicit off", summary)
+	}
 	receipt := asObject(saved["submission"])
 	if receipt["shardIndex"] != float64(2) || receipt["submitted"] != float64(1) {
 		t.Fatalf("submission receipt counts = %#v, want shard 2 submitted 1", receipt)
@@ -1275,6 +1927,9 @@ func TestRunTerminalEvalOutIncludesSubmissionReceiptAndEffectiveLimits(t *testin
 		t.Fatalf("submission aggregate receipt = %#v", aggregate)
 	}
 	runConfig := asObject(submitted["runConfig"])
+	if runConfig["thinkingLevel"] != "off" || runConfig["thinkingLevelSource"] != "cli" {
+		t.Fatalf("submitted thinking metadata = %#v, want explicit off", runConfig)
+	}
 	if runConfig["maxTurns"] != float64(1) {
 		t.Fatalf("effective maxTurns = %#v, want manifest limit 1", runConfig["maxTurns"])
 	}
@@ -1900,7 +2555,7 @@ func TestOpenTerminalLiveCheckpointRebuildsStaleProgressFromDurableResults(t *te
 		{Task: terminalTask{ID: "scored-task", Instruction: "scored fixture"}},
 		{Task: terminalTask{ID: "unscored-task", Instruction: "unscored fixture"}},
 	}
-	cfg := terminalConfig{args: args, shellMode: "stateless", maxTurns: 1}
+	cfg := terminalConfig{args: args, shellMode: "stateless", maxTurns: 1, thinkingLevel: "medium", thinkingSource: "endpoint"}
 	hardware := map[string]any{"gpu": "fixture"}
 	store, _, err := openTerminalLiveCheckpoint(args, "fixture-dataset", 1, bundles, "http://model.invalid", "fixture-model", "fixture/model", "", "", hardware, cfg)
 	if err != nil {
@@ -1943,6 +2598,12 @@ func TestOpenTerminalLiveCheckpointRebuildsStaleProgressFromDurableResults(t *te
 	}
 	if len(rebuilt.ActiveTasks) != 0 {
 		t.Fatalf("rebuilt active tasks = %+v, want stale in-flight work cleared", rebuilt.ActiveTasks)
+	}
+	if rebuilt.ThinkingLevel != "medium" || rebuilt.ThinkingSource != "endpoint" {
+		t.Fatalf("rebuilt thinking metadata = (%q, %q), want (medium, endpoint)", rebuilt.ThinkingLevel, rebuilt.ThinkingSource)
+	}
+	if rebuilt.FingerprintFields["thinkingLevel"] == "" {
+		t.Fatal("checkpoint fingerprint omitted thinkingLevel")
 	}
 }
 
@@ -2353,6 +3014,7 @@ func TestRunTerminalEvalJSONStatusSeparatesStreamsAndEmitsStructuredCompletion(t
 				"--base-url", server.URL,
 				"--served-model", "fixture-model",
 				"--model", "fixture/model",
+				"--thinking-level", "off",
 				"--shell-mode", "stateless",
 				"--json-status",
 				"--run-dir", filepath.Join(t.TempDir(), "run"),
@@ -2671,12 +3333,9 @@ func TestSubmitTerminalEvalDryRunBuildsCanonicalPayloadWithoutNetworkOrBenchmark
 	}))
 	defer server.Close()
 
-	args := parseArgs([]string{
-		"eval", "terminal", "submit", runDir,
+	args := parseArgs([]string{"eval", "terminal", "submit", runDir,
 		"--dataset", "terminal-bench-fixture",
-		"--shard-index", "7",
-		"--hf-id", "fixture/model",
-		"--model-revision", "fixture-revision",
+		"--shard-index", "7", "--hf-id", "fixture/model", "--thinking-level", "off", "--model-revision", "fixture-revision",
 		"--hardware", hardwarePath,
 		"--quantization", "Q4_K_M",
 		"--quant-format", "gguf",
@@ -2685,8 +3344,7 @@ func TestSubmitTerminalEvalDryRunBuildsCanonicalPayloadWithoutNetworkOrBenchmark
 		"--notes", "fixture-notes",
 		"--api-url", server.URL,
 		"--out", payloadPath,
-		"--dry-run", "--quiet",
-	})
+		"--dry-run", "--quiet"})
 	if err := submitTerminalEval(args); err != nil {
 		t.Fatalf("submitTerminalEval dry-run: %v", err)
 	}
@@ -2874,16 +3532,12 @@ func TestSubmitTerminalEvalRejectsInvalidCheckpointRecords(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			runDir, hardwarePath := writeDeferredTerminalSubmitFixture(t)
 			tc.mutate(t, runDir)
-			args := parseArgs([]string{
-				"eval", "terminal", "submit", runDir,
+			args := parseArgs([]string{"eval", "terminal", "submit", runDir,
 				"--dataset", "terminal-bench-fixture",
-				"--shard-index", "7",
-				"--hf-id", "fixture/model",
-				"--hardware", hardwarePath,
+				"--shard-index", "7", "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
 				"--quantization", "Q4_K_M",
 				"--quant-format", "gguf",
-				"--dry-run", "--quiet",
-			})
+				"--dry-run", "--quiet"})
 			err := submitTerminalEval(args)
 			var cliErr cliError
 			if !errors.As(err, &cliErr) || cliErr.Code != tc.wantCode {
@@ -3090,15 +3744,11 @@ func TestSubmitTerminalEvalCanonicalCheckpointDryRunPartitionsExactTaskSet(t *te
 	}))
 	defer server.Close()
 
-	err := submitTerminalEval(parseArgs([]string{
-		"eval", "terminal", "submit", runDir,
-		"--dataset", terminalBench21Dataset,
-		"--hf-id", "fixture/model",
-		"--hardware", hardwarePath,
+	err := submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", runDir,
+		"--dataset", terminalBench21Dataset, "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
 		"--api-url", server.URL,
 		"--out", payloadPath,
-		"--dry-run", "--quiet",
-	}))
+		"--dry-run", "--quiet"}))
 	if err != nil {
 		t.Fatalf("submit canonical dry-run: %v", err)
 	}
@@ -3146,14 +3796,10 @@ func TestSubmitCRUDbenchCanonicalCheckpointDryRunPartitionsExactTaskSet(t *testi
 	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
 	payloadPath := filepath.Join(t.TempDir(), "crud-bench-batch.json")
 
-	err := submitTerminalEval(parseArgs([]string{
-		"eval", "terminal", "submit", runDir,
-		"--dataset", crudBenchDataset,
-		"--hf-id", "fixture/model",
-		"--hardware", hardwarePath,
+	err := submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", runDir,
+		"--dataset", crudBenchDataset, "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
 		"--out", payloadPath,
-		"--dry-run", "--quiet",
-	}))
+		"--dry-run", "--quiet"}))
 	if err != nil {
 		t.Fatalf("submit CRUDbench dry-run: %v", err)
 	}
@@ -3205,13 +3851,9 @@ func TestSubmitTerminalEvalRejectsNonCanonicalTerminalBench21TaskSets(t *testing
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, tc.taskIDs, true)
-			err := submitTerminalEval(parseArgs([]string{
-				"eval", "terminal", "submit", runDir,
-				"--dataset", terminalBench21Dataset,
-				"--hf-id", "fixture/model",
-				"--hardware", hardwarePath,
-				"--dry-run", "--quiet",
-			}))
+			err := submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", runDir,
+				"--dataset", terminalBench21Dataset, "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
+				"--dry-run", "--quiet"}))
 			var cliErr cliError
 			if !errors.As(err, &cliErr) || cliErr.Code != "checkpoint_task_set_mismatch" {
 				t.Fatalf("error = %#v, want checkpoint_task_set_mismatch", err)
@@ -3236,15 +3878,11 @@ func TestSubmitTerminalEvalExplicitCanonicalShardWritesIsolatedCheckpointPayload
 	wantIDs := canonicalIDs[:firstShardEnd]
 	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, wantIDs, true)
 	payloadPath := filepath.Join(t.TempDir(), "isolated-shard.json")
-	err := submitTerminalEval(parseArgs([]string{
-		"eval", "terminal", "submit", runDir,
+	err := submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", runDir,
 		"--dataset", terminalBench21Dataset,
-		"--shard-index", "1",
-		"--hf-id", "fixture/model",
-		"--hardware", hardwarePath,
+		"--shard-index", "1", "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
 		"--out", payloadPath,
-		"--dry-run", "--quiet",
-	}))
+		"--dry-run", "--quiet"}))
 	if err != nil {
 		t.Fatalf("submit explicit canonical shard: %v", err)
 	}
@@ -3265,15 +3903,11 @@ func TestSubmitCRUDbenchExplicitCanonicalShardWritesIsolatedCheckpointPayload(t 
 	wantIDs := crudBenchCanonicalTaskIDs[:8]
 	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, wantIDs, true)
 	payloadPath := filepath.Join(t.TempDir(), "crud-bench-shard.json")
-	err := submitTerminalEval(parseArgs([]string{
-		"eval", "terminal", "submit", runDir,
+	err := submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", runDir,
 		"--dataset", crudBenchDataset,
-		"--shard-index", "1",
-		"--hf-id", "fixture/model",
-		"--hardware", hardwarePath,
+		"--shard-index", "1", "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
 		"--out", payloadPath,
-		"--dry-run", "--quiet",
-	}))
+		"--dry-run", "--quiet"}))
 	if err != nil {
 		t.Fatalf("submit CRUDbench shard: %v", err)
 	}
@@ -3330,15 +3964,11 @@ func TestSubmitTerminalEvalPostsCanonicalShardsSequentiallyAndStopsAtFailure(t *
 	}))
 	defer server.Close()
 
-	err := submitTerminalEval(parseArgs([]string{
-		"eval", "terminal", "submit", runDir,
-		"--dataset", terminalBench21Dataset,
-		"--hf-id", "fixture/model",
-		"--hardware", hardwarePath,
+	err := submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", runDir,
+		"--dataset", terminalBench21Dataset, "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
 		"--api-url", server.URL,
 		"--api-key", "fixture-key",
-		"--quiet",
-	}))
+		"--quiet"}))
 	var cliErr cliError
 	if !errors.As(err, &cliErr) || cliErr.Code != "terminal_submit_shard_failed" {
 		t.Fatalf("error = %#v, want terminal_submit_shard_failed", err)
@@ -3435,5 +4065,108 @@ func assertTerminalShardPayload(t *testing.T, payload map[string]any, wantShardI
 		if artifact["itemIndex"] != float64(i) {
 			t.Fatalf("shard %d artifact %q itemIndex = %#v, want local index %d", wantShardIndex, wantID, artifact["itemIndex"], i)
 		}
+	}
+}
+
+func TestDeterministicTerminalTarGzIsStableAndRootedByTaskID(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, "tests"))
+	mustWrite(t, filepath.Join(dir, "task.json"), `{"id":"crud-task","instruction":"Fix CRUD."}`)
+	mustWrite(t, filepath.Join(dir, "tests", "test.sh"), "#!/bin/sh\n")
+	bundle, err := loadSingleTerminalBundle(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := deterministicTerminalTarGz(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dir, "tests", "test.sh"), time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := deterministicTerminalTarGz(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatal("archive changed when only source timestamps changed")
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	var names []string
+	for {
+		header, nextErr := tr.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			t.Fatal(nextErr)
+		}
+		names = append(names, header.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"crud-task/task.json", "crud-task/tests", "crud-task/tests/test.sh"}) {
+		t.Fatalf("archive names = %#v", names)
+	}
+}
+
+func TestDeterministicTerminalTarGzRejectsSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, "tests"))
+	mustWrite(t, filepath.Join(dir, "task.json"), `{"id":"crud-task","instruction":"Fix CRUD."}`)
+	mustWrite(t, filepath.Join(dir, "tests", "test.sh"), "#!/bin/sh\n")
+	if err := os.Symlink("/etc/passwd", filepath.Join(dir, "tests", "escape")); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := loadSingleTerminalBundle(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deterministicTerminalTarGz(bundle); err == nil {
+		t.Fatal("symlink bundle was accepted")
+	}
+}
+
+func TestUploadTerminalBundleDoesNotDuplicateHoistedMetadata(t *testing.T) {
+	const hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/benchmarks/storage/upload-url":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"uploadUrl": server.URL + "/upload?x-amz-meta-sha256=" + hash,
+				"headers": map[string]string{
+					"Content-Type":      "application/gzip",
+					"x-amz-meta-sha256": hash,
+				},
+				"storageRef": map[string]any{
+					"storageKey":  "eval-uploads/user/terminal-task/task.tar.gz",
+					"contentType": "application/gzip",
+					"format":      "tar.gz",
+					"byteSize":    4,
+					"sha256":      hash,
+					"itemCount":   1,
+				},
+			})
+		case "/upload":
+			if got := r.Header.Get("x-amz-meta-sha256"); got != "" {
+				t.Errorf("hoisted metadata was also sent as a header: %q", got)
+			}
+			w.WriteHeader(http.StatusOK)
+		case "/api/benchmarks/storage/complete":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	args := parseArgs([]string{"eval", "terminal", "publish", "--api-url", server.URL, "--api-key", "bhk_test"})
+	if _, err := uploadTerminalBundle(args, "task.tar.gz", []byte("data"), hash); err != nil {
+		t.Fatal(err)
 	}
 }

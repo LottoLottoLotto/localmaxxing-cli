@@ -15,19 +15,47 @@ lmx eval suite init \
   --out my-topic-eval.json
 ```
 
-Validate it:
+Import an existing CSV, JSONL, or JSON array:
+
+```bash
+lmx eval suite import questions.jsonl \
+  --slug my-topic-eval \
+  --name "My Topic Eval" \
+  --kind multiple_choice \
+  --input-column question \
+  --gold-column answer \
+  --choices-column choices \
+  --out my-topic-eval.json
+```
+
+Validate structure, audit dataset quality, and execute representative samples:
 
 ```bash
 lmx eval suite validate my-topic-eval.json
+lmx eval suite audit my-topic-eval.json
+lmx eval suite check my-topic-eval.json \
+  --model Qwen/Qwen3-8B \
+  --base-url http://localhost:8000 \
+  --samples 5
 ```
 
-Submit it:
+`validate --remote` runs the authoritative server contract, verifies bucket references, and checks slug availability.
+
+Submit it. `--upload-datasets` converts inline task items to verified bucket-backed JSONL first:
 
 ```bash
-lmx eval suite submit my-topic-eval.json --api-key bhk_...
+lmx eval suite submit my-topic-eval.json --upload-datasets
 ```
 
-Submitted suites start as `PENDING` and appear publicly after admin approval.
+Use `LMX_API_KEY` or `lmx auth` for authentication. Submitted suites start as `PENDING`.
+
+Review status, read admin feedback, correct rejected suites, or withdraw unused submissions:
+
+```bash
+lmx eval suite submissions
+lmx eval suite resubmit <submission-id> --file my-topic-eval.json
+lmx eval suite withdraw <submission-id> --kind suite --yes
+```
 
 ## Suite Types
 
@@ -103,8 +131,9 @@ Example math task:
 6. For judge evals, provide a precise `rubric` and optional `referenceAnswer`.
 7. Ensure prompts never include gold answers.
 8. Put source notes, methodology, and license context in `description` or `sourceUrl`.
-9. Run `lmx eval suite validate <file>` before submitting.
-10. Submit with `lmx eval suite submit <file> --api-key bhk_...`.
+9. Run `lmx eval suite validate <file>` and `lmx eval suite audit <file>`.
+10. Smoke-test representative items with `lmx eval suite check <file> --model <hfId> --base-url <url>`.
+11. Submit with `lmx eval suite submit <file>`; add `--upload-datasets` for larger inline datasets.
 
 ## Label Redaction
 

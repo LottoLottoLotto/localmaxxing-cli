@@ -114,13 +114,13 @@ Describe the speculative configuration using engine-neutral submission fields:
 
 ```bash
 lmx speed-test run sglang \
-  --spec-method dflash \
+  --spec-method dflash2 \
   --spec-draft-model z-lab/Qwen3.8-27B-DFlash2 \
   --spec-num-tokens 8 \
   --spec-draft-window-size 16
 ```
 
-Available fields are `--spec-decoding`, `--spec-method`, `--spec-draft-model`, `--spec-num-tokens`, `--spec-draft-tp`, and `--spec-draft-window-size`. `dflash`/`draft-dflash` and `mtp`/`draft-mtp` are canonicalized to `DFlash` and `MTP`.
+Available fields are `--spec-decoding`, `--spec-method`, `--spec-draft-model`, `--spec-num-tokens`, `--spec-draft-tp`, and `--spec-draft-window-size`. `dflash2`/`draft-dflash2`, `dflash`/`draft-dflash`, and `mtp`/`draft-mtp` are canonicalized to `DFlash2`, `DFlash`, and `MTP`. A DFlash method paired with a draft-model name containing `DFlash2` is recorded as `DFlash2`.
 
 ## Agent-friendly flags
 
