@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -335,7 +336,25 @@ func validateSuiteRemote(payload any, args cliArgs) error {
 		return missingAPIKey("--api-key or LMX_API_KEY is required for authoritative suite validation")
 	}
 	_, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/suites/dry-run", key, payload)
-	return err
+	if err == nil || !isAPIStatus(err, http.StatusMethodNotAllowed) {
+		return err
+	}
+
+	slug := stringValue(asObject(payload)["slug"])
+	_, lookupErr := fetchJSON("GET", apiURL(args)+"/api/benchmarks/suites/"+url.PathEscape(slug), "", nil)
+	if lookupErr == nil {
+		return cliError{"suite_slug_exists", fmt.Sprintf("A benchmark with slug %q already exists.", slug), []string{"Choose a different --slug before any dataset upload."}, nil}
+	}
+	if !isAPIStatus(lookupErr, http.StatusNotFound) {
+		return lookupErr
+	}
+	printStatus(args, "suite_remote_preflight_legacy", map[string]any{"slug": slug, "warning": "Server does not expose suite dry-run yet; local validation and public slug availability passed. The create endpoint remains authoritative."})
+	return nil
+}
+
+func isAPIStatus(err error, status int) bool {
+	value, ok := err.(cliError)
+	return ok && value.Code == "api_error" && strings.HasPrefix(value.Message, strconv.Itoa(status)+" ")
 }
 
 func uploadSuiteInlineDatasets(payload any, args cliArgs) (any, error) {

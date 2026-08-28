@@ -296,6 +296,8 @@ func runWithArgs(args cliArgs) error {
 	case "eval":
 		sub := positional(args, 1)
 		switch sub {
+		case "publish":
+			return handleEvalPublish(positional(args, 2), args)
 		case "storage":
 			return handleStorage(positional(args, 2), positional(args, 3), args, "")
 		case "artifact", "artifacts":
@@ -344,7 +346,8 @@ func isBooleanOption(key string) bool {
 		"no-stream", "missing-only", "all-missing", "cleanup-images", "native-tools", "oracle",
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
-		"save-run", "key-stdin", "draft":
+		"save-run", "key-stdin", "draft", "strict", "no-upload-datasets", "upload-datasets",
+		"skip-oracle", "remote":
 		return true
 	default:
 		return false
@@ -11656,6 +11659,9 @@ var usageExamples = []string{
 	`lmx speed-test submit speed-test.json --api-key bhk_...`,
 	`lmx speed-test dry-run speed-test.json --api-key bhk_...`,
 	`lmx speed-test validate-local speed-test.json`,
+	`lmx eval publish questions.jsonl --description "Original networking questions written to test protocol reasoning." --source-url https://github.com/org/repo`,
+	`lmx eval publish ./terminal-bench-tasks --description "Repository-level API repair tasks with deterministic verifiers." --source-url https://github.com/org/repo`,
+	`lmx eval publish my-eval.eval-suite.json --dry-run`,
 	`lmx eval suite list --out suites.json`,
 	`lmx eval suite search reasoning --out reasoning-suites.json`,
 	`lmx eval suite show hellaswag --out hellaswag-suite.json`,
@@ -11956,36 +11962,38 @@ var commandDescriptions = map[string]string{
 	"model search":            "Search LocalMaxxing model records.",
 	"model resolve-remote":    "Resolve a remote endpoint alias to likely HF candidates.",
 	"eval":                    "Discover, run, and submit evaluation suites.",
-	"eval suite":              "Import, audit, sample-check, submit, and manage eval suites.",
-	"eval suite import":       "Convert CSV, JSONL, or a JSON array into a runnable suite manifest.",
-	"eval suite audit":        "Check dataset duplicates, gold values, leakage, balance, provenance, and size.",
-	"eval suite check":        "Execute representative suite samples against an OpenAI-compatible endpoint.",
-	"eval suite submissions":  "List your suite and sharded-dataset review status and admin notes.",
-	"eval suite resubmit":     "Replace and return a pending or rejected suite to review.",
-	"eval suite withdraw":     "Permanently remove an unused pending or rejected submission.",
-	"eval run":                "Run an approved suite locally and write/submit a run payload.",
-	"eval pull":               "Download a suite + datasets for offline runs and inspection.",
-	"eval submit":             "Submit a previously saved run payload (deferred submit).",
-	"eval shard":              "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
-	"eval shard status":       "Print aggregate shard coverage and missing shard indexes for a model.",
-	"eval terminal":           "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
-	"eval terminal import":    "Convert Harbor or Terminal-Bench 2.1 task directories into canonical local bundles.",
-	"eval terminal publish":   "Oracle-verify, package, upload, and submit a Pro terminal benchmark for review.",
-	"eval terminal run":       "Preflight, run, resume, or detach a Terminal-Bench task selection.",
-	"eval terminal status":    "Read a durable terminal run snapshot, including worker and task progress.",
-	"eval terminal logs":      "Replay canonical terminal JSONL events; --follow waits through job completion.",
-	"eval terminal cancel":    "Request cooperative cancellation; --force terminates the detached worker immediately.",
-	"eval terminal submit":    "Validate a completed terminal checkpoint, batch canonical Terminal-Bench 2.1 into 10 shards, or submit one explicit --shard-index.",
-	"eval train":              "Prepare verifier-filtered training data from eval results or run an explicit local trainer.",
-	"eval train prepare":      "Export passing OMP trajectories as conversational SFT JSONL and failures as diagnostics.",
-	"eval train run":          "Expand and optionally execute an explicit local training command from a prepared manifest.",
-	"eval train rl":           "Prepare prompt-only online GRPO data or plan and execute the embedded TRL trainer.",
-	"eval train rl prepare":   "Prepare imported terminal task prompts and a trusted environment-factory manifest for online GRPO.",
-	"eval train rl run":       "Validate an online GRPO manifest and plan or execute its embedded Python trainer.",
-	"kvcache":                 "Run KV-cache and context-length sweeps.",
-	"profile":                 "Save and manage reusable CLI defaults.",
-	"auth":                    "Manage LocalMaxxing API authentication.",
-	"server":                  "Build or run local model server commands.",
+	"eval publish": "Publish through one guarded command. Accepts CSV, JSONL, JSON arrays, suite manifests, imported terminal bundles, and raw Harbor/Terminal-Bench directories.\n\n" +
+		"Automatically detects safe column mappings, validates structure, audits quality, runs the authenticated server preflight before uploads, and submits as PENDING for review. Inline datasets upload automatically. Terminal publication requires Pro, Docker, a public --source-url, and oracle-verifies every task before upload. Use --dry-run first when desired.",
+	"eval suite":             "Import, audit, sample-check, submit, and manage eval suites.",
+	"eval suite import":      "Convert CSV, JSONL, or a JSON array into a runnable suite manifest.",
+	"eval suite audit":       "Check dataset duplicates, gold values, leakage, balance, provenance, and size.",
+	"eval suite check":       "Execute representative suite samples against an OpenAI-compatible endpoint.",
+	"eval suite submissions": "List your suite and sharded-dataset review status and admin notes.",
+	"eval suite resubmit":    "Replace and return a pending or rejected suite to review.",
+	"eval suite withdraw":    "Permanently remove an unused pending or rejected submission.",
+	"eval run":               "Run an approved suite locally and write/submit a run payload.",
+	"eval pull":              "Download a suite + datasets for offline runs and inspection.",
+	"eval submit":            "Submit a previously saved run payload (deferred submit).",
+	"eval shard":             "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",
+	"eval shard status":      "Print aggregate shard coverage and missing shard indexes for a model.",
+	"eval terminal":          "Run Terminal-Bench task bundles with the localmaxxing Docker agent harness.",
+	"eval terminal import":   "Convert Harbor or Terminal-Bench 2.1 task directories into canonical local bundles.",
+	"eval terminal publish":  "Oracle-verify, package, upload, and submit a Pro terminal benchmark for review.",
+	"eval terminal run":      "Preflight, run, resume, or detach a Terminal-Bench task selection.",
+	"eval terminal status":   "Read a durable terminal run snapshot, including worker and task progress.",
+	"eval terminal logs":     "Replay canonical terminal JSONL events; --follow waits through job completion.",
+	"eval terminal cancel":   "Request cooperative cancellation; --force terminates the detached worker immediately.",
+	"eval terminal submit":   "Validate a completed terminal checkpoint, batch canonical Terminal-Bench 2.1 into 10 shards, or submit one explicit --shard-index.",
+	"eval train":             "Prepare verifier-filtered training data from eval results or run an explicit local trainer.",
+	"eval train prepare":     "Export passing OMP trajectories as conversational SFT JSONL and failures as diagnostics.",
+	"eval train run":         "Expand and optionally execute an explicit local training command from a prepared manifest.",
+	"eval train rl":          "Prepare prompt-only online GRPO data or plan and execute the embedded TRL trainer.",
+	"eval train rl prepare":  "Prepare imported terminal task prompts and a trusted environment-factory manifest for online GRPO.",
+	"eval train rl run":      "Validate an online GRPO manifest and plan or execute its embedded Python trainer.",
+	"kvcache":                "Run KV-cache and context-length sweeps.",
+	"profile":                "Save and manage reusable CLI defaults.",
+	"auth":                   "Manage LocalMaxxing API authentication.",
+	"server":                 "Build or run local model server commands.",
 }
 
 func commandHelp(args cliArgs) (string, bool) {

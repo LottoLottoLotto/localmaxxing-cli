@@ -2,59 +2,101 @@
 
 This guide is intended for AI agents and humans creating new LocalMaxxing eval suites.
 
-## Commands
+## Recommended: One Guarded Command
 
-Create a starter suite:
+Authenticate once:
 
 ```bash
-lmx eval suite init \
-  --slug my-topic-eval \
-  --name "My Topic Eval" \
-  --category reasoning \
+lmx auth login
+```
+
+Then publish the source directly:
+
+```bash
+lmx eval publish questions.jsonl \
+  --description "Original networking questions written to test protocol reasoning." \
+  --source-url https://github.com/org/repo
+```
+
+`eval publish` accepts:
+
+- CSV with a header row
+- JSONL objects
+- A JSON array of objects
+- An existing LocalMaxxing suite manifest
+- Raw Harbor/Terminal-Bench task directories
+- Already imported terminal bundle directories
+
+For tabular datasets, it detects common prompt, gold-answer, choices, and rubric
+columns and prints the chosen mapping before doing network writes. Inferences
+can always be overridden:
+
+```bash
+lmx eval publish custom.csv \
   --kind multiple_choice \
-  --out my-topic-eval.json
+  --input-column prompt_text \
+  --gold-column expected \
+  --choices-column candidates \
+  --description "Original systems questions with manually verified answers."
 ```
 
-Import an existing CSV, JSONL, or JSON array:
+The guarded sequence is:
 
-```bash
-lmx eval suite import questions.jsonl \
-  --slug my-topic-eval \
-  --name "My Topic Eval" \
-  --kind multiple_choice \
-  --input-column question \
-  --gold-column answer \
-  --choices-column choices \
-  --out my-topic-eval.json
-```
+1. Detect the input format and require unambiguous column mappings.
+2. Build or load a persistent manifest under `.localmaxxing/`.
+3. Validate every field and item locally.
+4. Require a useful public description.
+5. Audit duplicates, choices, labels, leakage, balance, and dataset size.
+6. Run the authenticated server preflight before uploading.
+7. Upload inline datasets only after the preflight succeeds.
+8. Submit as `PENDING` and print exact status and recovery commands.
 
-Validate structure, audit dataset quality, and execute representative samples:
+Use `--dry-run` to stop an ordinary suite before upload or submission. Use
+`--strict` to make audit warnings blocking. `--no-upload-datasets` is an
+advanced override for small inline manifests; bucket-backed datasets are the
+safe default.
 
-```bash
-lmx eval suite validate my-topic-eval.json
-lmx eval suite audit my-topic-eval.json
-lmx eval suite check my-topic-eval.json \
-  --model Qwen/Qwen3-8B \
-  --base-url http://localhost:8000 \
-  --samples 5
-```
-
-`validate --remote` runs the authoritative server contract, verifies bucket references, and checks slug availability.
-
-Submit it. `--upload-datasets` converts inline task items to verified bucket-backed JSONL first:
-
-```bash
-lmx eval suite submit my-topic-eval.json --upload-datasets
-```
-
-Use `LMX_API_KEY` or `lmx auth` for authentication. Submitted suites start as `PENDING`.
-
-Review status, read admin feedback, correct rejected suites, or withdraw unused submissions:
+Track review and correct feedback without starting over:
 
 ```bash
 lmx eval suite submissions
-lmx eval suite resubmit <submission-id> --file my-topic-eval.json
-lmx eval suite withdraw <submission-id> --kind suite --yes
+lmx eval suite resubmit <submission-id> \
+  --file .localmaxxing/my-benchmark.eval-suite.json
+```
+
+### Terminal benchmarks
+
+```bash
+lmx eval publish ./harbor-tasks \
+  --description "Repository-level API repair tasks with deterministic verifiers." \
+  --source-url https://github.com/org/repo
+```
+
+Terminal publication additionally requires LocalMaxxing Pro, Docker, at least
+two tasks, and a public provenance URL. The CLI checks account access and quota
+before oracle execution, imports raw tasks, rejects unsafe bundles, verifies
+every task with the oracle, packages deterministic archives, uploads with
+signed SHA-256 metadata, validates the complete manifest, and submits it for
+review. Resumable state and canonical bundles live under `.localmaxxing/`.
+
+For terminal inputs, `--dry-run` still uploads and verifies archives but does not
+create the dataset. `--skip-oracle` is only for a collection already verified
+locally; it never bypasses server checks or admin review.
+
+### Advanced individual commands
+
+The lower-level commands remain available when each stage must be inspected:
+
+```bash
+lmx eval suite init --slug my-topic-eval --name "My Topic Eval" \
+  --category reasoning --kind multiple_choice --out my-topic-eval.json
+lmx eval suite import questions.jsonl --slug my-topic-eval \
+  --name "My Topic Eval" --kind multiple_choice --out my-topic-eval.json
+lmx eval suite validate my-topic-eval.json
+lmx eval suite audit my-topic-eval.json
+lmx eval suite check my-topic-eval.json \
+  --model Qwen/Qwen3-8B --base-url http://localhost:8000 --samples 5
+lmx eval suite submit my-topic-eval.json --upload-datasets
 ```
 
 ## Suite Types

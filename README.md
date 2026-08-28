@@ -404,24 +404,32 @@ lmx eval run my-judge-suite \
 
 ### Publish a Terminal-Bench 2.1 style dataset
 
-Publishing executable terminal bundles requires LocalMaxxing Pro. The publisher
-oracle-verifies every task by default, creates deterministic `.tar.gz` bundles,
-uploads them with SHA-256 metadata, validates the complete manifest, and submits
-the dataset for admin review. Upload state is saved under `.localmaxxing/` so an
-interrupted publish reuses completed objects.
+The recommended path is one command against raw Harbor/Terminal-Bench tasks:
 
 ```bash
-lmx eval terminal import ./harbor-tasks --out ./tb-bundles --version 2.1
-lmx eval terminal publish ./tb-bundles \
-  --slug my-terminal-bench \
-  --name "My Terminal Benchmark" \
-  --source-url https://github.com/org/repo \
-  --shard-count 5
+lmx eval publish ./harbor-tasks \
+  --description "Repository-level API repair tasks with deterministic verifiers." \
+  --source-url https://github.com/org/repo
 ```
 
-Use `--dry-run` to stop after authenticated object and manifest verification.
-`--skip-oracle` is available for a previously verified collection, but does not
-bypass server policy or admin approval.
+The CLI derives the slug and name from the directory; override them with
+`--slug` and `--name`. It imports raw tasks into a managed `.localmaxxing/`
+workspace, checks Pro access and storage quota **before** expensive work,
+oracle-verifies every task, rejects unsupported or unsafe bundles, creates
+deterministic `.tar.gz` archives, uploads them with signed SHA-256 metadata,
+validates the full manifest, and submits it as `PENDING` for admin review.
+Interrupted publishes are resumable and reuse verified uploads.
+
+Executable terminal publication requires LocalMaxxing Pro, Docker, at least two
+tasks, a description of at least 20 characters, and a public HTTPS
+`--source-url` for provenance and review. `--dry-run` stops before dataset
+creation but still uploads and verifies the task archives. `--skip-oracle` is an
+advanced escape hatch for a collection already verified locally; it never
+bypasses server policy or admin approval.
+
+The lower-level `lmx eval terminal import` and
+`lmx eval terminal publish` commands remain available when the canonical bundle
+directory must be inspected or edited between steps.
 
 ### Train from verified eval trajectories
 
@@ -527,25 +535,49 @@ lmx endpoint discover --base-url http://server:8080 --include-server-metadata
 
 ## Eval Suite Authoring
 
+Start with the guarded one-command workflow:
+
 ```bash
-# Scaffold or import questions from CSV, JSONL, or JSON.
-lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --kind multiple_choice --out my-eval.json
-lmx eval suite import questions.jsonl --slug my-eval --name "My Eval" --kind multiple_choice \
-  --input-column question --gold-column answer --choices-column choices --out my-eval.json
+lmx auth login
 
-# Validate, inspect quality, and run a small endpoint smoke test.
-lmx eval suite validate my-eval.json
-lmx eval suite audit my-eval.json
-lmx eval suite check my-eval.json --model Qwen/Qwen3-8B --base-url http://localhost:8000 --samples 5
-
-# Upload large inline datasets automatically and submit for review.
-lmx eval suite submit my-eval.json --upload-datasets
-
-# Track status and admin feedback.
-lmx eval suite submissions
+lmx eval publish questions.jsonl \
+  --description "Original networking questions written to test protocol reasoning." \
+  --source-url https://github.com/org/repo
 ```
 
-Submitted suites start as `PENDING`. Rejected suites can be corrected with `lmx eval suite resubmit <id> --file my-eval.json`.
+Accepted inputs are CSV, JSONL, JSON arrays, LocalMaxxing suite manifests,
+imported terminal bundles, and raw Harbor/Terminal-Bench directories. For
+tabular data, the CLI safely detects common columns:
+
+- Prompt: `input`, `question`, `prompt`, or `instruction`
+- Gold answer: `gold`, `answer`, `label`, `target`, or `expected_answer`
+- Choices: `choices`, `options`, or `answers`
+- Judge rubric: `rubric`, `grading_rubric`, or `criteria`
+
+Ambiguous or missing mappings stop before network writes and explain the exact
+`--input-column`, `--gold-column`, `--choices-column`, or `--rubric-column`
+override to use. The CLI infers `multiple_choice`, `judge`, or `qa`, prints the
+detected mapping, and derives a name and slug from the filename. Override any
+inference with `--kind`, `--name`, or `--slug`.
+
+Before submission it validates the manifest, requires a useful description,
+audits duplicates, invalid choices, likely label leakage, answer imbalance, and
+dataset size, then runs the authenticated server preflight. Only after that
+passes does it upload inline datasets and create a `PENDING` submission. Use
+`--dry-run` to stop before uploads and submission, and `--strict` when audit
+warnings should also block publication.
+
+Generated manifests live under `.localmaxxing/` so rejected submissions can be
+edited and resubmitted:
+
+```bash
+lmx eval suite submissions
+lmx eval suite resubmit <submission-id> \
+  --file .localmaxxing/my-benchmark.eval-suite.json
+```
+
+The lower-level `eval suite init`, `import`, `validate`, `audit`, `check`, and
+`submit` commands remain available for authors who need full control.
 
 ## Development
 

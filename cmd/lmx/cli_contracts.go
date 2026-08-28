@@ -59,7 +59,7 @@ var extraOptionNames = map[string]bool{
 	"choices-separator": true, "reference-column": true, "rubric-column": true,
 	"source-url": true, "samples": true, "remote": true, "upload-datasets": true,
 	"name": true, "kind": true, "shard-count": true, "shards": true, "state": true,
-	"skip-oracle": true,
+	"skip-oracle": true, "strict": true, "no-upload-datasets": true,
 }
 
 func knownOptionName(name string) bool {

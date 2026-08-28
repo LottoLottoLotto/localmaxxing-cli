@@ -2,7 +2,29 @@
 
 Use eval commands to measure quality / accuracy rather than speed.
 
-## Suites
+## Publish a suite
+
+Prefer the guarded one-command workflow:
+
+```bash
+lmx eval publish questions.jsonl \
+  --description "Original networking questions written to test protocol reasoning." \
+  --source-url https://github.com/org/repo
+```
+
+It accepts CSV, JSONL, JSON arrays, suite manifests, and terminal task
+directories. It detects safe column mappings, validates and audits locally,
+runs the authenticated server preflight before uploads, uploads inline data,
+and submits as `PENDING`. Use `--dry-run` before ordinary suite writes and
+`--strict` to block audit warnings. Missing or ambiguous mappings must be fixed
+with `--input-column`, `--gold-column`, `--choices-column`, or
+`--rubric-column`; never guess after the CLI rejects a mapping.
+
+Use `lmx eval suite submissions` for status and admin feedback, then
+`lmx eval suite resubmit <id> --file .localmaxxing/<slug>.eval-suite.json` to
+correct a rejected submission.
+
+Lower-level discovery and authoring commands remain available:
 
 ```bash
 lmx eval suite list --out suites.json
@@ -14,10 +36,7 @@ lmx eval suite validate my-eval.json
 lmx eval suite audit my-eval.json
 lmx eval suite check my-eval.json --model Qwen/Qwen3-8B --base-url http://localhost:8000 --samples 5
 lmx eval suite submit my-eval.json --upload-datasets
-lmx eval suite submissions
 ```
-
-User-submitted suites start `PENDING`. Use `submissions` to read admin feedback, `resubmit <id> --file <suite.json>` to correct a submission, and `withdraw <id> --yes` to remove an unused pending or rejected suite.
 
 ## Run a LocalMaxxing suite
 
@@ -75,6 +94,23 @@ Useful shard flags include `--questions`, `--shard`, `--missing-only`, `--all-mi
 
 ## Terminal-Bench
 
+Publish raw Harbor/Terminal-Bench tasks with the same guarded command:
+
+```bash
+lmx eval publish ./terminal-bench-tasks \
+  --description "Repository-level repair tasks with deterministic verifiers." \
+  --source-url https://github.com/org/repo
+```
+
+Terminal publication requires Pro, Docker, at least two tasks, and a public
+provenance URL. The CLI checks access and quota before oracle work, imports,
+oracle-verifies, packages, uploads, preflights, and submits as `PENDING`.
+`.localmaxxing/` keeps canonical bundles and resumable upload state. Terminal
+`--dry-run` still uploads and verifies archives but does not create the dataset.
+Use `--skip-oracle` only for a collection already verified locally.
+
+Lower-level import/publish and execution commands remain available:
+
 ```bash
 lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1
 lmx eval terminal publish ./tb-bundles --slug my-terminal-bench --name "My Terminal Benchmark" --source-url https://github.com/org/repo --shard-count 5
@@ -82,13 +118,6 @@ lmx eval terminal verify ./tb-bundles/smoke --oracle
 lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --run-dir ./runs/tb21-qwen --resume auto --json-status --json --submit
 lmx eval terminal submit ./completed-terminal-run --dataset terminal-bench-2-1 --hf-id Qwen/Qwen3-8B --hardware hardware.json --quantization Q4_K_M --quant-format gguf --dry-run --out terminal-submit-payload.json
 ```
-
-Terminal dataset publishing requires LocalMaxxing Pro. `publish` oracle-verifies
-tasks by default, rejects symlinks, creates deterministic task archives, uploads
-each archive through a signed `terminal-task` URL, runs the authenticated
-manifest dry-run, and creates a `PENDING` dataset. Its state file under
-`.localmaxxing/` makes retries resumable. Use `--dry-run` to verify uploads and
-the manifest without creating the dataset.
 
 For an unattended run, use this sequence:
 

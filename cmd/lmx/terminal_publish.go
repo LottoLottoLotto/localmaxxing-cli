@@ -56,6 +56,16 @@ func publishTerminalDataset(args cliArgs) error {
 	if len(bundles) > 500 {
 		return cliError{"terminal_dataset_too_many_tasks", "Terminal datasets are limited to 500 tasks.", nil, map[string]any{"tasks": len(bundles)}}
 	}
+	if len(bundles) < 2 {
+		return cliError{"terminal_dataset_too_small", "A public terminal benchmark needs at least two tasks.", []string{"Add another task so the dataset can be partitioned into at least two shards."}, map[string]any{"tasks": len(bundles)}}
+	}
+	if _, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/storage/upload-url", key, map[string]any{
+		"kind": "terminal-task", "filename": "publication-access-check.tar.gz", "contentType": "application/gzip",
+		"format": "tar.gz", "byteSize": 1, "sha256": strings.Repeat("0", 64), "itemCount": 1,
+	}); err != nil {
+		return cliError{"terminal_publish_access_failed", "Terminal publication access check failed before oracle verification.", []string{"Terminal benchmark publishing requires LocalMaxxing Pro.", "Resolve authentication, subscription, or storage quota errors, then retry."}, err}
+	}
+	printStatus(args, "terminal_publish_access_verified", map[string]any{"tasks": len(bundles)})
 	if !hasFlag(args, "skip-oracle") {
 		printStatus(args, "terminal_publish_oracle_start", map[string]any{"tasks": len(bundles)})
 		if err := runTerminalEval(args, true); err != nil {
@@ -147,7 +157,10 @@ func publishTerminalDataset(args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	return writeOrPrintJSON("terminal_dataset_submitted", args, map[string]any{"dataset": created, "preflight": preflight, "state": statePath})
+	return writeOrPrintJSON("terminal_dataset_submitted", args, map[string]any{
+		"dataset": created, "preflight": preflight, "state": statePath, "status": "PENDING", "slug": slug,
+		"next": []string{"Track review: lmx eval suite submissions", "Retry safely: rerun the same publish command; uploaded bundles are reused.", "After approval: " + strings.TrimRight(apiURL(args), "/") + "/benchmarks/" + slug},
+	})
 }
 
 func deterministicTerminalTarGz(bundle terminalBundle) ([]byte, error) {
