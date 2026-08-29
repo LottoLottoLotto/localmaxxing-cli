@@ -109,10 +109,15 @@ oracle-verifies, packages, uploads, preflights, and submits as `PENDING`.
 `--dry-run` still uploads and verifies archives but does not create the dataset.
 Use `--skip-oracle` only for a collection already verified locally.
 
+Harbor Dockerfile and multi-service Docker Compose environments are both
+supported. Compose dependencies and GPU requests are retained. For isolated
+verifiers, the agent environment is stopped and only task-declared artifacts
+(after exclusion rules) are materialized into the fresh verifier environment.
+
 Lower-level import/publish and execution commands remain available:
 
 ```bash
-lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1
+lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version=2.1
 lmx eval terminal publish ./tb-bundles --slug my-terminal-bench --name "My Terminal Benchmark" --source-url https://github.com/org/repo --shard-count 5
 lmx eval terminal verify ./tb-bundles/smoke --oracle
 lmx eval terminal run terminal-bench-2-1 --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --run-dir ./runs/tb21-qwen --resume auto --json-status --json --submit

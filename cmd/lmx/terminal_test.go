@@ -29,7 +29,9 @@ func TestTerminalImportHarborTask(t *testing.T) {
 	taskDir := filepath.Join(src, "adaptive-rejection-sampler")
 	mustMkdir(t, filepath.Join(taskDir, "environment"))
 	mustMkdir(t, filepath.Join(taskDir, "tests"))
-	mustWrite(t, filepath.Join(taskDir, "task.toml"), `[task]
+	mustWrite(t, filepath.Join(taskDir, "task.toml"), `artifacts = ["/app/result.json", { source = "/shared/evidence.json", service = "api", exclude = ["*.tmp"] }]
+
+[task]
 name = "terminal-bench/adaptive-rejection-sampler"
 description = "sample"
 
@@ -38,6 +40,22 @@ category = "scientific-computing"
 
 [verifier]
 timeout_sec = 900
+environment_mode = "separate"
+
+[[verifier.collect]]
+service = "api"
+command = "cp /tmp/report.json /shared/evidence.json"
+timeout_sec = 45
+env = { REPORT_MODE = "full" }
+
+[verifier.environment]
+build_timeout_sec = 1200
+cpus = 2
+memory_mb = 4096
+storage_mb = 20480
+gpus = 1
+allow_internet = false
+env = { VERIFY_MODE = "isolated" }
 
 [agent]
 timeout_sec = 900
@@ -48,9 +66,10 @@ allow_internet = true
 `)
 	mustWrite(t, filepath.Join(taskDir, "instruction.md"), "Do the task.\n")
 	mustWrite(t, filepath.Join(taskDir, "tests", "test.sh"), "#!/usr/bin/env bash\n")
+	mustWrite(t, filepath.Join(taskDir, "tests", "Dockerfile"), "FROM ubuntu:24.04\nCOPY . /tests/\n")
 
 	out := t.TempDir()
-	args := parseArgs([]string{"eval", "terminal", "import", src, "--out", out, "--version", "2.1"})
+	args := parseArgs([]string{"eval", "terminal", "import", src, "--out", out, "--version=4.0.0"})
 	if err := runTerminalImport(args); err != nil {
 		t.Fatalf("runTerminalImport failed: %v", err)
 	}
@@ -62,6 +81,9 @@ allow_internet = true
 	if err := json.Unmarshal(data, &task); err != nil {
 		t.Fatalf("task.json invalid: %v", err)
 	}
+	if task.Version != "4.0.0" {
+		t.Fatalf("version mismatch: %q", task.Version)
+	}
 	if task.Image.Prebuilt != "alexgshaw/adaptive-rejection-sampler:20251031" {
 		t.Fatalf("prebuilt image mismatch: %q", task.Image.Prebuilt)
 	}
@@ -71,8 +93,23 @@ allow_internet = true
 	if task.Environment.Network != "public" {
 		t.Fatalf("network mismatch: %q", task.Environment.Network)
 	}
+	if task.Verifier.EnvironmentMode != "separate" {
+		t.Fatalf("verifier environment mode mismatch: %q", task.Verifier.EnvironmentMode)
+	}
+	if task.Verifier.BuildTimeoutSec != 1200 || task.Verifier.Environment.CPUs != 2 || task.Verifier.Environment.MemoryMb != 4096 || task.Verifier.Environment.StorageMb != 20480 || task.Verifier.Environment.GPUs != 1 || task.Verifier.Environment.Network != "no-network" || task.Verifier.Environment.Env["VERIFY_MODE"] != "isolated" {
+		t.Fatalf("verifier environment mismatch: %#v", task.Verifier)
+	}
+	if len(task.Verifier.Collect) != 1 || task.Verifier.Collect[0].Service != "api" || task.Verifier.Collect[0].Command != "cp /tmp/report.json /shared/evidence.json" || task.Verifier.Collect[0].TimeoutSec != 45 || task.Verifier.Collect[0].Env["REPORT_MODE"] != "full" {
+		t.Fatalf("verifier collect mismatch: %#v", task.Verifier.Collect)
+	}
+	if len(task.Artifacts) != 2 || task.Artifacts[0].Source != "/app/result.json" || task.Artifacts[1].Service != "api" || !reflect.DeepEqual(task.Artifacts[1].Exclude, []string{"*.tmp"}) {
+		t.Fatalf("artifacts mismatch: %#v", task.Artifacts)
+	}
 	if _, err := os.Stat(filepath.Join(out, "adaptive-rejection-sampler", "tests", "test.sh")); err != nil {
 		t.Fatalf("tests/ not copied: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "adaptive-rejection-sampler", "tests", "Dockerfile")); err != nil {
+		t.Fatalf("tests/Dockerfile not copied: %v", err)
 	}
 }
 
@@ -760,7 +797,7 @@ func TestResolveEnvTemplates(t *testing.T) {
 	}
 }
 
-func TestTerminalImportSkipsComposeTasks(t *testing.T) {
+func TestTerminalImportPreservesComposeTasks(t *testing.T) {
 	src := t.TempDir()
 	writeHarborTask := func(id string, compose bool) {
 		taskDir := filepath.Join(src, id)
@@ -781,8 +818,16 @@ func TestTerminalImportSkipsComposeTasks(t *testing.T) {
 	if err := runTerminalImport(args); err != nil {
 		t.Fatalf("runTerminalImport failed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(out, "compose-task")); !os.IsNotExist(err) {
-		t.Fatalf("compose task should be skipped, stat err = %v", err)
+	composeData, err := os.ReadFile(filepath.Join(out, "compose-task", "task.json"))
+	if err != nil {
+		t.Fatalf("compose task not imported: %v", err)
+	}
+	var composeTask terminalTask
+	if err := json.Unmarshal(composeData, &composeTask); err != nil {
+		t.Fatalf("compose task.json invalid: %v", err)
+	}
+	if composeTask.Image.ComposeFile != "docker-compose.yaml" {
+		t.Fatalf("compose file = %q, want docker-compose.yaml", composeTask.Image.ComposeFile)
 	}
 	data, err := os.ReadFile(filepath.Join(out, "plain-task", "task.json"))
 	if err != nil {
@@ -796,15 +841,83 @@ func TestTerminalImportSkipsComposeTasks(t *testing.T) {
 		t.Fatalf("[solution].env not imported: %#v", task.Solution.Env)
 	}
 
-	// A tree with only compose tasks must fail loudly rather than import nothing.
 	onlyCompose := t.TempDir()
 	src = onlyCompose
 	writeHarborTask("compose-only", true)
-	args = parseArgs([]string{"eval", "terminal", "import", onlyCompose, "--out", t.TempDir()})
-	err = runTerminalImport(args)
-	var ce cliError
-	if err == nil || !errorsAsCli(err, &ce) || ce.Code != "task_import_failed" {
-		t.Fatalf("expected task_import_failed for compose-only tree, got %v", err)
+	if err := runTerminalImport(parseArgs([]string{"eval", "terminal", "import", onlyCompose, "--out", t.TempDir()})); err != nil {
+		t.Fatalf("compose-only tree should import: %v", err)
+	}
+}
+
+func TestRunTerminalTaskComposeSeparateVerifier(t *testing.T) {
+	if dockerPreflight() != nil {
+		t.Skip("docker unavailable")
+	}
+	if _, code, _, _ := runCommand(context.Background(), 30*time.Second, "docker", "compose", "version"); code != 0 {
+		t.Skip("docker compose unavailable")
+	}
+	bundle := t.TempDir()
+	mustMkdir(t, filepath.Join(bundle, "environment"))
+	mustMkdir(t, filepath.Join(bundle, "tests"))
+	mustWrite(t, filepath.Join(bundle, "environment", "Dockerfile"), "FROM ubuntu:24.04\nRUN mkdir -p /app /shared\n")
+	mustWrite(t, filepath.Join(bundle, "environment", "docker-compose.yaml"), `services:
+  main:
+    volumes:
+      - shared:/shared
+  evidence:
+    build:
+      context: .
+    command: ["sh", "-c", "sleep infinity"]
+    volumes:
+      - shared:/shared
+volumes:
+  shared:
+`)
+	mustWrite(t, filepath.Join(bundle, "tests", "Dockerfile"), "FROM ubuntu:24.04\nRUN mkdir -p /app /shared /logs/verifier\nCOPY . /tests/\n")
+	mustWrite(t, filepath.Join(bundle, "tests", "test.sh"), `#!/bin/bash
+mkdir -p /logs/verifier
+if [ "$(cat /app/result.txt 2>/dev/null)" = "agent-pass" ] && [ "$(cat /shared/evidence.txt 2>/dev/null)" = "sidecar-pass" ] && [ ! -e /shared/ignored.tmp ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+`)
+	task := terminalTask{
+		ID:          "compose-separate-verifier",
+		Instruction: "synthetic",
+		Image: terminalImage{
+			Dockerfile:      "environment/Dockerfile",
+			Context:         "environment",
+			BuildTimeoutSec: 300,
+			ComposeFile:     "docker-compose.yaml",
+		},
+		Verifier: terminalVerifierConfig{
+			TimeoutSec:      60,
+			Command:         "bash /tests/test.sh",
+			RewardFile:      "/logs/verifier/reward.txt",
+			EnvironmentMode: "separate",
+			BuildTimeoutSec: 300,
+			Environment:     terminalEnvironmentConfig{CPUs: 1, MemoryMb: 512, Network: "public"},
+			Collect: []terminalVerifierCollectConfig{{
+				Service: "evidence", Command: "echo sidecar-pass > /shared/evidence.txt; echo exclude-me > /shared/ignored.tmp",
+			}},
+		},
+		Environment: terminalEnvironmentConfig{CPUs: 1, MemoryMb: 512, Network: "public"},
+		Artifacts: []terminalArtifactConfig{
+			{Source: "/app/result.txt"},
+			{Source: "/shared", Service: "evidence", Exclude: []string{"*.tmp"}},
+		},
+	}
+	cfg := terminalConfig{
+		args:           parseArgs([]string{"eval", "terminal", "run", "--quiet"}),
+		oracle:         false,
+		agentExecution: "routed-shell",
+		agentCommand:   `docker exec "$LMX_TERMINAL_CONTAINER" sh -c 'echo agent-pass > /app/result.txt'`,
+		cleanupImages:  true,
+	}
+	result := runTerminalTask(context.Background(), task, bundle, "", "", cfg)
+	if result.errCode != "" || !result.scored || !result.pass {
+		t.Fatalf("compose separate verifier result = %+v", result)
 	}
 }
 

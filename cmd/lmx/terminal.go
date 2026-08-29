@@ -118,6 +118,7 @@ type terminalTask struct {
 	Verifier    terminalVerifierConfig    `json:"verifier"`
 	Solution    terminalSolutionConfig    `json:"solution"`
 	Environment terminalEnvironmentConfig `json:"environment"`
+	Artifacts   []terminalArtifactConfig  `json:"artifacts,omitempty"`
 }
 
 type terminalImage struct {
@@ -125,6 +126,7 @@ type terminalImage struct {
 	Dockerfile      string `json:"dockerfile,omitempty"`
 	Context         string `json:"context,omitempty"`
 	BuildTimeoutSec int    `json:"buildTimeoutSec,omitempty"`
+	ComposeFile     string `json:"composeFile,omitempty"`
 }
 
 type terminalAgentConfig struct {
@@ -133,16 +135,33 @@ type terminalAgentConfig struct {
 	User       string `json:"user"`
 }
 
-type terminalVerifierConfig struct {
-	TimeoutSec int               `json:"timeoutSec"`
+type terminalVerifierCollectConfig struct {
 	Command    string            `json:"command"`
-	RewardFile string            `json:"rewardFile"`
-	User       string            `json:"user"`
+	Service    string            `json:"service,omitempty"`
+	TimeoutSec int               `json:"timeoutSec,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
+}
+
+type terminalVerifierConfig struct {
+	TimeoutSec      int                             `json:"timeoutSec"`
+	Command         string                          `json:"command"`
+	RewardFile      string                          `json:"rewardFile"`
+	User            string                          `json:"user"`
+	Env             map[string]string               `json:"env,omitempty"`
+	EnvironmentMode string                          `json:"environmentMode,omitempty"`
+	BuildTimeoutSec int                             `json:"buildTimeoutSec,omitempty"`
+	Environment     terminalEnvironmentConfig       `json:"environment,omitempty"`
+	Collect         []terminalVerifierCollectConfig `json:"collect,omitempty"`
 }
 
 type terminalSolutionConfig struct {
 	Env map[string]string `json:"env,omitempty"`
+}
+
+type terminalArtifactConfig struct {
+	Source  string   `json:"source"`
+	Service string   `json:"service,omitempty"`
+	Exclude []string `json:"exclude,omitempty"`
 }
 
 type terminalEnvironmentConfig struct {
@@ -356,22 +375,106 @@ type terminalBundle struct {
 	Dir  string
 }
 
+type harborArtifacts []terminalArtifactConfig
+
+func (artifacts *harborArtifacts) UnmarshalTOML(data any) error {
+	items, ok := data.([]map[string]any)
+	if ok {
+		for _, item := range items {
+			artifact, err := harborArtifactFromTOML(item)
+			if err != nil {
+				return err
+			}
+			*artifacts = append(*artifacts, artifact)
+		}
+		return nil
+	}
+	values, ok := data.([]any)
+	if !ok {
+		return fmt.Errorf("artifacts must be an array")
+	}
+	for _, value := range values {
+		switch item := value.(type) {
+		case string:
+			if strings.TrimSpace(item) == "" {
+				return fmt.Errorf("artifact source must not be empty")
+			}
+			*artifacts = append(*artifacts, terminalArtifactConfig{Source: item})
+		case map[string]any:
+			artifact, err := harborArtifactFromTOML(item)
+			if err != nil {
+				return err
+			}
+			*artifacts = append(*artifacts, artifact)
+		default:
+			return fmt.Errorf("artifact must be a path or inline table, got %T", value)
+		}
+	}
+	return nil
+}
+
+func harborArtifactFromTOML(item map[string]any) (terminalArtifactConfig, error) {
+	source, _ := item["source"].(string)
+	if strings.TrimSpace(source) == "" {
+		return terminalArtifactConfig{}, fmt.Errorf("artifact inline table requires source")
+	}
+	service, _ := item["service"].(string)
+	var exclude []string
+	switch values := item["exclude"].(type) {
+	case nil:
+	case []string:
+		exclude = append(exclude, values...)
+	case []any:
+		for _, value := range values {
+			pattern, ok := value.(string)
+			if !ok {
+				return terminalArtifactConfig{}, fmt.Errorf("artifact exclude entries must be strings")
+			}
+			exclude = append(exclude, pattern)
+		}
+	default:
+		return terminalArtifactConfig{}, fmt.Errorf("artifact exclude must be an array")
+	}
+	return terminalArtifactConfig{Source: source, Service: service, Exclude: exclude}, nil
+}
+
+type harborVerifierConfig struct {
+	TimeoutSec      tomlNumber        `toml:"timeout_sec"`
+	Command         string            `toml:"command"`
+	RewardFile      string            `toml:"reward_file"`
+	Env             map[string]string `toml:"env"`
+	User            string            `toml:"user"`
+	EnvironmentMode string            `toml:"environment_mode"`
+	Collect         []struct {
+		Command    string            `toml:"command"`
+		Service    string            `toml:"service"`
+		TimeoutSec tomlNumber        `toml:"timeout_sec"`
+		Env        map[string]string `toml:"env"`
+	} `toml:"collect"`
+	Environment struct {
+		BuildTimeoutSec tomlNumber        `toml:"build_timeout_sec"`
+		CPUs            tomlNumber        `toml:"cpus"`
+		MemoryMb        tomlNumber        `toml:"memory_mb"`
+		StorageMb       tomlNumber        `toml:"storage_mb"`
+		GPUs            tomlNumber        `toml:"gpus"`
+		NetworkMode     string            `toml:"network_mode"`
+		AllowedHosts    []string          `toml:"allowed_hosts"`
+		AllowInternet   *bool             `toml:"allow_internet"`
+		Env             map[string]string `toml:"env"`
+	} `toml:"environment"`
+}
+
 type harborTaskToml struct {
-	Task struct {
+	Artifacts harborArtifacts `toml:"artifacts"`
+	Task      struct {
 		Name        string `toml:"name"`
 		Description string `toml:"description"`
 	} `toml:"task"`
 	Metadata struct {
 		Category string `toml:"category"`
 	} `toml:"metadata"`
-	Verifier struct {
-		TimeoutSec tomlNumber        `toml:"timeout_sec"`
-		Command    string            `toml:"command"`
-		RewardFile string            `toml:"reward_file"`
-		Env        map[string]string `toml:"env"`
-		User       string            `toml:"user"`
-	} `toml:"verifier"`
-	Agent struct {
+	Verifier harborVerifierConfig `toml:"verifier"`
+	Agent    struct {
 		TimeoutSec tomlNumber `toml:"timeout_sec"`
 		MaxTurns   tomlNumber `toml:"max_turns"`
 		User       string     `toml:"user"`
@@ -458,22 +561,12 @@ func runTerminalImport(args cliArgs) error {
 	if len(taskDirs) == 0 {
 		return cliError{"task_import_failed", "No harbor task.toml files were found.", []string{"Pass a harbor task directory or a parent directory containing task subdirectories."}, map[string]any{"src": src}}
 	}
-	imported, skipped := 0, 0
 	for _, taskDir := range taskDirs {
-		if composeFile := harborComposeFile(taskDir); composeFile != "" {
-			printStatus(args, "terminal_import_skipped", map[string]any{"taskId": filepath.Base(filepath.Clean(taskDir)), "reason": "docker-compose task environments are not supported by this runner", "composeFile": composeFile})
-			skipped++
-			continue
-		}
 		if err := importHarborTask(taskDir, out, version); err != nil {
 			return err
 		}
-		imported++
 	}
-	if imported == 0 {
-		return cliError{"task_import_failed", "Every harbor task was skipped.", []string{"docker-compose task environments are not supported; import tasks that use environment/Dockerfile or [environment].docker_image."}, map[string]any{"src": src, "skipped": skipped}}
-	}
-	printInfo(args, "terminal_import_complete", map[string]any{"src": src, "out": out, "tasks": imported, "skipped": skipped, "version": version})
+	printInfo(args, "terminal_import_complete", map[string]any{"src": src, "out": out, "tasks": len(taskDirs), "version": version})
 	return nil
 }
 
@@ -527,7 +620,7 @@ func importHarborTask(taskDir, out, version string) error {
 	if err != nil {
 		return cliError{"task_import_failed", fmt.Sprintf("%s: no instruction.md", id), []string{"Ensure each harbor task directory contains instruction.md."}, map[string]any{"taskId": id, "path": filepath.Join(taskDir, "instruction.md"), "error": err.Error()}}
 	}
-	image := terminalImage{}
+	image := terminalImage{ComposeFile: harborComposeFile(taskDir)}
 	if strings.TrimSpace(ht.Environment.DockerImage) != "" {
 		image.Prebuilt = strings.TrimSpace(ht.Environment.DockerImage)
 	} else {
@@ -551,6 +644,48 @@ func importHarborTask(taskDir, out, version string) error {
 	if network == "" {
 		return cliError{"task_import_failed", fmt.Sprintf("%s: invalid environment network", id), []string{"Set network_mode to public, no-network, or allowlist."}, map[string]any{"taskId": id, "network_mode": ht.Environment.NetworkMode}}
 	}
+	verifierMode := firstNonEmpty(strings.TrimSpace(ht.Verifier.EnvironmentMode), "shared")
+	if verifierMode != "shared" && verifierMode != "separate" {
+		return cliError{"task_import_failed", fmt.Sprintf("%s: invalid verifier environment mode", id), []string{"Set [verifier].environment_mode to shared or separate."}, map[string]any{"taskId": id, "environment_mode": ht.Verifier.EnvironmentMode}}
+	}
+	verifierNetwork := strings.TrimSpace(ht.Verifier.Environment.NetworkMode)
+	if verifierNetwork == "" && ht.Verifier.Environment.AllowInternet != nil {
+		if *ht.Verifier.Environment.AllowInternet {
+			verifierNetwork = "public"
+		} else {
+			verifierNetwork = "no-network"
+		}
+	}
+	verifierNetwork = normalizeTerminalNetwork(firstNonEmpty(verifierNetwork, network))
+	if verifierNetwork == "" {
+		return cliError{"task_import_failed", fmt.Sprintf("%s: invalid verifier environment network", id), []string{"Set [verifier.environment].network_mode to public, no-network, or allowlist."}, map[string]any{"taskId": id, "network_mode": ht.Verifier.Environment.NetworkMode}}
+	}
+	collectHooks := make([]terminalVerifierCollectConfig, 0, len(ht.Verifier.Collect))
+	for _, hook := range ht.Verifier.Collect {
+		if strings.TrimSpace(hook.Command) == "" {
+			return cliError{"task_import_failed", fmt.Sprintf("%s: verifier collect hook has no command", id), []string{"Set [[verifier.collect]].command."}, map[string]any{"taskId": id}}
+		}
+		collectHooks = append(collectHooks, terminalVerifierCollectConfig{
+			Command: strings.TrimSpace(hook.Command), Service: strings.TrimSpace(hook.Service),
+			TimeoutSec: firstPositive(hook.TimeoutSec.Int(), 30), Env: nonNilStringMap(hook.Env),
+		})
+	}
+	verifierEnvironmentConfigured := ht.Verifier.Environment.BuildTimeoutSec.Float() > 0 ||
+		ht.Verifier.Environment.CPUs.Float() > 0 || ht.Verifier.Environment.MemoryMb.Int() > 0 ||
+		ht.Verifier.Environment.StorageMb.Int() > 0 || ht.Verifier.Environment.GPUs.Int() > 0 ||
+		ht.Verifier.Environment.AllowInternet != nil || strings.TrimSpace(ht.Verifier.Environment.NetworkMode) != "" ||
+		len(ht.Verifier.Environment.AllowedHosts) > 0 || len(ht.Verifier.Environment.Env) > 0
+	verifierGPUs := ht.Environment.GPUs.Int()
+	if verifierEnvironmentConfigured {
+		verifierGPUs = ht.Verifier.Environment.GPUs.Int()
+	}
+	verifierEnvironment := terminalEnvironmentConfig{
+		CPUs:      firstPositiveFloat(ht.Verifier.Environment.CPUs.Float(), firstPositiveFloat(ht.Environment.CPUs.Float(), 1)),
+		MemoryMb:  firstPositive(ht.Verifier.Environment.MemoryMb.Int(), firstPositive(ht.Environment.MemoryMb.Int(), 2048)),
+		StorageMb: firstPositive(ht.Verifier.Environment.StorageMb.Int(), firstPositive(ht.Environment.StorageMb.Int(), 10240)),
+		GPUs:      verifierGPUs, Network: verifierNetwork,
+		AllowedHosts: ht.Verifier.Environment.AllowedHosts, Env: nonNilStringMap(ht.Verifier.Environment.Env),
+	}
 	task := terminalTask{
 		ID:          id,
 		Version:     version,
@@ -559,9 +694,16 @@ func importHarborTask(taskDir, out, version string) error {
 		Source:      firstNonEmpty(ht.Task.Name, "terminal-bench/"+id),
 		Image:       image,
 		Agent:       terminalAgentConfig{TimeoutSec: ht.Agent.TimeoutSec.Int(), MaxTurns: ht.Agent.MaxTurns.Int(), User: ht.Agent.User},
-		Verifier:    terminalVerifierConfig{TimeoutSec: firstPositive(ht.Verifier.TimeoutSec.Int(), 900), Command: firstNonEmpty(ht.Verifier.Command, "bash /tests/test.sh"), RewardFile: firstNonEmpty(ht.Verifier.RewardFile, "/logs/verifier/reward.txt"), User: ht.Verifier.User, Env: nonNilStringMap(ht.Verifier.Env)},
+		Verifier: terminalVerifierConfig{
+			TimeoutSec: firstPositive(ht.Verifier.TimeoutSec.Int(), 900), Command: firstNonEmpty(ht.Verifier.Command, "bash /tests/test.sh"),
+			RewardFile: firstNonEmpty(ht.Verifier.RewardFile, "/logs/verifier/reward.txt"), User: ht.Verifier.User,
+			Env: nonNilStringMap(ht.Verifier.Env), EnvironmentMode: verifierMode,
+			BuildTimeoutSec: firstPositive(ht.Verifier.Environment.BuildTimeoutSec.Int(), image.BuildTimeoutSec),
+			Environment:     verifierEnvironment, Collect: collectHooks,
+		},
 		Solution:    terminalSolutionConfig{Env: nonNilStringMap(ht.Solution.Env)},
 		Environment: terminalEnvironmentConfig{CPUs: firstPositiveFloat(ht.Environment.CPUs.Float(), 1), MemoryMb: firstPositive(ht.Environment.MemoryMb.Int(), 2048), StorageMb: firstPositive(ht.Environment.StorageMb.Int(), 10240), GPUs: ht.Environment.GPUs.Int(), Network: network, AllowedHosts: ht.Environment.AllowedHosts, Env: nonNilStringMap(ht.Environment.Env)},
+		Artifacts:   append([]terminalArtifactConfig(nil), ht.Artifacts...),
 	}
 	dest := filepath.Join(out, id)
 	if err := os.RemoveAll(dest); err != nil {
@@ -2990,27 +3132,37 @@ sendJobs:
 	return results, nil
 }
 
-func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL, model string, cfg terminalConfig) (result terminalTaskResult) {
-	started := time.Now()
-	result = terminalTaskResult{instruction: task.ID, prompt: terminalSystemPrompt, turnsUnreported: cfg.oracle || cfg.agentCommand != ""}
-	defer func() {
-		if ctx.Err() != nil {
-			result.scored = false
-			result.errCode = "terminal_cancelled"
-			result.errText = "Terminal execution was cancelled."
-			result.wallTimeMs = time.Since(started).Milliseconds()
-		}
-	}()
-	if err := dockerPreflightContext(ctx); err != nil {
-		result.errCode = "docker_unavailable"
-		result.errText = err.Error()
-		return result
+type terminalTaskEnvironment struct {
+	containerName   string
+	composeArgs     []string
+	cleanup         func()
+	skipTestsUpload bool
+}
+
+func (environment *terminalTaskEnvironment) serviceContainer(ctx context.Context, service string) (string, error) {
+	if service == "" || service == "main" {
+		return environment.containerName, nil
+	}
+	if len(environment.composeArgs) == 0 {
+		return "", fmt.Errorf("artifact service %q requires a Docker Compose task", service)
+	}
+	args := append(append([]string(nil), environment.composeArgs...), "ps", "--quiet", service)
+	out, code, timedOut, err := runCommand(ctx, 30*time.Second, "docker", args...)
+	containerName := strings.TrimSpace(out)
+	if err != nil || timedOut || code != 0 || containerName == "" {
+		return "", terminalCommandError("container_lookup_failed", "Could not resolve Docker Compose service container.", "docker", args, code, out, timedOut)
+	}
+	return containerName, nil
+}
+
+func startTerminalTaskEnvironment(ctx context.Context, task terminalTask, bundleDir string, cfg terminalConfig) (*terminalTaskEnvironment, error) {
+	if task.Image.ComposeFile != "" {
+		return startTerminalComposeEnvironment(ctx, task, bundleDir, cfg)
 	}
 	imageStart := time.Now()
 	imageRef, cleanupImage, err := resolveTerminalImage(ctx, task, bundleDir)
 	if err != nil {
-		result.errCode, result.errText = cliErrorCodeText(err)
-		return result
+		return nil, err
 	}
 	printStatus(cfg.args, "terminal_image_resolved", map[string]any{"taskId": task.ID, "mode": imageMode(task.Image), "ms": time.Since(imageStart).Milliseconds()})
 	containerName := "lmx-tb-" + sanitizeDockerName(task.ID) + "-" + randomHex(6)
@@ -3039,13 +3191,323 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 	startArgs = append(startArgs, imageRef, "sleep", "infinity")
 	out, code, timedOut, runErr := runCommand(ctx, 60*time.Second, "docker", startArgs...)
 	if runErr != nil || timedOut || code != 0 {
-		result.errCode = "container_start_failed"
-		result.errText = terminalCommandError("container_start_failed", "Could not start terminal task container.", "docker", startArgs, code, out, timedOut).Error()
 		cleanupTerminalImage(cleanupImage, cfg.cleanupImages)
+		return nil, terminalCommandError("container_start_failed", "Could not start terminal task container.", "docker", startArgs, code, out, timedOut)
+	}
+	var once sync.Once
+	return &terminalTaskEnvironment{
+		containerName: containerName,
+		cleanup: func() {
+			once.Do(func() {
+				_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
+				cleanupTerminalImage(cleanupImage, cfg.cleanupImages)
+			})
+		},
+	}, nil
+}
+
+func startTerminalVerifierEnvironment(ctx context.Context, task terminalTask, bundleDir string, cfg terminalConfig) (*terminalTaskEnvironment, error) {
+	dockerfile := filepath.Join(bundleDir, "tests", "Dockerfile")
+	if _, err := os.Stat(dockerfile); err != nil {
+		return startTerminalTaskEnvironment(ctx, task, bundleDir, cfg)
+	}
+	verifierTask := task
+	verifierTask.ID += "-verifier"
+	verifierTask.Image = terminalImage{
+		Dockerfile: "tests/Dockerfile", Context: "tests",
+		BuildTimeoutSec: firstPositive(task.Verifier.BuildTimeoutSec, task.Image.BuildTimeoutSec),
+	}
+	imageStart := time.Now()
+	imageRef, cleanupImage, err := resolveTerminalImage(ctx, verifierTask, bundleDir)
+	if err != nil {
+		return nil, err
+	}
+	printStatus(cfg.args, "terminal_verifier_image_resolved", map[string]any{"taskId": task.ID, "mode": "dockerfile", "ms": time.Since(imageStart).Milliseconds()})
+	containerName := "lmx-tb-" + sanitizeDockerName(task.ID) + "-verifier-" + randomHex(6)
+	startArgs := []string{"run", "-d", "--rm", "--name", containerName}
+	if cfg.runLabel != "" {
+		startArgs = append(startArgs, "--label", "localmaxxing.run="+cfg.runLabel, "--label", "localmaxxing.task="+task.ID)
+	}
+	environment := task.Verifier.Environment
+	if environment.CPUs > 0 {
+		startArgs = append(startArgs, "--cpus", strconv.FormatFloat(environment.CPUs, 'f', -1, 64))
+	}
+	if environment.MemoryMb > 0 {
+		startArgs = append(startArgs, "--memory", fmt.Sprintf("%dm", environment.MemoryMb))
+	}
+	if environment.GPUs > 0 {
+		startArgs = append(startArgs, "--gpus", "all")
+	}
+	if environment.Network == "no-network" {
+		startArgs = append(startArgs, "--network", "none")
+	}
+	for k, v := range resolveEnvTemplates(environment.Env) {
+		startArgs = append(startArgs, "-e", k+"="+v)
+	}
+	startArgs = append(startArgs, imageRef, "sleep", "infinity")
+	out, code, timedOut, runErr := runCommand(ctx, 60*time.Second, "docker", startArgs...)
+	if runErr != nil || timedOut || code != 0 {
+		cleanupTerminalImage(cleanupImage, cfg.cleanupImages)
+		return nil, terminalCommandError("verifier_container_start_failed", "Could not start terminal verifier container.", "docker", startArgs, code, out, timedOut)
+	}
+	var once sync.Once
+	return &terminalTaskEnvironment{
+		containerName:   containerName,
+		skipTestsUpload: true,
+		cleanup: func() {
+			once.Do(func() {
+				_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
+				cleanupTerminalImage(cleanupImage, cfg.cleanupImages)
+			})
+		},
+	}, nil
+}
+
+func startTerminalComposeEnvironment(ctx context.Context, task terminalTask, bundleDir string, cfg terminalConfig) (*terminalTaskEnvironment, error) {
+	environmentDir, err := filepath.Abs(filepath.Join(bundleDir, "environment"))
+	if err != nil {
+		return nil, cliError{"compose_start_failed", "Could not resolve the task environment directory.", []string{"Check the downloaded task bundle path."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+	}
+	composeFile := filepath.Join(environmentDir, task.Image.ComposeFile)
+	if _, err := os.Stat(composeFile); err != nil {
+		return nil, cliError{"compose_start_failed", "Task bundle is missing its Docker Compose file.", []string{"Re-import or re-download the task bundle."}, map[string]any{"taskId": task.ID, "composeFile": composeFile, "error": err.Error()}}
+	}
+	tempDir, err := os.MkdirTemp("", "lmx-terminal-compose-*")
+	if err != nil {
+		return nil, cliError{"compose_start_failed", "Could not create the Docker Compose override.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+	}
+	basePath := filepath.Join(tempDir, "base.json")
+	mainService := map[string]any{
+		"command": []string{"sh", "-c", "sleep infinity"},
+	}
+	if task.Image.Prebuilt != "" {
+		mainService["image"] = task.Image.Prebuilt
+	} else {
+		mainService["build"] = map[string]any{"context": environmentDir}
+		mainService["pull_policy"] = "build"
+	}
+	if task.Environment.CPUs > 0 {
+		mainService["cpus"] = task.Environment.CPUs
+	}
+	if task.Environment.MemoryMb > 0 {
+		mainService["mem_limit"] = fmt.Sprintf("%dm", task.Environment.MemoryMb)
+	}
+	if task.Environment.GPUs > 0 {
+		mainService["gpus"] = "all"
+	}
+	if task.Environment.Network == "no-network" {
+		mainService["network_mode"] = "none"
+	}
+	if task.Environment.Network == "allowlist" {
+		printStatus(cfg.args, "terminal_network_degraded", map[string]any{"taskId": task.ID, "allowedHosts": strings.Join(task.Environment.AllowedHosts, ",")})
+	}
+	if resolvedEnv := resolveEnvTemplates(task.Environment.Env); len(resolvedEnv) > 0 {
+		mainService["environment"] = resolvedEnv
+	}
+	if cfg.runLabel != "" {
+		mainService["labels"] = map[string]string{"localmaxxing.run": cfg.runLabel, "localmaxxing.task": task.ID}
+	}
+	baseContent, err := json.Marshal(map[string]any{"services": map[string]any{"main": mainService}})
+	if err != nil {
+		_ = os.RemoveAll(tempDir)
+		return nil, err
+	}
+	if err := os.WriteFile(basePath, baseContent, 0o600); err != nil {
+		_ = os.RemoveAll(tempDir)
+		return nil, cliError{"compose_start_failed", "Could not write the Docker Compose override.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+	}
+	projectName := "lmx-tb-" + sanitizeDockerName(task.ID) + "-" + randomHex(6)
+	composeArgs := []string{"compose", "--project-name", projectName, "--project-directory", environmentDir, "-f", basePath, "-f", composeFile}
+	upArgs := append(append([]string(nil), composeArgs...), "up", "--detach", "--build", "--wait")
+	timeout := time.Duration(firstPositive(task.Image.BuildTimeoutSec, 600)+300) * time.Second
+	imageStart := time.Now()
+	out, code, timedOut, runErr := runCommand(ctx, timeout, "docker", upArgs...)
+	if runErr != nil || timedOut || code != 0 {
+		downArgs := append(append([]string(nil), composeArgs...), "down", "--volumes", "--remove-orphans")
+		_, _, _, _ = runCommand(context.Background(), 2*time.Minute, "docker", downArgs...)
+		_ = os.RemoveAll(tempDir)
+		return nil, terminalCommandError("compose_start_failed", "Could not start Docker Compose task services.", "docker", upArgs, code, out, timedOut)
+	}
+	psArgs := append(append([]string(nil), composeArgs...), "ps", "--quiet", "main")
+	mainOut, mainCode, mainTimedOut, mainErr := runCommand(ctx, 30*time.Second, "docker", psArgs...)
+	containerName := strings.TrimSpace(mainOut)
+	if mainErr != nil || mainTimedOut || mainCode != 0 || containerName == "" {
+		downArgs := append(append([]string(nil), composeArgs...), "down", "--volumes", "--remove-orphans")
+		_, _, _, _ = runCommand(context.Background(), 2*time.Minute, "docker", downArgs...)
+		_ = os.RemoveAll(tempDir)
+		return nil, terminalCommandError("container_lookup_failed", "Could not resolve the Docker Compose main service.", "docker", psArgs, mainCode, mainOut, mainTimedOut)
+	}
+	printStatus(cfg.args, "terminal_image_resolved", map[string]any{"taskId": task.ID, "mode": imageMode(task.Image), "ms": time.Since(imageStart).Milliseconds()})
+	var once sync.Once
+	return &terminalTaskEnvironment{
+		containerName: containerName,
+		composeArgs:   composeArgs,
+		cleanup: func() {
+			once.Do(func() {
+				downArgs := append(append([]string(nil), composeArgs...), "down", "--volumes", "--remove-orphans")
+				if cfg.cleanupImages {
+					downArgs = append(downArgs, "--rmi", "local")
+				}
+				_, _, _, _ = runCommand(context.Background(), 2*time.Minute, "docker", downArgs...)
+				_ = os.RemoveAll(tempDir)
+			})
+		},
+	}, nil
+}
+
+func runTerminalVerifierCollectHooks(ctx context.Context, task terminalTask, environment *terminalTaskEnvironment) error {
+	for _, hook := range task.Verifier.Collect {
+		containerName, err := environment.serviceContainer(ctx, hook.Service)
+		if err != nil {
+			return cliError{"artifact_collection_failed", "Could not locate a verifier collect service.", []string{"Check [[verifier.collect]].service in the canonical Harbor task."}, map[string]any{"taskId": task.ID, "service": hook.Service, "error": err.Error()}}
+		}
+		execArgs := []string{"exec"}
+		resolvedEnv := resolveEnvTemplates(hook.Env)
+		keys := make([]string, 0, len(resolvedEnv))
+		for key := range resolvedEnv {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			execArgs = append(execArgs, "--env", key+"="+resolvedEnv[key])
+		}
+		execArgs = append(execArgs, containerName, "sh", "-lc", hook.Command)
+		timeout := time.Duration(firstPositive(hook.TimeoutSec, 30)) * time.Second
+		out, code, timedOut, runErr := runCommand(ctx, timeout, "docker", execArgs...)
+		if runErr != nil || timedOut || code != 0 {
+			return terminalCommandError("artifact_collection_failed", "A verifier collect hook failed.", "docker", execArgs, code, out, timedOut)
+		}
+	}
+	return nil
+}
+
+func collectTerminalArtifacts(ctx context.Context, task terminalTask, environment *terminalTaskEnvironment, cfg terminalConfig) (string, error) {
+	root, err := os.MkdirTemp("", "lmx-terminal-artifacts-*")
+	if err != nil {
+		return "", cliError{"artifact_collection_failed", "Could not create the artifact staging directory.", []string{"Check temporary directory permissions."}, map[string]any{"taskId": task.ID, "error": err.Error()}}
+	}
+	for _, artifact := range task.Artifacts {
+		source := path.Clean(strings.TrimSpace(artifact.Source))
+		if !strings.HasPrefix(source, "/") || source == "/" {
+			_ = os.RemoveAll(root)
+			return "", cliError{"artifact_collection_failed", "Artifact sources must be absolute container paths.", []string{"Re-import the canonical Harbor task."}, map[string]any{"taskId": task.ID, "source": artifact.Source}}
+		}
+		containerName, err := environment.serviceContainer(ctx, artifact.Service)
+		if err != nil {
+			_ = os.RemoveAll(root)
+			return "", cliError{"artifact_collection_failed", "Could not locate an artifact source service.", []string{"Check that every artifact service exists in the task Compose file."}, map[string]any{"taskId": task.ID, "service": artifact.Service, "source": source, "error": err.Error()}}
+		}
+		hostPath := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(source, "/")))
+		if err := os.MkdirAll(filepath.Dir(hostPath), 0o755); err != nil {
+			_ = os.RemoveAll(root)
+			return "", err
+		}
+		out, code, timedOut, copyErr := runCommand(ctx, 2*time.Minute, "docker", "cp", containerName+":"+source, hostPath)
+		if copyErr != nil || timedOut || code != 0 {
+			printStatus(cfg.args, "terminal_artifact_missing", map[string]any{"taskId": task.ID, "service": firstNonEmpty(artifact.Service, "main"), "source": source, "detail": truncateString(out, 1024)})
+			continue
+		}
+		if err := pruneTerminalArtifactExcludes(hostPath, artifact.Exclude); err != nil {
+			_ = os.RemoveAll(root)
+			return "", cliError{"artifact_collection_failed", "Could not apply artifact exclusions.", []string{"Check artifact paths and permissions."}, map[string]any{"taskId": task.ID, "source": source, "error": err.Error()}}
+		}
+	}
+	return root, nil
+}
+
+func pruneTerminalArtifactExcludes(root string, patterns []string) error {
+	if len(patterns) == 0 {
+		return nil
+	}
+	cleanPatterns := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		cleanPatterns = append(cleanPatterns, strings.TrimPrefix(filepath.ToSlash(filepath.Clean(pattern)), "./"))
+	}
+	return filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if current == root {
+			return nil
+		}
+		relative, err := filepath.Rel(root, current)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		for _, pattern := range cleanPatterns {
+			relativeMatch, _ := path.Match(pattern, relative)
+			baseMatch, _ := path.Match(pattern, path.Base(relative))
+			if !relativeMatch && !baseMatch {
+				continue
+			}
+			if err := os.RemoveAll(current); err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		return nil
+	})
+}
+
+func uploadTerminalArtifacts(ctx context.Context, task terminalTask, environment *terminalTaskEnvironment, root string) error {
+	for _, artifact := range task.Artifacts {
+		source := path.Clean(strings.TrimSpace(artifact.Source))
+		hostPath := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(source, "/")))
+		info, err := os.Stat(hostPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		parent := path.Dir(source)
+		if out, code, timedOut, err := runCommand(ctx, 30*time.Second, "docker", "exec", environment.containerName, "mkdir", "-p", parent); err != nil || timedOut || code != 0 {
+			return terminalCommandError("artifact_upload_failed", "Could not create the verifier artifact directory.", "docker", []string{"exec", environment.containerName, "mkdir", "-p", parent}, code, out, timedOut)
+		}
+		if !info.IsDir() {
+			_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "exec", environment.containerName, "rm", "-rf", source)
+		}
+		copySource := hostPath
+		if info.IsDir() {
+			if out, code, timedOut, err := runCommand(ctx, 30*time.Second, "docker", "exec", environment.containerName, "mkdir", "-p", source); err != nil || timedOut || code != 0 {
+				return terminalCommandError("artifact_upload_failed", "Could not create the verifier artifact directory.", "docker", []string{"exec", environment.containerName, "mkdir", "-p", source}, code, out, timedOut)
+			}
+			copySource += string(os.PathSeparator) + "."
+		}
+		if out, code, timedOut, err := runCommand(ctx, 2*time.Minute, "docker", "cp", copySource, environment.containerName+":"+source); err != nil || timedOut || code != 0 {
+			return terminalCommandError("artifact_upload_failed", "Could not upload an artifact to the separate verifier environment.", "docker", []string{"cp", copySource, environment.containerName + ":" + source}, code, out, timedOut)
+		}
+	}
+	return nil
+}
+
+func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL, model string, cfg terminalConfig) (result terminalTaskResult) {
+	started := time.Now()
+	result = terminalTaskResult{instruction: task.ID, prompt: terminalSystemPrompt, turnsUnreported: cfg.oracle || cfg.agentCommand != ""}
+	defer func() {
+		if ctx.Err() != nil {
+			result.scored = false
+			result.errCode = "terminal_cancelled"
+			result.errText = "Terminal execution was cancelled."
+			result.wallTimeMs = time.Since(started).Milliseconds()
+		}
+	}()
+	if err := dockerPreflightContext(ctx); err != nil {
+		result.errCode = "docker_unavailable"
+		result.errText = err.Error()
 		return result
 	}
-	defer cleanupTerminalImage(cleanupImage, cfg.cleanupImages)
-	defer runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
+	environment, err := startTerminalTaskEnvironment(ctx, task, bundleDir, cfg)
+	if err != nil {
+		result.errCode, result.errText = cliErrorCodeText(err)
+		return result
+	}
+	defer environment.cleanup()
+	containerName := environment.containerName
 	if cfg.oracle {
 		transcript, err := runOracleSolution(ctx, task, bundleDir, containerName, cfg)
 		result.transcript = transcript
@@ -3097,7 +3559,36 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 			printStatus(cfg.args, "terminal_agent_timeout", map[string]any{"taskId": task.ID, "timeoutSec": terminalAgentTimeoutSec(cfg, task), "proceedingToVerifier": true})
 		}
 	}
-	pass, verifierOutput, err := runTerminalVerifier(ctx, task, bundleDir, containerName, cfg)
+	if task.Verifier.EnvironmentMode == "separate" {
+		if collectHookErr := runTerminalVerifierCollectHooks(ctx, task, environment); collectHookErr != nil {
+			result.errCode, result.errText = cliErrorCodeText(collectHookErr)
+			result.wallTimeMs = time.Since(started).Milliseconds()
+			return persistTerminalTaskErrorTrace(task, result, cfg)
+		}
+		artifactsRoot, collectErr := collectTerminalArtifacts(ctx, task, environment, cfg)
+		if collectErr != nil {
+			result.errCode, result.errText = cliErrorCodeText(collectErr)
+			result.wallTimeMs = time.Since(started).Milliseconds()
+			return persistTerminalTaskErrorTrace(task, result, cfg)
+		}
+		defer os.RemoveAll(artifactsRoot)
+		environment.cleanup()
+		verifierEnvironment, startErr := startTerminalVerifierEnvironment(ctx, task, bundleDir, cfg)
+		if startErr != nil {
+			result.errCode, result.errText = cliErrorCodeText(startErr)
+			result.wallTimeMs = time.Since(started).Milliseconds()
+			return persistTerminalTaskErrorTrace(task, result, cfg)
+		}
+		defer verifierEnvironment.cleanup()
+		if uploadErr := uploadTerminalArtifacts(ctx, task, verifierEnvironment, artifactsRoot); uploadErr != nil {
+			result.errCode, result.errText = cliErrorCodeText(uploadErr)
+			result.wallTimeMs = time.Since(started).Milliseconds()
+			return persistTerminalTaskErrorTrace(task, result, cfg)
+		}
+		environment = verifierEnvironment
+		containerName = verifierEnvironment.containerName
+	}
+	pass, verifierOutput, err := runTerminalVerifierWithMode(ctx, task, bundleDir, containerName, environment.skipTestsUpload, cfg)
 	result.pass = pass
 	result.verifierOutput = verifierOutput
 	result.scored = err == nil
@@ -3986,10 +4477,20 @@ func clearTerminalVerifierReward(ctx context.Context, containerName, rewardFile 
 // exit code is ignored once a reward was written. A verifier timeout or a
 // missing/unparseable reward file scores the task as failed.
 func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, containerName string, cfg terminalConfig) (bool, string, error) {
+	return runTerminalVerifierWithMode(ctx, task, bundleDir, containerName, false, cfg)
+}
+
+func runTerminalVerifierWithMode(ctx context.Context, task terminalTask, bundleDir, containerName string, skipTestsUpload bool, cfg terminalConfig) (bool, string, error) {
 	_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "mkdir", "-p", "/logs/verifier")
-	out, code, timedOut, err := runCommand(ctx, 120*time.Second, "docker", "cp", filepath.Join(bundleDir, "tests")+"/.", containerName+":/tests")
-	if err != nil || timedOut || code != 0 {
-		return false, out, terminalCommandError("verifier_failed", "Could not copy verifier tests into the task container.", "docker", []string{"cp", filepath.Join(bundleDir, "tests") + "/.", containerName + ":/tests"}, code, out, timedOut)
+	var out string
+	var code int
+	var timedOut bool
+	if !skipTestsUpload {
+		var err error
+		out, code, timedOut, err = runCommand(ctx, 120*time.Second, "docker", "cp", filepath.Join(bundleDir, "tests")+"/.", containerName+":/tests")
+		if err != nil || timedOut || code != 0 {
+			return false, out, terminalCommandError("verifier_failed", "Could not copy verifier tests into the task container.", "docker", []string{"cp", filepath.Join(bundleDir, "tests") + "/.", containerName + ":/tests"}, code, out, timedOut)
+		}
 	}
 	cmdArgs := []string{"exec"}
 	if task.Verifier.User != "" {
@@ -5241,6 +5742,9 @@ func shortHash(value string) string {
 	return hex.EncodeToString(sum[:])[:12]
 }
 func imageMode(img terminalImage) string {
+	if img.ComposeFile != "" {
+		return "docker-compose"
+	}
 	if img.Prebuilt != "" {
 		return "prebuilt"
 	}

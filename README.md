@@ -402,7 +402,7 @@ lmx eval run my-judge-suite \
   --submit
 ```
 
-### Publish a Terminal-Bench 2.1 style dataset
+### Publish a Harbor / Terminal-Bench dataset
 
 The recommended path is one command against raw Harbor/Terminal-Bench tasks:
 
@@ -430,6 +430,11 @@ bypasses server policy or admin approval.
 The lower-level `lmx eval terminal import` and
 `lmx eval terminal publish` commands remain available when the canonical bundle
 directory must be inspected or edited between steps.
+
+Imported Harbor tasks may use either one Dockerfile or a multi-service
+`docker-compose.yaml`. Compose service dependencies, GPU requests, artifact
+collection/exclusions, and `verifier.environment_mode = "separate"` are
+preserved through execution; separate verifiers receive only declared artifacts.
 
 ### Train from verified eval trajectories
 

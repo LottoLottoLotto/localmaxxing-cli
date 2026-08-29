@@ -827,7 +827,7 @@ lmx eval train rl prepare <imported-bundle-or-parent> \
 For example:
 
 ```bash
-lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version 2.1
+lmx eval terminal import ./terminal-bench-tasks --out ./tb-bundles --version=2.1
 lmx eval train rl prepare ./tb-bundles \
   --out ./rl-training \
   --base-model Qwen/Qwen3-Coder-30B-A3B-Instruct \
