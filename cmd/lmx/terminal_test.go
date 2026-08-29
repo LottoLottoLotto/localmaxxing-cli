@@ -937,7 +937,7 @@ func TestRunTerminalTaskHarborSemantics(t *testing.T) {
 		Instruction: "synthetic",
 		Image:       terminalImage{Prebuilt: "ubuntu:24.04"},
 		Agent:       terminalAgentConfig{TimeoutSec: 60},
-		Verifier:    terminalVerifierConfig{TimeoutSec: 60, Command: "bash /tests/test.sh", RewardFile: "/logs/verifier/reward.txt"},
+		Verifier:    terminalVerifierConfig{TimeoutSec: 60, Command: "bash /tests/test.sh", RewardFile: "/logs/verifier/reward.txt", User: "nobody"},
 		Environment: terminalEnvironmentConfig{CPUs: 1, MemoryMb: 512, Network: "public"},
 	}
 	cfg := terminalConfig{

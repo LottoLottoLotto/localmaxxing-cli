@@ -501,4 +501,7 @@ func TestNormalizeHardwarePayloadAcceptsLegacyGpuNameField(t *testing.T) {
 	if stringValue(asObject(slots[1])["gpuName"]) != "NVIDIA GeForce RTX 4090" {
 		t.Fatalf("slot 1 gpuName = %#v", asObject(slots[1]))
 	}
+	if asObject(slots[0])["count"] != 1 || asObject(slots[1])["count"] != 1 {
+		t.Fatalf("missing GPU slot counts were not defaulted: %#v", slots)
+	}
 }

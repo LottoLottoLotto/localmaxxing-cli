@@ -10587,6 +10587,9 @@ func normalizeHardwarePayload(value any) any {
 			if gpuName := firstNonEmpty(stringValue(slot["gpuName"]), stringValue(slot["name"]), stringValue(slot["gpuModel"]), stringValue(slot["gpu"])); gpuName != "" {
 				slot["gpuName"] = gpuName
 			}
+			if _, ok := slot["count"]; !ok {
+				slot["count"] = 1
+			}
 			delete(slot, "name")
 			delete(slot, "gpuModel")
 			delete(slot, "gpu")

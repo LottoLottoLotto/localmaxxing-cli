@@ -4481,7 +4481,7 @@ func runTerminalVerifier(ctx context.Context, task terminalTask, bundleDir, cont
 }
 
 func runTerminalVerifierWithMode(ctx context.Context, task terminalTask, bundleDir, containerName string, skipTestsUpload bool, cfg terminalConfig) (bool, string, error) {
-	_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "mkdir", "-p", "/logs/verifier")
+	_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "exec", containerName, "install", "-d", "-m", "1777", "/logs/verifier")
 	var out string
 	var code int
 	var timedOut bool
