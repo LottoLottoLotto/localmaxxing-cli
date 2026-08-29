@@ -18,7 +18,7 @@ lmx speed-test run ollama --mode remote --base-url http://server:11434 --served-
 
 Defaults: 1 untimed warmup and 3 timed iterations. The submitted summary reports the median, and per-iteration details appear in `samples` / `sampleStats`. Tune with `--warmup` and `--iterations`; `--warmup 0 --iterations 1` is a single shot.
 
-Remote decode throughput is measured over the inter-token window from first streamed token to last streamed token. `tokSPrefill` is estimated from the endpoint's `usage.prompt_tokens` divided by TTFT. When usage is unavailable, the CLI falls back to the declared or locally estimated prompt count and marks the source accordingly.
+Remote decode throughput is measured over the inter-token window from first streamed token to last streamed token. For OpenAI-compatible endpoints, each warmup and timed request receives a unique leading nonce so prefix caches cannot turn a cold-prefill measurement into a cache-hit measurement. `tokSPrefill` is estimated independently for each request from the endpoint's `usage.prompt_tokens` divided by TTFT. When usage is unavailable, the CLI falls back to the declared or locally estimated prompt count and marks the source accordingly.
 
 Important remote flags:
 

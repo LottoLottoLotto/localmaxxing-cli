@@ -413,8 +413,8 @@ func TestMeasureOpenAIEndpointMarksEstimatedPrefillAndStringEngineFlags(t *testi
 	if !ok {
 		t.Fatalf("engineFlags type = %T, want map[string]any", metrics["engineFlags"])
 	}
-	if engineFlags["stream"] != true || engineFlags["maxTokens"] != 16 || engineFlags["servedModel"] != "served-model" || engineFlags["concurrency"] != 1 {
-		t.Fatalf("engineFlags = %#v, want single-stream remote metadata", engineFlags)
+	if engineFlags["stream"] != true || engineFlags["maxTokens"] != 16 || engineFlags["servedModel"] != "served-model" || engineFlags["concurrency"] != 1 || engineFlags["prefixCacheBust"] != "leading_nonce_per_request" {
+		t.Fatalf("engineFlags = %#v, want single-stream remote metadata with per-request prefix cache busting", engineFlags)
 	}
 	if metrics["tokSPrefill"] == nil || metrics["ttftMs"] == nil {
 		t.Fatalf("expected tokSPrefill and ttftMs, got %#v", metrics)
@@ -464,8 +464,8 @@ func TestMeasureOpenAIEndpointReadsPromptFileAndTrustsUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("measureOpenAIEndpoint returned error: %v", err)
 	}
-	if receivedPrompt != prompt {
-		t.Fatalf("received prompt length = %d, want %d", len(receivedPrompt), len(prompt))
+	if !strings.HasSuffix(receivedPrompt, prompt) || !strings.HasPrefix(receivedPrompt, "[LocalMaxxing cache-bust nonce: ") {
+		t.Fatalf("received prompt does not contain a leading cache-bust nonce followed by the prompt")
 	}
 	if metrics["promptTokens"] != 8201.0 || asObject(metrics["tokenSources"])["prompt"] != "endpoint_usage" {
 		t.Fatalf("prompt accounting = %#v / %#v, want endpoint usage 8201", metrics["promptTokens"], metrics["tokenSources"])
@@ -477,6 +477,48 @@ func TestMeasureOpenAIEndpointReadsPromptFileAndTrustsUsage(t *testing.T) {
 	engineFlags := asObject(metrics["engineFlags"])
 	if engineFlags["promptSource"] != "file" || engineFlags["promptFile"] != promptPath {
 		t.Fatalf("prompt engine flags = %#v", engineFlags)
+	}
+}
+
+func TestRemoteBenchmarkPayloadKeepsObservedPromptTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[{"id":"served-model","quantization":"fp16"}]}`)
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
+			time.Sleep(time.Millisecond)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":" world"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":8201,"completion_tokens":2}}`)
+			fmt.Fprintln(w, `data: [DONE]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	payload, err := benchmarkPayloadFromFlags("vllm", cliArgs{
+		opts: map[string]string{
+			"mode":          "remote",
+			"base-url":      server.URL,
+			"served-model":  "served-model",
+			"hf-id":         "org/model",
+			"quantization":  "fp16",
+			"hardware":      writeBenchmarkHardwareForTest(t),
+			"prompt":        "context",
+			"prompt-tokens": "8192",
+			"max-tokens":    "16",
+			"warmup":        "0",
+			"iterations":    "1",
+		},
+		flags: map[string]bool{"quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	if payload["promptTokens"] != 8201.0 {
+		t.Fatalf("promptTokens = %v, want endpoint-observed 8201 instead of requested 8192", payload["promptTokens"])
 	}
 }
 
@@ -2403,11 +2445,18 @@ func TestDecodeThroughputPrefersInterTokenWindow(t *testing.T) {
 
 func TestMeasureOpenAIEndpointAggregatesIterations(t *testing.T) {
 	chatCalls := 0
+	receivedPrompts := map[string]bool{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
 			http.NotFound(w, r)
 			return
 		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		messages := anySlice(body["messages"])
+		receivedPrompts[stringValue(asObject(messages[0])["content"])] = true
 		chatCalls++
 		w.Header().Set("Content-Type", "text/event-stream")
 		time.Sleep(2 * time.Millisecond)
@@ -2423,6 +2472,14 @@ func TestMeasureOpenAIEndpointAggregatesIterations(t *testing.T) {
 	}
 	if chatCalls != 5 {
 		t.Fatalf("chatCalls = %d, want 2 warmup + 3 timed", chatCalls)
+	}
+	if len(receivedPrompts) != chatCalls {
+		t.Fatalf("unique prompts = %d, want a distinct leading nonce for all %d requests", len(receivedPrompts), chatCalls)
+	}
+	for prompt := range receivedPrompts {
+		if !strings.HasPrefix(prompt, "[LocalMaxxing cache-bust nonce: ") || !strings.HasSuffix(prompt, defaultRemoteSpeedTestPrompt) {
+			t.Fatalf("request prompt does not contain a leading cache-bust nonce followed by the benchmark prompt: %q", prompt)
+		}
 	}
 	samples, ok := metrics["samples"].([]map[string]any)
 	if !ok || len(samples) != 3 {

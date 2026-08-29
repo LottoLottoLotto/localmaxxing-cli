@@ -4967,7 +4967,10 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		Extra:           metrics,
 	}
 	payload := builder.ToMap()
-	setNumericFlagFields(payload, args, map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "prompt-tokens": "promptTokens", "output-tokens": "outputTokens", "num-prompts": "numPrompts"})
+	setNumericFlagFields(payload, args, map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "output-tokens": "outputTokens", "num-prompts": "numPrompts"})
+	if numberField(payload, "promptTokens") == 0 {
+		setNumericFlagFields(payload, args, map[string]string{"prompt-tokens": "promptTokens"})
+	}
 	if raw := opt(args, "gpu-power-watts"); raw != "" {
 		watts, err := parseGpuPowerWatts(raw)
 		if err != nil {
@@ -6096,16 +6099,16 @@ func timedChatCompletion(args cliArgs, baseURL string, body map[string]any, time
 	return probe, nil
 }
 
-func timedChatCompletionBatch(args cliArgs, baseURL string, body map[string]any, timeout time.Duration, errorCode string, concurrency int) ([]chatProbe, error) {
-	probes := make([]chatProbe, concurrency)
-	errs := make([]error, concurrency)
+func timedChatCompletionBatch(args cliArgs, baseURL string, bodies []map[string]any, timeout time.Duration, errorCode string) ([]chatProbe, error) {
+	probes := make([]chatProbe, len(bodies))
+	errs := make([]error, len(bodies))
 	var wg sync.WaitGroup
-	wg.Add(concurrency)
-	for i := range concurrency {
-		go func(index int) {
+	wg.Add(len(bodies))
+	for i, body := range bodies {
+		go func(index int, requestBody map[string]any) {
 			defer wg.Done()
-			probes[index], errs[index] = timedChatCompletion(args, baseURL, body, timeout, errorCode)
-		}(i)
+			probes[index], errs[index] = timedChatCompletion(args, baseURL, requestBody, timeout, errorCode)
+		}(i, body)
 	}
 	wg.Wait()
 	for _, err := range errs {
@@ -6194,6 +6197,16 @@ func promptTokenCountOption(args cliArgs) (int, error) {
 // fallback for endpoints that omit usage, and are checked against usage when
 // both are available.
 
+func cacheBustedRemoteSpeedTestBody(base map[string]any, prompt string) (map[string]any, string) {
+	requestPrompt := "[LocalMaxxing cache-bust nonce: " + randomHex(16) + "]\n" + prompt
+	body := make(map[string]any, len(base))
+	for key, value := range base {
+		body[key] = value
+	}
+	body["messages"] = []any{map[string]any{"role": "user", "content": requestPrompt}}
+	return body, requestPrompt
+}
+
 func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	baseURL, err := requireOpt(args, "base-url")
 	if err != nil {
@@ -6272,13 +6285,13 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		return nil, err
 	}
 	revision := firstNonEmpty(opt(args, "model-revision"), "main")
-	for i := 0; i < warmup; i++ {
+	for i := range warmup {
 		printStatus(args, "endpoint_warmup_request", map[string]any{"index": i + 1, "warmup": warmup})
-		if _, err := timedChatCompletion(args, baseURL, body, timeout, "endpoint_benchmark_failed"); err != nil {
+		warmupBody, _ := cacheBustedRemoteSpeedTestBody(body, prompt)
+		if _, err := timedChatCompletion(args, baseURL, warmupBody, timeout, "endpoint_benchmark_failed"); err != nil {
 			return nil, err
 		}
 	}
-	promptTokens := 0
 	promptTokenSource := ""
 	outputTokenSource := ""
 	outputText := ""
@@ -6288,10 +6301,17 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	tokSOutValues := []float64{}
 	tokSTotalValues := []float64{}
 	tokSPrefillValues := []float64{}
+	promptTokenValues := []float64{}
 	outputTokenValues := []float64{}
 	warnings := []string{}
+	promptTokenAdjustmentWarned := false
 	for i := range iterations {
-		probes, err := timedChatCompletionBatch(args, baseURL, body, timeout, "endpoint_benchmark_failed", concurrency)
+		requestBodies := make([]map[string]any, concurrency)
+		requestPrompts := make([]string, concurrency)
+		for requestIndex := range concurrency {
+			requestBodies[requestIndex], requestPrompts[requestIndex] = cacheBustedRemoteSpeedTestBody(body, prompt)
+		}
+		probes, err := timedChatCompletionBatch(args, baseURL, requestBodies, timeout, "endpoint_benchmark_failed")
 		if err != nil {
 			return nil, err
 		}
@@ -6299,6 +6319,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		groupCompleted := probes[0].completedAt
 		groupFirstToken := time.Time{}
 		groupOutputTokens := 0
+		groupPromptTokens := 0
 		for requestIndex, probe := range probes {
 			if probe.started.Before(groupStarted) {
 				groupStarted = probe.started
@@ -6309,19 +6330,22 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 			if !probe.firstTokenAt.IsZero() && (groupFirstToken.IsZero() || probe.firstTokenAt.Before(groupFirstToken)) {
 				groupFirstToken = probe.firstTokenAt
 			}
-			if promptTokens == 0 {
-				usagePromptTokens := usageToken(probe.usage, "prompt_tokens")
-				result, err := tokenCount(args, hfID, revision, prompt, usagePromptTokens, "prompt")
-				if err != nil {
-					return nil, err
-				}
-				promptTokens = result.Count
-				promptTokenSource = result.Source
-				if declaredPromptTokens > 0 && usagePromptTokens > 0 && declaredPromptTokens != usagePromptTokens {
-					warning := fmt.Sprintf("Endpoint usage reported %d prompt tokens; using it instead of --prompt-tokens %d.", usagePromptTokens, declaredPromptTokens)
-					warnings = append(warnings, warning)
-					printStatus(args, "prompt_token_count_adjusted", map[string]any{"declared": declaredPromptTokens, "observed": usagePromptTokens, "source": "endpoint_usage"})
-				}
+			usagePromptTokens := usageToken(probe.usage, "prompt_tokens")
+			promptResult, err := tokenCount(args, hfID, revision, requestPrompts[requestIndex], usagePromptTokens, "prompt")
+			if err != nil {
+				return nil, err
+			}
+			samplePromptTokens := promptResult.Count
+			groupPromptTokens += samplePromptTokens
+			promptTokenValues = append(promptTokenValues, float64(samplePromptTokens))
+			if promptTokenSource == "" {
+				promptTokenSource = promptResult.Source
+			}
+			if !promptTokenAdjustmentWarned && declaredPromptTokens > 0 && usagePromptTokens > 0 && declaredPromptTokens != usagePromptTokens {
+				warning := fmt.Sprintf("Endpoint usage reported %d prompt tokens; using it instead of --prompt-tokens %d.", usagePromptTokens, declaredPromptTokens)
+				warnings = append(warnings, warning)
+				promptTokenAdjustmentWarned = true
+				printStatus(args, "prompt_token_count_adjusted", map[string]any{"declared": declaredPromptTokens, "observed": usagePromptTokens, "source": "endpoint_usage"})
 			}
 			outputResult, err := tokenCount(args, hfID, revision, probe.outputText, firstNonZero(usageToken(probe.usage, "completion_tokens"), usageToken(probe.usage, "output_tokens")), "output")
 			if err != nil {
@@ -6331,7 +6355,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 			groupOutputTokens += outputTokens
 			outputTokenSource = outputResult.Source
 			outputText = probe.outputText
-			sample := map[string]any{"iteration": i + 1, "request": requestIndex + 1, "outputTokens": float64(outputTokens)}
+			sample := map[string]any{"iteration": i + 1, "request": requestIndex + 1, "promptTokens": float64(samplePromptTokens), "outputTokens": float64(outputTokens)}
 			outputTokenValues = append(outputTokenValues, float64(outputTokens))
 			if value, source, ok := decodeThroughput(probe, outputTokens); ok {
 				sample["tokSOut"] = value
@@ -6344,8 +6368,8 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 				ttftMs := durationMS(probe.firstTokenAt.Sub(probe.started))
 				sample["ttftMs"] = roundMetric(ttftMs)
 				ttftValues = append(ttftValues, ttftMs)
-				if ttftMs > 0 && promptTokens > 0 {
-					value := round1(float64(promptTokens) / (ttftMs / 1000))
+				if ttftMs > 0 && samplePromptTokens > 0 {
+					value := round1(float64(samplePromptTokens) / (ttftMs / 1000))
 					sample["tokSPrefill"] = value
 					tokSPrefillValues = append(tokSPrefillValues, value)
 				}
@@ -6354,7 +6378,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		}
 		groupMs := durationMS(groupCompleted.Sub(groupStarted))
 		if groupMs > 0 {
-			tokSTotalValues = append(tokSTotalValues, round1(float64((promptTokens*concurrency)+groupOutputTokens)/(groupMs/1000)))
+			tokSTotalValues = append(tokSTotalValues, round1(float64(groupPromptTokens+groupOutputTokens)/(groupMs/1000)))
 		}
 		if concurrency > 1 {
 			decodeStarted := groupFirstToken
@@ -6372,12 +6396,13 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		}
 		printStatus(args, "endpoint_iteration_complete", iterationStatus)
 	}
+	promptTokens := medianOf(promptTokenValues)
 	printStatus(args, "token_count_source", map[string]any{"prompt": promptTokenSource, "output": outputTokenSource, "promptTokens": promptTokens})
 	metrics := map[string]any{
 		"prompt":       prompt,
 		"outputText":   outputText,
-		"promptTokens": float64(promptTokens),
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": concurrency, "promptSource": promptSource, "promptFile": opt(args, "prompt-file")},
+		"promptTokens": promptTokens,
+		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": concurrency, "promptSource": promptSource, "promptFile": opt(args, "prompt-file"), "prefixCacheBust": "leading_nonce_per_request"},
 		"tokenSources": map[string]any{"prompt": promptTokenSource, "output": outputTokenSource},
 		"timingSource": "client_observed_http",
 		"metricSource": "remote_endpoint",
