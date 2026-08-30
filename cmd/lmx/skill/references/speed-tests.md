@@ -25,6 +25,7 @@ Important remote flags:
 - `--base-url <url>`: model server base URL; accepts host or host plus `/v1`.
 - `--served-model <name>`: model name served by the endpoint.
 - `--model-api-key <key>`: bearer token for the model endpoint.
+- `--backend <name>`: accelerator backend recorded for the run, such as `cuda`, `rocm`, or `tt-metal`. Remote runs do not assume CUDA when omitted.
 - `--prompt <text>` / `--prompt-file <path>`: semantic prompt sent to the endpoint; use `--prompt-file -` for stdin. These inputs are mutually exclusive.
 - `--prompt-tokens <n>`: target prompt size when prompt text is omitted; the CLI synthesizes deterministic text of approximately that many tokens. Endpoint usage remains authoritative and a mismatch is recorded in `warnings`.
 - `--max-tokens <n>`: max generated tokens; remote speed-test default is 256.

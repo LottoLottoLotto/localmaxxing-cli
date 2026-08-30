@@ -9,6 +9,14 @@ lmx hardware --out hardware.json
 lmx hardware init --out hardware.json
 ```
 
+On hosts with both a GPU and a Tenstorrent card, select the Tenstorrent detector explicitly:
+
+```bash
+lmx hardware --backend tt-metal --out hardware.json
+```
+
+The Tenstorrent detector reads `tt-smi -s`; P150 and P150a board identifiers are normalized to `Tenstorrent P150` with 32 GB per card.
+
 Validate a hardware file against the live LocalMaxxing hardware schema and allowlist:
 
 ```bash

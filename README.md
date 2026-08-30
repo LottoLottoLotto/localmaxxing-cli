@@ -212,6 +212,8 @@ lmx speed-test run vllm \
 
 For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server. If a remote run already has metrics but lacks hardware, attach it without rerunning: `lmx speed-test add-hardware runs/Model/run.json --hardware hardware.json`.
 
+Use `--backend tt-metal` for Tenstorrent endpoints. Remote runs no longer assume CUDA when the backend is omitted.
+
 Remote endpoint runs issue one untimed warmup request and three timed iterations by default, reporting the median of each metric plus per-iteration `samples` and `sampleStats` (min/p50/mean/max/stddev). Tune with `--warmup <n>` and `--iterations <n>`; `--warmup 0 --iterations 1` restores single-shot measurement. Decode throughput is measured over the inter-token window (first to last streamed token) when more than one token arrives.
 
 Record speculative decoding with normalized fields so runs remain comparable across engines:

@@ -196,6 +196,39 @@ func TestApplyNvidiaSMIHardwareParsesMultipleGPUs(t *testing.T) {
 	}
 }
 
+func TestApplyTenstorrentSMIHardwareParsesP150(t *testing.T) {
+	hardware := map[string]any{"hwClass": "CPU_ONLY"}
+	output := `{"device_info":[{"board_info":{"board_type":"p150a"}},{"board_info":{"board_type":"p150"}}]}`
+
+	if !applyTenstorrentSMIHardware(hardware, output) {
+		t.Fatal("applyTenstorrentSMIHardware did not detect P150 devices")
+	}
+	if hardware["hwClass"] != "DISCRETE_GPU" {
+		t.Fatalf("hwClass = %v, want DISCRETE_GPU", hardware["hwClass"])
+	}
+	if hardware["gpuName"] != "Tenstorrent P150" {
+		t.Fatalf("gpuName = %v, want Tenstorrent P150", hardware["gpuName"])
+	}
+	if hardware["gpuCount"] != 2 {
+		t.Fatalf("gpuCount = %v, want 2", hardware["gpuCount"])
+	}
+	if hardware["vramGb"] != 32.0 || hardware["totalVramGb"] != 64.0 {
+		t.Fatalf("memory fields = per-device %#v total %#v", hardware["vramGb"], hardware["totalVramGb"])
+	}
+}
+
+func TestBackendFromTenstorrentHardware(t *testing.T) {
+	hardware := map[string]any{
+		"hwClass":  "DISCRETE_GPU",
+		"gpuName":  "Tenstorrent P150",
+		"gpuCount": 1,
+		"vramGb":   32.0,
+	}
+	if got := backendFromHardware(hardware); got != "tt-metal" {
+		t.Fatalf("backendFromHardware = %q, want tt-metal", got)
+	}
+}
+
 func TestBenchmarkSubmitNormalizesGeneratedHardware(t *testing.T) {
 	payload := map[string]any{
 		"hfId":         "nvidia/Gemma-4-31B-IT-NVFP4",
@@ -1064,6 +1097,26 @@ func TestBenchmarkRemoteDryRunDoesNotUseClientHardware(t *testing.T) {
 	}
 	if payload["hardwareSource"] != "missing_remote" {
 		t.Fatalf("hardwareSource = %v, want missing_remote", payload["hardwareSource"])
+	}
+}
+
+func TestBenchmarkRemoteDryRunAcceptsExplicitTenstorrentBackend(t *testing.T) {
+	payload, err := benchmarkPayloadFromFlags("vllm", cliArgs{
+		opts: map[string]string{
+			"mode":         "remote",
+			"base-url":     "http://127.0.0.1:8000",
+			"hf-id":        "tiiuae/Falcon3-7B-Instruct",
+			"served-model": "tiiuae/Falcon3-7B-Instruct",
+			"quantization": "bfp_bf8",
+			"backend":      "tt-metal",
+		},
+		flags: map[string]bool{"dry-run": true, "quiet": true},
+	})
+	if err != nil {
+		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+	}
+	if payload["backend"] != "tt-metal" {
+		t.Fatalf("backend = %#v, want tt-metal", payload["backend"])
 	}
 }
 

@@ -1233,7 +1233,7 @@ func handleHardware(action string, args cliArgs) error {
 	if action == "validate" {
 		return validateHardwareFile(positional(args, 2), args)
 	}
-	hardware := detectHardware()
+	hardware := detectHardware(args)
 	if action == "init" && opt(args, "out") == "" {
 		args.opts["out"] = "hardware.json"
 	}
@@ -1845,17 +1845,26 @@ func runLongCommand(commandSnippet string) error {
 	return nil
 }
 
-func detectHardware() map[string]any {
+func detectHardware(args cliArgs) map[string]any {
 	base := map[string]any{"hwClass": "CPU_ONLY", "cpu": detectCPU(), "os": runtime.GOOS, "cpuThreads": runtime.NumCPU()}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		base["hwClass"] = "UNIFIED"
 		base["chipVendor"] = "Apple"
 		applyAppleHardware(base)
 	}
+	preferTenstorrent := strings.EqualFold(opt(args, "backend"), "tt-metal")
+	if preferTenstorrent {
+		if out, err := exec.Command("tt-smi", "-s").Output(); err == nil {
+			applyTenstorrentSMIHardware(base, string(out))
+		}
+		return base
+	}
 	if out, err := exec.Command("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits").Output(); err == nil {
 		applyNvidiaSMIHardware(base, string(out))
 	} else if out, err := exec.Command("rocm-smi", "--showproductname", "--showmeminfo", "vram", "--csv").Output(); err == nil {
 		applyRocmSMIHardware(base, string(out))
+	} else if out, err := exec.Command("tt-smi", "-s").Output(); err == nil {
+		applyTenstorrentSMIHardware(base, string(out))
 	}
 	return base
 }
@@ -1976,6 +1985,35 @@ func applyRocmSMIHardware(base map[string]any, output string) {
 		base["vramGb"] = round1(vramGb)
 	}
 	base["gpuCount"] = 1
+}
+
+func applyTenstorrentSMIHardware(base map[string]any, output string) bool {
+	var telemetry struct {
+		DeviceInfo []struct {
+			BoardInfo struct {
+				BoardType string `json:"board_type"`
+			} `json:"board_info"`
+		} `json:"device_info"`
+	}
+	if err := json.Unmarshal([]byte(output), &telemetry); err != nil {
+		return false
+	}
+	count := 0
+	for _, device := range telemetry.DeviceInfo {
+		switch strings.ToLower(strings.TrimSpace(device.BoardInfo.BoardType)) {
+		case "p150", "p150a":
+			count++
+		}
+	}
+	if count == 0 {
+		return false
+	}
+	base["hwClass"] = "DISCRETE_GPU"
+	base["gpuName"] = "Tenstorrent P150"
+	base["gpuCount"] = count
+	base["vramGb"] = 32.0
+	base["totalVramGb"] = 32.0 * float64(count)
+	return true
 }
 
 func round1(n float64) float64 { return math.Round(n*10) / 10 }
@@ -4875,8 +4913,9 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	if err != nil {
 		return nil, err
 	}
+	mode := benchmarkMode(args)
 	backend := opt(args, "backend")
-	if backend == "" {
+	if backend == "" && mode != "remote" {
 		backend = engineBackendDefault(engineName)
 	}
 	quantization := opt(args, "quantization")
@@ -4885,7 +4924,6 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	}
 
 	metrics := map[string]any{}
-	mode := benchmarkMode(args)
 	printStatus(args, "speed_test_mode_selected", map[string]any{"mode": mode, "engine": engineName, "model": model})
 	if mode == "remote" && opt(args, "command") != "" {
 		return nil, cliError{"invalid_benchmark_mode", "Remote speed-test mode cannot run local commands.", []string{"Use --mode local when running llama-bench on the host server.", "Use --mode remote --base-url <url> for OpenAI-compatible endpoint TPS measurement."}, nil}
@@ -4952,6 +4990,9 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	hardware, hardwareSource, err := benchmarkHardware(mode, args)
 	if err != nil {
 		return nil, err
+	}
+	if backend == "" && mode == "remote" {
+		backend = backendFromHardware(hardware)
 	}
 
 	builder := benchmarkPayload{
@@ -5030,7 +5071,26 @@ func benchmarkHardware(mode string, args cliArgs) (any, string, error) {
 	if mode == "remote" {
 		return nil, "missing_remote", nil
 	}
-	return detectHardware(), "detected_local", nil
+	return detectHardware(args), "detected_local", nil
+}
+
+func backendFromHardware(value any) string {
+	hardware := asObject(value)
+	if hardware == nil {
+		return ""
+	}
+	names := []string{stringValue(hardware["gpuName"])}
+	for _, slot := range anySlice(hardware["gpus"]) {
+		gpu := asObject(slot)
+		names = append(names, firstNonEmpty(stringValue(gpu["gpuName"]), stringValue(gpu["name"])))
+	}
+	for _, name := range names {
+		normalized := strings.ToLower(name)
+		if strings.Contains(normalized, "tenstorrent") || strings.Contains(normalized, "p150") {
+			return "tt-metal"
+		}
+	}
+	return ""
 }
 
 func validateBenchmarkSubmitPayload(payload map[string]any) error {
@@ -11742,7 +11802,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --profile <name>         Load saved defaults from lmx profile save
   --model <hfId>           HuggingFace model ID
   --hf-id <hfId>           Canonical HuggingFace model ID for deferred terminal submit
-  --backend <name>         lm-eval backend name for eval lm-eval (default: hf)
+  --backend <name>         Speed-test accelerator backend (e.g. cuda, rocm, tt-metal); lm-eval backend for eval lm-eval
   --num-fewshot <n>        lm-eval --num_fewshot override
   --lm-eval-bin <path>     lm-eval executable (default: lm_eval)
   --questions <n>          Eval-shard questions to run (default: 95%/±5% CI recommendation)
