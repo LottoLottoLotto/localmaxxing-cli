@@ -513,11 +513,11 @@ func TestMeasureOpenAIEndpointReadsPromptFileAndTrustsUsage(t *testing.T) {
 	}
 }
 
-func TestRemoteBenchmarkPayloadKeepsObservedPromptTokens(t *testing.T) {
+func TestRemoteBenchmarkPayloadSubmitsObservedRunShape(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/models":
-			fmt.Fprint(w, `{"data":[{"id":"served-model","quantization":"fp16"}]}`)
+			fmt.Fprint(w, `{"data":[{"id":"served-model","quantization":"fp16","max_model_len":32768}]}`)
 		case "/v1/chat/completions":
 			w.Header().Set("Content-Type", "text/event-stream")
 			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
@@ -550,8 +550,24 @@ func TestRemoteBenchmarkPayloadKeepsObservedPromptTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
 	}
-	if payload["promptTokens"] != 8201.0 {
-		t.Fatalf("promptTokens = %v, want endpoint-observed 8201 instead of requested 8192", payload["promptTokens"])
+	submit := toBenchmarkSubmit(payload)
+	for field, want := range map[string]float64{
+		"promptTokens":  8201,
+		"outputTokens":  2,
+		"contextLength": 32768,
+		"batchSize":     1,
+	} {
+		if submit[field] != want {
+			t.Fatalf("%s = %v, want %v in API submission", field, submit[field], want)
+		}
+	}
+}
+
+func TestNormalizeEngineNameRecognizesZMLLLMDAliases(t *testing.T) {
+	for _, alias := range []string{"llmd", "ZML", "zml/llmd", "ZML LLMD"} {
+		if got := normalizeEngineName(alias); got != "llmd" {
+			t.Fatalf("normalizeEngineName(%q) = %q, want llmd", alias, got)
+		}
 	}
 }
 

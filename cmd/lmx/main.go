@@ -6467,6 +6467,10 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		"timingSource": "client_observed_http",
 		"metricSource": "remote_endpoint",
 		"ttftSource":   "unavailable_no_stream",
+		"batchSize":    float64(concurrency),
+	}
+	if contextLength := firstJSONNumber(servedModelInfo, "max_model_len", "maxModelLen", "context_length", "contextLength", "context_window", "contextWindow", "num_ctx", "numCtx"); contextLength > 0 {
+		metrics["contextLength"] = contextLength
 	}
 	if len(warnings) > 0 {
 		metrics["warnings"] = warnings
@@ -6618,6 +6622,7 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 		"timingSource": "ollama_native_api",
 		"metricSource": "remote_endpoint",
 		"ttftSource":   "unavailable_ollama_nonstreaming",
+		"batchSize":    float64(1),
 	}
 	if len(promptTokenValues) > 0 {
 		metrics["promptTokens"] = medianOf(promptTokenValues)
@@ -7593,6 +7598,8 @@ func normalizeEngineName(value string) string {
 		return "vllm"
 	case "sglang", "sgl", "sglang-bench":
 		return "sglang"
+	case "llmd", "zml", "zml/llmd", "zml llmd":
+		return "llmd"
 	case "":
 		return ""
 	default:
