@@ -1242,6 +1242,21 @@ func TestLlamaBenchmarkCommandSupportsCommonBenchFlags(t *testing.T) {
 	}
 }
 
+func TestLlamaBenchmarkCommandOutputLenAliasesOutputTokens(t *testing.T) {
+	command := localBenchmarkCommand("llama.cpp", cliArgs{
+		opts: map[string]string{"model-path": "/models/qwen.gguf", "output-len": "512"},
+	})
+	if !strings.Contains(command, "-n 512") {
+		t.Fatalf("benchmark command = %q, expected --output-len to drive -n", command)
+	}
+	command = localBenchmarkCommand("llama.cpp", cliArgs{
+		opts: map[string]string{"model-path": "/models/qwen.gguf", "output-tokens": "64", "output-len": "512"},
+	})
+	if !strings.Contains(command, "-n 64") {
+		t.Fatalf("benchmark command = %q, expected --output-tokens to win over --output-len", command)
+	}
+}
+
 func TestLlamaBenchmarkCommandSupportsNoFlashAttention(t *testing.T) {
 	command := localBenchmarkCommand("llama.cpp", cliArgs{
 		opts:  map[string]string{"model-path": "/models/qwen.gguf"},

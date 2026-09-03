@@ -2792,6 +2792,10 @@ func fetchTerminalManifestItems(ctx context.Context, args cliArgs, dataset strin
 		if ctx.Err() != nil {
 			return nil, -1, terminalCancelledError(ctx)
 		}
+		var apiErr cliError
+		if errors.As(err, &apiErr) && apiErr.Code == "cli_upgrade_required" {
+			return nil, -1, apiErr
+		}
 		return nil, -1, cliError{"manifest_fetch_failed", fmt.Sprintf("Could not fetch terminal dataset manifest: %v", err), []string{"Check the dataset slug and API URL.", "Confirm the dataset is approved and eval storage is configured."}, map[string]any{"url": metaURL, "error": err.Error()}}
 	}
 	if ctx.Err() != nil {

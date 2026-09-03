@@ -28,7 +28,8 @@ Important remote flags:
 - `--backend <name>`: accelerator backend recorded for the run, such as `cuda`, `rocm`, or `tt-metal`. Remote runs do not assume CUDA when omitted.
 - `--prompt <text>` / `--prompt-file <path>`: semantic prompt sent to the endpoint; use `--prompt-file -` for stdin. These inputs are mutually exclusive.
 - `--prompt-tokens <n>`: target prompt size when prompt text is omitted; the CLI synthesizes deterministic text of approximately that many tokens. Endpoint usage remains authoritative and a mismatch is recorded in `warnings`.
-- `--max-tokens <n>`: max generated tokens; remote speed-test default is 256.
+- `--kv-cache-tokens <n>`: tokens already held in KV cache before the test. Omit for a fresh request; the CLI submits `0`. `--prefill-tokens` and `--depth` remain aliases.
+- `--max-tokens <n>`: `max_tokens` sent to the endpoint; remote speed-test default is 256. Larger values give a steadier `tokSOut` at the cost of a longer run; `--output-tokens` is not used on the remote path.
 - `--temperature <f>`: sampling temperature; default is 0.
 - `--no-stream`: disable streaming.
 - `--endpoint-timeout-seconds <n>`: remote endpoint timeout; default is 600.
@@ -44,14 +45,16 @@ Optional cost/power metadata for submissions:
 Use local mode when running `llama-bench` on the host that owns the model/hardware. With `--model-path`, `lmx` generates:
 
 ```bash
-llama-bench -m <model-path> -p <prompt-tokens|512> -n <output-tokens|128> [-d <prefill-tokens>]
+llama-bench -m <model-path> -p <prompt-tokens|512> -n <output-tokens|128> [-d <kv-cache-tokens>]
 ```
 
 Useful flags:
 
 - `--threads <n>`
 - `--gpu-layers <n>`
-- `--depth <n>` / `--prefill-tokens <n>`: llama-bench `-d`; submitted as `prefillTokens`
+- `--prompt-tokens <n>`: llama-bench `-p`; default 512
+- `--output-tokens <n>` (alias `--output-len`): llama-bench `-n`, the number of generated tokens the decode rate is measured over; default 128. Raise it (e.g. 512) when short runs are noisy or dominated by warm-up.
+- `--kv-cache-tokens <n>` / `--prefill-tokens <n>` / `--depth <n>`: llama-bench `-d`; submitted as `prefillTokens`
 - `--batch-size <n>`
 - `--micro-batch-size <n>`
 - `--repetitions <n>`
@@ -60,14 +63,24 @@ Useful flags:
 - `--benchmark-format <fmt>`
 
 `promptTokens` is the fresh prompt size (`-p`/`n_prompt`). `prefillTokens` is
-the cached depth present before generation (`-d`/`n_depth`); the CLI keeps these
-fields separate in saved and submitted speed-test payloads.
+the cached depth present before generation (`-d`/`n_depth`), supplied most
+clearly as `--kv-cache-tokens`. The CLI submits `0` when a fresh run omits it.
 
 Use `--command "..."` for custom local engines or exact commands.
 
 ## Local vLLM and SGLang generated benches
 
-For local vLLM/SGLang speed tests, `lmx` can generate `bench` commands. Control request shapes with `--input-len`, `--output-len`, and `--num-prompts`. Set `--bench-kind serve`, `--bench-kind throughput`, or `--bench-kind latency` depending on the engine and speed-test path.
+For local vLLM/SGLang speed tests, `lmx` can generate `bench` commands. Control request shapes with `--input-len` (prompt tokens), `--output-len` / `--output-tokens` (generated tokens per request; default 128, passed as `--random-output-len`), and `--num-prompts`. Set `--bench-kind serve`, `--bench-kind throughput`, or `--bench-kind latency` depending on the engine and speed-test path.
+
+## Output-token flag summary
+
+| Path | Flag | Default | Effect |
+|---|---|---|---|
+| Remote endpoint (`--base-url`) | `--max-tokens` | 256 | `max_tokens` in the chat-completions request |
+| Local llama.cpp (`--model-path`) | `--output-tokens` / `--output-len` | 128 | `llama-bench -n` |
+| Local vLLM / SGLang bench | `--output-len` / `--output-tokens` | 128 | `--random-output-len` per request |
+| KV-cache / context sweeps (`--levels`) | `--output-tokens` / `--output-len` / `--max-tokens` (first set wins) | 128 | Completion cap at every sweep level |
+| Manual submit (`--tok-s-out …`) | `--output-len` / `--output-tokens` | — | Recorded as `outputLen` / `outputTokens` metadata only |
 
 ## Saved runs and profiles
 

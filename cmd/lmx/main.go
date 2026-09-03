@@ -553,6 +553,7 @@ func fetchJSONContext(ctx context.Context, method, rawURL, key string, body any)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set("X-Lmx-Version", version)
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
@@ -581,8 +582,14 @@ func fetchJSONContext(ctx context.Context, method, rawURL, key string, body any)
 			hints = append(hints, "The suite or run shape is valid JSON but incompatible with the API rules.")
 		case 429:
 			hints = append(hints, "Wait for the rate-limit window before submitting again.")
+		case http.StatusUpgradeRequired:
+			hints = append(hints, "This dataset requires a newer lmx. Run `lmx update` (or rebuild from source) and retry.")
 		}
-		return nil, cliError{"api_error", fmt.Sprintf("%d %s: %s", res.StatusCode, res.Status, apiMessage(parsed, string(text))), hints, parsed}
+		code := "api_error"
+		if res.StatusCode == http.StatusUpgradeRequired {
+			code = "cli_upgrade_required"
+		}
+		return nil, cliError{code, fmt.Sprintf("%d %s: %s", res.StatusCode, res.Status, apiMessage(parsed, string(text))), hints, parsed}
 	}
 	return parsed, nil
 }
@@ -5623,7 +5630,7 @@ func localBenchmarkCommand(engineName string, args cliArgs) string {
 	if value := firstNonEmpty(opt(args, "prompt-tokens"), "512"); value != "" {
 		cmd = append(cmd, "-p", shellQuote(value))
 	}
-	if value := firstNonEmpty(opt(args, "output-tokens"), "128"); value != "" {
+	if value := firstNonEmpty(opt(args, "output-tokens"), opt(args, "output-len"), "128"); value != "" {
 		cmd = append(cmd, "-n", shellQuote(value))
 	}
 	if value := opt(args, "threads"); value != "" {
@@ -11894,6 +11901,8 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --k <n>                   k for pass@k over --n-samples (default: 1)
   --few-shot <n>            Few-shot examples for MBPP-family code evals (default: 3 for mbpp*, 0 otherwise)
   --prompt-tokens <n>       Remote target prompt size when prompt text is omitted; endpoint usage wins if counts differ. Local llama-bench: -p
+  --output-tokens <n>       Generated tokens for local speed tests: llama-bench -n (default: 128); KV sweeps use it as the per-level completion cap. Alias: --output-len
+  --max-tokens <n>          Remote endpoint max_tokens for speed tests (default: 256)
   --kv-cache-tokens <n>     Tokens already held in KV cache before the test; defaults to 0 for a fresh run
   --prefill-tokens <n>      Alias for --kv-cache-tokens; llama-bench -d cached depth
   --depth <n>               Alias for --kv-cache-tokens; KV sweeps use --levels
@@ -11910,7 +11919,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --benchmark-bin <path>   Benchmark executable (default: vllm for vLLM)
   --python-bin <path>      Python executable for SGLang commands
   --input-len <n>          Prompt/input tokens for built-in speed-test commands
-  --output-len <n>         Generated/output tokens for built-in speed-test commands
+  --output-len <n>         Generated/output tokens for built-in vLLM/SGLang bench commands (default: 128); alias of --output-tokens
   --levels <list>          KV-cache/context sweep levels, e.g. 10000,20000,30000
   --command-template <cmd> Local sweep command template using {input} and {output}
   --probe-prompt <text>    Final remote prompt after loading retained context
