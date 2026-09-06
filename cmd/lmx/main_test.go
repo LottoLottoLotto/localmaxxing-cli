@@ -829,6 +829,29 @@ func TestResolveEvalModelIDSuppressesCandidateNoiseForExactExplicitSourceRepo(t 
 	}
 }
 
+func TestResolveEvalModelIDPreservesMatchingEndpointWithoutFileMetadata(t *testing.T) {
+	const declared = "Qwen/Qwen3.5-9B"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			fmt.Fprint(w, `{"data":[{"id":"`+declared+`"}]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	resolved, _, err := resolveEvalModelID(cliArgs{
+		opts:  map[string]string{"base-url": server.URL, "api-url": server.URL},
+		flags: map[string]bool{"quiet": true},
+	}, declared)
+	if err != nil {
+		t.Fatalf("resolveEvalModelID returned error: %v", err)
+	}
+	if resolved != declared {
+		t.Fatalf("resolved hfId = %q, want explicit repository %q", resolved, declared)
+	}
+}
+
 func TestResolveEvalModelIDPreservesExplicitRepoAgainstFuzzyCandidate(t *testing.T) {
 	const declared = "google/gemma-4-26B-A4B-it"
 	const candidate = "Jiunsong/supergemma4-26b-uncensored-gguf-v2"

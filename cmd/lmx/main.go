@@ -6814,6 +6814,9 @@ func resolveEvalModelID(args cliArgs, declared string) (string, map[string]any, 
 						map[string]any{"declared": declared, "detected": sourceRepo, "servedModel": servedModel, "loadedFilename": stringValue(resolution["loadedFilename"])},
 					}
 				}
+				if resolution == nil {
+					resolution = make(map[string]any)
+				}
 				resolution["identityPolicy"] = "explicit_repository_preserved"
 				resolution["effectiveHfId"] = declared
 				if suggested := resolvedHFIDFromModelResolution(resolution); suggested != "" && !strings.EqualFold(suggested, declared) {
