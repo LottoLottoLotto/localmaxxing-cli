@@ -196,7 +196,7 @@ The API, CLI, and web editor all use `contentFormat: "gfm"` and format version `
 
 ## Speed tests
 
-### Remote Endpoint (vLLM, SGLang, Ollama, custom OpenAI-compatible)
+### Remote Endpoint (FreeToken, NInfer, vLLM, SGLang, Ollama, custom OpenAI-compatible)
 
 ```bash
 lmx speed-test run vllm \
@@ -209,6 +209,22 @@ lmx speed-test run vllm \
   --max-tokens 256 \
   --dry-run
 ```
+
+FreeToken and NInfer are first-class OpenAI-compatible engines:
+
+```bash
+lmx speed-test run freetoken \
+  --mode remote \
+  --base-url http://server:8000 \
+  --hf-id Qwen/Qwen3-8B \
+  --quantization fp16 \
+  --hardware hardware.json \
+  --engine-version 0.3.1 \
+  --engine-build cuda-12.8-sm120 \
+  --engine-commit abcdef123456
+```
+
+`freetoken` and `ninfer` default `--engine-repository` to their canonical GitHub repositories. Override it for forks or mirrors. `--engine-version`, `--engine-repository`, `--engine-build`, and `--engine-commit` are saved with the run and forwarded by later dry-run/submission commands.
 
 For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server. If a remote run already has metrics but lacks hardware, attach it without rerunning: `lmx speed-test add-hardware runs/Model/run.json --hardware hardware.json`.
 

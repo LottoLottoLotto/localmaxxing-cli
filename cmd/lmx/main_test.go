@@ -571,6 +571,84 @@ func TestNormalizeEngineNameRecognizesZMLLLMDAliases(t *testing.T) {
 	}
 }
 
+func TestBenchmarkPayloadSupportsFreeTokenAndNInferProvenance(t *testing.T) {
+	tests := []struct {
+		name       string
+		engine     string
+		repository string
+		opts       map[string]string
+	}{
+		{
+			name:       "FreeToken explicit provenance",
+			engine:     "free-token",
+			repository: "https://example.com/custom/freetoken",
+			opts: map[string]string{
+				"engine-version":    "0.3.1",
+				"engine-repository": "https://example.com/custom/freetoken/",
+				"engine-build":      "cuda-12.8-sm120",
+				"engine-commit":     "ABCDEF123456",
+			},
+		},
+		{
+			name:       "NInfer canonical repository",
+			engine:     "N-Infer",
+			repository: "https://github.com/Neroued/ninfer",
+			opts:       map[string]string{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.opts["mode"] = "local"
+			test.opts["hf-id"] = "org/model"
+			test.opts["quantization"] = "fp16"
+			test.opts["tok-s-out"] = "120"
+			test.opts["tok-s-prefill"] = "1800"
+			payload, err := benchmarkPayloadFromFlags(test.engine, cliArgs{
+				opts:  test.opts,
+				flags: map[string]bool{"dry-run": true, "quiet": true},
+			})
+			if err != nil {
+				t.Fatalf("benchmarkPayloadFromFlags returned error: %v", err)
+			}
+
+			submit := toBenchmarkSubmit(payload)
+			if got := submit["engineName"]; got != normalizeEngineName(test.engine) {
+				t.Fatalf("engineName = %v, want %q", got, normalizeEngineName(test.engine))
+			}
+			if got := submit["engineRepository"]; got != test.repository {
+				t.Fatalf("engineRepository = %v, want %q", got, test.repository)
+			}
+			if test.engine == "free-token" {
+				for field, want := range map[string]any{
+					"engineVersion": "0.3.1",
+					"engineBuild":   "cuda-12.8-sm120",
+					"engineCommit":  "abcdef123456",
+				} {
+					if got := submit[field]; got != want {
+						t.Fatalf("%s = %v, want %v", field, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestEngineProvenanceRejectsInvalidRepositoryAndCommit(t *testing.T) {
+	for name, opts := range map[string]map[string]string{
+		"repository": {"engine-repository": "github.com/org/repo"},
+		"commit":     {"engine-commit": "not-a-commit"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, _, _, err := engineProvenance("freetoken", cliArgs{opts: opts, flags: map[string]bool{}})
+			var cliErr cliError
+			if !errors.As(err, &cliErr) || cliErr.Code != "invalid_option" {
+				t.Fatalf("engineProvenance error = %#v, want invalid_option", err)
+			}
+		})
+	}
+}
+
 func TestRemoteSpeedTestPromptSynthesizesTargetAndRejectsConflicts(t *testing.T) {
 	prompt, source, err := remoteSpeedTestPrompt(cliArgs{opts: map[string]string{"prompt-tokens": "128"}, flags: map[string]bool{}})
 	if err != nil {

@@ -42,6 +42,8 @@ const remoteKVCacheReuseMethodology = "Two-step remote cache-reuse probe: pre-wa
 const remoteKVCacheFallbackWarning = "Remote OpenAI-compatible endpoints do not provide a portable persistent KV-cache session API; this sweep resends the full prefix at each depth and can only verify cache reuse when backend-specific cache metrics are exposed. Results may fall back to cold depth TPS instead of retained KV-cache TPS."
 const defaultRemoteSpeedTestPrompt = "Explain why local inference speed tests should report prompt prefill throughput, decode throughput, and time to first token."
 
+var gitCommitPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
 var apiHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 var statusOutputMu sync.Mutex
@@ -3599,16 +3601,20 @@ func metricBetter(value, baseline float64, metric string) bool {
 }
 
 type benchmarkPayload struct {
-	EngineName      string
-	HFID            string
-	ModelRevision   string
-	Quantization    string
-	Backend         string
-	BenchmarkMode   string
-	DetectedEngines []detectedEngine
-	Hardware        any
-	HardwareSource  string
-	Extra           map[string]any
+	EngineName       string
+	HFID             string
+	ModelRevision    string
+	EngineVersion    string
+	EngineRepository string
+	EngineBuild      string
+	EngineCommit     string
+	Quantization     string
+	Backend          string
+	BenchmarkMode    string
+	DetectedEngines  []detectedEngine
+	Hardware         any
+	HardwareSource   string
+	Extra            map[string]any
 }
 
 func (payload benchmarkPayload) ToMap() map[string]any {
@@ -3619,6 +3625,18 @@ func (payload benchmarkPayload) ToMap() map[string]any {
 		"quantization":    payload.Quantization,
 		"benchmarkMode":   payload.BenchmarkMode,
 		"detectedEngines": payload.DetectedEngines,
+	}
+	if payload.EngineVersion != "" {
+		out["engineVersion"] = payload.EngineVersion
+	}
+	if payload.EngineRepository != "" {
+		out["engineRepository"] = payload.EngineRepository
+	}
+	if payload.EngineBuild != "" {
+		out["engineBuild"] = payload.EngineBuild
+	}
+	if payload.EngineCommit != "" {
+		out["engineCommit"] = payload.EngineCommit
 	}
 	if payload.Backend != "" {
 		out["backend"] = payload.Backend
@@ -3633,6 +3651,45 @@ func (payload benchmarkPayload) ToMap() map[string]any {
 		out[key] = value
 	}
 	return out
+}
+
+func engineProvenance(engineName string, args cliArgs) (version, repository, build, commit string, err error) {
+	version = strings.TrimSpace(opt(args, "engine-version"))
+	repository = strings.TrimSpace(firstNonEmpty(opt(args, "engine-repository"), opt(args, "engine-repo"), canonicalEngineRepository(engineName)))
+	build = strings.TrimSpace(opt(args, "engine-build"))
+	commit = strings.ToLower(strings.TrimSpace(opt(args, "engine-commit")))
+
+	if len(version) > 512 {
+		return "", "", "", "", cliError{"invalid_option", "--engine-version must be at most 512 characters", nil, nil}
+	}
+	if len(repository) > 512 {
+		return "", "", "", "", cliError{"invalid_option", "--engine-repository must be at most 512 characters", nil, nil}
+	}
+	if repository != "" {
+		parsed, parseErr := url.ParseRequestURI(repository)
+		if parseErr != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return "", "", "", "", cliError{"invalid_option", "--engine-repository must be a valid HTTP(S) URL", []string{"Pass the source repository used for the benchmark, e.g. https://github.com/FlashML-org/FreeToken."}, nil}
+		}
+		repository = strings.TrimSuffix(repository, "/")
+	}
+	if len(build) > 256 {
+		return "", "", "", "", cliError{"invalid_option", "--engine-build must be at most 256 characters", nil, nil}
+	}
+	if commit != "" && !gitCommitPattern.MatchString(commit) {
+		return "", "", "", "", cliError{"invalid_option", "--engine-commit must be a 7-64 character hexadecimal Git commit hash", nil, nil}
+	}
+	return version, repository, build, commit, nil
+}
+
+func canonicalEngineRepository(engineName string) string {
+	switch normalizeEngineName(engineName) {
+	case "freetoken":
+		return "https://github.com/FlashML-org/FreeToken"
+	case "ninfer":
+		return "https://github.com/Neroued/ninfer"
+	default:
+		return ""
+	}
 }
 
 func setNumericFlagFields(payload map[string]any, args cliArgs, mapping map[string]string) {
@@ -5002,17 +5059,26 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		backend = backendFromHardware(hardware)
 	}
 
+	engineVersion, engineRepository, engineBuild, engineCommit, err := engineProvenance(engineName, args)
+	if err != nil {
+		return nil, err
+	}
+
 	builder := benchmarkPayload{
-		EngineName:      engineName,
-		HFID:            model,
-		ModelRevision:   firstNonEmpty(opt(args, "model-revision"), "main"),
-		Quantization:    quantization,
-		Backend:         backend,
-		BenchmarkMode:   mode,
-		DetectedEngines: detectInferenceEngines(args),
-		Hardware:        hardware,
-		HardwareSource:  hardwareSource,
-		Extra:           metrics,
+		EngineName:       engineName,
+		HFID:             model,
+		ModelRevision:    firstNonEmpty(opt(args, "model-revision"), "main"),
+		EngineVersion:    engineVersion,
+		EngineRepository: engineRepository,
+		EngineBuild:      engineBuild,
+		EngineCommit:     engineCommit,
+		Quantization:     quantization,
+		Backend:          backend,
+		BenchmarkMode:    mode,
+		DetectedEngines:  detectInferenceEngines(args),
+		Hardware:         hardware,
+		HardwareSource:   hardwareSource,
+		Extra:            metrics,
 	}
 	payload := builder.ToMap()
 	setNumericFlagFields(payload, args, map[string]string{"tok-s-out": "tokSOut", "tok-s-prefill": "tokSPrefill", "tok-s-total": "tokSTotal", "ttft-ms": "ttftMs", "peak-vram-gb": "peakVramGb", "context-length": "contextLength", "batch-size": "batchSize", "input-len": "inputLen", "output-len": "outputLen", "output-tokens": "outputTokens", "num-prompts": "numPrompts"})
@@ -5120,6 +5186,7 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 
 	for _, key := range []string{
 		"hfId", "modelRevision", "engineName", "engineVersion",
+		"engineRepository", "engineBuild", "engineCommit",
 		"quantization", "backend", "promptTokens", "outputTokens",
 		"contextLength", "batchSize", "temperature", "topP",
 		"ttftMs", "tokSOut", "tokSPrefill", "tokSTotal",
@@ -5127,6 +5194,15 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 	} {
 		if v, ok := payload[key]; ok && (submitValuePresent(v) || (key == "prefillTokens" && v != nil)) {
 			out[key] = v
+		}
+	}
+
+	if engineName := normalizeEngineName(stringValue(out["engineName"])); engineName != "" {
+		out["engineName"] = engineName
+		if _, exists := out["engineRepository"]; !exists {
+			if repository := canonicalEngineRepository(engineName); repository != "" {
+				out["engineRepository"] = repository
+			}
 		}
 	}
 
@@ -5355,7 +5431,7 @@ func remapEngineFlags(ef map[string]any, payload map[string]any) map[string]any 
 
 func engineBackendDefault(engine string) string {
 	switch engine {
-	case "llama.cpp", "vllm", "sglang", "tensorrt-llm", "exllamav2", "lmdeploy", "tgi":
+	case "llama.cpp", "vllm", "sglang", "tensorrt-llm", "exllamav2", "lmdeploy", "tgi", "freetoken", "ninfer":
 		return "cuda"
 	case "mlx":
 		return "metal"
@@ -7610,6 +7686,10 @@ func normalizeEngineName(value string) string {
 		return "sglang"
 	case "llmd", "zml", "zml/llmd", "zml llmd":
 		return "llmd"
+	case "freetoken", "free-token", "free token":
+		return "freetoken"
+	case "ninfer", "n-infer", "n infer":
+		return "ninfer"
 	case "":
 		return ""
 	default:
@@ -11820,6 +11900,11 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --model <hfId>           HuggingFace model ID
   --hf-id <hfId>           Canonical HuggingFace model ID for deferred terminal submit
   --backend <name>         Speed-test accelerator backend (e.g. cuda, rocm, tt-metal); lm-eval backend for eval lm-eval
+  --engine-version <value> Engine release/version used for the speed test
+  --engine-repository <url>
+                           Source repository used for the speed test; defaults for FreeToken and NInfer
+  --engine-build <value>   Build or artifact identifier used for the speed test
+  --engine-commit <hash>   7-64 character hexadecimal Git commit used for the speed test
   --num-fewshot <n>        lm-eval --num_fewshot override
   --lm-eval-bin <path>     lm-eval executable (default: lm_eval)
   --questions <n>          Eval-shard questions to run (default: 95%/±5% CI recommendation)
