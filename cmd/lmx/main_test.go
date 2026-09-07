@@ -1238,7 +1238,14 @@ func TestBenchmarkRemoteDryRunAcceptsExplicitTenstorrentBackend(t *testing.T) {
 }
 
 func TestBenchmarkRemoteSubmitRequiresHardware(t *testing.T) {
-	err := validateBenchmarkSubmitPayload(map[string]any{"benchmarkMode": "remote", "tokSOut": 120.0})
+	payload := map[string]any{
+		"benchmarkMode": "remote",
+		"hfId":          "org/model",
+		"engineName":    "freetoken",
+		"quantization":  "BF16",
+		"tokSOut":       120.0,
+	}
+	err := validateBenchmarkSubmitPayload(payload)
 	if err == nil {
 		t.Fatal("validateBenchmarkSubmitPayload accepted remote payload without hardware")
 	}
@@ -1246,9 +1253,48 @@ func TestBenchmarkRemoteSubmitRequiresHardware(t *testing.T) {
 		t.Fatalf("error = %#v, want missing_remote_hardware", err)
 	}
 
-	err = validateBenchmarkSubmitPayload(map[string]any{"benchmarkMode": "remote", "tokSOut": 120.0, "hardware": map[string]any{"gpuName": "RTX 4090"}})
-	if err != nil {
+	payload["hardware"] = map[string]any{"gpuName": "RTX 4090"}
+	if err := validateBenchmarkSubmitPayload(payload); err != nil {
 		t.Fatalf("validateBenchmarkSubmitPayload rejected hardware: %v", err)
+	}
+}
+
+func TestBenchmarkLocalValidationRejectsPayloadWithoutMetrics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plan.json")
+	if err := writeJSON(path, map[string]any{
+		"benchmarkMode": "remote",
+		"hfId":          "org/model",
+		"engineName":    "freetoken",
+		"quantization":  "BF16",
+		"hardware":      map[string]any{"gpuName": "RTX 4090"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := validateBenchmarkFileLocally(path, cliArgs{flags: map[string]bool{"quiet": true}})
+	var cliErr cliError
+	if !errors.As(err, &cliErr) || cliErr.Code != "invalid_benchmark_payload" {
+		t.Fatalf("validateBenchmarkFileLocally error = %#v, want invalid_benchmark_payload", err)
+	}
+	details := asObject(cliErr.Details)
+	formErrors, ok := details["formErrors"].([]string)
+	if !ok || len(formErrors) != 1 || !strings.Contains(formErrors[0], "At least one performance metric") {
+		t.Fatalf("formErrors = %#v, want missing performance metric", details["formErrors"])
+	}
+}
+
+func TestBenchmarkLocalValidationAcceptsDryRunContract(t *testing.T) {
+	for _, metric := range []string{"ttftMs", "tokSOut", "tokSTotal"} {
+		payload := map[string]any{
+			"hfId":         "org/model",
+			"engineName":   "freetoken",
+			"quantization": "BF16",
+			"hardware":     map[string]any{"gpuName": "RTX 4090"},
+			metric:         1.0,
+		}
+		if err := validateBenchmarkSubmitPayload(payload); err != nil {
+			t.Fatalf("validateBenchmarkSubmitPayload rejected %s: %v", metric, err)
+		}
 	}
 }
 
@@ -1477,6 +1523,7 @@ func TestSpeedTestDryRunUsesSpeedTestsEndpoint(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "speed-test.json")
 	if err := writeJSON(path, map[string]any{
 		"hfId": "org/model", "engineName": "vllm", "quantization": "fp16", "tokSOut": 100.0,
+		"hardware": map[string]any{"gpuName": "RTX 4090"},
 	}); err != nil {
 		t.Fatal(err)
 	}

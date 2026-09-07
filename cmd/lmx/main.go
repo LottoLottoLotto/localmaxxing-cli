@@ -5173,7 +5173,61 @@ func validateBenchmarkSubmitPayload(payload map[string]any) error {
 	if stringValue(payload["benchmarkMode"]) == "remote" && asObject(payload["hardware"]) == nil {
 		return cliError{"missing_remote_hardware", "Remote speed-test submission requires explicit server hardware metadata.", []string{"Run lmx hardware --out hardware.json on the machine running the endpoint, or create an equivalent hardware JSON for that server.", "Rerun the remote speed test with --hardware hardware.json before dry-run or submit.", "Do not rely on client auto-detected hardware for endpoint speed tests."}, nil}
 	}
+
+	fieldErrors := map[string][]string{}
+	for field, message := range map[string]string{
+		"hfId":         "Model ID is required",
+		"engineName":   "Engine name is required",
+		"quantization": "Quantization is required",
+	} {
+		if strings.TrimSpace(stringValue(payload[field])) == "" {
+			fieldErrors[field] = []string{message}
+		}
+	}
+	if asObject(payload["hardware"]) == nil {
+		fieldErrors["hardware"] = []string{"Hardware is required"}
+	}
+
+	hasPerformanceMetric := false
+	for _, field := range []string{"ttftMs", "tokSOut", "tokSTotal"} {
+		value, present := payload[field]
+		if !present || value == nil {
+			continue
+		}
+		if positiveBenchmarkNumber(value) {
+			hasPerformanceMetric = true
+		} else {
+			fieldErrors[field] = []string{"Must be a positive number"}
+		}
+	}
+	formErrors := []string{}
+	if !hasPerformanceMetric {
+		formErrors = append(formErrors, "At least one performance metric (ttftMs, tokSOut, or tokSTotal) is required")
+	}
+	if len(fieldErrors) > 0 || len(formErrors) > 0 {
+		return cliError{
+			"invalid_benchmark_payload",
+			"Benchmark payload failed local validation.",
+			[]string{"Fix the reported fields before API dry-run or submission."},
+			map[string]any{"fieldErrors": fieldErrors, "formErrors": formErrors},
+		}
+	}
 	return nil
+}
+
+func positiveBenchmarkNumber(value any) bool {
+	switch number := value.(type) {
+	case float64:
+		return number > 0
+	case float32:
+		return number > 0
+	case int:
+		return number > 0
+	case int64:
+		return number > 0
+	default:
+		return false
+	}
 }
 
 // toBenchmarkSubmit strips internal-only fields and remaps hardware/engineFlags
