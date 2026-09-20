@@ -267,6 +267,45 @@ func TestBenchmarkSubmitNormalizesGeneratedHardware(t *testing.T) {
 	}
 }
 
+func TestBenchmarkSubmitPreservesVerificationEvidence(t *testing.T) {
+	payload := map[string]any{
+		"hfId":             "org/model",
+		"engineName":       "vllm",
+		"quantization":     "fp16",
+		"tokSOut":          100.0,
+		"promptSha256":     "prompt-hash",
+		"promptSample":     "prompt",
+		"outputSha256":     "output-hash",
+		"outputSample":     "output",
+		"engineTimingsRaw": map[string]any{"usage": map[string]any{"completion_tokens": 32.0}},
+		"internalOnly":     "must not leak",
+		"engineFlags": map[string]any{
+			"canonicalPromptId":      "shared-v1",
+			"specDraftTokens":        64.0,
+			"specAcceptedTokens":     0.0,
+			"specAcceptanceRate":     0.0,
+			"specMeanAcceptedLength": 1.0,
+			"temperature":            0.0,
+		},
+	}
+
+	submit := toBenchmarkSubmit(payload)
+	for _, field := range []string{"promptSha256", "promptSample", "outputSha256", "outputSample", "engineTimingsRaw"} {
+		if _, ok := submit[field]; !ok {
+			t.Fatalf("verification field %q was dropped: %#v", field, submit)
+		}
+	}
+	if _, ok := submit["internalOnly"]; ok {
+		t.Fatalf("internal field leaked into submission: %#v", submit)
+	}
+	flags := asObject(submit["engineFlags"])
+	for _, field := range []string{"canonicalPromptId", "specDraftTokens", "specAcceptedTokens", "specAcceptanceRate", "specMeanAcceptedLength", "temperature"} {
+		if _, ok := flags[field]; !ok {
+			t.Fatalf("verification engine flag %q was dropped: %#v", field, flags)
+		}
+	}
+}
+
 func TestNormalizeHardwareForSubmitMapsGpuSlotName(t *testing.T) {
 	normalized := normalizeHardwareForSubmit(map[string]any{
 		"hwClass": "DISCRETE_GPU",

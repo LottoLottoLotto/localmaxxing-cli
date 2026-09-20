@@ -5245,6 +5245,7 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 		"contextLength", "batchSize", "temperature", "topP",
 		"ttftMs", "tokSOut", "tokSPrefill", "tokSTotal",
 		"peakVramGb", "gpuPowerWatts", "hardwareCost", "prefillTokens", "notes",
+		"promptSha256", "promptSample", "outputSha256", "outputSample", "engineTimingsRaw",
 	} {
 		if v, ok := payload[key]; ok && (submitValuePresent(v) || (key == "prefillTokens" && v != nil)) {
 			out[key] = v
@@ -5469,18 +5470,31 @@ func remapEngineFlags(ef map[string]any, payload map[string]any) map[string]any 
 		"concurrency", "numParallel", "maxRunningSeqs", "gpuMemUtil",
 		"specDecoding", "specModel", "specDraftModel", "specNgramSize",
 		"specNumTokens", "specDraftTp", "specMethod", "mtpEnabled", "mtpDraftLayers",
-		"specDraftWindowSize",
+		"specDraftWindowSize", "specDraftTokens", "specAcceptedTokens",
+		"specAcceptanceRate", "specMeanAcceptedLength", "canonicalPromptId",
 		"temperature", "topP", "topK", "minP", "repeatPenalty", "mirostat",
 		"ropeScale", "ropeScaling", "yarnExtFactor", "schedulerDelayFactor",
 		"attentionBackend", "sglangQuant", "engineQuant", "splitMode", "warmup",
 		"prefillChunkSize", "kvCacheSizeMb", "cpuOffloadGb", "extraFlags",
 	} {
-		if v, ok := ef[key]; ok && submitValuePresent(v) {
+		if v, ok := ef[key]; ok && (submitValuePresent(v) || submitEngineFlagZeroAllowed(key, v)) {
 			remapped[key] = v
 		}
 	}
 
 	return remapped
+}
+
+func submitEngineFlagZeroAllowed(key string, value any) bool {
+	if value == nil {
+		return false
+	}
+	switch key {
+	case "specDraftTokens", "specAcceptedTokens", "specAcceptanceRate", "temperature":
+		return true
+	default:
+		return false
+	}
 }
 
 func engineBackendDefault(engine string) string {
