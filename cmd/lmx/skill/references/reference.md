@@ -14,9 +14,14 @@ Raw HTTP API docs are available from the site through `GET /api/agent-context` a
 - `lmx server`: build or run local model server commands.
 - `lmx endpoint`: discover OpenAI-compatible endpoints.
 - `lmx kvcache` / `lmx kv-cache` / `lmx context-sweep`: run KV-cache/context sweeps.
-- `lmx speed-test`: create, manage, validate, and submit inference speed tests.
+- `lmx speed-test`: create, repair, manage, validate, and submit inference speed tests.
 - `lmx eval`: discover, run, and submit evaluation suites.
+- `lmx report` / `lmx reports`: create, edit, publish, and manage model reports.
+- `lmx calculate` / `lmx calculator` / `lmx decode-calculator`: calculate model memory fit and decode ceilings.
 - `lmx skill`: print or install the bundled agent skill.
+- `lmx update` / `lmx upgrade`: securely update a release binary; use `--dry-run` to inspect the asset first.
+- `lmx version`: print release/build metadata; prefer `--json` for automation.
+- `lmx commands`: print the versioned machine-readable command and option schema.
 
 ## Flag glossary
 
@@ -175,6 +180,15 @@ KV-cache and saved runs:
 - `--patch <path>`: merge a JSON object file into a saved or remote speed-test run.
 - `--unset <fields>`: remove fields from a saved speed-test run.
 - `--yes`: confirm saved-run deletion.
+
+Existing speed-test submission:
+
+- `lmx speed-test validate-local <run.json>`: validate the local payload without authentication or writes.
+- `lmx speed-test dry-run <run.json>`: apply the live server schema and allowlists without persisting.
+- `lmx speed-test submit <run.json>`: submit a completed run without rerunning it.
+- `lmx speed-test fixup <run.json>`: normalize a known older LocalMaxxing run file.
+- `lmx speed-test add-hardware <run.json> --hardware <hardware.json>`: attach measured-host hardware without rerunning.
+- Verification evidence passed through by current releases includes `promptSha256`, `promptSample`, `outputSha256`, `outputSample`, `engineTimingsRaw`, and speculative acceptance fields under `engineFlags`.
 
 Hardware and submission metadata:
 

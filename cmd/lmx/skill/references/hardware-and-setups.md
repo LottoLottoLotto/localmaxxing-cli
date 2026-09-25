@@ -25,6 +25,15 @@ lmx hardware validate hardware.json
 
 `speed-test submit` and `speed-test dry-run` sanitize generated hardware before posting, including converting detector GPU slots from `{ "name": ... }` to API slots shaped as `{ "gpuName": ... }`. Validation still checks the current allowlist; choose a GPU name from `lmx context` if the detector reports a vendor-specific marketing string.
 
+Inspect canonical names immediately before authoring or repairing a payload:
+
+```bash
+lmx context get hardwareOptions.discreteGpuNames --compact
+lmx context get hardwareOptions.chipVendors --compact
+```
+
+The live context is authoritative; do not freeze a copied hardware list into automation.
+
 
 ## Hardware templates
 

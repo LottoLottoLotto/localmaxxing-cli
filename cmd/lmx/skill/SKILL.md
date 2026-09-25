@@ -36,6 +36,7 @@ lmx hardware --out hardware.json
 
 - Already-running OpenAI-compatible / vLLM / SGLang / Ollama endpoint: use a **remote speed test** with `--mode remote --base-url ...`. This is the path where you control the prompt.
 - Raw llama.cpp throughput on the host: use a **local speed test** with `--mode local --model-path model.gguf`; it runs `llama-bench` with synthetic token counts.
+- Existing completed speed-test JSON: validate and submit it without rerunning; see `skill://localmaxxing-cli/references/speed-tests.md` for the upload shape and repair commands.
 - Quality / accuracy instead of speed: use evals; see `skill://localmaxxing-cli/references/evals.md`.
 - Long-form findings or analysis that a user should edit in the web report studio: use `lmx report`; see `skill://localmaxxing-cli/references/reports.md`.
 - Speed vs context depth: use a KV-cache sweep with `lmx kvcache run`.
@@ -75,10 +76,13 @@ Read `result.state` first. `usable` includes `result.optimum` with aggregate and
 
 1. Run with `--dry-run --out plan.json` to write a measurement plan without adding managed run history.
 2. Run again without `--dry-run` to measure.
-3. Validate with `lmx speed-test dry-run <file>` (authenticated API validation, no write).
-4. Submit with `lmx speed-test submit <file>`.
+3. Check the saved file with `lmx speed-test validate-local <file>`.
+4. Validate against the current server contract with `lmx speed-test dry-run <file>` (authenticated, no write).
+5. Submit with `lmx speed-test submit <file>`.
 
-Submissions require `hfId`, `hardware`, `engineName`, `quantization`, and `tokSOut` plus at least one secondary metric: `tokSPrefill`, `tokSTotal`, `ttftMs`, or `peakVramGb`. Optionally include `gpuPowerWatts`: an array of measured watts, one entry per physical GPU (heterogeneous rigs list each card, e.g. `[285.5,310.2]`; 1–64 entries, each positive and ≤10000). Pass it to `speed-test run` as `--gpu-power-watts 285.5,310.2`; the server computes and returns `totalPowerWatts`. For remote endpoints, the hardware must describe the server running the endpoint, not the machine running `lmx`; run `lmx hardware --out hardware.json` on the server or provide an equivalent reviewed file, then pass `--hardware hardware.json`. Remote mode never auto-detects client hardware. If a completed remote run lacks hardware, repair the saved JSON without rerunning: `lmx speed-test add-hardware <run.json> --hardware hardware.json`.
+Existing completed runs do not need to be rerun. Convert them to the LocalMaxxing speed-test JSON shape, attach server-side hardware metadata, then use the same validate/dry-run/submit sequence. `lmx speed-test fixup <file>` repairs older LocalMaxxing run files; it does not infer metrics from arbitrary vendor benchmark formats.
+
+Submissions require `hfId`, `hardware`, `engineName`, `quantization`, and `tokSOut` plus at least one secondary metric: `tokSPrefill`, `tokSTotal`, `ttftMs`, or `peakVramGb`. Optionally include `gpuPowerWatts`: an array of measured watts, one entry per physical GPU (heterogeneous rigs list each card, e.g. `[285.5,310.2]`; 1–64 entries, each positive and ≤10000). Pass it to `speed-test run` as `--gpu-power-watts 285.5,310.2`; the server computes and returns `totalPowerWatts`. For remote endpoints, the hardware must describe the server running the endpoint, not the machine running `lmx`; run `lmx hardware --out hardware.json` on the server or provide an equivalent reviewed file, then pass `--hardware hardware.json`. Remote mode never auto-detects client hardware.
 
 FreeToken and NInfer are accepted as first-class engine names (`freetoken`, `ninfer`) for OpenAI-compatible endpoint runs. Record exact runtime provenance with `--engine-version`, `--engine-repository`, `--engine-build`, and `--engine-commit`; the canonical repository is filled automatically for these two engines when omitted.
 
@@ -134,6 +138,8 @@ Available fields are `--spec-decoding`, `--spec-method`, `--spec-draft-model`, `
 - `lmx commands --json`: inspect the versioned machine-readable command schema.
 - `lmx context list`: list live context sections.
 - `lmx context get <dotted.path> --compact`: fetch only the needed live enum or schema.
+- `lmx version --json`: inspect the installed release before relying on recently added fields or commands.
+- `lmx update --dry-run`: inspect the latest compatible release asset before updating.
 - `lmx <command> --help`: show examples and relevant flags for a command.
 - Long Terminal-Bench jobs: preflight first, then launch with a unique `--run-dir ... --detach`; poll with `lmx eval terminal status <run-dir> --json`, consume `logs <run-dir> [--follow]` as JSONL, and cancel with `cancel <run-dir>`. Resume by repeating the exact run identity with the same directory and `--resume auto`; see `references/evals.md`.
 

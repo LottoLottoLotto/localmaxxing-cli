@@ -88,6 +88,78 @@ For local vLLM/SGLang speed tests, `lmx` can generate `bench` commands. Control 
 | KV-cache / context sweeps (`--levels`) | `--output-tokens` / `--output-len` / `--max-tokens` (first set wins) | 128 | Completion cap at every sweep level |
 | Manual submit (`--tok-s-out …`) | `--output-len` / `--output-tokens` | — | Recorded as `outputLen` / `outputTokens` metadata only |
 
+## Submit an existing completed run
+
+`speed-test submit` accepts a LocalMaxxing speed-test JSON document; it does not require the measurement to have been launched by `lmx`. A minimal discrete-GPU payload is:
+
+```json
+{
+  "hfId": "Qwen/Qwen3-8B",
+  "modelRevision": "main",
+  "engineName": "vllm",
+  "quantization": "fp16",
+  "backend": "cuda",
+  "tokSOut": 123.4,
+  "ttftMs": 86.2,
+  "promptTokens": 512,
+  "outputTokens": 128,
+  "hardware": {
+    "hwClass": "DISCRETE_GPU",
+    "gpuName": "Intel Arc Pro B65",
+    "gpuCount": 1,
+    "vramGb": 32,
+    "cpu": "AMD Ryzen 9 9950X",
+    "ramGb": 64,
+    "os": "Linux"
+  },
+  "engineFlags": {
+    "commandSnippet": "vllm serve Qwen/Qwen3-8B",
+    "tensorParallel": 1,
+    "concurrency": 1,
+    "temperature": 0
+  },
+  "notes": "Imported from an existing benchmark run."
+}
+```
+
+Required fields are `hfId`, `hardware`, `engineName`, `quantization`, and `tokSOut`, plus at least one of `tokSPrefill`, `tokSTotal`, `ttftMs`, or `peakVramGb`. Use canonical hardware names from the live context; never copy the example GPU when it does not match the measured host.
+
+Validate in increasing order of authority:
+
+```bash
+lmx speed-test validate-local run.json
+lmx speed-test dry-run run.json
+lmx speed-test submit run.json
+```
+
+`validate-local` checks the CLI-known shape without network writes. Authenticated `dry-run` applies the current server schema and hardware allowlist without creating a run. Only `submit` persists it.
+
+For an older LocalMaxxing run file:
+
+```bash
+lmx speed-test fixup run.json
+lmx speed-test add-hardware run.json --hardware hardware.json
+```
+
+`fixup` normalizes known LocalMaxxing fields; it is not a converter for arbitrary vLLM, SGLang, or llama.cpp output. Map external results into the upload shape explicitly and preserve the original command in `engineFlags.commandSnippet`.
+
+### Verified-run evidence
+
+Ordinary submissions may be accepted without a verified-run badge. For verification, preserve the evidence produced by the measurement instead of inventing or reconstructing it:
+
+- Top level: `promptSha256`, `promptSample`, `outputSha256`, `outputSample`, `engineTimingsRaw`, `engineVersion`, `engineRepository`, `engineBuild`, `engineCommit`, `backend`, and `peakVramGb`.
+- `engineFlags`: `specDraftTokens`, `specAcceptedTokens`, `specAcceptanceRate`, `specMeanAcceptedLength`, and `temperature` when applicable.
+
+Zero accepted speculative tokens and temperature `0` are valid values and must not be omitted. Current `lmx` preserves these fields through `dry-run` and `submit`. Read `verifiedRun` and `verificationIssues` in the server response; a successful submission is not necessarily a verified run.
+
+The live contract is authoritative:
+
+```bash
+lmx context list
+lmx context --out localmaxxing-agent-context.json
+curl -fsS https://www.localmaxxing.com/api/openapi.json -o localmaxxing-openapi.json
+```
+
 ## Saved runs and profiles
 
 Saved run commands:
