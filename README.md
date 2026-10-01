@@ -321,10 +321,37 @@ rejected runs, or patch a recent submission by its server run ID:
 ```bash
 lmx speed-test submissions list --limit 20 --offset 0
 lmx speed-test submissions edit <runId> --set-json '{"prefillTokens":4096,"notes":"corrected"}'
+
+# Multiple fields in one edit request; every --set is retained.
+lmx speed-test submissions edit <runId> \
+  --set tensorParallel=2 \
+  --set gpuMemUtil=0.94 \
+  --set kvCacheDtype=bfloat16 \
+  --set prefixCaching=true \
+  --set chunkedPrefill=true \
+  --set prefillChunkSize=4096 \
+  --set maxRunningSeqs=6
+
+# Alternatively, use the nested engineFlags shape from a submission.
+lmx speed-test submissions edit <runId> --set-json \
+  '{"engineFlags":{"tensorParallel":2,"prefixCaching":false,"commandSnippet":"vllm serve org/model --tensor-parallel-size 2"}}'
 ```
 
 Remote edits use `PATCH /api/runs/{id}`. The API limits non-admin owners to the
 first 24 hours after submission and enforces a five-minute edit cooldown.
+Choose one request form above; each successful edit is subject to that cooldown.
+Remote `--patch` and `--set-json` accept flat API fields or a nested `engineFlags`
+object, which the CLI flattens before sending. Supply the actual launch command
+as `commandSnippet`; the CLI does not invent one from a remote endpoint.
+
+Precedence is `--patch` file, then `--set-json`, then all `--set` assignments in
+argument order. Repeating the same field in `--set` uses its last value.
+Explicit `false`, zero and `null` are preserved; the API decides which fields
+can be cleared and validates value ranges. Unknown remote fields, malformed
+assignments, empty/non-object `engineFlags`, or the same field both flat and
+nested within one input fail before any API request. Use `--set tensorParallel=2`,
+not dotted `--set engineFlags.tensorParallel=2`. Repeated `--set` also works for
+local saved-run edits; their arbitrary-field editing behavior is unchanged.
 
 
 Inspect a saved run for post-run fixes before submission:

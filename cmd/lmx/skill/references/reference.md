@@ -175,9 +175,9 @@ KV-cache and saved runs:
 - `--metrics <fields>`: comma-separated metrics for comparing two run files.
 - `--fields <fields>`: comma-separated saved-run export fields.
 - `--hardware-name <text>`: filter saved runs by hardware label substring.
-- `--set field=value`: edit one field in a saved or remote speed-test run.
-- `--set-json <json>`: merge a JSON object into a saved or remote speed-test run.
-- `--patch <path>`: merge a JSON object file into a saved or remote speed-test run.
+- `--set field=value`: repeat to edit multiple saved or remote run fields; the last assignment to each field wins.
+- `--set-json <json>`: merge a JSON object; remote edits also accept nested `engineFlags` and reject unknown fields or ambiguous flat/nested duplicates.
+- `--patch <path>`: merge a JSON object file. Edit precedence is patch file, then set-json, then ordered set assignments; explicit false/zero/null are preserved.
 - `--unset <fields>`: remove fields from a saved speed-test run.
 - `--yes`: confirm saved-run deletion.
 

@@ -58,6 +58,7 @@ type cliArgs struct {
 	opts         map[string]string
 	flags        map[string]bool
 	provided     map[string]bool
+	setValues    []string
 	jsonPrinted  *bool
 	jsonFallback *any
 }
@@ -369,7 +370,11 @@ func parseArgs(argv []string) cliArgs {
 		key := strings.TrimPrefix(arg, "--")
 		args.provided[strings.SplitN(key, "=", 2)[0]] = true
 		if eq := strings.Index(key, "="); eq >= 0 {
-			args.opts[key[:eq]] = key[eq+1:]
+			if key[:eq] == "set" {
+				args.setValues = append(args.setValues, key[eq+1:])
+			} else {
+				args.opts[key[:eq]] = key[eq+1:]
+			}
 			continue
 		}
 		if isBooleanOption(key) {
@@ -380,7 +385,11 @@ func parseArgs(argv []string) cliArgs {
 			args.flags[key] = true
 			continue
 		}
-		args.opts[key] = argv[i+1]
+		if key == "set" {
+			args.setValues = append(args.setValues, argv[i+1])
+		} else {
+			args.opts[key] = argv[i+1]
+		}
 		i++
 	}
 	return args
@@ -2725,6 +2734,11 @@ func handleBenchmarkSubmissions(action, runID string, args cliArgs) error {
 
 func benchmarkSubmissionPatch(args cliArgs) (map[string]any, error) {
 	patch := map[string]any{}
+	for _, key := range []string{"patch", "set-json"} {
+		if hasFlag(args, key) || (args.provided[key] && opt(args, key) == "") {
+			return nil, cliError{Code: "invalid_patch", Message: "--" + key + " requires a nonempty value."}
+		}
+	}
 	if patchPath := opt(args, "patch"); patchPath != "" {
 		value, err := readJSON(patchPath)
 		if err != nil {
@@ -2733,6 +2747,9 @@ func benchmarkSubmissionPatch(args cliArgs) (map[string]any, error) {
 		obj := asObject(value)
 		if obj == nil {
 			return nil, cliError{"invalid_patch", "--patch must point to a JSON object.", nil, value}
+		}
+		if err := normalizeSubmissionEdit(obj); err != nil {
+			return nil, err
 		}
 		mergeObject(patch, obj)
 	}
@@ -2745,15 +2762,19 @@ func benchmarkSubmissionPatch(args cliArgs) (map[string]any, error) {
 		if obj == nil {
 			return nil, cliError{"invalid_patch", "--set-json must be a JSON object.", nil, value}
 		}
+		if err := normalizeSubmissionEdit(obj); err != nil {
+			return nil, err
+		}
 		mergeObject(patch, obj)
 	}
-	if set := opt(args, "set"); set != "" {
-		field, raw, ok := strings.Cut(set, "=")
-		if !ok || strings.TrimSpace(field) == "" {
-			return nil, cliError{"invalid_option", "--set must be field=value", []string{"Example: --set prefillTokens=4096", "For multiple fields, use --set-json '{\"prefillTokens\":4096,\"notes\":\"corrected\"}'."}, nil}
-		}
-		patch[strings.TrimSpace(field)] = parseEditValue(raw)
+	assignments, err := parseEditAssignments(args)
+	if err != nil {
+		return nil, err
 	}
+	if err := normalizeSubmissionEdit(assignments); err != nil {
+		return nil, err
+	}
+	mergeObject(patch, assignments)
 	if len(patch) == 0 {
 		return nil, cliError{"missing_edit", "No remote edit was provided.", []string{"Use --set field=value, --set-json '{...}', or --patch patch.json."}, nil}
 	}
@@ -3999,12 +4020,12 @@ func editBenchmarkRun(path string, args cliArgs) error {
 		mergeObject(payload, patchObj)
 		changed = true
 	}
-	if set := opt(args, "set"); set != "" {
-		field, raw, ok := strings.Cut(set, "=")
-		if !ok || strings.TrimSpace(field) == "" {
-			return cliError{"invalid_option", "--set must be field=value", []string{"Example: --set tokSOut=120.5", "For multiple fields, use --set-json '{\"tokSOut\":120.5,\"notes\":\"fixed\"}'."}, nil}
-		}
-		payload[strings.TrimSpace(field)] = parseEditValue(raw)
+	assignments, err := parseEditAssignments(args)
+	if err != nil {
+		return err
+	}
+	for field, value := range assignments {
+		payload[field] = value
 		changed = true
 	}
 	if unset := opt(args, "unset"); unset != "" {
@@ -12101,9 +12122,9 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --metrics <fields>       Comma-separated metrics for comparing two run files
   --fields <fields>        Comma-separated saved-run export fields
   --hardware-name <text>   Filter saved runs by hardware label substring
-  --set field=value        Edit one field in a saved or remote speed-test run
-  --set-json <json>        Merge a JSON object into a saved or remote speed-test run
-  --patch <path>           Merge a JSON object file into a saved or remote speed-test run
+  --set field=value        Repeat to edit multiple saved/remote run fields; last value per field wins
+  --set-json <json>        Merge a JSON object; remote edits also accept nested engineFlags
+  --patch <path>           Merge a JSON object file; precedence: patch < set-json < set
   --unset <fields>         Comma-separated saved-run fields to remove
   --offset <n>             Pagination offset for remote speed-test submissions
   --yes                    Confirm saved-run deletion

@@ -182,10 +182,23 @@ Authenticated remote submission commands:
 ```bash
 lmx speed-test submissions list --limit 20 --offset 0
 lmx speed-test submissions edit <runId> --set-json '{"prefillTokens":4096,"notes":"corrected"}'
+lmx speed-test submissions edit <runId> --set tensorParallel=2 --set gpuMemUtil=0.94 --set kvCacheDtype=bfloat16 --set prefixCaching=true
+lmx speed-test submissions edit <runId> --set-json '{"engineFlags":{"tensorParallel":2,"prefixCaching":false,"commandSnippet":"vllm serve org/model --tensor-parallel-size 2"}}'
 ```
 
 The list includes pending, approved, and rejected runs owned by the API key.
 Remote edits are limited by the API's owner edit window and cooldown.
+Choose one edit request; do not run every example against the same run in a row.
+Repeated `--set` applies every assignment; the last assignment to a field wins.
+Precedence is `--patch` < `--set-json` < ordered `--set`, independent of option
+position. Remote JSON/file edits accept flat fields or a nested `engineFlags`
+object and send flat API fields. Explicit false, zero and null survive; value
+and nullability validation remains server-side. Unknown fields, malformed
+assignments, empty/non-object `engineFlags` and flat/nested collisions in a
+single input fail locally without consuming an edit. Use flat assignment names
+(`--set tensorParallel=2`, not `--set engineFlags.tensorParallel=2`).
+Supply the real command snippet explicitly; endpoint metadata is not proof of
+the server's launch flags. Saved local run edits also retain repeated `--set`.
 
 
 Profiles and repair helpers:
