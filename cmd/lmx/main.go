@@ -5263,12 +5263,12 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 		"hfId", "modelRevision", "engineName", "engineVersion",
 		"engineRepository", "engineBuild", "engineCommit",
 		"quantization", "backend", "promptTokens", "outputTokens",
-		"contextLength", "batchSize", "temperature", "topP",
+		"contextLength", "batchSize",
 		"ttftMs", "tokSOut", "tokSPrefill", "tokSTotal",
 		"peakVramGb", "gpuPowerWatts", "hardwareCost", "prefillTokens", "notes",
 		"promptSha256", "promptSample", "outputSha256", "outputSample", "engineTimingsRaw",
 	} {
-		if v, ok := payload[key]; ok && (submitValuePresent(v) || (key == "prefillTokens" && v != nil)) {
+		if v, ok := payload[key]; ok && (submitValuePresent(v) || (v != nil && (key == "promptTokens" || key == "outputTokens" || key == "prefillTokens"))) {
 			out[key] = v
 		}
 	}
@@ -5285,7 +5285,8 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 	if hw := asObject(payload["hardware"]); hw != nil {
 		out["hardware"] = normalizeHardwareForSubmit(hw)
 	}
-	if ef := asObject(payload["engineFlags"]); ef != nil {
+	ef := asObject(payload["engineFlags"])
+	if ef != nil || payload["temperature"] != nil || payload["topP"] != nil {
 		out["engineFlags"] = remapEngineFlags(ef, payload)
 	}
 
@@ -5492,13 +5493,19 @@ func remapEngineFlags(ef map[string]any, payload map[string]any) map[string]any 
 		"specDecoding", "specModel", "specDraftModel", "specNgramSize",
 		"specNumTokens", "specDraftTp", "specMethod", "mtpEnabled", "mtpDraftLayers",
 		"specDraftWindowSize", "specDraftTokens", "specAcceptedTokens",
-		"specAcceptanceRate", "specMeanAcceptedLength", "canonicalPromptId",
+		"specAcceptanceRate", "specMeanAcceptedLength",
 		"temperature", "topP", "topK", "minP", "repeatPenalty", "mirostat",
 		"ropeScale", "ropeScaling", "yarnExtFactor", "schedulerDelayFactor",
-		"attentionBackend", "sglangQuant", "engineQuant", "splitMode", "warmup",
+		"attentionBackend", "sglangQuant", "engineQuant", "splitMode",
 		"prefillChunkSize", "kvCacheSizeMb", "cpuOffloadGb", "extraFlags",
 	} {
-		if v, ok := ef[key]; ok && (submitValuePresent(v) || submitEngineFlagZeroAllowed(key, v)) {
+		v, ok := ef[key]
+		// Older run payloads store sampling fields at the top level. Explicit
+		// nested values take precedence, even when zero, false, or null.
+		if !ok && (key == "temperature" || key == "topP") {
+			v = payload[key]
+		}
+		if submitEngineFlagValuePresent(v) {
 			remapped[key] = v
 		}
 	}
@@ -5506,15 +5513,14 @@ func remapEngineFlags(ef map[string]any, payload map[string]any) map[string]any 
 	return remapped
 }
 
-func submitEngineFlagZeroAllowed(key string, value any) bool {
-	if value == nil {
-		return false
-	}
-	switch key {
-	case "specDraftTokens", "specAcceptedTokens", "specAcceptanceRate", "temperature":
+func submitEngineFlagValuePresent(value any) bool {
+	switch value.(type) {
+	case bool, int, int64, float64, float32:
+		// Zero and false are explicit settings, not missing measurements.
+		// Let the server reject values outside each flag's allowed range.
 		return true
 	default:
-		return false
+		return submitValuePresent(value)
 	}
 }
 

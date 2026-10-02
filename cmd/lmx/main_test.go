@@ -273,14 +273,20 @@ func TestBenchmarkSubmitPreservesVerificationEvidence(t *testing.T) {
 		"engineName":       "vllm",
 		"quantization":     "fp16",
 		"tokSOut":          100.0,
-		"promptSha256":     "prompt-hash",
+		"engineVersion":    "0.10.0",
+		"engineRepository": "https://github.com/vllm-project/vllm",
+		"engineBuild":      "synthetic-validation-build",
+		"engineCommit":     "abcdef1234567890",
+		"backend":          "cuda",
+		"peakVramGb":       12.0,
+		"promptSha256":     strings.Repeat("a", 64),
 		"promptSample":     "prompt",
-		"outputSha256":     "output-hash",
+		"outputSha256":     strings.Repeat("b", 64),
 		"outputSample":     "output",
 		"engineTimingsRaw": map[string]any{"usage": map[string]any{"completion_tokens": 32.0}},
 		"internalOnly":     "must not leak",
 		"engineFlags": map[string]any{
-			"canonicalPromptId":      "shared-v1",
+			"commandSnippet":         "vllm serve org/model",
 			"specDraftTokens":        64.0,
 			"specAcceptedTokens":     0.0,
 			"specAcceptanceRate":     0.0,
@@ -290,19 +296,97 @@ func TestBenchmarkSubmitPreservesVerificationEvidence(t *testing.T) {
 	}
 
 	submit := toBenchmarkSubmit(payload)
-	for _, field := range []string{"promptSha256", "promptSample", "outputSha256", "outputSample", "engineTimingsRaw"} {
-		if _, ok := submit[field]; !ok {
-			t.Fatalf("verification field %q was dropped: %#v", field, submit)
+	for _, field := range []string{
+		"promptSha256", "promptSample", "outputSha256", "outputSample", "engineTimingsRaw",
+		"engineVersion", "engineRepository", "engineBuild", "engineCommit", "backend", "peakVramGb",
+	} {
+		if !reflect.DeepEqual(submit[field], payload[field]) {
+			t.Fatalf("submitted %s = %#v, want %#v", field, submit[field], payload[field])
 		}
 	}
 	if _, ok := submit["internalOnly"]; ok {
 		t.Fatalf("internal field leaked into submission: %#v", submit)
 	}
 	flags := asObject(submit["engineFlags"])
-	for _, field := range []string{"canonicalPromptId", "specDraftTokens", "specAcceptedTokens", "specAcceptanceRate", "specMeanAcceptedLength", "temperature"} {
-		if _, ok := flags[field]; !ok {
-			t.Fatalf("verification engine flag %q was dropped: %#v", field, flags)
+	if !reflect.DeepEqual(flags, payload["engineFlags"]) {
+		t.Fatalf("submitted verification flags = %#v, want %#v", flags, payload["engineFlags"])
+	}
+}
+
+func TestBenchmarkSubmitPreservesExplicitFlagBoundaries(t *testing.T) {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(`{
+		"promptTokens": 0, "outputTokens": 0, "prefillTokens": 0,
+		"engineFlags": {
+			"commandSnippet": "vllm serve org/model --enable-prefix-caching",
+			"prefixCaching": false, "flashAttn": false, "chunkedPrefill": false,
+			"contBatching": false, "specDecoding": false, "mtpEnabled": false,
+			"gpuLayers": 0, "cpuLayers": 0, "gpuMemUtil": 0, "cpuOffloadGb": 0,
+			"yarnExtFactor": 0, "schedulerDelayFactor": 0,
+			"specDraftTokens": 0, "specAcceptedTokens": 0, "specAcceptanceRate": 0,
+			"temperature": 0, "topP": 0, "topK": 0, "minP": 0,
+			"repeatPenalty": 0, "mirostat": 0
 		}
+	}`), &payload); err != nil {
+		t.Fatal(err)
+	}
+	submit := toBenchmarkSubmit(payload)
+	if !reflect.DeepEqual(submit, payload) {
+		t.Fatalf("explicit zero/false settings changed: got %#v, want %#v", submit, payload)
+	}
+}
+
+func TestBenchmarkSubmitSamplingPrecedenceAndOmissions(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload map[string]any
+		want    map[string]any
+	}{
+		{
+			name:    "flat sampling without flags",
+			payload: map[string]any{"temperature": 0.0, "topP": 0.0},
+			want:    map[string]any{"temperature": 0.0, "topP": 0.0},
+		},
+		{
+			name: "nested zero wins with flat fallback",
+			payload: map[string]any{
+				"temperature": 0.9, "topP": 0.5,
+				"engineFlags": map[string]any{"temperature": 0.0},
+			},
+			want: map[string]any{"temperature": 0.0, "topP": 0.5},
+		},
+		{
+			name: "explicit nested omissions do not fall back",
+			payload: map[string]any{
+				"temperature": 0.9, "topP": 0.5,
+				"engineFlags": map[string]any{
+					"temperature": nil, "topP": "", "extraFlags": "",
+					"gpuLayers": nil, "internalOnly": true,
+					"canonicalPromptId": "internal-id", "warmup": 1,
+				},
+			},
+			want: map[string]any{},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			submit := toBenchmarkSubmit(test.payload)
+			if _, ok := submit["temperature"]; ok {
+				t.Fatal("temperature must be submitted inside engineFlags")
+			}
+			if _, ok := submit["topP"]; ok {
+				t.Fatal("topP must be submitted inside engineFlags")
+			}
+			flags := asObject(submit["engineFlags"])
+			delete(flags, "commandSnippet")
+			if !reflect.DeepEqual(flags, test.want) {
+				t.Fatalf("submitted engineFlags = %#v, want %#v", flags, test.want)
+			}
+		})
+	}
+	submit := toBenchmarkSubmit(map[string]any{"outputSample": nil, "internalOnly": true})
+	if len(submit) != 0 {
+		t.Fatalf("omitted evidence/settings must not be invented: %#v", submit)
 	}
 }
 

@@ -150,7 +150,9 @@ Ordinary submissions may be accepted without a verified-run badge. For verificat
 - Top level: `promptSha256`, `promptSample`, `outputSha256`, `outputSample`, `engineTimingsRaw`, `engineVersion`, `engineRepository`, `engineBuild`, `engineCommit`, `backend`, and `peakVramGb`.
 - `engineFlags`: `specDraftTokens`, `specAcceptedTokens`, `specAcceptanceRate`, `specMeanAcceptedLength`, and `temperature` when applicable.
 
-Zero accepted speculative tokens and temperature `0` are valid values and must not be omitted. Current `lmx` preserves these fields through `dry-run` and `submit`. Read `verifiedRun` and `verificationIssues` in the server response; a successful submission is not necessarily a verified run.
+Explicit engine-flag zero and false values survive `dry-run` and `submit`, including zero accepted speculative tokens, sampling settings, and disabled caching/batching options. Absent or null flags remain omitted; unknown/internal keys are not forwarded. Sampling belongs in `engineFlags`: older top-level `temperature` and `topP` values are moved there only when that nested key is absent, so explicit nested settings take precedence.
+
+The CLI preserves supplied evidence; it does not create missing measurements or guarantee a badge. Read `verification.verified` and `verification.issues` in the dry-run response, and `verifiedRun` and `verificationIssues` in the submission response. A successful submission is not necessarily a verified run.
 
 The live contract is authoritative:
 
