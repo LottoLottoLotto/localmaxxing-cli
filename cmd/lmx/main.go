@@ -37,9 +37,9 @@ import (
 const defaultAPIURL = "https://www.localmaxxing.com"
 const defaultHFAPIURL = "https://huggingface.co"
 const defaultEndpointTimeout = 10 * time.Minute
-const remoteKVCacheColdMethodology = "Single streaming request with inline filler padded to target context size; measures cold prefill + decode at that context depth."
-const remoteKVCacheReuseMethodology = "Two-step remote cache-reuse probe: pre-warm target context, then time a streaming request with the same prefix plus probe; measures cached-prefix decode at that context depth."
-const remoteKVCacheFallbackWarning = "Remote OpenAI-compatible endpoints do not provide a portable persistent KV-cache session API; this sweep resends the full prefix at each depth and can only verify cache reuse when backend-specific cache metrics are exposed. Results may fall back to cold depth TPS instead of retained KV-cache TPS."
+const remoteKVCacheColdMethodology = "Two-step remote probe: pre-warm a prefix, then time a streaming request; timed-request counters report no prefix reuse."
+const remoteKVCacheReuseMethodology = "Two-step remote probe: pre-warm a prefix, then time a streaming request; timed-request counters verify reuse. cachedTokens and uncachedTokens describe the actual timed prompt, not nominal context coverage."
+const remoteKVCacheUnknownMethodology = "Two-step remote probe: pre-warm a prefix, then time a streaming request; cache reuse and prefill work could not be verified."
 const defaultRemoteSpeedTestPrompt = "Explain why local inference speed tests should report prompt prefill throughput, decode throughput, and time to first token."
 
 var gitCommitPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
@@ -260,7 +260,7 @@ func runWithArgs(args cliArgs) error {
 		return handleVersion(args)
 	case "commands":
 		return handleCommands(args)
-	case "update", "upgrade":
+	case "update":
 		return handleUpdate(args)
 	case "auth":
 		return handleAuth(args)
@@ -270,17 +270,15 @@ func runWithArgs(args cliArgs) error {
 		return handleSetups(positional(args, 1), args)
 	case "skill":
 		return handleSkill(positional(args, 1), args)
-	case "context", "agent-context":
+	case "context":
 		return handleContext(args)
-	case "calculate", "calculator":
+	case "calculate":
 		sub := positional(args, 1)
 		if sub == "" || sub == "decode" {
 			return handleDecodeCalculator(args)
 		}
 		return cliError{"unknown_subcommand", "Unknown calculator subcommand: " + sub, []string{"Use lmx calculate decode."}, map[string]any{"subcommand": sub}}
-	case "decode-calculator":
-		return handleDecodeCalculator(args)
-	case "report", "reports":
+	case "report":
 		return handleReport(positional(args, 1), positional(args, 2), args)
 	case "model":
 		return handleModel(positional(args, 1), positional(args, 2), args)
@@ -292,7 +290,7 @@ func runWithArgs(args cliArgs) error {
 		return handleServer(positional(args, 1), positional(args, 2), args)
 	case "endpoint":
 		return handleEndpoint(positional(args, 1), args)
-	case "kvcache", "kv-cache", "context-sweep":
+	case "kvcache":
 		return handleKVCache(positional(args, 1), positional(args, 2), args)
 	case "speed-test":
 		return handleBenchmark(positional(args, 1), positional(args, 2), args)
@@ -305,11 +303,13 @@ func runWithArgs(args cliArgs) error {
 			return handleStorage(positional(args, 2), positional(args, 3), args, "")
 		case "artifact", "artifacts":
 			return handleStorage(positional(args, 2), positional(args, 3), args, "artifact")
+		case "dataset":
+			return handleEvalDataset(positional(args, 2), positional(args, 3), args)
 		case "suite":
 			return handleSuite(positional(args, 2), positional(args, 3), args)
 		case "execute":
 			return handleExecute(positional(args, 2), args)
-		case "lm-eval", "lmeval":
+		case "lm-eval":
 			return handleLmEval(positional(args, 2), args)
 		case "run":
 			return handleEvalRun(positional(args, 2), args)
@@ -334,7 +334,7 @@ func runWithArgs(args cliArgs) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "speed-test", "report", "reports", "auth", "hardware", "setups", "context", "agent-context", "calculate", "calculator", "decode-calculator", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "kv-cache", "context-sweep", "skill", "update", "upgrade", "version", "commands":
+	case "eval", "speed-test", "report", "auth", "hardware", "setups", "context", "calculate", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "skill", "update", "version", "commands":
 		return true
 	default:
 		return false
@@ -2140,6 +2140,12 @@ func handleSuite(action, target string, args cliArgs) error {
 		if err != nil {
 			return err
 		}
+		if numberField(asObject(value), "total") == 0 {
+			printStatus(args, "suite_catalog_empty", map[string]any{
+				"message": "No approved registered suites. Shard datasets have a separate catalog; an empty suite list does not mean evals are unavailable.",
+				"next":    "lmx eval dataset list",
+			})
+		}
 		return writeOrPrintJSON("suites", args, redactGold(value))
 	case "show", "get":
 		if target == "" {
@@ -2147,7 +2153,7 @@ func handleSuite(action, target string, args cliArgs) error {
 		}
 		value, err := fetchJSON("GET", apiURL(args)+"/api/benchmarks/suites/"+url.PathEscape(target), "", nil)
 		if err != nil {
-			return err
+			return suiteLookupError(target, err)
 		}
 		return writeOrPrintJSON("suite", args, redactGold(value))
 	case "search":
@@ -2581,7 +2587,7 @@ func handleBenchmark(action, target string, args cliArgs) error {
 	if action == "list" || action == "show" || action == "edit" || action == "rerun" || action == "delete" || action == "rm" || action == "remove" {
 		return handleBenchmarkRuns(action, target, args)
 	}
-	if action == "kvcache" || action == "kv-cache" || action == "context-sweep" {
+	if action == "kvcache" {
 		return handleKVCache("run", target, args)
 	}
 	if action == "run" || action == "measure" {
@@ -4323,11 +4329,6 @@ func handleKVCache(action, target string, args cliArgs) error {
 		engineName = resolved
 	}
 	quantization := opt(args, "quantization")
-	remoteWarnings := []string{}
-	if mode == "remote" {
-		remoteWarnings = append(remoteWarnings, remoteKVCacheFallbackWarning)
-		printStatus(args, "kvcache_remote_depth_fallback", map[string]any{"warning": remoteKVCacheFallbackWarning, "fallback": "remote_depth_tps"})
-	}
 
 	var hardware any
 	hardwareSource := ""
@@ -4393,13 +4394,10 @@ func handleKVCache(action, target string, args cliArgs) error {
 		if commandSnippet := stringValue(point["commandSnippet"]); commandSnippet != "" {
 			runPayload["engineFlags"] = map[string]any{"mode": mode, "commandSnippet": commandSnippet}
 		}
-		for _, key := range []string{"methodology", "warnings", "cacheReuse", "usagePromptTokens", "modelResolution", "quantizationResolution"} {
+		for _, key := range []string{"methodology", "warnings", "cacheReuse", "usagePromptTokens", "tokSPrefillSource", "modelResolution", "quantizationResolution"} {
 			if value, ok := point[key]; ok {
 				runPayload[key] = value
 			}
-		}
-		if len(remoteWarnings) > 0 {
-			runPayload["warnings"] = mergeWarnings(remoteWarnings, runPayload["warnings"])
 		}
 
 		if hasFlag(args, "dry-run") {
@@ -4437,9 +4435,6 @@ func handleKVCache(action, target string, args cliArgs) error {
 	}
 	if hardwareSource != "" {
 		aggregate["hardwareSource"] = hardwareSource
-	}
-	if len(remoteWarnings) > 0 {
-		aggregate["warnings"] = remoteWarnings
 	}
 	if hasFlag(args, "dry-run") {
 		aggregate["dryRun"] = true
@@ -4719,7 +4714,7 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 	}
 	maxTokens := kvOutputTokens(args)
 	if hasFlag(args, "dry-run") {
-		point := map[string]any{"contextTokens": float64(level), "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "maxTokens": float64(maxTokens), "dryRun": true, "methodology": remoteKVCacheColdMethodology}
+		point := map[string]any{"contextTokens": float64(level), "mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "maxTokens": float64(maxTokens), "dryRun": true, "methodology": remoteKVCacheUnknownMethodology}
 		if modelResolution != nil {
 			point["modelResolution"] = modelResolution
 		}
@@ -4745,39 +4740,22 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 	if err != nil {
 		return nil, err
 	}
-	cacheStatus := map[string]any{"status": "unknown"}
-	methodology := remoteKVCacheColdMethodology
-	warnings := []string{}
 	if err := warmRemoteKVCachePrefix(args, baseURL, servedModel, prefixMessages, timeout); err != nil {
 		return nil, err
-	}
-	cacheTokens, slots, err := remoteKVCacheSlotPromptTokens(args, baseURL, timeout)
-	if err != nil {
-		warning := "Could not verify llama.cpp /slots cache retention; results may reflect cold prefill rather than cached-context speed."
-		warnings = append(warnings, warning)
-		cacheStatus["status"] = "unverified"
-		cacheStatus["warning"] = warning
-		cacheStatus["error"] = err.Error()
-		printStatus(args, "kvcache_cache_reuse_unverified", map[string]any{"level": level, "warning": warning, "error": err.Error()})
-	} else {
-		cacheStatus["nPromptTokensCacheMax"] = cacheTokens
-		cacheStatus["slots"] = slots
-		if cacheTokens > 0 {
-			cacheStatus["status"] = "retained"
-			methodology = remoteKVCacheReuseMethodology
-			printStatus(args, "kvcache_cache_reuse_detected", map[string]any{"level": level, "nPromptTokensCacheMax": cacheTokens})
-		} else {
-			warning := "Server does not appear to retain KV cache between requests; results reflect cold prefill, not cached-context speed."
-			warnings = append(warnings, warning)
-			cacheStatus["status"] = "not_retained"
-			cacheStatus["warning"] = warning
-			printStatus(args, "kvcache_cache_reuse_missing", map[string]any{"level": level, "warning": warning})
-		}
 	}
 	probe, err := timedChatCompletion(args, baseURL, body, timeout, "kvcache_remote_failed")
 	if err != nil {
 		return nil, err
 	}
+	cacheStatus := remoteKVCacheEvidence(probe)
+	methodology := remoteKVCacheUnknownMethodology
+	switch cacheStatus["status"] {
+	case "retained", "partial":
+		methodology = remoteKVCacheReuseMethodology
+	case "not_retained":
+		methodology = remoteKVCacheColdMethodology
+	}
+	printStatus(args, "kvcache_cache_evidence", cacheStatus)
 	usagePromptTokens := usageToken(probe.usage, "prompt_tokens")
 	usageOutputTokens := firstNonZero(usageToken(probe.usage, "completion_tokens"), usageToken(probe.usage, "output_tokens"))
 	outputTokens := usageOutputTokens
@@ -4824,22 +4802,17 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 	if quantizationResolution != nil {
 		point["quantizationResolution"] = quantizationResolution
 	}
-	if len(warnings) > 0 {
-		point["warnings"] = warnings
+	if warning := stringValue(cacheStatus["warning"]); warning != "" {
+		point["warnings"] = []string{warning}
 	}
 	if !probe.firstTokenAt.IsZero() {
 		ttftMs := durationMS(probe.firstTokenAt.Sub(probe.started))
 		point["ttftMs"] = roundMetric(ttftMs)
-		prefillTokens := promptTokens
-		prefillSource := "estimated_from_ttft"
-		if stringValue(cacheStatus["status"]) == "retained" {
-			// Only the non-cached suffix is actually prefetched during TTFT.
-			prefillTokens = promptTokens - cacheTokens
-			prefillSource = "estimated_from_ttft_uncached"
-		}
-		if ttftMs > 0 && prefillTokens > 0 {
-			point["tokSPrefill"] = round1(float64(prefillTokens) / (ttftMs / 1000))
-			point["tokSPrefillSource"] = prefillSource
+		// TTFT includes HTTP overhead and first-token work; this remains an
+		// estimate, using only verified uncached tokens from this request.
+		if uncached, ok := jsonNumber(cacheStatus["uncachedTokens"]); ok && ttftMs > 0 && uncached > 0 {
+			point["tokSPrefill"] = round1(uncached / (ttftMs / 1000))
+			point["tokSPrefillSource"] = "estimated_from_ttft_uncached"
 		}
 	}
 	return point, nil
@@ -4873,52 +4846,63 @@ func warmRemoteKVCachePrefix(args cliArgs, baseURL, servedModel string, messages
 	return nil
 }
 
-func remoteKVCacheSlotPromptTokens(args cliArgs, baseURL string, timeout time.Duration) (int, any, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/slots", nil)
-	if err != nil {
-		return 0, nil, err
+// remoteKVCacheEvidence uses only request-local counters. Slot snapshots can
+// describe warm-up work or another client's request and cannot prove reuse.
+func remoteKVCacheEvidence(probe chatProbe) map[string]any {
+	evidence := map[string]any{
+		"status":  "unknown",
+		"source":  "timed_request",
+		"usage":   probe.usage,
+		"timings": probe.timings,
+		"warning": "Timed response does not provide valid cache counters; reuse is unknown and prefill throughput is omitted.",
 	}
-	if key := opt(args, "model-api-key"); key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
+	total, ok := jsonNumber(probe.usage["prompt_tokens"])
+	if !ok || math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 || math.Trunc(total) != total {
+		return evidence
 	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return 0, nil, fmt.Errorf("GET /slots returned %s", res.Status)
-	}
-	var slots any
-	if err := json.Unmarshal(data, &slots); err != nil {
-		return 0, nil, err
-	}
-	return maxSlotPromptCacheTokens(slots), slots, nil
-}
-
-func maxSlotPromptCacheTokens(value any) int {
-	maxValue := 0
-	var visit func(any)
-	visit = func(current any) {
-		switch typed := current.(type) {
-		case []any:
-			for _, item := range typed {
-				visit(item)
-			}
-		case map[string]any:
-			if n := int(numberField(typed, "n_prompt_tokens_cache")); n > maxValue {
-				maxValue = n
-			}
-			for _, item := range typed {
-				visit(item)
-			}
+	cached := -1.0
+	for _, counter := range []struct {
+		fields   map[string]any
+		key      string
+		uncached bool
+	}{
+		{asObject(probe.usage["prompt_tokens_details"]), "cached_tokens", false},
+		{probe.timings, "cache_n", false},
+		{probe.timings, "prompt_n", true},
+	} {
+		raw, present := counter.fields[counter.key]
+		if !present {
+			continue
 		}
+		value, valid := jsonNumber(raw)
+		if !valid || math.IsNaN(value) || value < 0 || value > total || math.Trunc(value) != value {
+			return evidence
+		}
+		if counter.uncached {
+			value = total - value
+		}
+		if cached >= 0 && cached != value {
+			evidence["warning"] = "Timed-response cache counters disagree; reuse is unknown and prefill throughput is omitted."
+			return evidence
+		}
+		cached = value
 	}
-	visit(value)
-	return maxValue
+	if cached < 0 {
+		return evidence
+	}
+	delete(evidence, "warning")
+	evidence["promptTokens"] = total
+	evidence["cachedTokens"] = cached
+	evidence["uncachedTokens"] = total - cached
+	switch {
+	case cached == 0:
+		evidence["status"] = "not_retained"
+	case cached == total:
+		evidence["status"] = "retained"
+	default:
+		evidence["status"] = "partial"
+	}
+	return evidence
 }
 
 // kvCacheFillerVocab lists common single-token words used to synthesize a
@@ -6281,6 +6265,7 @@ type chatProbe struct {
 	completedAt  time.Time
 	outputText   string
 	usage        map[string]any
+	timings      map[string]any
 }
 
 // timedChatCompletion posts one chat completion and returns client-observed
@@ -6322,6 +6307,7 @@ func timedChatCompletion(args cliArgs, baseURL string, body map[string]any, time
 		probe.completedAt = streamResult.completedAt
 		probe.outputText = streamResult.outputText
 		probe.usage = streamResult.usage
+		probe.timings = streamResult.timings
 	} else {
 		var response map[string]any
 		if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
@@ -6329,6 +6315,7 @@ func timedChatCompletion(args cliArgs, baseURL string, body map[string]any, time
 		}
 		probe.outputText = nonStreamingContent(response)
 		probe.usage = asObject(response["usage"])
+		probe.timings = asObject(response["timings"])
 		probe.completedAt = time.Now()
 	}
 	if probe.completedAt.IsZero() {
@@ -7532,6 +7519,7 @@ type openAIStreamResult struct {
 	completedAt  time.Time
 	outputText   string
 	usage        map[string]any
+	timings      map[string]any
 }
 
 func readOpenAIStream(args cliArgs, body io.Reader, started time.Time) (openAIStreamResult, error) {
@@ -7569,6 +7557,9 @@ func consumeOpenAIStreamLine(args cliArgs, line string, started time.Time, resul
 	}
 	if obj := asObject(chunk["usage"]); obj != nil {
 		result.usage = obj
+	}
+	if obj := asObject(chunk["timings"]); obj != nil {
+		result.timings = obj
 	}
 	content := streamingContent(chunk)
 	if content == "" {
@@ -8251,6 +8242,15 @@ func handleLmEval(suiteSlug string, args cliArgs) error {
 	backend := firstNonEmpty(opt(args, "backend"), "hf")
 	command := firstNonEmpty(opt(args, "lm-eval-bin"), "lm_eval")
 	resultsPath := firstNonEmpty(opt(args, "results"), "localmaxxing-lm-eval-results.json")
+	if err := os.MkdirAll(filepath.Dir(resultsPath), 0o755); err != nil {
+		return err
+	}
+	outputDir, err := os.MkdirTemp(filepath.Dir(resultsPath), ".lmx-lm-eval-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(outputDir)
+	harnessOutput := filepath.Join(outputDir, "results.json")
 	tasks := firstNonEmpty(opt(args, "tasks"), strings.Join(evalTaskKeys(suiteDoc(suite)), ","), suiteSlug)
 	modelArgs := opt(args, "model-args")
 	if modelArgs == "" && backend == "hf" {
@@ -8264,16 +8264,51 @@ func handleLmEval(suiteSlug string, args cliArgs) error {
 	if fewshot := firstNonEmpty(opt(args, "num-fewshot"), opt(args, "fewshot"), inferredEvalFewShot(suiteDoc(suite))); fewshot != "" {
 		cmdArgs = append(cmdArgs, "--num_fewshot", fewshot)
 	}
-	cmdArgs = append(cmdArgs, "--output_path", resultsPath)
+	cmdArgs = append(cmdArgs, "--output_path", harnessOutput)
 	printInfo(args, "lm_eval_start", map[string]any{"suite": suiteSlug, "command": command, "backend": backend, "modelArgs": modelArgs, "tasks": tasks, "output": resultsPath})
 	cmd := exec.Command(command, cmdArgs...)
 	cmd.Stdout = os.Stdout
+	if hasFlag(args, "json") {
+		cmd.Stdout = os.Stderr
+	}
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 	if err := cmd.Run(); err != nil {
 		return err
 	}
+	resultFile, err := lmEvalResultFile(outputDir)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(resultFile, resultsPath); err != nil {
+		return err
+	}
+	args.opts["results"] = resultsPath
 	return handleEvalRun(suiteSlug, args)
+}
+
+// Harness versions may write results.json or results_<timestamp>.json. Only
+// inspect this invocation's private directory; never reuse a previous run.
+func lmEvalResultFile(outputDir string) (string, error) {
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		return "", err
+	}
+	resultFile := ""
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() || (name != "results.json" && !(strings.HasPrefix(name, "results_") && strings.HasSuffix(name, ".json"))) {
+			continue
+		}
+		if resultFile != "" {
+			return "", cliError{"lm_eval_results_ambiguous", "lm-eval produced multiple aggregate result files.", []string{"Use a harness invocation that produces one aggregate results JSON file."}, nil}
+		}
+		resultFile = filepath.Join(outputDir, name)
+	}
+	if resultFile == "" {
+		return "", cliError{"lm_eval_results_missing", "lm-eval completed without an aggregate results JSON file.", []string{"Check that --lm-eval-bin supports --output_path and writes aggregate results."}, nil}
+	}
+	return resultFile, nil
 }
 
 func handleEvalRun(suiteSlug string, args cliArgs) error {
@@ -10372,7 +10407,7 @@ func loadSuiteForEvalRun(suiteSlug string, args cliArgs) (map[string]any, error)
 	}
 	value, err := fetchJSON("GET", apiURL(args)+"/api/benchmarks/suites/"+url.PathEscape(suiteSlug), key, nil)
 	if err != nil {
-		return nil, err
+		return nil, suiteLookupError(suiteSlug, err)
 	}
 	obj := asObject(value)
 	if obj == nil {
@@ -10640,7 +10675,11 @@ func scoreFromLmEvalTask(value any, scoring string) (float64, bool) {
 		return 0, false
 	}
 	for _, key := range lmEvalMetricCandidates(scoring) {
-		if normalized, ok := normalizeMetricScore(key, numberField(obj, key)); ok {
+		score, exists := jsonNumber(obj[key])
+		if !exists {
+			continue
+		}
+		if normalized, ok := normalizeMetricScore(key, score); ok {
 			return normalized, true
 		}
 	}
@@ -10648,11 +10687,31 @@ func scoreFromLmEvalTask(value any, scoring string) (float64, bool) {
 		if strings.Contains(strings.ToLower(key), "stderr") {
 			continue
 		}
-		if normalized, ok := normalizeMetricScore(key, numericValue(raw)); ok {
+		score, valid := jsonNumber(raw)
+		if !valid {
+			continue
+		}
+		if normalized, ok := normalizeMetricScore(key, score); ok {
 			return normalized, true
 		}
 	}
 	return 0, false
+}
+
+func jsonNumber(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		parsed, err := v.Float64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func lmEvalMetricCandidates(scoring string) []string {
@@ -11942,13 +12001,15 @@ var usageExamples = []string{
 	`lmx eval publish questions.jsonl --description "Original networking questions written to test protocol reasoning." --source-url https://github.com/org/repo`,
 	`lmx eval publish ./terminal-bench-tasks --description "Repository-level API repair tasks with deterministic verifiers." --source-url https://github.com/org/repo`,
 	`lmx eval publish my-eval.eval-suite.json --dry-run`,
+	`lmx eval dataset list --out datasets.json`,
+	`lmx eval dataset show hellaswag --out hellaswag-dataset.json`,
 	`lmx eval suite list --out suites.json`,
 	`lmx eval suite search reasoning --out reasoning-suites.json`,
-	`lmx eval suite show hellaswag --out hellaswag-suite.json`,
+	`lmx eval suite show <approved-suite-slug> --out suite.json`,
 	`lmx model search qwen3-8b --out models.json`,
 	`lmx eval storage upload traces.jsonl --kind artifact --format jsonl --out artifact-bundle.json`,
 	`lmx eval storage download <storageKey> --out traces.jsonl`,
-	`lmx eval lm-eval hellaswag --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run`,
+	`lmx eval lm-eval <approved-suite-slug> --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run`,
 	`lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --out my-eval.json`,
 	`lmx eval suite import questions.jsonl --slug my-eval --name "My Eval" --kind qa --out my-eval.json`,
 	`lmx eval suite audit my-eval.json`,
@@ -12225,10 +12286,7 @@ var commandDescriptions = map[string]string{
 	"report delete":           "Permanently delete a report, comments, and images.",
 	"calculate":               "Run local, deterministic hardware and model calculations.",
 	"calculate decode":        "Calculate memory fit and a bandwidth-limited decode upper bound.",
-	"calculator":              "Alias for calculate.",
-	"decode-calculator":       "Alias for calculate decode.",
 	"update":                  "Download the newest LocalMaxxing CLI release and replace the current binary.",
-	"upgrade":                 "Alias for update.",
 	"endpoint discover":       "Discover an OpenAI-compatible endpoint and speed-test command hints.",
 	"endpoint":                "Discover OpenAI-compatible model endpoints.",
 	"speed-test":              "Create, manage, validate, and submit inference speed tests.",
@@ -12251,6 +12309,9 @@ var commandDescriptions = map[string]string{
 	"eval":                    "Discover, run, and submit evaluation suites.",
 	"eval publish": "Publish through one guarded command. Accepts CSV, JSONL, JSON arrays, suite manifests, imported terminal bundles, and raw Harbor/Terminal-Bench directories.\n\n" +
 		"Automatically detects safe column mappings, validates structure, audits quality, runs the authenticated server preflight before uploads, and submits as PENDING for review. Inline datasets upload automatically. Terminal publication requires Pro, Docker, a public --source-url, and oracle-verifies every task before upload. Use --dry-run first when desired.",
+	"eval dataset":           "Discover approved shard datasets separately from registered eval suites.",
+	"eval dataset list":      "List approved question and terminal shard datasets, counts, and API endpoints.",
+	"eval dataset show":      "Show one approved shard dataset by slug.",
 	"eval suite":             "Import, audit, sample-check, submit, and manage eval suites.",
 	"eval suite import":      "Convert CSV, JSONL, or a JSON array into a runnable suite manifest.",
 	"eval suite audit":       "Check dataset duplicates, gold values, leakage, balance, provenance, and size.",
@@ -12259,6 +12320,7 @@ var commandDescriptions = map[string]string{
 	"eval suite resubmit":    "Replace and return a pending or rejected suite to review.",
 	"eval suite withdraw":    "Permanently remove an unused pending or rejected submission.",
 	"eval run":               "Run an approved suite locally and write/submit a run payload.",
+	"eval lm-eval":           "Run the external lm-eval harness and write a suite run payload; --dry-run still executes the harness before server validation.",
 	"eval pull":              "Download a suite + datasets for offline runs and inspection.",
 	"eval submit":            "Submit a previously saved run payload (deferred submit).",
 	"eval shard":             "Run eval shards, inspect aggregate shard coverage, and guard duplicate submissions.",

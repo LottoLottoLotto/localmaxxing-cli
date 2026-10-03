@@ -2,6 +2,19 @@
 
 Use eval commands to measure quality / accuracy rather than speed.
 
+## Discover runnable benchmarks
+
+```bash
+lmx eval dataset list
+lmx eval dataset show hellaswag
+lmx eval shard hellaswag --base-url http://localhost:8000 --questions 3 --dry-run
+```
+
+Shard datasets and registered suites are separate catalogs. HellaSwag and GSM8K
+use `eval shard`; terminal task datasets use `eval terminal`. An empty
+`eval suite list` does not mean evals are unavailable. Only use suite commands
+with approved slugs returned by the suite catalog on the selected API instance.
+
 ## Publish a suite
 
 Prefer the guarded one-command workflow:
@@ -29,7 +42,7 @@ Lower-level discovery and authoring commands remain available:
 ```bash
 lmx eval suite list --out suites.json
 lmx eval suite search reasoning --out reasoning-suites.json
-lmx eval suite show hellaswag --out hellaswag-suite.json
+lmx eval suite show <approved-suite-slug> --out suite.json
 lmx eval suite init --slug my-eval --name "My Eval" --category reasoning --out my-eval.json
 lmx eval suite import questions.jsonl --slug my-eval --name "My Eval" --kind qa --out my-eval.json
 lmx eval suite validate my-eval.json
@@ -54,13 +67,28 @@ Eval runs start `PENDING` and appear after admin approval. Eval submissions are 
 
 ## lm-eval harness
 
-Run lm-eval through the CLI:
+Run lm-eval through the CLI using an approved `LM_EVAL_HARNESS` suite slug,
+not a task name or shard dataset slug:
 
 ```bash
-lmx eval lm-eval hellaswag --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run
+lmx eval lm-eval <approved-suite-slug> --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run
 ```
 
-Upload existing lm-eval results with `--results <path>`. Optional dependencies include `lm-eval` and `transformers`.
+For `eval lm-eval`, `--results <path>` selects the native harness result
+destination (default `localmaxxing-lm-eval-results.json`), while `--out` selects
+the imported LocalMaxxing payload. The wrapper collects a single aggregate
+result from a fresh current-run directory, including native timestamped files;
+missing or multiple aggregates fail instead of reusing stale results. Numeric
+scores, including zero, are imported; nonnumeric metadata and standard-error
+fields are not scores. With `--json`, harness output goes to stderr so stdout
+remains one CLI JSON document.
+
+`--dry-run` performs inference and validates without submitting; `--submit`
+submits, and neither flag means local files only. Upload an existing native
+result without rerunning inference using
+`lmx eval run <approved-suite-slug> --model <hfId> --results <path> --hardware hardware.json --submit`.
+The approved suite's task keys must match the results. Optional dependencies
+include `lm-eval` and `transformers`.
 
 Useful lm-eval flags:
 

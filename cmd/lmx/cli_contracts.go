@@ -267,7 +267,7 @@ func commandAuthentication(name string) string {
 		return "required"
 	case strings.HasPrefix(name, "auth keys"), strings.Contains(name, "submit"), name == "setups", strings.HasPrefix(name, "setups "):
 		return "required"
-	case name == "auth", name == "report", name == "report list", name == "report show":
+	case name == "auth", name == "report", name == "report list", name == "report show", name == "eval lm-eval":
 		return "optional"
 	default:
 		return "none"
@@ -276,7 +276,7 @@ func commandAuthentication(name string) string {
 
 func commandSideEffects(name string) []string {
 	switch {
-	case name == "update" || name == "upgrade":
+	case name == "update":
 		return []string{"replaces installed executable"}
 	case name == "auth":
 		return []string{"may persist or remove credentials"}

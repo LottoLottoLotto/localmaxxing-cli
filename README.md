@@ -62,6 +62,38 @@ go build -o lmx ./cmd/lmx
 ./lmx --help
 ```
 
+## Command-name cutover (v0.1.47)
+
+v0.1.47 removes the aliases below. Update scripts and saved command
+templates to the canonical spelling when upgrading. Removed spellings are
+unknown commands; they do not forward to the replacement or perform work.
+Arguments after the renamed command stay unchanged.
+
+| Removed spelling | Canonical spelling |
+|---|---|
+| `lmx eval lmeval` | `lmx eval lm-eval` |
+| `lmx calculator` | `lmx calculate` |
+| `lmx decode-calculator` | `lmx calculate decode` |
+| `lmx agent-context` | `lmx context` |
+| `lmx reports` | `lmx report` |
+| `lmx upgrade` | `lmx update` |
+| `lmx kv-cache` | `lmx kvcache` |
+| `lmx speed-test kv-cache <engine>` | `lmx kvcache run <engine>` |
+| `lmx context-sweep` | `lmx kvcache` |
+| `lmx speed-test context-sweep <engine>` | `lmx kvcache run <engine>` |
+
+The command-name cutover does not change API endpoints, JSON field names, or
+benchmark formats. For example, `/api/agent-context` remains the API route.
+The lm-eval importer ignores nonnumeric metadata when selecting scores; absent
+preferred metrics no longer mask a valid fallback, and an explicit zero remains
+valid. The wrapper collects timestamped harness result files into `--results`
+(default `localmaxxing-lm-eval-results.json`) from an isolated current-run directory.
+With `--json`, harness logs and tables go to stderr so stdout remains JSON.
+
+Remote KV-cache sweeps now classify reuse from the timed response's counters,
+not warm-up slot snapshots. Partial reuse is reported explicitly; missing or
+inconsistent evidence no longer produces a cold-prefill claim or prefill rate.
+
 ## Authentication
 
 Create an API key from your [LocalMaxxing dashboard](https://localmaxxing.com), then either set it in the environment:
@@ -400,9 +432,43 @@ lmx kvcache run vllm \
   --output-tokens 128
 ```
 
-Remote sweeps pre-warm the target context prefix, inspect llama.cpp `/slots` for `n_prompt_tokens_cache`, then time a streaming probe with the same prefix. The default filler is a deterministic varied-word sequence (a single repeated word is unrealistically friendly to prefix caching); pass `--filler-token <word>` to override. Reported `promptTokens` come from the endpoint's `usage.prompt_tokens` when available, and cached points estimate prefill speed from the non-cached suffix only. If `/slots` reports no retained prompt cache, the CLI records a warning and labels the point as a cold inline prefill measurement instead of cached-context speed.
+Remote sweeps pre-warm the target context prefix, then time a streaming probe
+with the same prefix. The default filler is a deterministic varied-word
+sequence; pass `--filler-token <word>` to override.
+
+`cacheReuse` uses only the timed response's `usage.prompt_tokens_details.cached_tokens`
+or llama.cpp `timings.cache_n` / `timings.prompt_n`, checked against
+`usage.prompt_tokens`. Warm-up results and `/slots` snapshots are not evidence
+of reuse by the timed request.
+
+- `retained`: the entire timed prompt was cached.
+- `partial`: some, but not all, timed prompt tokens were cached.
+- `not_retained`: the timed response explicitly reports zero cached tokens.
+- `unknown`: counters are missing, invalid, or inconsistent; a warning explains
+  the uncertainty, and no prefill rate is derived.
+
+Verified points include `cachedTokens` and `uncachedTokens` inside `cacheReuse`,
+along with raw usage/timing evidence. These counts describe the full timed
+prompt, including chat-template and probe tokens—not guaranteed retention of
+the nominal `contextTokens` depth. Prefill throughput is estimated from only
+`uncachedTokens / TTFT`, with `tokSPrefillSource` persisted as
+`estimated_from_ttft_uncached`; HTTP overhead and first-token generation remain
+included in TTFT. No prefill rate is reported for a fully cached prompt.
 
 ## Evals
+
+Discover approved shard datasets first:
+
+```bash
+lmx eval dataset list
+lmx eval dataset show hellaswag
+lmx eval shard hellaswag --base-url http://localhost:8000 --questions 3 --dry-run
+```
+
+Shard datasets and registered suites are separate catalogs. HellaSwag and GSM8K
+use `eval shard`, not `eval run` or `eval lm-eval`. An empty `eval suite list`
+does not mean evals are unavailable. Terminal datasets use `eval terminal`.
+The suite examples below require an approved suite on the selected API instance.
 
 ### Run a custom suite against a local endpoint
 
@@ -416,18 +482,28 @@ lmx eval run my-custom-suite \
 
 ### LM-Eval Harness
 
+Set `SUITE_SLUG` to an approved `LM_EVAL_HARNESS` suite from `lmx eval suite list`;
+do not substitute a shard dataset slug.
+
 ```bash
-lmx eval lm-eval hellaswag \
+lmx eval lm-eval "$SUITE_SLUG" \
   --model Qwen/Qwen3-8B \
   --backend hf \
   --hardware hardware.json \
   --dry-run
 ```
 
-Upload existing lm-eval output:
+The wrapper saves the native aggregate result at `--results` (default
+`localmaxxing-lm-eval-results.json`) and the imported run payload at `--out`.
+It collects only this invocation's output; missing or multiple aggregate files
+are errors. `--dry-run` performs inference and validates the payload, `--submit`
+submits it, and neither flag means local files only. With `--json`, harness
+output goes to stderr.
+
+Upload existing lm-eval output to the approved suite whose task keys match:
 
 ```bash
-lmx eval run local-open-llm-core \
+lmx eval run "$SUITE_SLUG" \
   --model Qwen/Qwen3-8B \
   --results localmaxxing-lm-eval-results.json \
   --hardware hardware.json \
@@ -566,10 +642,12 @@ support tool calling and preserve the generated prefix. As with SFT, these eval
 tasks contaminate same-task measurements: train only after acknowledging that
 fact and report quality on a separate, previously unseen holdout.
 
-## Discover Models and Suites
+## Discover Models, Datasets, and Suites
 
 ```bash
 lmx context --out localmaxxing-agent-context.json
+lmx eval dataset list --out localmaxxing-datasets.json
+lmx eval dataset show hellaswag
 lmx eval suite list --out localmaxxing-suites.json
 lmx eval suite search reasoning
 lmx model search qwen3-8b

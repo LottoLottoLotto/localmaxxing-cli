@@ -4,7 +4,7 @@ Raw HTTP API docs are available from the site through `GET /api/agent-context` a
 
 ## Top-level commands
 
-- `lmx context` / `lmx agent-context`: fetch live enum values and schemas.
+- `lmx context`: fetch live enum values and schemas.
 - `lmx auth`: manage LocalMaxxing API authentication.
 - `lmx hardware`: detect, validate, or template hardware metadata.
 - `lmx setups`: list and pull saved account setups.
@@ -13,13 +13,13 @@ Raw HTTP API docs are available from the site through `GET /api/agent-context` a
 - `lmx engines` / `lmx engine`: list engine helpers.
 - `lmx server`: build or run local model server commands.
 - `lmx endpoint`: discover OpenAI-compatible endpoints.
-- `lmx kvcache` / `lmx kv-cache` / `lmx context-sweep`: run KV-cache/context sweeps.
+- `lmx kvcache`: run KV-cache/context sweeps.
 - `lmx speed-test`: create, repair, manage, validate, and submit inference speed tests.
-- `lmx eval`: discover, run, and submit evaluation suites.
-- `lmx report` / `lmx reports`: create, edit, publish, and manage model reports.
-- `lmx calculate` / `lmx calculator` / `lmx decode-calculator`: calculate model memory fit and decode ceilings.
+- `lmx eval`: discover shard datasets and registered suites, run evals, and submit results.
+- `lmx report`: create, edit, publish, and manage model reports.
+- `lmx calculate`: calculate model memory fit and decode ceilings.
 - `lmx skill`: print or install the bundled agent skill.
-- `lmx update` / `lmx upgrade`: securely update a release binary; use `--dry-run` to inspect the asset first.
+- `lmx update`: securely update a release binary; use `--dry-run` to inspect the asset first.
 - `lmx version`: print release/build metadata; prefer `--json` for automation.
 - `lmx commands`: print the versioned machine-readable command and option schema.
 
@@ -50,7 +50,7 @@ Model/eval:
 - `--model-args <args>`: lm-eval `--model_args` value.
 - `--num-fewshot <n>`: lm-eval `--num_fewshot` override.
 - `--lm-eval-bin <path>`: lm-eval executable; default `lm_eval`.
-- `--results <path>`: existing lm-eval output JSON for run upload.
+- `--results <path>`: existing native lm-eval output JSON for `eval run` upload. For `eval lm-eval`, the native harness result destination (default `localmaxxing-lm-eval-results.json`), distinct from the imported payload at `--out`. Timestamped harness results are collected from an isolated current-run directory; previous results are not reused. With `--json`, harness output goes to stderr.
 - `--kind <kind>`: storage upload kind, usually `artifact` or `dataset`.
 - `--format <format>`: output/storage format. `speed-test runs show` and `speed-test runs compare` support `table`, `ascii`, or `json`; storage uploads use `json`, `jsonl`, `parquet`, or `zip`.
 - `--item-count <n>`: optional record/sample count for storage metadata.

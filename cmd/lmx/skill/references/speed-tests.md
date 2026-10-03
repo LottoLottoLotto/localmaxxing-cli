@@ -220,4 +220,10 @@ lmx kvcache run llama.cpp --hf-id Qwen/Qwen3-8B --model-path model.gguf --levels
 lmx kvcache run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --levels 10000,20000,30000,40000
 ```
 
-Remote sweeps pre-warm the prefix, inspect `/slots` when available, use a deterministic varied-word filler by default, and finish with `--probe-prompt`. Use `--filler-token` to override the filler text.
+Remote sweeps pre-warm the prefix, use a deterministic varied-word filler by default, and finish with `--probe-prompt`. Use `--filler-token` to override the filler text.
+
+Cache evidence comes only from the timed response: `usage.prompt_tokens_details.cached_tokens` and llama.cpp `timings.cache_n` / `timings.prompt_n`, checked against `usage.prompt_tokens`. `/slots` and warm-up counters do not establish reuse by the timed request.
+
+`cacheReuse.status` is `retained` when the entire timed prompt is cached, `partial` for positive reuse below the full prompt length, `not_retained` for an explicit zero, and `unknown` for missing/invalid/conflicting counters. Inspect `cachedTokens`, `uncachedTokens`, and the raw usage/timing evidence; nominal context depth does not establish cache coverage.
+
+Prefill throughput uses verified uncached tokens divided by client-observed TTFT, with `tokSPrefillSource` persisted as `estimated_from_ttft_uncached`. It remains an estimate including HTTP and first-token overhead. Unknown reuse carries a warning and no derived prefill rate; fully cached prompts also have no prefill rate.

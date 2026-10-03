@@ -72,7 +72,24 @@ Fetch the current LocalMaxxing agent context:
 lmx context --out localmaxxing-agent-context.json
 ```
 
-List approved eval suites:
+List approved shard datasets, including HellaSwag and GSM8K:
+
+```bash
+lmx eval dataset list --out localmaxxing-datasets.json
+lmx eval dataset show hellaswag --out hellaswag-dataset.json
+lmx eval shard hellaswag --base-url http://localhost:8000 --questions 3 --dry-run
+```
+
+These commands use `/api/benchmarks/datasets` and `/api/benchmarks/<dataset>/shard`.
+An authenticated shard request downloads the real dataset from object storage;
+the dry-run performs local inference without submitting results. Terminal task
+datasets use `eval terminal` instead.
+
+Registered suites are a separate catalog at `/api/benchmarks/suites`. It can be
+empty while official shard evals remain available. HellaSwag and GSM8K are not
+registered suite slugs; do not use them with `eval run`, `eval pull`, or `eval lm-eval`.
+
+List approved registered suites:
 
 ```bash
 lmx eval suite list --out localmaxxing-suites.json
@@ -84,10 +101,10 @@ Search suites:
 lmx eval suite search reasoning --limit 10 --out reasoning-suites.json
 ```
 
-Inspect one suite:
+Set `SUITE_SLUG` to a slug returned by the suite catalog, then inspect it:
 
 ```bash
-lmx eval suite show hellaswag --out hellaswag-suite.json
+lmx eval suite show "$SUITE_SLUG" --out suite.json
 ```
 
 Search for the canonical model ID:
@@ -100,10 +117,13 @@ The suite file includes `suiteDoc`, task keys, scoring method, aggregation, and 
 
 ## 5. Run An LM-Eval Harness Suite
 
-For `LM_EVAL_HARNESS` suites such as `hellaswag`, `mmlu`, or `gsm8k`, use the wrapper:
+For an approved suite whose `runner` is `LM_EVAL_HARNESS`, use the wrapper.
+Set `SUITE_SLUG` to that registered suite's slug, not an lm-eval task name or a
+shard dataset slug. If none are listed, publish a new suite and wait for approval,
+or use the existing shard workflow above.
 
 ```bash
-lmx eval lm-eval hellaswag \
+lmx eval lm-eval "$SUITE_SLUG" \
   --model Qwen/Qwen3-8B \
   --backend hf \
   --hardware hardware.json \
@@ -115,7 +135,7 @@ For `--backend hf`, the CLI defaults `--model-args` to `pretrained=<model>`.
 For another lm-eval backend, pass explicit model args:
 
 ```bash
-lmx eval lm-eval hellaswag \
+lmx eval lm-eval "$SUITE_SLUG" \
   --model Qwen/Qwen3-8B \
   --backend vllm \
   --model-args pretrained=Qwen/Qwen3-8B,tensor_parallel_size=1 \
@@ -128,9 +148,20 @@ The wrapper:
 - Fetches the suite from LocalMaxxing.
 - Verifies it is an `LM_EVAL_HARNESS` suite.
 - Builds and runs `lm_eval`.
-- Parses the output JSON.
+- Collects this invocation's aggregate JSON, including native timestamped lm-eval filenames.
 - Writes a LocalMaxxing run payload.
-- Calls the LocalMaxxing dry-run or submit endpoint.
+- Calls the LocalMaxxing validation endpoint with `--dry-run`, or submits with `--submit`; neither flag means local files only.
+
+`--results <file.json>` selects the saved native harness result file; the default
+is `localmaxxing-lm-eval-results.json`. The wrapper runs the harness in a fresh
+output directory and moves its single aggregate result to that path before
+importing it, so a previous result cannot silently stand in for missing output.
+Missing or multiple aggregate files are errors. `--out` separately selects the
+LocalMaxxing run payload. Numeric metric values, including zero, are imported;
+task labels and standard-error metadata are not scores.
+
+With `--json`, harness logs and tables go to stderr so stdout remains one CLI
+JSON document. `--dry-run` still performs inference; it is not a command preview.
 
 If `lm_eval` is not installed:
 
@@ -141,7 +172,7 @@ pip install lm-eval
 If your executable has a custom name or path:
 
 ```bash
-lmx eval lm-eval hellaswag \
+lmx eval lm-eval "$SUITE_SLUG" \
   --model Qwen/Qwen3-8B \
   --lm-eval-bin /path/to/lm_eval \
   --hardware hardware.json \
@@ -150,10 +181,11 @@ lmx eval lm-eval hellaswag \
 
 ## 6. Upload Existing LM-Eval Results
 
-If you already ran lm-eval yourself, upload the result JSON:
+If you already ran lm-eval yourself, upload the result JSON to the approved suite
+selected above. Its task keys must match your results:
 
 ```bash
-lmx eval run hellaswag \
+lmx eval run "$SUITE_SLUG" \
   --model Qwen/Qwen3-8B \
   --results localmaxxing-lm-eval-results.json \
   --hardware hardware.json \
@@ -163,7 +195,7 @@ lmx eval run hellaswag \
 When the dry-run passes, submit it:
 
 ```bash
-lmx eval run hellaswag \
+lmx eval run "$SUITE_SLUG" \
   --model Qwen/Qwen3-8B \
   --results localmaxxing-lm-eval-results.json \
   --hardware hardware.json \

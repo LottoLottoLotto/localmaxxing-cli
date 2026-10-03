@@ -37,10 +37,29 @@ lmx hardware --out hardware.json
 - Already-running OpenAI-compatible / vLLM / SGLang / Ollama endpoint: use a **remote speed test** with `--mode remote --base-url ...`. This is the path where you control the prompt.
 - Raw llama.cpp throughput on the host: use a **local speed test** with `--mode local --model-path model.gguf`; it runs `llama-bench` with synthetic token counts.
 - Existing completed speed-test JSON: validate and submit it without rerunning; see `skill://localmaxxing-cli/references/speed-tests.md` for the upload shape and repair commands.
-- Quality / accuracy instead of speed: use evals; see `skill://localmaxxing-cli/references/evals.md`.
+- Quality / accuracy instead of speed: discover shard datasets with `lmx eval dataset list` and `lmx eval dataset show <slug>`. HellaSwag/GSM8K use `eval shard`; terminal datasets use `eval terminal`. Registered suites are a separate catalog; an empty `eval suite list` does not mean evals are unavailable. See `skill://localmaxxing-cli/references/evals.md`.
 - Long-form findings or analysis that a user should edit in the web report studio: use `lmx report`; see `skill://localmaxxing-cli/references/reports.md`.
 - Speed vs context depth: use a KV-cache sweep with `lmx kvcache run`.
 - Planning a model/hardware configuration without running inference: use `lmx calculate decode --json`.
+
+Use the canonical v0.1.47 commands: `eval lm-eval`, `calculate` / `calculate decode`,
+`context`, `report`, `update`, and `kvcache`. Removed command spellings fail
+rather than forwarding. The `engine` / `engines` aliases remain available.
+
+For `eval lm-eval`, select an approved `LM_EVAL_HARNESS` suite from the suite
+catalog, not a shard dataset slug. `--results` is the native result destination
+(default `localmaxxing-lm-eval-results.json`); `--out` is the imported payload.
+Each invocation collects fresh harness output, including timestamped aggregate
+files. With `--json`, harness output goes to stderr. To import an existing result
+without running inference, use `eval run <suite> --results <path>`.
+
+Remote KV-cache evidence must come from the timed response, not `/slots` or
+warm-up counters. `retained` means the full timed prompt is cached; `partial`
+means positive but incomplete reuse; `not_retained` requires explicit zero;
+missing, invalid, or conflicting evidence is `unknown`. Only verified uncached
+tokens contribute to the TTFT-based prefill estimate; unknown and fully cached
+points have no derived prefill rate. See the speed-test reference for raw evidence
+and persisted estimate provenance.
 
 ## Agent-run decode calculator
 

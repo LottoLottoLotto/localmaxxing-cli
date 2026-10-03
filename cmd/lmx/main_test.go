@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2425,60 +2426,6 @@ func TestHandleKVCacheHonorsOutAndRunsDir(t *testing.T) {
 	}
 }
 
-func TestHandleRemoteKVCacheWarnsAboutDepthFallback(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1/models":
-			fmt.Fprint(w, `{"object":"list","data":[{"id":"served-model","object":"model"}]}`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	tmp := t.TempDir()
-	out := filepath.Join(tmp, "sweep.json")
-	runsDir := filepath.Join(tmp, "runs")
-	args := cliArgs{
-		opts: map[string]string{
-			"mode":         "remote",
-			"base-url":     server.URL,
-			"hf-id":        "org/model",
-			"served-model": "served-model",
-			"levels":       "128",
-			"out":          out,
-			"runs-dir":     runsDir,
-		},
-		flags: map[string]bool{"dry-run": true, "quiet": true},
-	}
-	if err := handleKVCache("run", "vllm", args); err != nil {
-		t.Fatalf("handleKVCache returned error: %v", err)
-	}
-
-	aggregate, err := readJSON(out)
-	if err != nil {
-		t.Fatalf("read aggregate: %v", err)
-	}
-	warnings := aggregate.(map[string]any)["warnings"].([]any)
-	if len(warnings) != 1 || !strings.Contains(stringValue(warnings[0]), "Remote OpenAI-compatible endpoints") {
-		t.Fatalf("aggregate warnings = %#v", warnings)
-	}
-
-	entries, err := os.ReadDir(filepath.Join(runsDir, "org-model"))
-	if err != nil {
-		t.Fatalf("read remote kvcache run dir: %v", err)
-	}
-	value, err := readJSON(filepath.Join(runsDir, "org-model", entries[0].Name()))
-	if err != nil {
-		t.Fatalf("read saved kvcache run: %v", err)
-	}
-	payload := value.(map[string]any)["payload"].(map[string]any)
-	runWarnings := payload["warnings"].([]any)
-	if len(runWarnings) != 1 || !strings.Contains(stringValue(runWarnings[0]), "cold depth TPS") {
-		t.Fatalf("run warnings = %#v", runWarnings)
-	}
-}
-
 func TestParseLlamaBenchJSONDepthMetrics(t *testing.T) {
 	metrics := parseBenchmarkOutput(`[
   {"n_prompt":512,"n_gen":0,"n_depth":10000,"avg_ts":6425.91},
@@ -2596,114 +2543,88 @@ func TestParseVLLMLatencyJSONMetrics(t *testing.T) {
 	}
 }
 
-func TestRemoteKVCachePointReportsUsagePromptTokens(t *testing.T) {
-	var warmRequestBody string
-	var timedRequestBody string
-	chatRequests := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/slots":
-			fmt.Fprint(w, `[{"id":0,"n_prompt_tokens_cache":10000}]`)
-			return
-		case "/v1/chat/completions":
-			chatRequests++
-			data, _ := io.ReadAll(r.Body)
-			if chatRequests == 1 {
-				warmRequestBody = string(data)
-				fmt.Fprint(w, `{"choices":[{"message":{"content":"warm"}}],"usage":{"prompt_tokens":10000,"completion_tokens":1}}`)
+func TestRemoteKVCacheTimedRequestEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, usage, timings, status string
+		cached, uncached             float64
+	}{
+		{"missing counters", `{"prompt_tokens":564,"completion_tokens":2}`, `null`, "unknown", 0, 0},
+		{"explicit zero", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":0}}`, `null`, "not_retained", 0, 564},
+		{"partial reuse", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":32}}`, `null`, "partial", 32, 532},
+		{"entire prompt reused", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":564}}`, `null`, "retained", 564, 0},
+		{"native cache counter", `{"prompt_tokens":564,"completion_tokens":2}`, `{"cache_n":32}`, "partial", 32, 532},
+		{"native processed counter", `{"prompt_tokens":564,"completion_tokens":2}`, `{"prompt_n":532}`, "partial", 32, 532},
+		{"consistent counters", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":32}}`, `{"cache_n":32,"prompt_n":532}`, "partial", 32, 532},
+		{"conflicting cache counters", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":32}}`, `{"cache_n":0}`, "unknown", 0, 0},
+		{"conflicting processed counter", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":32}}`, `{"prompt_n":564}`, "unknown", 0, 0},
+		{"missing total", `{"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":32}}`, `null`, "unknown", 0, 0},
+		{"negative cache", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":-1}}`, `null`, "unknown", 0, 0},
+		{"cache exceeds prompt", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":565}}`, `null`, "unknown", 0, 0},
+		{"fractional cache", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":0.5}}`, `null`, "unknown", 0, 0},
+		{"text cache", `{"prompt_tokens":564,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":"32"}}`, `null`, "unknown", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chatRequests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/slots":
+					// Unrelated slot state must not establish reuse by the probe.
+					fmt.Fprint(w, `[{"id":0,"n_prompt_tokens_cache":10000}]`)
+				case "/v1/chat/completions":
+					chatRequests++
+					if chatRequests == 1 {
+						fmt.Fprint(w, `{"choices":[{"message":{"content":"warm"}}],"usage":{"prompt_tokens":548,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":548}}}`)
+						return
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					time.Sleep(2 * time.Millisecond)
+					fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
+					fmt.Fprintf(w, "data: {\"choices\":[],\"usage\":%s,\"timings\":%s}\n", tc.usage, tc.timings)
+					fmt.Fprintln(w, `data: [DONE]`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			point, err := measureRemoteKVCachePoint(cliArgs{
+				opts:  map[string]string{"base-url": server.URL, "served-model": "served-model", "prompt-tokens": "512"},
+				flags: map[string]bool{"quiet": true},
+			}, "org/model", 512)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cache := point["cacheReuse"].(map[string]any)
+			if cache["status"] != tc.status {
+				t.Fatalf("cache evidence = %#v, want %s", cache, tc.status)
+			}
+			if tc.status == "unknown" {
+				if _, present := cache["cachedTokens"]; present {
+					t.Fatalf("unknown reuse must not publish a cached token count: %#v", cache)
+				}
+				if _, present := point["tokSPrefill"]; present {
+					t.Fatalf("unknown reuse must not publish prefill throughput: %#v", point)
+				}
+				if _, present := point["warnings"]; !present {
+					t.Fatal("unknown reuse must carry a warning")
+				}
 				return
 			}
-			timedRequestBody = string(data)
-			w.Header().Set("Content-Type", "text/event-stream")
-			time.Sleep(2 * time.Millisecond)
-			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
-			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":10067,"completion_tokens":2}}`)
-			fmt.Fprintln(w, `data: [DONE]`)
-		default:
-			http.NotFound(w, r)
-			return
-		}
-	}))
-	defer server.Close()
-
-	point, err := measureRemoteKVCachePoint(cliArgs{opts: map[string]string{"base-url": server.URL, "served-model": "served-model", "max-tokens": "16", "prompt-tokens": "10000"}, flags: map[string]bool{"quiet": true}}, "org/model", 10000)
-	if err != nil {
-		t.Fatalf("measureRemoteKVCachePoint returned error: %v", err)
-	}
-	if chatRequests != 2 {
-		t.Fatalf("chatRequests = %d, want prewarm + timed requests", chatRequests)
-	}
-	if point["contextTokens"] != 10000.0 || point["promptTokens"] != 10067.0 || point["usagePromptTokens"] != 10067.0 || point["outputTokens"] != 2.0 {
-		t.Fatalf("point token fields = %#v", point)
-	}
-	if point["tokSOut"] == nil || point["ttftMs"] == nil || point["tokSPrefill"] == nil {
-		t.Fatalf("expected throughput fields, got %#v", point)
-	}
-	if point["tokSPrefillSource"] != "estimated_from_ttft_uncached" {
-		t.Fatalf("tokSPrefillSource = %v, want estimated_from_ttft_uncached", point["tokSPrefillSource"])
-	}
-	if point["methodology"] != remoteKVCacheReuseMethodology {
-		t.Fatalf("methodology = %v", point["methodology"])
-	}
-	cacheReuse := point["cacheReuse"].(map[string]any)
-	if cacheReuse["status"] != "retained" || cacheReuse["nPromptTokensCacheMax"] != 10000 {
-		t.Fatalf("cacheReuse = %#v", cacheReuse)
-	}
-	if !strings.Contains(timedRequestBody, "Context received.") || !strings.Contains(timedRequestBody, "stream_options") {
-		t.Fatalf("timedRequestBody missing retained chat history or usage options: %s", timedRequestBody)
-	}
-	for name, body := range map[string]string{"warm": warmRequestBody, "timed": timedRequestBody} {
-		var request map[string]any
-		if err := json.Unmarshal([]byte(body), &request); err != nil {
-			t.Fatalf("parse %s request body: %v", name, err)
-		}
-		messages := request["messages"].([]any)
-		prefix := messages[1].(map[string]any)["content"].(string)
-		if got := len(strings.Fields(prefix)); got != 10000 {
-			t.Fatalf("%s request prefill depth = %d words, want 10000", name, got)
-		}
-	}
-}
-
-func TestRemoteKVCachePointWarnsWhenSlotsShowNoCache(t *testing.T) {
-	chatRequests := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/slots":
-			fmt.Fprint(w, `[{"id":0,"n_prompt_tokens_cache":0}]`)
-		case "/v1/chat/completions":
-			chatRequests++
-			if chatRequests == 1 {
-				fmt.Fprint(w, `{"choices":[{"message":{"content":"warm"}}],"usage":{"prompt_tokens":10000,"completion_tokens":1}}`)
-				return
+			if cache["cachedTokens"] != tc.cached || cache["uncachedTokens"] != tc.uncached {
+				t.Fatalf("cache counts = %#v, want cached=%v uncached=%v", cache, tc.cached, tc.uncached)
 			}
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`)
-			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":67,"completion_tokens":2}}`)
-			fmt.Fprintln(w, `data: [DONE]`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	point, err := measureRemoteKVCachePoint(cliArgs{opts: map[string]string{"base-url": server.URL, "served-model": "served-model", "max-tokens": "16", "prompt-tokens": "10000"}, flags: map[string]bool{"quiet": true}}, "org/model", 10000)
-	if err != nil {
-		t.Fatalf("measureRemoteKVCachePoint returned error: %v", err)
-	}
-	cacheReuse := point["cacheReuse"].(map[string]any)
-	if cacheReuse["status"] != "not_retained" || cacheReuse["nPromptTokensCacheMax"] != 0 {
-		t.Fatalf("cacheReuse = %#v", cacheReuse)
-	}
-	if point["methodology"] != remoteKVCacheColdMethodology {
-		t.Fatalf("methodology = %v", point["methodology"])
-	}
-	if point["promptTokens"] != 67.0 || point["usagePromptTokens"] != 67.0 {
-		t.Fatalf("point token fields = %#v", point)
-	}
-	warnings := point["warnings"].([]string)
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "cold prefill") {
-		t.Fatalf("warnings = %#v", warnings)
+			if tc.uncached == 0 {
+				if _, present := point["tokSPrefill"]; present {
+					t.Fatalf("fully cached prompt has no measured prefill throughput: %#v", point)
+				}
+			} else {
+				// Recover the work estimate from the rounded public metrics.
+				work := numberField(point, "tokSPrefill") * numberField(point, "ttftMs") / 1000
+				if math.Abs(work-tc.uncached) > math.Max(1, tc.uncached*0.01) {
+					t.Fatalf("prefill estimated %v tokens of work, want %v", work, tc.uncached)
+				}
+			}
+		})
 	}
 }
 
