@@ -12011,13 +12011,13 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --answer-regex <re>      Regex used when --answer-extraction regex
   --prompt-template <t>    Eval-shard prompt template using {{input}} and {{choices}}
   --concurrency <n>        Eval-shard parallel requests (default: 1)
-  --artifact-limit <n>     Shard traces to submit (default: 0 = all, for a complete whole-shard bundle; >0 keeps a balanced pass/fail sample)
+  --artifact-limit <n>     Eval-shard traces to submit (0 = all; >0 samples); rejected by terminal submit, which includes every task
   --task-dir <dir>        Terminal eval bundle directory (one bundle or parent of bundles)
   --run-dir <dir>         Durable terminal run checkpoint; writes run.json, atomic per-task results, traces, and final result.json
   --detach                Launch a terminal run as a durable background worker; requires --run-dir and cannot be combined with --dry-run
   --follow                Continue streaming terminal events until the persisted job reaches a terminal state
   --dataset <slug>        Terminal eval dataset slug; required for deferred submit
-  --shard-index <n>       Deferred terminal submit shard; required for isolated/noncanonical checkpoints
+  --shard-index <n>       Deferred terminal submit: retry only shard N from a full checkpoint, or identify an isolated shard
   --max-turns <n>         Requested turn cap; built-in/Terminus enforce it, arbitrary --agent-cmd only receives the env value and is not enforced (default: task manifest, then 50)
   --max-tokens <n>        Terminal model completion cap (default: 16384; retry: 8192)
   --agent-timeout <sec>   Terminal whole-agent timeout (default: task manifest, then 900 seconds)
@@ -12270,7 +12270,7 @@ var commandDescriptions = map[string]string{
 	"eval terminal status":   "Read a durable terminal run snapshot, including worker and task progress.",
 	"eval terminal logs":     "Replay canonical terminal JSONL events; --follow waits through job completion.",
 	"eval terminal cancel":   "Request cooperative cancellation; --force terminates the detached worker immediately.",
-	"eval terminal submit":   "Validate a completed terminal checkpoint, batch canonical Terminal-Bench 2.1 into 10 shards, or submit one explicit --shard-index.",
+	"eval terminal submit":   "Validate a completed checkpoint, batch canonical Terminal-Bench 2.1/CRUDbench shards, or retry only --shard-index N with stable full-checkpoint identity.",
 	"eval train":             "Prepare verifier-filtered training data from eval results or run an explicit local trainer.",
 	"eval train prepare":     "Export passing OMP trajectories as conversational SFT JSONL and failures as diagnostics.",
 	"eval train run":         "Expand and optionally execute an explicit local training command from a prepared manifest.",

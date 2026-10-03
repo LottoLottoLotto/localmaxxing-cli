@@ -149,10 +149,21 @@ Completion is authoritative only when `status.state` is `completed` or `submitte
 
 The approved Terminal-Bench 2.1 dataset partitions 89 tasks into 10 disjoint
 shards. A full deferred checkpoint is validated against the exact canonical task
-set and written/submitted as 10 ordered shard payloads; `--shard-index <n>` is
-required for an already-isolated shard or any other dataset. Dry-run performs no
-network calls. Saved shard-local and full-checkpoint token totals remain in
-`runConfig`.
+set and written/submitted as 10 ordered shard payloads. CRUDbench likewise uses
+its canonical task set and shard partition. To retry a failed shard, submit the
+**original full checkpoint** with the same options plus `--shard-index <n>`:
+all checkpoint records are validated, but only shard N is sent. Every shard keeps
+the same `runConfig.fullCheckpointId`, a stable SHA256 fingerprint of the complete
+saved results, measurements, and full trace content, independent of checkpoint
+location and summary ordering. Changed checkpoint content gets a different ID.
+Full-checkpoint task, shard, score, and token totals remain in `runConfig`.
+
+`--shard-index <n>` is required for an already-isolated shard or any other dataset.
+Isolated checkpoints do not claim full-checkpoint identity. Dry-run performs no
+network calls. `eval terminal submit` rejects `--artifact-limit` (including zero)
+before submission or output writes: terminal submission includes an artifact for
+every task. Existing bounded trace previews are unchanged; the server retains
+all uploaded trace content in the full bundle.
 
 For long agent-driven runs, always pass a unique `--run-dir`; `--resume auto` is
 then the default. Each task result and `run.json` are atomically persisted before

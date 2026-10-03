@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"html"
 	"io"
 	"net/http"
@@ -1806,6 +1807,9 @@ type terminalSubmissionRecord struct {
 // does not share runTerminalEval's acquisition path: deferred submit must never
 // contact a model endpoint, acquire tasks, start Docker, or rerun a verifier.
 func submitTerminalEval(args cliArgs) error {
+	if _, supplied := args.opts["artifact-limit"]; supplied || hasFlag(args, "artifact-limit") {
+		return cliError{"unsupported_option", "--artifact-limit is not supported by eval terminal submit; terminal submission includes artifacts for every task.", []string{"Remove --artifact-limit and submit the complete checkpoint."}, nil}
+	}
 	runDir := positional(args, 3)
 	if runDir == "" {
 		return cliError{"missing_option", "eval terminal submit requires a completed run directory.", []string{"Run: lmx eval terminal submit <run-dir> --dataset <slug> --hf-id <org/model> --hardware hardware.json --dry-run."}, nil}
@@ -1858,11 +1862,9 @@ func submitTerminalEval(args cliArgs) error {
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Task < entries[j].Task })
+	fullCheckpoint := canonical && terminalCheckpointHasCanonicalTaskSet(entries, canonicalDataset.taskIDs)
 	if canonical {
-		if explicitShard {
-			if terminalCheckpointHasCanonicalTaskSet(entries, canonicalDataset.taskIDs) {
-				return cliError{"full_checkpoint_with_shard_index", fmt.Sprintf("A full canonical %s checkpoint cannot be labeled as one shard.", canonicalDataset.name), []string{"Remove --shard-index to partition the full checkpoint into canonical shards."}, map[string]any{"tasks": len(entries), "shardIndex": shardIndex}}
-			}
+		if explicitShard && !fullCheckpoint {
 			if err := validateCanonicalTerminalShardTaskSet(entries, canonicalDataset, shardIndex); err != nil {
 				return err
 			}
@@ -1889,6 +1891,15 @@ func submitTerminalEval(args cliArgs) error {
 	artifactBytes, maxArtifactBytes, traceCount, fallbackCount := 0, 0, 0, 0
 	totalUsage := terminalTokenUsage{}
 	previewTotals := terminalTracePreviewStats{}
+	var checkpointHash hash.Hash
+	var checkpointEncoder *json.Encoder
+	// Domain separation permits future fingerprint versions without including
+	// local checkpoint paths, credentials, or submission-only options.
+	if fullCheckpoint {
+		checkpointHash = sha256.New()
+		checkpointEncoder = json.NewEncoder(checkpointHash)
+		_, _ = io.WriteString(checkpointHash, "lmx-terminal-full-checkpoint-v1\n")
+	}
 	for _, entry := range entries {
 		recordPath, err := terminalCheckpointResultPath(root, entry)
 		if err != nil {
@@ -1915,6 +1926,11 @@ func submitTerminalEval(args cliArgs) error {
 		usage := tokenUsageFromObject(record.TokenUsage)
 		totalLatencyMs += latency
 		totalUsage.add(usage)
+		if fullCheckpoint {
+			if err := encodeTerminalCheckpointIdentity(checkpointEncoder, root, record); err != nil {
+				return cliError{"checkpoint_fingerprint_failed", fmt.Sprintf("Could not fingerprint the full checkpoint task %q.", entry.Task), []string{"Restore readable complete task results and traces before retrying."}, err.Error()}
+			}
+		}
 		response, previewStats, usedTrace, err := terminalSavedArtifactResponse(root, recordPath, record)
 		if err != nil {
 			return cliError{"trace_read_failed", fmt.Sprintf("Could not package the OMP trace for task %q.", entry.Task), []string{"Check that the selected omp.jsonl is readable, or remove the broken trace to use the bounded saved response fallback."}, map[string]any{"taskId": entry.Task, "error": err.Error()}}
@@ -1962,7 +1978,7 @@ func submitTerminalEval(args cliArgs) error {
 	fullAccuracy := float64(passed) / float64(len(records))
 	fullAvgLatencyMs := totalLatencyMs / int64(len(records))
 	fullProvenance := map[string]any{"fullCheckpoint": false}
-	if !explicitShard {
+	if fullCheckpoint {
 		fullTaskIDs := make([]string, len(records))
 		for i := range records {
 			fullTaskIDs[i] = records[i].questionID
@@ -1972,6 +1988,7 @@ func submitTerminalEval(args cliArgs) error {
 		// every shard while the unprefixed runConfig metrics remain shard-local.
 		fullProvenance = map[string]any{
 			"fullCheckpoint":                    true,
+			"fullCheckpointId":                  hex.EncodeToString(checkpointHash.Sum(nil)),
 			"fullCheckpointTasksRun":            len(records),
 			"fullCheckpointAccuracy":            fullAccuracy,
 			"fullCheckpointAvgLatencyMs":        fullAvgLatencyMs,
@@ -1983,11 +2000,15 @@ func submitTerminalEval(args cliArgs) error {
 
 	recordShards := [][]terminalSubmissionRecord{records}
 	shardIndexes := []int{shardIndex}
-	if !explicitShard {
+	if fullCheckpoint {
 		recordShards = partitionTerminalSubmissionRecords(records, canonicalDataset.shardCount)
-		shardIndexes = make([]int, len(recordShards))
-		for i := range shardIndexes {
-			shardIndexes[i] = i + 1
+		if explicitShard {
+			recordShards = recordShards[shardIndex-1 : shardIndex]
+		} else {
+			shardIndexes = make([]int, len(recordShards))
+			for i := range shardIndexes {
+				shardIndexes[i] = i + 1
+			}
 		}
 	}
 	thinkingLevel, thinkingSource, err := resolveTerminalThinkingLevel(context.Background(), args, "", hfID, terminalConfig{agentCommand: "deferred-submit"}, os.Stdin, os.Stderr, terminalThinkingPromptAllowed(args))
@@ -2055,7 +2076,7 @@ func submitTerminalEval(args cliArgs) error {
 		currentShard := shardIndexes[i]
 		value, err := fetchJSON("POST", apiURL(args)+"/api/benchmarks/"+url.PathEscape(dataset)+"/submit", key, rawPayload)
 		if err != nil {
-			return cliError{"terminal_submit_shard_failed", fmt.Sprintf("Terminal submission stopped after shard %d failed.", currentShard), []string{"Fix the server error, then submit the remaining already-isolated shard checkpoints explicitly with --shard-index."}, map[string]any{"failedShardIndex": currentShard, "completedShardIndexes": completed, "error": err.Error()}}
+			return cliError{"terminal_submit_shard_failed", fmt.Sprintf("Terminal submission stopped after shard %d failed.", currentShard), []string{fmt.Sprintf("Fix the server error, then retry the original checkpoint with the same options and --shard-index %d; a full checkpoint retains its identity while sending only that shard.", currentShard), "Submit any later unsubmitted shard indexes from the same original checkpoint."}, map[string]any{"failedShardIndex": currentShard, "completedShardIndexes": completed, "error": err.Error()}}
 		}
 		completed = append(completed, currentShard)
 		receipt := map[string]any{"shardIndex": currentShard}
@@ -2072,12 +2093,43 @@ func submitTerminalEval(args cliArgs) error {
 		}
 		receipts = append(receipts, receipt)
 	}
-	fields["submitted"] = len(records)
+	submitted := 0
+	for _, size := range shardSizes {
+		submitted += size
+	}
+	fields["submitted"] = submitted
 	fields["completedShardIndexes"] = completed
 	fields["runIds"] = runIDs
 	fields["shardReceipts"] = receipts
 	printInfo(args, "terminal_submit_complete", fields)
 	return nil
+}
+
+// encodeTerminalCheckpointIdentity hashes complete trace bytes, not the bounded
+// display preview. Only saved result content and the trace digest enter the
+// identity; filenames, summary ordering, and submission credentials do not.
+func encodeTerminalCheckpointIdentity(encoder *json.Encoder, root string, record terminalSavedResult) error {
+	traceSHA256 := ""
+	if tracePath := findTerminalOMPTrace(root, record.QuestionID); tracePath != "" {
+		trace, err := os.Open(tracePath)
+		if err != nil {
+			return err
+		}
+		digest := sha256.New()
+		_, copyErr := io.Copy(digest, trace)
+		closeErr := trace.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		traceSHA256 = hex.EncodeToString(digest.Sum(nil))
+	}
+	return encoder.Encode(struct {
+		Result      terminalSavedResult `json:"result"`
+		TraceSHA256 string              `json:"traceSha256"`
+	}{Result: record, TraceSHA256: traceSHA256})
 }
 
 func terminalSubmitShardIndex(args cliArgs, dataset string) (int, bool, error) {

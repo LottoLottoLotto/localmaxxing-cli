@@ -3904,6 +3904,186 @@ func TestSubmitTerminalEvalCanonicalCheckpointDryRunPartitionsExactTaskSet(t *te
 	}
 }
 
+func TestSubmitTerminalEvalFullCheckpointIdentityAndTargetedRetry(t *testing.T) {
+	for _, dataset := range []string{terminalBench21Dataset, crudBenchDataset} {
+		t.Run(dataset, func(t *testing.T) {
+			canonical, _ := canonicalTerminalDatasetFor(dataset)
+			runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonical.taskIDs, true)
+			shards := terminalCheckpointIdentityBatch(t, runDir, hardwarePath, dataset)
+			fullConfig := asObject(asObject(shards[0])["runConfig"])
+			checkpointID := stringValue(fullConfig["fullCheckpointId"])
+			digest, err := hex.DecodeString(checkpointID)
+			if err != nil || len(digest) != sha256.Size {
+				t.Fatalf("full checkpoint ID = %q, want SHA256 hex", checkpointID)
+			}
+			for _, shard := range shards {
+				if got := asObject(asObject(shard)["runConfig"])["fullCheckpointId"]; got != checkpointID {
+					t.Fatalf("shards do not share checkpoint identity: got %v, want %s", got, checkpointID)
+				}
+			}
+
+			// Identical saved content is independent of checkpoint location,
+			// summary ordering, and credentials used for submission.
+			reorderedDir, reorderedHardware := writeTerminalCheckpointSetFixture(t, canonical.taskIDs, false)
+			reordered := terminalCheckpointIdentityBatch(t, reorderedDir, reorderedHardware, dataset, "--api-key", "different-fixture-key")
+			if got := asObject(asObject(reordered[0])["runConfig"])["fullCheckpointId"]; got != checkpointID {
+				t.Fatalf("reordered/moved checkpoint identity = %v, want %s", got, checkpointID)
+			}
+
+			const retryShard = 3
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Errorf("decode retry: %v", err)
+					http.Error(w, "invalid", http.StatusBadRequest)
+					return
+				}
+				start := (retryShard - 1) * len(canonical.taskIDs) / canonical.shardCount
+				end := retryShard * len(canonical.taskIDs) / canonical.shardCount
+				assertTerminalShardPayload(t, payload, retryShard, canonical.taskIDs[start:end])
+				config := asObject(payload["runConfig"])
+				for key, want := range fullConfig {
+					if strings.HasPrefix(key, "fullCheckpoint") && !reflect.DeepEqual(config[key], want) {
+						t.Errorf("retry %s = %#v, want %#v", key, config[key], want)
+					}
+				}
+				_, _ = w.Write([]byte(`{"run":{"id":"retried","status":"approved"}}`))
+			}))
+			defer server.Close()
+			err = submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", runDir,
+				"--dataset", dataset, "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
+				"--shard-index", "3", "--api-url", server.URL, "--api-key", "fixture-key", "--quiet"}))
+			if err != nil {
+				t.Fatalf("retry full checkpoint: %v", err)
+			}
+			if got := requests.Load(); got != 1 {
+				t.Fatalf("targeted retry sent %d requests, want exactly shard 3", got)
+			}
+
+			// Even a retry must validate tasks outside the selected shard.
+			if err := os.Remove(filepath.Join(runDir, canonical.taskIDs[0]+".json")); err != nil {
+				t.Fatal(err)
+			}
+			err = submitTerminalEval(parseArgs([]string{"eval", "terminal", "submit", runDir,
+				"--dataset", dataset, "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
+				"--shard-index", "3", "--api-url", server.URL, "--api-key", "fixture-key", "--quiet"}))
+			var cliErr cliError
+			if !errors.As(err, &cliErr) || cliErr.Code != "task_result_missing" || requests.Load() != 1 {
+				t.Fatalf("retry incomplete full checkpoint: error=%v, requests=%d", err, requests.Load())
+			}
+		})
+	}
+}
+
+func TestSubmitTerminalEvalFullCheckpointIdentityIncludesCompleteContent(t *testing.T) {
+	ids := terminalBench21CanonicalTestTaskIDs(t)
+	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, ids, false)
+	resultPath := filepath.Join(runDir, ids[0]+".json")
+	record, err := loadTerminalSavedResult(resultPath, ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The trace event is intentionally unknown to the bounded display preview.
+	tracePath := filepath.Join(runDir, "traces", ids[0], "agent", "session", "omp.jsonl")
+	mustMkdir(t, filepath.Dir(tracePath))
+	mustWrite(t, tracePath, "{\"type\":\"unknown\",\"data\":\"original\"}\n")
+	identity := func() string {
+		shards := terminalCheckpointIdentityBatch(t, runDir, hardwarePath, terminalBench21Dataset)
+		return stringValue(asObject(asObject(shards[0])["runConfig"])["fullCheckpointId"])
+	}
+	originalID := identity()
+	mutations := []struct {
+		name   string
+		mutate func(*terminalSavedResult)
+	}{
+		{"latency", func(r *terminalSavedResult) { r.WallTimeMs++ }},
+		{"token usage", func(r *terminalSavedResult) {
+			r.TokenUsage = map[string]any{"inputTokens": 2, "outputTokens": 1, "totalTokens": 3, "modelCalls": 1}
+		}},
+		{"saved response", func(r *terminalSavedResult) { r.Response += " changed" }},
+		{"verifier output", func(r *terminalSavedResult) { r.VerifierOutput = "different verifier evidence" }},
+		{"turn count", func(r *terminalSavedResult) {
+			turns := 4
+			r.Turns = &turns
+		}},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			changed := record
+			mutation.mutate(&changed)
+			writeTerminalTestJSON(t, resultPath, terminalSavedTaskFile{Results: []terminalSavedResult{changed}})
+			if got := identity(); got == originalID {
+				t.Fatalf("changed %s reused checkpoint ID %s", mutation.name, got)
+			}
+			writeTerminalTestJSON(t, resultPath, terminalSavedTaskFile{Results: []terminalSavedResult{record}})
+		})
+	}
+	mustWrite(t, tracePath, "{\"type\":\"unknown\",\"data\":\"changed\"}\n")
+	if got := identity(); got == originalID {
+		t.Fatalf("changed raw trace reused checkpoint ID %s", got)
+	}
+	mustWrite(t, tracePath, "{\"type\":\"unknown\",\"data\":\"original\"}\n")
+	if got := identity(); got != originalID {
+		t.Fatalf("restored checkpoint ID = %s, want %s", got, originalID)
+	}
+	summaryPath := filepath.Join(runDir, "summary.json")
+	summary, err := loadTerminalCheckpointSummary(summaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Pass = !record.Pass
+	summary[0].Pass = record.Pass
+	writeTerminalTestJSON(t, resultPath, terminalSavedTaskFile{Results: []terminalSavedResult{record}})
+	writeTerminalTestJSON(t, summaryPath, summary)
+	if got := identity(); got == originalID {
+		t.Fatalf("changed scored result reused checkpoint ID %s", got)
+	}
+}
+
+func terminalCheckpointIdentityBatch(t *testing.T, runDir, hardwarePath, dataset string, extra ...string) []any {
+	t.Helper()
+	payloadPath := filepath.Join(t.TempDir(), "batch.json")
+	argv := []string{"eval", "terminal", "submit", runDir,
+		"--dataset", dataset, "--hf-id", "fixture/model", "--thinking-level", "off", "--hardware", hardwarePath,
+		"--out", payloadPath, "--dry-run", "--quiet"}
+	err := submitTerminalEval(parseArgs(append(argv, extra...)))
+	if err != nil {
+		t.Fatalf("submit identity fixture: %v", err)
+	}
+	return anySlice(readTerminalSubmitBatch(t, payloadPath)["shards"])
+}
+
+func TestSubmitTerminalEvalRejectsArtifactLimitBeforeSideEffects(t *testing.T) {
+	for _, option := range [][]string{{"--artifact-limit", "0"}, {"--artifact-limit", "1"}, {"--artifact-limit", "-1"}, {"--artifact-limit"}} {
+		t.Run(strings.Join(option, " "), func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				http.Error(w, "unexpected network request", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+			out := filepath.Join(t.TempDir(), "payload.json")
+			runDir := filepath.Join(t.TempDir(), "not-created")
+			argv := []string{"eval", "terminal", "submit", runDir, "--api-url", server.URL, "--api-key", "fixture-key", "--out", out}
+			err := submitTerminalEval(parseArgs(append(argv, option...)))
+			var cliErr cliError
+			if !errors.As(err, &cliErr) || cliErr.Code != "unsupported_option" {
+				t.Fatalf("artifact limit error = %v, want unsupported_option before checkpoint access", err)
+			}
+			if requests.Load() != 0 {
+				t.Fatal("unsupported option made a network request")
+			}
+			for _, path := range []string{out, runDir} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("unsupported option wrote %s: stat error %v", path, err)
+				}
+			}
+		})
+	}
+}
+
 func TestSubmitCRUDbenchCanonicalCheckpointDryRunPartitionsExactTaskSet(t *testing.T) {
 	canonicalIDs := append([]string(nil), crudBenchCanonicalTaskIDs...)
 	runDir, hardwarePath := writeTerminalCheckpointSetFixture(t, canonicalIDs, true)
@@ -4009,6 +4189,9 @@ func TestSubmitTerminalEvalExplicitCanonicalShardWritesIsolatedCheckpointPayload
 	assertTerminalShardPayload(t, payload, 1, wantIDs)
 	if got := asObject(payload["runConfig"])["fullCheckpoint"]; got != false {
 		t.Fatalf("explicit shard fullCheckpoint = %#v, want false", got)
+	}
+	if got := asObject(payload["runConfig"])["fullCheckpointId"]; got != nil {
+		t.Fatalf("isolated shard invented full checkpoint identity: %v", got)
 	}
 }
 

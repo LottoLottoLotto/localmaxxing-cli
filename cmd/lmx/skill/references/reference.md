@@ -68,7 +68,7 @@ Eval shards and Terminal-Bench:
 - `--answer-regex <re>`: regex used with `--answer-extraction regex`.
 - `--prompt-template <t>`: eval-shard prompt template using `{{input}}` and `{{choices}}`.
 - `--concurrency <n>`: eval-shard parallel requests; default 1.
-- `--artifact-limit <n>`: shard traces to submit; default 0 means all.
+- `--artifact-limit <n>`: eval-shard traces to submit; default 0 means all. Rejected by `eval terminal submit`, which includes artifacts for every task.
 - `--scoring <mode>`: `exact_match`, `loglikelihood`, `llama_cpp_loglikelihood`, `code_execution`, or `cruxeval_execution`.
 - `--temperature <f>`: sampling temperature; eval-shard default 0.
 - `--top-p <f>`: sampling top_p; default 1.
@@ -83,7 +83,7 @@ Eval shards and Terminal-Bench:
 - `lmx eval terminal cancel <run-dir> [--json] [--force]`: request idempotent cooperative cancellation; `--force` skips the grace period and should be reserved for a stuck worker.
 - `--dataset <slug>`: Terminal eval dataset slug.
 - `--hf-id <hfId>`: canonical HuggingFace model ID for deferred terminal submit.
-- `--shard-index <n>`: explicit shard for an isolated deferred checkpoint; required for noncanonical datasets. Omit only for a complete canonical Terminal-Bench 2.1 checkpoint, which is validated and partitioned into 10 submissions.
+- `--shard-index <n>`: retry only shard N from an original full canonical Terminal-Bench 2.1 or CRUDbench checkpoint, retaining its stable content-based `runConfig.fullCheckpointId` and full-checkpoint totals. The entire checkpoint is validated before selecting that shard. Omit to submit all canonical shards. Required for isolated checkpoints/noncanonical datasets; isolated shards do not claim full-checkpoint identity.
 - `--max-turns <n>`: resolved Terminal eval turn cap. The built-in loop and Terminus-2 enforce it; arbitrary `--agent-cmd` wrappers only receive `LMX_TERMINAL_MAX_TURNS`, with enforcement reported as `not-enforced`.
 - `--max-tokens <n>`: Terminal model completion cap; default 16,384 and 8,192 on retry. An explicit value applies to both attempts.
 - `--agent-timeout <sec>`: Terminal eval whole-agent timeout.
