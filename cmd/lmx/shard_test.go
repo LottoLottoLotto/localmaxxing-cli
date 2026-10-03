@@ -816,14 +816,14 @@ func TestSandboxCommandQuotedRuntime(t *testing.T) {
 }
 
 func TestSandboxFailureHintsDockerPermission(t *testing.T) {
-	hints := strings.Join(sandboxFailureHints("permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"), "\n")
-	if !strings.Contains(hints, "Docker socket permission denied") || !strings.Contains(hints, "--sandbox-use-sudo") || !strings.Contains(hints, "docker build -t lmx-sandbox sandbox") {
+	hints := strings.Join(sandboxFailureHints("permission denied while trying to connect to the docker API at unix:///var/run/docker.sock", cliArgs{}), "\n")
+	if !strings.Contains(hints, "Docker socket permission denied") || !strings.Contains(hints, "--sandbox-use-sudo") || !strings.Contains(hints, "lmx eval sandbox setup") {
 		t.Fatalf("missing docker permission hints:\n%s", hints)
 	}
 }
 
 func TestSandboxFailureHintsPythonOperationNotPermitted(t *testing.T) {
-	hints := strings.Join(sandboxFailureHints("exec /usr/local/bin/python3: operation not permitted"), "\n")
+	hints := strings.Join(sandboxFailureHints("exec /usr/local/bin/python3: operation not permitted", cliArgs{}), "\n")
 	if !strings.Contains(hints, "--sandbox-relaxed-security") {
 		t.Fatalf("missing relaxed-security hint:\n%s", hints)
 	}
@@ -875,7 +875,7 @@ func TestRunEvalShardCodeExecGradesViaSandbox(t *testing.T) {
 		{"question_id": "humaneval:T2", "input": "def add(a, b):\n    \"\"\"add\"\"\"\n", "entry_point": "add", "test": "def check(candidate):\n    assert candidate(1, 2) == 999\n"},
 	}
 	cfg := runShardConfig{scoring: "code_execution", concurrency: 1}
-	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 ../../sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
+	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
 	results, stats, _, err := runEvalShardCodeExec(args, srv.URL, "m", items, cfg)
 	if err != nil {
 		t.Skipf("sandbox unavailable: %v", err)
@@ -922,7 +922,7 @@ func TestRunEvalShardCruxExecAcceptsEquivalentInput(t *testing.T) {
 		},
 	}
 	cfg := runShardConfig{scoring: "cruxeval_execution", concurrency: 1}
-	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 ../../sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
+	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
 	results, stats, _, err := runEvalShardCruxExec(args, srv.URL, "m", items, cfg)
 	if err != nil {
 		t.Skipf("sandbox unavailable: %v", err)
@@ -949,7 +949,7 @@ func TestRunEvalShardCruxExecScoresOutputPrediction(t *testing.T) {
 		},
 	}
 	cfg := runShardConfig{scoring: "cruxeval_execution", concurrency: 1}
-	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 ../../sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
+	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
 	results, stats, _, err := runEvalShardCruxExec(args, srv.URL, "m", items, cfg)
 	if err != nil {
 		t.Skipf("sandbox unavailable: %v", err)
@@ -989,7 +989,7 @@ func TestRunEvalShardCodeExecEmptyGenerationCountsAsFail(t *testing.T) {
 		{"question_id": "humaneval:E1", "input": "def f():\n    \"\"\"x\"\"\"\n", "entry_point": "f", "test": "def check(candidate):\n    assert candidate() == 1\n"},
 	}
 	cfg := runShardConfig{scoring: "code_execution", concurrency: 1}
-	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 ../../sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
+	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
 	results, stats, _, err := runEvalShardCodeExec(args, srv.URL, "m", items, cfg)
 	if err != nil {
 		t.Skipf("sandbox unavailable: %v", err)
@@ -1059,7 +1059,7 @@ func TestRunEvalShardCodeExecPassAtK(t *testing.T) {
 		{"question_id": "humaneval:P1", "input": "def add(a, b):\n    \"\"\"add\"\"\"\n", "entry_point": "add", "test": "def check(candidate):\n    assert candidate(1, 2) == 3\n"},
 	}
 	cfg := runShardConfig{scoring: "code_execution", concurrency: 1, nSamples: 2, passK: 2}
-	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 ../../sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
+	args := cliArgs{opts: map[string]string{"sandbox-cmd": "python3 sandbox/run_sandbox.py"}, flags: map[string]bool{"quiet": true}}
 	_, _, metrics, err := runEvalShardCodeExec(args, srv.URL, "m", items, cfg)
 	if err != nil {
 		t.Skipf("sandbox unavailable: %v", err)

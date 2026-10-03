@@ -1,7 +1,7 @@
 # Hardened sandbox image for execution-based code eval shards (HumanEval / MBPP).
 #
 # Build:
-#   docker build -t lmx-sandbox sandbox
+#   lmx eval sandbox setup   (builds from these sources embedded in the CLI)
 #
 # The default `lmx eval shard <code-dataset>` launcher uses:
 #   docker run --rm -i \

@@ -303,6 +303,8 @@ func runWithArgs(args cliArgs) error {
 			return handleStorage(positional(args, 2), positional(args, 3), args, "")
 		case "artifact", "artifacts":
 			return handleStorage(positional(args, 2), positional(args, 3), args, "artifact")
+		case "sandbox":
+			return handleEvalSandbox(positional(args, 2), args)
 		case "dataset":
 			return handleEvalDataset(positional(args, 2), positional(args, 3), args)
 		case "suite":
@@ -9519,18 +9521,22 @@ func preflightSandbox(args cliArgs) error {
 		return cliError{
 			"sandbox_unavailable",
 			fmt.Sprintf("Sandbox runtime %q was not found before model inference.", runtimeArgs[0]),
-			[]string{"Install the container runtime or select one with --sandbox-runtime.", "Override the sandbox launcher with --sandbox-cmd."},
+			[]string{"Install Docker (or Podman and pass --sandbox-runtime podman), then run " + sandboxSetupCommand(args) + ".", "Override the sandbox launcher with --sandbox-cmd."},
 			err.Error(),
 		}
 	}
-	image := firstNonEmpty(opt(args, "sandbox-image"), "lmx-sandbox")
+	image := sandboxImage(args)
 	inspectArgs := append(append([]string{}, runtimeArgs[1:]...), "image", "inspect", image)
-	output, err := exec.Command(runtimeArgs[0], inspectArgs...).CombinedOutput()
-	if err != nil {
+	if _, err := exec.Command(runtimeArgs[0], inspectArgs...).Output(); err != nil {
+		stderr := ""
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			stderr = string(exitErr.Stderr)
+		}
 		return cliError{
 			"sandbox_unavailable",
 			fmt.Sprintf("Sandbox image %q is not ready; model inference was not started.", image),
-			sandboxFailureHints(string(output)),
+			sandboxFailureHints(stderr, args),
 			map[string]any{"runtime": strings.Join(runtimeArgs, " "), "image": image, "error": err.Error()},
 		}
 	}
@@ -9540,13 +9546,13 @@ func preflightSandbox(args cliArgs) error {
 
 // sandboxCommand builds the process that runs the code sandbox. By default it
 // launches the hardened Docker image over stdin/stdout; --sandbox-cmd overrides
-// it entirely (e.g. podman, or `python3 sandbox/run_sandbox.py` without Docker).
+// it entirely (e.g. podman, or a direct `python3 run_sandbox.py` without Docker).
 func sandboxCommand(args cliArgs) (*exec.Cmd, string) {
 	if custom := opt(args, "sandbox-cmd"); custom != "" {
 		return exec.Command("sh", "-c", custom), custom
 	}
 	runtime := sandboxRuntimeArgs(args)
-	image := firstNonEmpty(opt(args, "sandbox-image"), "lmx-sandbox")
+	image := sandboxImage(args)
 	argv := append([]string{}, runtime...)
 	argv = append(argv,
 		"run", "--rm", "-i",
@@ -9569,7 +9575,7 @@ func sandboxCommand(args cliArgs) (*exec.Cmd, string) {
 	return exec.Command(argv[0], argv[1:]...), strings.Join(argv, " ")
 }
 
-func sandboxFailureHints(stderr string) []string {
+func sandboxFailureHints(stderr string, args cliArgs) []string {
 	clean := strings.TrimSpace(stderr)
 	hints := make([]string, 0, 5)
 	if clean != "" {
@@ -9585,7 +9591,7 @@ func sandboxFailureHints(stderr string) []string {
 	if strings.Contains(lower, "operation not permitted") && strings.Contains(lower, "python3") {
 		hints = append(hints, "If the container starts but cannot exec Python, retry with --sandbox-relaxed-security; some Docker/rootless/security-profile setups reject the stricter cap/no-new-privileges/read-only combination.")
 	}
-	hints = append(hints, "Build the image with `docker build -t lmx-sandbox sandbox`, or override with --sandbox-cmd.")
+	hints = append(hints, "Build or rebuild the image with `"+sandboxSetupCommand(args)+"` (no repository checkout needed), or override with --sandbox-cmd.")
 	return hints
 }
 
@@ -9803,7 +9809,7 @@ func runEvalShardCodeExec(args cliArgs, baseURL, model string, items []map[strin
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
-			return nil, shardStats{}, nil, cliError{"sandbox_failed", fmt.Sprintf("code sandbox failed: %v", err), sandboxFailureHints(stderr.String()), nil}
+			return nil, shardStats{}, nil, cliError{"sandbox_failed", fmt.Sprintf("code sandbox failed: %v", err), sandboxFailureHints(stderr.String(), args), nil}
 		}
 		scanner := bufio.NewScanner(bytes.NewReader(stdout.Bytes()))
 		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -10019,7 +10025,7 @@ func runEvalShardCruxExec(args cliArgs, baseURL, model string, items []map[strin
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
-			return nil, shardStats{}, nil, cliError{"sandbox_failed", fmt.Sprintf("CRUXEval sandbox failed: %v", err), sandboxFailureHints(stderr.String()), nil}
+			return nil, shardStats{}, nil, cliError{"sandbox_failed", fmt.Sprintf("CRUXEval sandbox failed: %v", err), sandboxFailureHints(stderr.String(), args), nil}
 		}
 		scanner := bufio.NewScanner(bytes.NewReader(stdout.Bytes()))
 		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -12003,6 +12009,8 @@ var usageExamples = []string{
 	`lmx eval publish my-eval.eval-suite.json --dry-run`,
 	`lmx eval dataset list --out datasets.json`,
 	`lmx eval dataset show hellaswag --out hellaswag-dataset.json`,
+	`lmx eval sandbox setup`,
+	`lmx eval sandbox check --json`,
 	`lmx eval suite list --out suites.json`,
 	`lmx eval suite search reasoning --out reasoning-suites.json`,
 	`lmx eval suite show <approved-suite-slug> --out suite.json`,
@@ -12133,12 +12141,12 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --port <n>               Local model server port for generated server/speed-test commands
   --model-path <path>      llama.cpp model path; generates llama-bench command
   --llama-scorer <path>     Local helper binary for llama_cpp_loglikelihood scoring (default: lmx-llama-score-hellaswag next to lmx)
-  --sandbox-image <name>    Docker image for code_execution scoring (default: lmx-sandbox; build with: docker build -t lmx-sandbox sandbox)
+  --sandbox-image <name>    Docker image for code_execution scoring (default: lmx-sandbox; build with: lmx eval sandbox setup)
   --sandbox-runtime <bin>   Container runtime for code_execution (default: docker; accepts quoted commands like "sudo docker")
   --sandbox-use-sudo        Prefix the default container runtime with sudo
   --sandbox-relaxed-security
                            Omit cap-drop/no-new-privileges/read-only when the host rejects the hardened profile
-  --sandbox-cmd <cmd>       Override the sandbox launcher entirely (e.g. podman, or "python3 sandbox/run_sandbox.py" without Docker)
+  --sandbox-cmd <cmd>       Override the sandbox launcher entirely (e.g. podman, or a direct "python3 run_sandbox.py" without Docker)
   --sandbox-memory <size>   Memory cap for the code sandbox container (default: 2g)
   --sandbox-cpus <n>        CPU cap for the code sandbox container (default: 2)
   --n-samples <n>           Samples per question for code evals (default: 1 greedy; >1 enables pass@k sampling)
@@ -12312,6 +12320,9 @@ var commandDescriptions = map[string]string{
 	"eval dataset":           "Discover approved shard datasets separately from registered eval suites.",
 	"eval dataset list":      "List approved question and terminal shard datasets, counts, and API endpoints.",
 	"eval dataset show":      "Show one approved shard dataset by slug.",
+	"eval sandbox":           "Build and verify the hardened code-execution sandbox used by HumanEval, MBPP, and CRUXEval shards.",
+	"eval sandbox setup":     "Build the sandbox image from sources embedded in lmx (no repository checkout), then verify it grades test programs.",
+	"eval sandbox check":     "Verify the configured sandbox runtime and image grade a passing and a failing test program, without model inference.",
 	"eval suite":             "Import, audit, sample-check, submit, and manage eval suites.",
 	"eval suite import":      "Convert CSV, JSONL, or a JSON array into a runnable suite manifest.",
 	"eval suite audit":       "Check dataset duplicates, gold values, leakage, balance, provenance, and size.",

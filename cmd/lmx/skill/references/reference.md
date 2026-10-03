@@ -99,7 +99,7 @@ Eval shards and Terminal-Bench:
 - `--shell-mode <mode>`: `persistent` or `stateless`; default `persistent`.
 - `--oracle`: run terminal task `solution/solve.sh` instead of the model agent.
 - `--llama-scorer <path>`: local helper for `llama_cpp_loglikelihood` scoring.
-- `--sandbox-image <name>`: code sandbox image; default `lmx-sandbox`.
+- `--sandbox-image <name>`: code sandbox image; default `lmx-sandbox`. Build it from the installed CLI with `lmx eval sandbox setup`; verify with `lmx eval sandbox check`.
 - `--sandbox-runtime <bin>`: container runtime for code execution; default `docker`.
 - `--sandbox-cmd <cmd>`: override sandbox launcher entirely.
 - `--sandbox-memory <size>`: sandbox memory cap; default `2g`.

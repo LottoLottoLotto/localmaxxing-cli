@@ -289,16 +289,25 @@ prediction passes if `generated_output == f(function_input)`. The CRUXEval promp
 uses a `CRUX_ANSWER:` safeword plus `<END_CRUX>` stop sequence so models can reason
 before the final extractable answer. The CLI runs checks inside a hardened sandbox
 and records pass/fail.
-Build the sandbox image once:
+Build the sandbox image once with the installed CLI (Docker or Podman required;
+no repository checkout needed — the image sources are embedded in `lmx`):
 
 ```bash
-docker build -t lmx-sandbox sandbox
+lmx eval sandbox setup
 ```
 
-Before sending any model requests, the CLI verifies that the configured runtime
-is executable, can inspect the configured image, and can access the container
-daemon. A failed preflight exits with `sandbox_unavailable`, so a missing image
-or Docker permission error cannot discard hours of model generation.
+`setup` builds `lmx-sandbox` (or `--sandbox-image <name>`) with the configured
+runtime, then grades one passing and one failing test program through the exact
+launcher code evals use. `lmx eval sandbox check` repeats that verification
+without rebuilding. Both accept `--sandbox-runtime`, `--sandbox-use-sudo`, and
+`--sandbox-relaxed-security`; `setup --dry-run` prints the build command. Rerun
+`setup` after upgrading `lmx` to pick up sandbox changes.
+
+Before sending any model requests, `eval shard` also verifies that the configured
+runtime is executable, can inspect the configured image, and can access the
+container daemon. A failed preflight exits with `sandbox_unavailable` and prints
+the exact `lmx eval sandbox setup ...` command, so a missing image or Docker
+permission error cannot discard hours of model generation.
 
 The default container command is:
 
@@ -335,9 +344,10 @@ hardening profile.
 
 Other knobs: `--sandbox-runtime podman`, `--sandbox-image <name>`,
 `--sandbox-memory`, `--sandbox-cpus`, or replace the launcher entirely with
-`--sandbox-cmd` (e.g. `--sandbox-cmd "python3 sandbox/run_sandbox.py"` for hosts
-without Docker — note that bypasses container isolation and should only be used
-on disposable boxes).
+`--sandbox-cmd` (e.g. `--sandbox-cmd "python3 run_sandbox.py"` using
+`cmd/lmx/sandbox/run_sandbox.py` from the repository, for hosts without Docker —
+note that bypasses container isolation and should only be used on disposable
+boxes). `lmx eval sandbox check --sandbox-cmd <cmd>` verifies a custom launcher.
 
 Scoring follows canonical pass@1: HumanEval programs keep the prompt stub's
 imports (so a dropped `import` is not a false fail), and a generation that errors

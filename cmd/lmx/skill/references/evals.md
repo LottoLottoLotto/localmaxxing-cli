@@ -15,6 +15,18 @@ use `eval shard`; terminal task datasets use `eval terminal`. An empty
 `eval suite list` does not mean evals are unavailable. Only use suite commands
 with approved slugs returned by the suite catalog on the selected API instance.
 
+Execution-based code shards (`humaneval-plus`, `mbpp-plus`, CRUXEval) need the
+hardened Docker sandbox. Build it once from the installed CLI before running
+them — no repository checkout needed:
+
+```bash
+lmx eval sandbox setup   # builds lmx-sandbox, then verifies it grades pass/fail correctly
+lmx eval sandbox check   # re-verify without rebuilding
+```
+
+`eval shard` refuses to start model inference when the runtime, daemon, or image
+is unavailable and prints the exact setup command to run.
+
 ## Publish a suite
 
 Prefer the guarded one-command workflow:
