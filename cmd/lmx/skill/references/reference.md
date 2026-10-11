@@ -14,7 +14,7 @@ Raw HTTP API docs are available from the site through `GET /api/agent-context` a
 - `lmx server`: build or run local model server commands.
 - `lmx endpoint`: discover OpenAI-compatible endpoints.
 - `lmx kvcache`: run KV-cache/context sweeps.
-- `lmx speed-test`: create, repair, manage, validate, and submit inference speed tests.
+- `lmx speed-test`: create, repair, manage, validate, and submit inference speed tests; `speed-test matrix` runs/imports llm-inference-bench concurrency × context matrices.
 - `lmx eval`: discover shard datasets and registered suites, run evals, and submit results.
 - `lmx report`: create, edit, publish, and manage model reports.
 - `lmx calculate`: calculate model memory fit and decode ceilings.

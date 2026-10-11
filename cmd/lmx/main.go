@@ -582,15 +582,24 @@ func fetchJSONContext(ctx context.Context, method, rawURL, key string, body any)
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		hints := []string{}
+		matrixEndpoint := strings.Contains(rawURL, inferenceMatrixEndpoint)
 		switch res.StatusCode {
 		case 401:
 			hints = append(hints, "Check --api-key or LMX_API_KEY.")
 		case 400:
 			hints = append(hints, "Run the relevant validate/dry-run command and fix the reported field.")
 		case 404:
-			hints = append(hints, "Check the suite slug or API URL.")
+			if matrixEndpoint {
+				hints = append(hints, "Check --hf-id (the model must exist on Hugging Face), the matrix id, or the API URL.")
+			} else {
+				hints = append(hints, "Check the suite slug or API URL.")
+			}
 		case 409:
-			hints = append(hints, "Choose a different suite slug; this one already exists.")
+			if matrixEndpoint {
+				hints = append(hints, "This benchmark report was already uploaded. Run `lmx speed-test matrix submissions list` to find it.")
+			} else {
+				hints = append(hints, "Choose a different suite slug; this one already exists.")
+			}
 		case 422:
 			hints = append(hints, "The suite or run shape is valid JSON but incompatible with the API rules.")
 		case 429:
@@ -602,7 +611,8 @@ func fetchJSONContext(ctx context.Context, method, rawURL, key string, body any)
 		if res.StatusCode == http.StatusUpgradeRequired {
 			code = "cli_upgrade_required"
 		}
-		return nil, cliError{code, fmt.Sprintf("%d %s: %s", res.StatusCode, res.Status, apiMessage(parsed, string(text))), hints, parsed}
+		// res.Status already starts with the numeric code ("409 Conflict").
+		return nil, cliError{code, fmt.Sprintf("%s: %s", res.Status, apiMessage(parsed, string(text))), hints, parsed}
 	}
 	return parsed, nil
 }
@@ -2588,6 +2598,9 @@ func handleBenchmark(action, target string, args cliArgs) error {
 	}
 	if action == "list" || action == "show" || action == "edit" || action == "rerun" || action == "delete" || action == "rm" || action == "remove" {
 		return handleBenchmarkRuns(action, target, args)
+	}
+	if action == "matrix" {
+		return handleBenchmarkMatrix(target, positional(args, 3), args)
 	}
 	if action == "kvcache" {
 		return handleKVCache("run", target, args)
@@ -12001,6 +12014,13 @@ var usageExamples = []string{
 	`lmx speed-test runs export --format csv --out runs.csv`,
 	`lmx kvcache run llama.cpp --hf-id Qwen/Qwen3-8B --model-path model.gguf --levels 10000,20000,30000,40000`,
 	`lmx kvcache run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --levels 10000,20000,30000,40000`,
+	`lmx speed-test matrix run --base-url http://127.0.0.1:8000 --hf-id Qwen/Qwen3-8B --concurrency 1,4,8 --contexts 0,16384 --prefill-contexts 8k`,
+	`lmx speed-test matrix import benchmark_results.json --hf-id Qwen/Qwen3-8B --quantization FP8 --hardware hardware.json --engine-version 0.11.0`,
+	`lmx speed-test matrix dry-run inference-matrices/Qwen-Qwen3-8B/matrix.json --api-key bhk_...`,
+	`lmx speed-test matrix submit inference-matrices/Qwen-Qwen3-8B/matrix.json --api-key bhk_...`,
+	`lmx speed-test matrix submissions list --api-key bhk_...`,
+	`lmx speed-test matrix submissions edit <id> --set quantization=FP8 --set engineVersion=0.11.0 --dry-run`,
+	`lmx speed-test matrix submissions delete <id> --yes`,
 	`lmx speed-test submit speed-test.json --api-key bhk_...`,
 	`lmx speed-test dry-run speed-test.json --api-key bhk_...`,
 	`lmx speed-test validate-local speed-test.json`,
@@ -12191,6 +12211,9 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --spec-draft-window-size <n>
                            DFlash / DFlash2 draft KV sliding-window size
   --runs-dir <dir>         Saved speed-test runs directory (default: runs)
+  --bench-script <path>    speed-test matrix: local llm_decode_bench.py instead of the pinned download
+  --prefill-contexts <list> speed-test matrix: prefill contexts passed to llm-inference-bench (e.g. 8k,64k)
+  --server-command <cmd>   speed-test matrix: serving command to record
   --group-by <field>       Group saved-run stats by field, e.g. quantization or hardware
   --by <field>             Group saved-run comparisons by field
   --metric <field>         Saved-run metric for stats/compare (default: tokSOut)
@@ -12302,6 +12325,7 @@ var commandDescriptions = map[string]string{
 	"speed-test runs":         "List, edit, compare, and export saved speed-test run files.",
 	"speed-test add-hardware": "Attach server hardware metadata to a saved speed-test run.",
 	"speed-test fixup":        "Inspect a saved speed-test run and print remediation commands.",
+	"speed-test matrix":       "Run llm-inference-bench against vLLM/SGLang or import its report, upload the matrix, and list/edit/delete your uploads (matrix submissions).",
 	"hardware":                "Detect, validate, or template hardware metadata.",
 	"hardware validate":       "Validate hardware metadata against the live LocalMaxxing schema and allowlist.",
 	"hardware template":       "Generate hardware metadata from explicit flags.",

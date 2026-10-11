@@ -211,6 +211,25 @@ lmx speed-test add-hardware runs/Model/run.json --hardware hardware.json
 lmx speed-test fixup runs/Model/run.json
 ```
 
+## Concurrency × context matrices (llm-inference-bench)
+
+For vLLM/SGLang scaling curves, run upstream [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) through lmx. One run uploads prefill plus every context × concurrency decode cell to `POST /api/inference-benchmarks`:
+
+```bash
+lmx speed-test matrix run --base-url http://127.0.0.1:8000 --hf-id Qwen/Qwen3-8B --quantization FP8 \
+  --concurrency 1,4,8 --contexts 0,16384 --prefill-contexts 8k --duration-seconds 30 --dry-run
+lmx speed-test matrix submit inference-matrices/Qwen-Qwen3-8B/matrix-<time>.json
+lmx speed-test matrix import benchmark_results.json --hf-id Qwen/Qwen3-8B --quantization FP8 --hardware hardware.json --engine-version 0.11.0 --dry-run
+```
+
+- Always pass explicit `--concurrency`/`--contexts`; upstream defaults sweep to C=128 and 128K context and take a long time.
+- Requires Python 3.10+ with `httpx rich psutil`. The pinned upstream script (`v0.7.7`) is checksum-verified; `--bench-script` uses a local copy.
+- Hardware is auto-detected only when `--base-url` is on this machine; remote hosts fail with `missing_remote_hardware`. For tunnels (ssh -L, kubectl port-forward), proxies and remote hosts pass `--hardware hardware.json` generated on the server. Pass `--server-command` to record the launch command. lil-bench `.json.gz` results import with their own inventory.
+- `--dry-run` runs the site's full import (quota, duplicate, model lookup, database writes) and rolls it back, so a passing dry-run means `submit` is accepted. A duplicate report fails the dry-run with 409.
+- `--quantization` can be omitted for vLLM/SGLang: lmx uses the launch `--quantization`, then `config.json` `quantization_config`, then the launch `--dtype`, then the config dtype (local model dir, else Hugging Face). compressed-tensors and bitsandbytes need an explicit `--quantization`.
+- Implausible matrices (a decode cell above 10× the memory-bandwidth ceiling) are held for admin review and hidden until approved; dry-run/submit print the reason.
+- Fix uploaded metadata with `lmx speed-test matrix submissions edit <id> --set hfId=org/model` (add `--dry-run` to preview; `--hardware file.json` replaces hardware). Remove one with `submissions delete <id> --yes`; list yours with `submissions list`. Measurements cannot be edited.
+
 ## KV-cache / context sweeps
 
 Use context sweeps to measure speed across context depth:

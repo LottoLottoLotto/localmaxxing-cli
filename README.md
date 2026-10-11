@@ -405,6 +405,33 @@ lmx speed-test runs export --format csv --out runs.csv
 ```
 
 `stats`, `show`, `compare`, and `export` accept `--runs-dir`, plus filters such as `--model`, `--engine`, `--mode`, `--quantization`, `--kind`, and `--hardware-name`. Group stats report min/p50/mean/max/p95/stddev and the best single run; group comparisons rank by the median (`p50`) so a single outlier run cannot win. `show --format table` prints every field from a single run as a flattened ASCII field/value table. `compare` defaults to an ASCII table with baseline, candidate/value, deltas, percent deltas, and a better/worse column; pass `--format json` for machine-readable output. `export` defaults to JSON and supports `--fields path,hfId,hardware,tokSOut` for custom extraction.
+## Inference Matrices (llm-inference-bench)
+
+`lmx speed-test matrix` integrates [local-inference-lab/llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (MIT, by Local Inference Lab). lmx runs the upstream `llm_decode_bench.py` unmodified against a vLLM or SGLang server and uploads its prefill and context × concurrency decode matrix as one run to `POST /api/inference-benchmarks`. It does not reimplement the measurement.
+
+```bash
+# Measure a local server (hardware and engine version are detected) and validate the upload
+lmx speed-test matrix run --base-url http://127.0.0.1:8000 --hf-id Qwen/Qwen3-8B \
+  --concurrency 1,4,8 --contexts 0,16384 --prefill-contexts 8k --dry-run
+lmx speed-test matrix submit inference-matrices/Qwen-Qwen3-8B/matrix-<time>.json
+
+# Import a report produced elsewhere: llm_decode_bench.py --output JSON or a lil-bench .json.gz
+lmx speed-test matrix import benchmark_results.json --hf-id Qwen/Qwen3-8B --quantization FP8 \
+  --hardware hardware.json --engine-version 0.11.0 --submit
+```
+
+- The default script is upstream release `v0.7.7`, downloaded once to the user cache and checked against a pinned SHA-256; `--bench-script <path>` runs any other copy (e.g. a checkout of a newer release). Python 3.10+ with `httpx rich psutil` is required (`--python-bin` selects the interpreter).
+- `run` is a thin wrapper around `import`: it detects the server's hardware and version, runs the bench, then imports the report through the same code as `lmx speed-test matrix import`. Pass `--server-command "<launch command>"` to record how the server was started. For containers built from lil-bench, running lil-bench and importing its `.json.gz` is equivalent.
+- `--concurrency`, `--contexts`, `--prefill-contexts`, `--duration-seconds` and `--max-tokens` are passed to the bench; anything else goes through `--extra-bench-args "..."`. Omitted values use upstream defaults, which sweep up to C=128 and 128K context.
+- `run` saves `inference-matrices/<model>/matrix-<time>.json` plus the untouched bench report beside it (`.bench.json`). `--submit` imports and records the run ID in the file.
+- `--quantization` is optional. lmx asks the endpoint first; vLLM and SGLang report nothing for unquantized models, so it then uses the launch command's `--quantization`, the model's `config.json` `quantization_config` (FP8, AWQ, GPTQ, MXFP4, NVFP4), the launch `--dtype`, and finally the config dtype (BF16/FP16/FP32). `config.json` is read from the local model directory in the launch command, else from Hugging Face (the launch repo, else `--hf-id`). Formats that cover several layouts (compressed-tensors, bitsandbytes) still need `--quantization`. `run` resolves this before the benchmark starts; the launch command comes from `--server-command` or the lil-bench serving command.
+- A matrix whose decode throughput is implausible (any cell above 10× the memory-bandwidth decode ceiling at its concurrency, the same check as speed tests) is stored but held for admin review and hidden until approved; `--dry-run` and `--submit` say so with the reason. The saved receipt links the run page, which you can open while it is held.
+- `--dry-run` (or `lmx speed-test matrix dry-run <file>`) runs the site's complete import — quota, duplicate check, HuggingFace lookup, hardware/engine resolution and every database write — in a transaction that is rolled back, and prints exactly what would be stored. A passing dry-run means the same file submitted now is accepted; a duplicate or exhausted quota fails the dry-run with the same 409/429 the submit would get.
+- Manage what you uploaded with `lmx speed-test matrix submissions list`, `submissions edit <id> --set quantization=FP8 --set engineVersion=0.11.0 [--hardware hardware.json] [--dry-run]`, and `submissions delete <id> --yes`. Only metadata is editable (model ID, revision, quantization, hardware, engine version/repository/build/commit, backend, launch command), within 24 hours and once per 5 minutes; `--set field=null` clears optional fields. Wrong numbers mean deleting and re-importing. The run ID is in `submission.id` of the saved matrix file. Owners also get Edit and Delete buttons on their matrix cards on the model page.
+- On localmaxxing.com each upload appears on the model page (with a throughput-vs-concurrency chart), on its own run page (`/inference-benchmarks/<id>`: full hardware/engine specs, launch command, every cell's metrics), and under Inference matrices in your dashboard. lmx records which command produced it (`lmx <version> run`, `import`, or `import (lil-bench …)`).
+- `run` detects hardware only when `--base-url` names this machine (localhost, loopback, or one of its interface addresses); remote endpoints fail with `missing_remote_hardware` before the benchmark starts, so pass `--hardware hardware.json` generated on the server. SSH/kubectl tunnels and proxies make remote servers look local, so pass `--hardware` for them too. lil-bench imports use the container's own GPU/CPU/RAM inventory, serving command and vLLM version. Secret-looking arguments (`--api-key`, tokens) are redacted from recorded commands.
+- Only `vllm` and `sglang` reports are accepted; hosted APIs (`openai_proxy`) are rejected. Per-request samples, event logs and server URLs are not uploaded. Matrix runs are separate from single speed tests and are not eligible for the Verified-run badge.
+
 ## KV-Cache Context Sweeps
 
 Measure how prefill, TTFT, and decode TPS change as context length grows:
