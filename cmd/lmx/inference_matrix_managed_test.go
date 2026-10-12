@@ -302,6 +302,10 @@ func TestParseArgsEngineArgsTakeFlagValues(t *testing.T) {
 
 func TestManagedInferenceMatrixRejectsUnsupportedSetups(t *testing.T) {
 	modelDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modelDir, "config.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ggufDir := t.TempDir()
 	for name, tc := range map[string]struct {
 		opts map[string]string
 		code string
@@ -311,6 +315,7 @@ func TestManagedInferenceMatrixRejectsUnsupportedSetups(t *testing.T) {
 		"port":      {map[string]string{"engine-args": "--port 9000"}, "invalid_option"},
 		"gpu-util":  {map[string]string{"gpu-memory-utilization": "1.5"}, "invalid_option"},
 		"not a dir": {map[string]string{"model-path": filepath.Join(modelDir, "missing")}, "invalid_model_path"},
+		"no config": {map[string]string{"model-path": ggufDir}, "invalid_model_path"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			opts := map[string]string{"model-path": modelDir, "hf-id": "org/model"}
@@ -373,11 +378,11 @@ EOF
 	t.Setenv("CUDA_HOME", "")
 	t.Setenv(matrixSamplerEnv, "")
 	os.Unsetenv(matrixSamplerEnv)
-	savedNvcc, savedPoll, savedGrace := matrixNvccFallbacks, managedEnginePollInterval, managedEngineStopGrace
+	savedNvcc, savedPoll, savedGrace, savedStartupGrace := matrixNvccFallbacks, managedEnginePollInterval, managedEngineStopGrace, managedEngineStartupStopGrace
 	t.Cleanup(func() {
-		matrixNvccFallbacks, managedEnginePollInterval, managedEngineStopGrace = savedNvcc, savedPoll, savedGrace
+		matrixNvccFallbacks, managedEnginePollInterval, managedEngineStopGrace, managedEngineStartupStopGrace = savedNvcc, savedPoll, savedGrace, savedStartupGrace
 	})
-	matrixNvccFallbacks, managedEnginePollInterval, managedEngineStopGrace = nil, 20*time.Millisecond, 300*time.Millisecond
+	matrixNvccFallbacks, managedEnginePollInterval, managedEngineStopGrace, managedEngineStartupStopGrace = nil, 20*time.Millisecond, 300*time.Millisecond, 300*time.Millisecond
 
 	fixture.args = cliArgs{opts: map[string]string{
 		"model-path":    modelDir,
@@ -540,5 +545,18 @@ func TestManagedInferenceMatrixRetriesWithoutFlashInferSampler(t *testing.T) {
 	exe, _ := os.Executable()
 	if !strings.HasPrefix(state.Path, filepath.Dir(exe)+string(os.PathListSeparator)) {
 		t.Fatalf("engine PATH = %q, want the engine binary's directory first", state.Path)
+	}
+}
+
+func TestEngineFailureReasonFindsRootCause(t *testing.T) {
+	log := `(EngineCore pid=1) ERROR 10-12 10:09:01 [core.py:1330]     raise ValueError(
+(EngineCore pid=1) ValueError: max_num_seqs (256) exceeds available Mamba cache blocks (79). Please lower max_num_seqs to at most 79.
+(APIServer pid=2)     raise RuntimeError(
+(APIServer pid=2) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}`
+	if got := engineFailureReason(log); got != "ValueError: max_num_seqs (256) exceeds available Mamba cache blocks (79). Please lower max_num_seqs to at most 79." {
+		t.Fatalf("reason = %q", got)
+	}
+	if got := engineFailureReason("INFO starting\nINFO loading weights"); got != "" {
+		t.Fatalf("no exception must give no reason, got %q", got)
 	}
 }

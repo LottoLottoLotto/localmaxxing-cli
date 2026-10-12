@@ -357,9 +357,9 @@ func runInferenceMatrixAt(runCtx context.Context, args cliArgs, plan matrixBench
 	if err != nil {
 		return err
 	}
-	python := firstNonEmpty(opt(args, "python-bin"), "python3")
-	if out, err := exec.Command(python, "-c", "import httpx, rich, psutil").CombinedOutput(); err != nil {
-		return cliError{"missing_python_dependencies", "llm-inference-bench needs Python 3.10+ with httpx, rich and psutil.", []string{python + " -m pip install httpx rich psutil", "Or pass --python-bin <interpreter> that already has them."}, strings.TrimSpace(string(out))}
+	python, err := matrixBenchPython(args)
+	if err != nil {
+		return err
 	}
 
 	outPath := matrixOutPath(args, hfID)
@@ -925,6 +925,16 @@ var matrixDtypes = map[string]string{
 	"bfloat16": "BF16", "bf16": "BF16",
 	"float16": "FP16", "fp16": "FP16", "half": "FP16",
 	"float32": "FP32", "fp32": "FP32", "float": "FP32",
+}
+
+// matrixBenchPython returns the interpreter for llm-inference-bench after
+// checking it has the bench's dependencies.
+func matrixBenchPython(args cliArgs) (string, error) {
+	python := firstNonEmpty(opt(args, "python-bin"), "python3")
+	if out, err := exec.Command(python, "-c", "import httpx, rich, psutil").CombinedOutput(); err != nil {
+		return "", cliError{"missing_python_dependencies", "llm-inference-bench needs Python 3.10+ with httpx, rich and psutil.", []string{python + " -m pip install httpx rich psutil", "Or pass --python-bin <interpreter> that already has them."}, strings.TrimSpace(string(out))}
+	}
+	return python, nil
 }
 
 // matrixQuantizationFromModel resolves the served weight format when the

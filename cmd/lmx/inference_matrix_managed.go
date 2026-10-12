@@ -14,9 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +28,9 @@ const matrixSamplerEnv = "VLLM_USE_FLASHINFER_SAMPLER"
 var (
 	managedEnginePollInterval = 2 * time.Second
 	managedEngineStopGrace    = 30 * time.Second
+	// vLLM defers SIGTERM while it loads and compiles; a server that never
+	// became ready has nothing to drain, so it is killed sooner.
+	managedEngineStartupStopGrace = 5 * time.Second
 	// nvcc locations checked after PATH and $CUDA_HOME/bin.
 	matrixNvccFallbacks = []string{"/usr/local/cuda/bin/nvcc"}
 )
@@ -54,6 +59,9 @@ func runManagedInferenceMatrix(args cliArgs) error {
 	modelPath := opt(args, "model-path")
 	if info, err := os.Stat(modelPath); err != nil || !info.IsDir() {
 		return cliError{"invalid_model_path", "--model-path " + modelPath + " is not a local model directory.", []string{"Pass the directory that contains config.json and the weights, e.g. ~/models/Qwen3-0.6B."}, nil}
+	}
+	if _, err := os.Stat(filepath.Join(modelPath, "config.json")); err != nil {
+		return cliError{"invalid_model_path", "--model-path " + modelPath + " has no config.json; lmx starts vLLM on Hugging Face model directories (safetensors).", []string{"Pass a directory with config.json and safetensors weights.", "For GGUF weights, start your server yourself and pass --base-url and --server-command."}, nil}
 	}
 	if abs, err := filepath.Abs(modelPath); err == nil {
 		modelPath = abs
@@ -110,6 +118,17 @@ func runManagedInferenceMatrix(args cliArgs) error {
 	}
 	argv = append(argv, engineArgs...)
 	command := strings.Join(append(append([]string{}, env...), shellJoin(redactSecretArgs(argv))), " ")
+	// Fail before the (minutes-long) server start on problems the run would
+	// only report after it: an undetectable weight format, a missing bench Python.
+	if opt(args, "quantization") == "" {
+		if quant, resolution := matrixQuantizationFromModel(argv, hfID, args); quant == "" {
+			reason := firstNonEmpty(stringValue(resolution["unresolved"]), "config.json names no quantization or dtype")
+			return cliError{"missing_quantization", "Could not detect the weight format of " + modelPath + ": " + reason + ".", []string{"Pass --quantization (e.g. BF16, FP8, NVFP4, AWQ); lmx did not start the server."}, resolution}
+		}
+	}
+	if _, err := matrixBenchPython(args); err != nil {
+		return err
+	}
 
 	outPath := matrixOutPath(args, hfID)
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
@@ -129,6 +148,7 @@ func runManagedInferenceMatrix(args cliArgs) error {
 	var server *managedEngine
 	defer func() {
 		if server != nil {
+			printStatus(args, "inference_matrix_server_stopping", map[string]any{"log": logPath})
 			server.stop()
 			printStatus(args, "inference_matrix_server_stopped", map[string]any{"log": logPath})
 		}
@@ -336,6 +356,7 @@ type managedEngine struct {
 	done    chan struct{}
 	waitErr error
 	once    sync.Once
+	ready   atomic.Bool
 }
 
 // startManagedEngine starts argv in its own process group with stdout and
@@ -372,13 +393,18 @@ func (s *managedEngine) waitReady(ctx context.Context, baseURL, model string, ti
 	client := &http.Client{Timeout: 5 * time.Second}
 	for {
 		if managedEngineReady(client, baseURL, model) {
+			s.ready.Store(true)
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return cliError{"interrupted", "Interrupted while waiting for vLLM to start; the server was stopped.", nil, map[string]any{"log": s.logPath}}
 		case <-s.done:
-			return cliError{"engine_exited", fmt.Sprintf("vLLM exited before it was ready (%v).", s.waitErr), []string{"Read the server log: " + s.logPath, "Pass extra server flags with --engine-args=\"...\" (e.g. --enforce-eager), or a lower --gpu-memory-utilization."}, map[string]any{"log": s.logPath, "logTail": strings.Split(logTail(s.logPath, 40), "\n")}}
+			message := fmt.Sprintf("vLLM exited before it was ready (%v).", s.waitErr)
+			if reason := engineFailureReason(logTail(s.logPath, 400)); reason != "" {
+				message = "vLLM exited before it was ready: " + reason
+			}
+			return cliError{"engine_exited", message, []string{"Read the server log: " + s.logPath, "Pass extra server flags with --engine-args=\"...\" (e.g. --max-num-seqs 64, --enforce-eager), or change --gpu-memory-utilization."}, map[string]any{"log": s.logPath, "logTail": strings.Split(logTail(s.logPath, 40), "\n")}}
 		case <-deadline.C:
 			return cliError{"engine_start_timeout", fmt.Sprintf("vLLM was not ready within %s; the server was stopped.", timeout), []string{"Read the server log: " + s.logPath, "Raise --start-timeout for large models or slow first-time compilation."}, map[string]any{"log": s.logPath, "logTail": strings.Split(logTail(s.logPath, 40), "\n")}}
 		case <-ticker.C:
@@ -418,10 +444,14 @@ func managedEngineReady(client *http.Client, baseURL, model string) bool {
 func (s *managedEngine) stop() {
 	s.once.Do(func() {
 		pid := s.cmd.Process.Pid
+		grace := managedEngineStopGrace
+		if !s.ready.Load() {
+			grace = managedEngineStartupStopGrace
+		}
 		_ = signalDetachedProcess(pid, false)
 		select {
 		case <-s.done:
-		case <-time.After(managedEngineStopGrace):
+		case <-time.After(grace):
 		}
 		_ = signalDetachedProcess(pid, true)
 		<-s.done
@@ -444,4 +474,28 @@ func logTail(path string, n int) string {
 func isCLIErrorCode(err error, code string) bool {
 	var cliErr cliError
 	return errors.As(err, &cliErr) && cliErr.Code == code
+}
+
+var (
+	engineErrorLine   = regexp.MustCompile(`\b[A-Z][A-Za-z]*(?:Error|Exception): .+`)
+	engineLogPrefixRE = regexp.MustCompile(`^\((?:APIServer|EngineCore)[^)]*\)\s*(?:ERROR \S+ \S+ \[[^\]]+\]\s*)?`)
+)
+
+// engineFailureReason returns the root-cause exception line from a vLLM
+// startup log: the last "XxxError: ..." line that is not vLLM's generic
+// "Engine core initialization failed" wrapper.
+func engineFailureReason(log string) string {
+	reason := ""
+	for _, line := range strings.Split(log, "\n") {
+		line = strings.TrimSpace(engineLogPrefixRE.ReplaceAllString(line, ""))
+		match := engineErrorLine.FindString(line)
+		if match == "" || strings.Contains(match, "Engine core initialization failed") {
+			continue
+		}
+		reason = match
+	}
+	if len(reason) > 400 {
+		reason = reason[:400] + "…"
+	}
+	return reason
 }
