@@ -40,7 +40,7 @@ lmx hardware --out hardware.json
 - Quality / accuracy instead of speed: discover shard datasets with `lmx eval dataset list` and `lmx eval dataset show <slug>`. HellaSwag/GSM8K use `eval shard`; terminal datasets use `eval terminal`. Registered suites are a separate catalog; an empty `eval suite list` does not mean evals are unavailable. See `skill://localmaxxing-cli/references/evals.md`.
 - Long-form findings or analysis that a user should edit in the web report studio: use `lmx report`; see `skill://localmaxxing-cli/references/reports.md`.
 - Speed vs context depth: use a KV-cache sweep with `lmx kvcache run`.
-- Throughput across concurrency × context on vLLM/SGLang (scaling curves): use `lmx speed-test matrix run --base-url ... --hf-id ...`; it runs upstream llm-inference-bench and uploads one matrix run. Existing `benchmark_results.json` or lil-bench `.json.gz`: `lmx speed-test matrix import`.
+- Throughput across concurrency × context on vLLM/SGLang (scaling curves): use `lmx speed-test matrix run --base-url ... --hf-id ...`, or `--model-path <dir> --hf-id ...` to let lmx start, size (`--max-model-len`) and stop vLLM itself; it runs upstream llm-inference-bench and uploads one matrix run. Context + `--max-tokens` (default 8192) must fit the server's `max_model_len`; oversize contexts fail fast unless `--skip-oversize`. Existing `benchmark_results.json` or lil-bench `.json.gz`: `lmx speed-test matrix import`.
 - Planning a model/hardware configuration without running inference: use `lmx calculate decode --json`.
 
 Use the canonical v0.1.47 commands: `eval lm-eval`, `calculate` / `calculate decode`,

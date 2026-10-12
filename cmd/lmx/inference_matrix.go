@@ -298,11 +298,25 @@ type matrixContext struct {
 }
 
 // runInferenceMatrix measures a local vLLM/SGLang server with llm-inference-bench
-// and hands the report to the import path with what it detected.
+// and hands the report to the import path with what it detected. With
+// --model-path it starts (and always stops) the vLLM server itself.
 func runInferenceMatrix(args cliArgs) error {
+	if opt(args, "model-path") != "" {
+		return runManagedInferenceMatrix(args)
+	}
+	plan, err := resolveMatrixBenchPlan(args)
+	if err != nil {
+		return err
+	}
+	return runInferenceMatrixAt(context.Background(), args, plan)
+}
+
+// runInferenceMatrixAt runs the bench against --base-url. Cancelling ctx
+// interrupts the bench.
+func runInferenceMatrixAt(runCtx context.Context, args cliArgs, plan matrixBenchPlan) error {
 	baseURL := opt(args, "base-url")
 	if baseURL == "" {
-		return cliError{"missing_option", "speed-test matrix run requires --base-url", []string{"Pass the vLLM/SGLang server, e.g. --base-url http://127.0.0.1:8000."}, nil}
+		return cliError{"missing_option", "speed-test matrix run requires --base-url or --model-path", []string{"Pass a running vLLM/SGLang server, e.g. --base-url http://127.0.0.1:8000.", "Or let lmx start vLLM: --model-path <model dir>."}, nil}
 	}
 	hfID := firstNonEmpty(opt(args, "hf-id"), opt(args, "model"))
 	if hfID == "" {
@@ -313,7 +327,13 @@ func runInferenceMatrix(args cliArgs) error {
 	if err != nil {
 		return cliError{"endpoint_unreachable", "Could not list models at " + baseURL + "/v1/models: " + err.Error(), []string{"Start the server first and check --base-url."}, nil}
 	}
+	if plan, err = applyMatrixPreflight(args, baseURL, modelKey, servedInfo, plan); err != nil {
+		return err
+	}
 	ctx := matrixContext{ServedModel: servedModel, SubmittedWith: "lmx " + version + " run", Provenance: map[string]any{}}
+	if len(plan.Skipped) > 0 {
+		ctx.Provenance["skippedContexts"] = joinMatrixContexts(plan.Skipped)
+	}
 	// Refuse unprovable hardware before spending time on the benchmark.
 	hardware, hardwareSource, err := inferenceMatrixHardware(baseURL, args)
 	if err != nil {
@@ -342,21 +362,20 @@ func runInferenceMatrix(args cliArgs) error {
 		return cliError{"missing_python_dependencies", "llm-inference-bench needs Python 3.10+ with httpx, rich and psutil.", []string{python + " -m pip install httpx rich psutil", "Or pass --python-bin <interpreter> that already has them."}, strings.TrimSpace(string(out))}
 	}
 
-	outPath := firstNonEmpty(opt(args, "out"), filepath.Join("inference-matrices", safePathSegment(hfID), "matrix-"+time.Now().UTC().Format("20060102T150405Z")+".json"))
+	outPath := matrixOutPath(args, hfID)
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return err
 	}
 	reportPath := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".bench.json"
-	benchArgs := []string{"--host", baseURL, "--model", servedModel, "--display-mode", "plain", "--output", reportPath, "--no-resume"}
-	for flag, option := range map[string]string{
-		"--concurrency":      "concurrency",
-		"--contexts":         "contexts",
-		"--prefill-contexts": "prefill-contexts",
-		"--duration":         "duration-seconds",
-		"--max-tokens":       "max-tokens",
+	benchArgs := []string{"--host", baseURL, "--model", servedModel, "--display-mode", "plain", "--output", reportPath, "--no-resume",
+		"--contexts", joinMatrixContexts(plan.Contexts), "--max-tokens", strconv.Itoa(plan.MaxTokens)}
+	for _, pair := range [][2]string{
+		{"--concurrency", "concurrency"},
+		{"--prefill-contexts", "prefill-contexts"},
+		{"--duration", "duration-seconds"},
 	} {
-		if value := opt(args, option); value != "" {
-			benchArgs = append(benchArgs, flag, value)
+		if value := opt(args, pair[1]); value != "" {
+			benchArgs = append(benchArgs, pair[0], value)
 		}
 	}
 	benchArgs = append(benchArgs, strings.Fields(opt(args, "extra-bench-args"))...)
@@ -365,13 +384,19 @@ func runInferenceMatrix(args cliArgs) error {
 		benchArgs = append(benchArgs, "--api-key", modelKey)
 	}
 
-	printStatus(args, "inference_matrix_start", map[string]any{"baseUrl": baseURL, "servedModel": servedModel, "report": reportPath})
-	cmd := exec.Command(python, append([]string{script}, benchArgs...)...)
+	printStatus(args, "inference_matrix_start", map[string]any{"baseUrl": baseURL, "servedModel": servedModel, "report": reportPath, "contexts": joinMatrixContexts(plan.Contexts), "maxTokens": plan.MaxTokens})
+	cmd := exec.CommandContext(runCtx, python, append([]string{script}, benchArgs...)...)
+	// Let the bench write its partial report when interrupted.
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = 30 * time.Second
 	// Keep stdout clean for --json; the bench's progress goes to stderr.
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), "LLM_BENCH_NO_UPDATE_CHECK=1")
 	if err := cmd.Run(); err != nil {
+		if runCtx.Err() != nil {
+			return cliError{"interrupted", "speed-test matrix run was interrupted.", []string{"A partial report, if any, is at " + reportPath + "; import it with lmx speed-test matrix import."}, nil}
+		}
 		return cliError{"matrix_benchmark_failed", "llm_decode_bench.py failed: " + err.Error(), []string{"Read the benchmark output above.", "A partial report, if any, is at " + reportPath + "; import it with lmx speed-test matrix import."}, nil}
 	}
 	reportValue, err := readMatrixSource(reportPath)
@@ -385,6 +410,175 @@ func runInferenceMatrix(args cliArgs) error {
 	ctx.Provenance["harness"] = scriptInfo
 	ctx.Provenance["reportPath"] = reportPath
 	return importMatrixReport(report, ctx, outPath, args)
+}
+
+func matrixOutPath(args cliArgs, hfID string) string {
+	return firstNonEmpty(opt(args, "out"), filepath.Join("inference-matrices", safePathSegment(hfID), "matrix-"+time.Now().UTC().Format("20060102T150405Z")+".json"))
+}
+
+// llm_decode_bench.py v0.7.7 argparse defaults for the decode matrix. The
+// profile default of 40000 output tokens applies only to --profile /
+// --completion-stats runs, which lmx does not use. lmx always passes both
+// explicitly so its preflight checks exactly what the bench will request.
+const (
+	matrixDefaultMaxTokens = 8192
+	matrixDefaultContexts  = "0,16k,32k,64k,128k"
+	// The bench sizes padding text with one chars/token calibration probe at
+	// --calibration-context (8k), measured with the chat template, document
+	// wrapper, assistant turn and generation prompt included. Contexts at or
+	// above the probe come out at or below their target; smaller ones (and
+	// context 0) can exceed it by that fixed wrapper, which is well under
+	// matrixPromptMargin tokens.
+	matrixCalibrationContext = 8192
+	matrixPromptMargin       = 256
+)
+
+type matrixContextValue struct {
+	Raw    string
+	Tokens int
+}
+
+// matrixBenchPlan is what lmx asks the bench to run: decode contexts and the
+// output length of every decode request.
+type matrixBenchPlan struct {
+	Contexts  []matrixContextValue
+	MaxTokens int
+	// Skipped holds contexts dropped by --skip-oversize; recorded in the
+	// matrix provenance and the JSON result so scripts can see them.
+	Skipped []matrixContextValue
+}
+
+func resolveMatrixBenchPlan(args cliArgs) (matrixBenchPlan, error) {
+	extra := launchFlags(strings.Fields(opt(args, "extra-bench-args")))
+	for _, name := range []string{"max-tokens", "contexts"} {
+		if _, ok := extra[name]; ok {
+			return matrixBenchPlan{}, cliError{"invalid_option", "Pass --" + name + " directly, not inside --extra-bench-args.", []string{"lmx checks --contexts and --max-tokens against the server's context window before the bench starts."}, nil}
+		}
+	}
+	maxTokens, err := intOption(args, matrixDefaultMaxTokens, 1, "max-tokens")
+	if err != nil {
+		return matrixBenchPlan{}, err
+	}
+	contexts, err := parseMatrixContexts(firstNonEmpty(opt(args, "contexts"), matrixDefaultContexts))
+	if err != nil {
+		return matrixBenchPlan{}, err
+	}
+	return matrixBenchPlan{Contexts: contexts, MaxTokens: maxTokens}, nil
+}
+
+// parseMatrixContexts mirrors the bench's parse_token_value: "16k" = 16384.
+func parseMatrixContexts(list string) ([]matrixContextValue, error) {
+	values := []matrixContextValue{}
+	for _, raw := range strings.Split(list, ",") {
+		raw = strings.TrimSpace(raw)
+		number, multiplier := raw, 1.0
+		if strings.HasSuffix(strings.ToLower(raw), "k") {
+			number, multiplier = raw[:len(raw)-1], 1024
+		}
+		parsed, err := strconv.ParseFloat(number, 64)
+		if raw == "" || err != nil || parsed < 0 || (multiplier == 1 && parsed != float64(int(parsed))) {
+			return nil, cliError{"invalid_option", fmt.Sprintf("--contexts entry %q is not a token count", raw), []string{"Pass comma-separated token counts with an optional k suffix, e.g. --contexts 0,4k,16k,32k."}, nil}
+		}
+		values = append(values, matrixContextValue{Raw: raw, Tokens: int(parsed * multiplier)})
+	}
+	return values, nil
+}
+
+func joinMatrixContexts(values []matrixContextValue) string {
+	raw := make([]string, len(values))
+	for i, value := range values {
+		raw[i] = value.Raw
+	}
+	return strings.Join(raw, ",")
+}
+
+// matrixContextNeed is the context window one decode request at this context needs.
+func matrixContextNeed(contextTokens, maxTokens int) int {
+	need := contextTokens + maxTokens
+	if contextTokens < matrixCalibrationContext {
+		need += matrixPromptMargin
+	}
+	return need
+}
+
+func roundUpTo(value, multiple int) int {
+	return (value + multiple - 1) / multiple * multiple
+}
+
+// matrixPreflight checks that every decode context plus the output length fits
+// the server's max_model_len. Oversize contexts fail the run unless
+// skipOversize drops them. Prefill contexts need no check: they request one
+// output token and the bench already caps them at max_model_len - 64.
+func matrixPreflight(plan matrixBenchPlan, maxModelLen int, skipOversize bool) (matrixBenchPlan, []matrixContextValue, error) {
+	fits, oversize := []matrixContextValue{}, []matrixContextValue{}
+	largestNeed, largestContextNeed := 0, 0
+	for _, value := range plan.Contexts {
+		need := matrixContextNeed(value.Tokens, plan.MaxTokens)
+		largestNeed = max(largestNeed, need)
+		largestContextNeed = max(largestContextNeed, need-plan.MaxTokens)
+		if need > maxModelLen {
+			oversize = append(oversize, value)
+		} else {
+			fits = append(fits, value)
+		}
+	}
+	if len(oversize) == 0 {
+		return plan, nil, nil
+	}
+	details := map[string]any{"maxModelLen": maxModelLen, "maxTokens": plan.MaxTokens, "oversizeContexts": joinMatrixContexts(oversize), "requiredMaxModelLen": roundUpTo(largestNeed, 1024), "promptMargin": matrixPromptMargin}
+	if skipOversize && len(fits) > 0 {
+		plan.Contexts = fits
+		return plan, oversize, nil
+	}
+	hints := []string{fmt.Sprintf("Restart the server with --max-model-len %d or more.", roundUpTo(largestNeed, 1024))}
+	if fitting := maxModelLen - largestContextNeed; fitting > 0 {
+		hints = append(hints, fmt.Sprintf("Or pass --max-tokens %d, the largest output length that fits every context.", fitting))
+	}
+	if len(fits) > 0 {
+		hints = append(hints, "Or drop them: --contexts "+joinMatrixContexts(fits)+", or pass --skip-oversize.")
+	} else {
+		hints = append(hints, "Or pass smaller --contexts.")
+	}
+	message := fmt.Sprintf("Contexts %s do not fit the server's max_model_len %d with %d output tokens per request: context + --max-tokens must be <= max_model_len (contexts below 8k reserve %d more tokens for the prompt wrapper).", joinMatrixContexts(oversize), maxModelLen, plan.MaxTokens, matrixPromptMargin)
+	if skipOversize {
+		message = fmt.Sprintf("No requested context fits the server's max_model_len %d with %d output tokens per request.", maxModelLen, plan.MaxTokens)
+	}
+	return plan, oversize, cliError{"context_exceeds_server_limit", message, hints, details}
+}
+
+// serverMaxModelLen reads the served model's context window: vLLM (and recent
+// SGLang) report max_model_len per model in /v1/models; older SGLang reports
+// context_length in /get_server_info. 0 means unknown.
+func serverMaxModelLen(baseURL, apiKey string, servedInfo map[string]any) (int, string) {
+	if value := int(numberField(servedInfo, "max_model_len")); value > 0 {
+		return value, "/v1/models"
+	}
+	if info, err := fetchEndpointJSON(openAIBaseURL(baseURL)+"/get_server_info", apiKey); err == nil {
+		if value := int(numberField(asObject(info), "context_length")); value > 0 {
+			return value, "/get_server_info"
+		}
+	}
+	return 0, ""
+}
+
+func applyMatrixPreflight(args cliArgs, baseURL, apiKey string, servedInfo map[string]any, plan matrixBenchPlan) (matrixBenchPlan, error) {
+	maxModelLen, source := serverMaxModelLen(baseURL, apiKey, servedInfo)
+	if maxModelLen <= 0 {
+		printStatus(args, "inference_matrix_preflight_skipped", map[string]any{"reason": "the server does not report max_model_len; context limits are not checked before the run"})
+		return plan, nil
+	}
+	checked, dropped, err := matrixPreflight(plan, maxModelLen, hasFlag(args, "skip-oversize"))
+	if err != nil {
+		return plan, err
+	}
+	// Keep contexts managed mode already dropped for the model's own limit.
+	checked.Skipped = append(append([]matrixContextValue{}, plan.Skipped...), dropped...)
+	if len(dropped) > 0 {
+		printStatus(args, "inference_matrix_contexts_skipped", map[string]any{"skipped": joinMatrixContexts(dropped), "contexts": joinMatrixContexts(checked.Contexts), "maxModelLen": maxModelLen, "maxTokens": checked.MaxTokens, "reason": "context + max tokens exceeds the server's max_model_len (--skip-oversize)"})
+	} else {
+		printStatus(args, "inference_matrix_preflight_ok", map[string]any{"maxModelLen": maxModelLen, "source": source, "maxTokens": checked.MaxTokens, "contexts": joinMatrixContexts(checked.Contexts)})
+	}
+	return checked, nil
 }
 
 // importInferenceMatrix turns an existing llm_decode_bench.py report or
@@ -497,6 +691,9 @@ func finishInferenceMatrix(outPath string, document map[string]any, args cliArgs
 	payload := asObject(document["payload"])
 	summary := inferenceMatrixSummary(payload)
 	summary["path"] = outPath
+	if skipped := asObject(document["provenance"])["skippedContexts"]; skipped != nil {
+		summary["skippedContexts"] = skipped
+	}
 	printInfo(args, "inference_matrix_saved", summary)
 	if hasFlag(args, "dry-run") || hasFlag(args, "submit") {
 		return sendInferenceMatrix(outPath, document, hasFlag(args, "dry-run"), args)

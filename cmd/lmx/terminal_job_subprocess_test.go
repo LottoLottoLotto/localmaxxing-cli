@@ -8,6 +8,10 @@ import (
 const terminalJobTestHelperEnv = "LMX_TEST_TERMINAL_JOB_HELPER"
 
 func TestMain(m *testing.M) {
+	if os.Getenv(matrixFakeEngineEnv) != "" {
+		runFakeMatrixEngine()
+		os.Exit(0)
+	}
 	switch os.Getenv(terminalJobTestHelperEnv) {
 	case "detached-output":
 		_, _ = os.Stdout.WriteString("detached worker stdout\n")

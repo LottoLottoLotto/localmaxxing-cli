@@ -352,7 +352,7 @@ func isBooleanOption(key string) bool {
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
 		"save-run", "key-stdin", "draft", "strict", "no-upload-datasets", "upload-datasets",
-		"skip-oracle", "remote":
+		"skip-oracle", "remote", "skip-oversize":
 		return true
 	default:
 		return false
@@ -379,6 +379,11 @@ func parseArgs(argv []string) cliArgs {
 			}
 			continue
 		}
+		if rawValueOption(key) && i+1 < len(argv) {
+			args.opts[key] = argv[i+1]
+			i++
+			continue
+		}
 		if isBooleanOption(key) {
 			args.flags[key] = true
 			continue
@@ -395,6 +400,12 @@ func parseArgs(argv []string) cliArgs {
 		i++
 	}
 	return args
+}
+
+// rawValueOption names options whose value is a list of pass-through flags
+// (e.g. --engine-args "--enforce-eager"), so it always takes the next argument.
+func rawValueOption(key string) bool {
+	return key == "engine-args" || key == "extra-bench-args"
 }
 
 func humanOutput(args cliArgs) bool {
@@ -12015,6 +12026,7 @@ var usageExamples = []string{
 	`lmx kvcache run llama.cpp --hf-id Qwen/Qwen3-8B --model-path model.gguf --levels 10000,20000,30000,40000`,
 	`lmx kvcache run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --levels 10000,20000,30000,40000`,
 	`lmx speed-test matrix run --base-url http://127.0.0.1:8000 --hf-id Qwen/Qwen3-8B --concurrency 1,4,8 --contexts 0,16384 --prefill-contexts 8k`,
+	`lmx speed-test matrix run --model-path ~/models/Qwen3-0.6B --hf-id Qwen/Qwen3-0.6B --concurrency 1,4,16 --contexts 0,4k,16k,32k --dry-run`,
 	`lmx speed-test matrix import benchmark_results.json --hf-id Qwen/Qwen3-8B --quantization FP8 --hardware hardware.json --engine-version 0.11.0`,
 	`lmx speed-test matrix dry-run inference-matrices/Qwen-Qwen3-8B/matrix.json --api-key bhk_...`,
 	`lmx speed-test matrix submit inference-matrices/Qwen-Qwen3-8B/matrix.json --api-key bhk_...`,
@@ -12159,7 +12171,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --command <cmd>          Local speed-test command, e.g. llama-bench
   --host <addr>            Local model server host for generated server commands
   --port <n>               Local model server port for generated server/speed-test commands
-  --model-path <path>      llama.cpp model path; generates llama-bench command
+  --model-path <path>      llama.cpp model path; generates llama-bench command. speed-test matrix run: local model directory that lmx serves with vLLM
   --llama-scorer <path>     Local helper binary for llama_cpp_loglikelihood scoring (default: lmx-llama-score-hellaswag next to lmx)
   --sandbox-image <name>    Docker image for code_execution scoring (default: lmx-sandbox; build with: lmx eval sandbox setup)
   --sandbox-runtime <bin>   Container runtime for code_execution (default: docker; accepts quoted commands like "sudo docker")
@@ -12213,7 +12225,16 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --runs-dir <dir>         Saved speed-test runs directory (default: runs)
   --bench-script <path>    speed-test matrix: local llm_decode_bench.py instead of the pinned download
   --prefill-contexts <list> speed-test matrix: prefill contexts passed to llm-inference-bench (e.g. 8k,64k)
-  --server-command <cmd>   speed-test matrix: serving command to record
+  --contexts <list>        speed-test matrix: decode contexts (default: 0,16k,32k,64k,128k)
+  --duration-seconds <n>   speed-test matrix: seconds per decode cell
+  --max-tokens <n>         speed-test matrix: output tokens per decode request (default: 8192); context + max tokens must fit max_model_len
+  --skip-oversize          speed-test matrix: drop contexts that do not fit the server's max_model_len instead of failing
+  --server-command <cmd>   speed-test matrix: serving command to record (managed mode records its own)
+  --engine-bin <path>      speed-test matrix --model-path: vllm executable (default: PATH, then ~/vllm, ~/.venv, ~/venvs/vllm, ~/.local/share/vllm)
+  --engine-args <args>     speed-test matrix --model-path: extra vllm serve arguments, e.g. "--enforce-eager"
+  --gpu-memory-utilization <f>
+                           speed-test matrix --model-path: vLLM --gpu-memory-utilization (default: 0.9)
+  --start-timeout <s>      speed-test matrix --model-path: seconds to wait for vLLM to become ready (default: 900)
   --group-by <field>       Group saved-run stats by field, e.g. quantization or hardware
   --by <field>             Group saved-run comparisons by field
   --metric <field>         Saved-run metric for stats/compare (default: tokSOut)
