@@ -369,22 +369,14 @@ func runInferenceMatrixAt(runCtx context.Context, args cliArgs, plan matrixBench
 	reportPath := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".bench.json"
 	benchArgs := []string{"--host", baseURL, "--model", servedModel, "--display-mode", "plain", "--output", reportPath, "--no-resume",
 		"--contexts", joinMatrixContexts(plan.Contexts), "--max-tokens", strconv.Itoa(plan.MaxTokens)}
-	for _, pair := range [][2]string{
-		{"--concurrency", "concurrency"},
-		{"--prefill-contexts", "prefill-contexts"},
-		{"--duration", "duration-seconds"},
-	} {
-		if value := opt(args, pair[1]); value != "" {
-			benchArgs = append(benchArgs, pair[0], value)
-		}
-	}
+	benchArgs = append(benchArgs, plan.BenchArgs...)
 	benchArgs = append(benchArgs, strings.Fields(opt(args, "extra-bench-args"))...)
 	scriptInfo["argv"] = redactSecretArgs(benchArgs)
 	if modelKey != "" {
 		benchArgs = append(benchArgs, "--api-key", modelKey)
 	}
 
-	printStatus(args, "inference_matrix_start", map[string]any{"baseUrl": baseURL, "servedModel": servedModel, "report": reportPath, "contexts": joinMatrixContexts(plan.Contexts), "maxTokens": plan.MaxTokens})
+	printStatus(args, "inference_matrix_start", matrixPlanStatus(plan, map[string]any{"baseUrl": baseURL, "servedModel": servedModel, "report": reportPath}))
 	cmd := exec.CommandContext(runCtx, python, append([]string{script}, benchArgs...)...)
 	// Let the bench write its partial report when interrupted.
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
@@ -423,6 +415,11 @@ func matrixOutPath(args cliArgs, hfID string) string {
 const (
 	matrixDefaultMaxTokens = 8192
 	matrixDefaultContexts  = "0,16k,32k,64k,128k"
+	// The bench's own default; lmx passes it explicitly so the plan it prints
+	// and records is the grid that actually runs.
+	matrixDefaultConcurrency = "1,2,4,8,16,32,64,128"
+	matrixMaxGridAxis        = 128
+	matrixMaxDecodeCells     = 2048
 	// The bench sizes padding text with one chars/token calibration probe at
 	// --calibration-context (8k), measured with the chat template, document
 	// wrapper, assistant turn and generation prompt included. Contexts at or
@@ -441,19 +438,59 @@ type matrixContextValue struct {
 // matrixBenchPlan is what lmx asks the bench to run: decode contexts and the
 // output length of every decode request.
 type matrixBenchPlan struct {
-	Contexts  []matrixContextValue
-	MaxTokens int
+	Contexts        []matrixContextValue
+	MaxTokens       int
+	Concurrency     []int
+	PrefillContexts []matrixContextValue
+	// BenchArgs are the validated grid and mode options in llm-inference-bench
+	// form (--concurrency, --run-burst, ...), appended after --contexts/--max-tokens.
+	BenchArgs []string
 	// Skipped holds contexts dropped by --skip-oversize; recorded in the
 	// matrix provenance and the JSON result so scripts can see them.
 	Skipped []matrixContextValue
 }
 
+// matrixGridOptions maps lmx's grid and mode options to llm-inference-bench
+// flags. They are first-class so lmx can validate them before a (managed)
+// server spends minutes starting, and record them in the plan.
+var matrixGridOptions = []struct {
+	lmx, bench string
+	boolean    bool
+	minimum    int
+}{
+	{lmx: "duration-seconds", bench: "--duration", minimum: 1},
+	{lmx: "warmup-seconds", bench: "--decode-warmup-seconds", minimum: 0},
+	{lmx: "run-burst", bench: "--run-burst", boolean: true},
+	{lmx: "burst-requests", bench: "--burst-requests-per-concurrency", minimum: 1},
+	{lmx: "request-count", bench: "--request-count", minimum: 1},
+	{lmx: "skip-prefill", bench: "--skip-prefill", boolean: true},
+	{lmx: "standalone-prefill", bench: "--standalone-prefill", boolean: true},
+	{lmx: "prefill-duration-seconds", bench: "--prefill-duration", minimum: 1},
+}
+
+// matrixBenchOwnedFlags are bench flags lmx sets itself; passing them through
+// --extra-bench-args would bypass validation or contradict the recorded plan.
+var matrixBenchOwnedFlags = map[string]string{
+	"contexts": "--contexts", "max-tokens": "--max-tokens", "concurrency": "--concurrency",
+	"prefill-contexts": "--prefill-contexts", "duration": "--duration-seconds",
+	"decode-warmup-seconds": "--warmup-seconds", "run-burst": "--run-burst",
+	"burst-requests-per-concurrency": "--burst-requests", "request-count": "--request-count",
+	"skip-prefill": "--skip-prefill", "standalone-prefill": "--standalone-prefill",
+	"prefill-duration": "--prefill-duration-seconds",
+	"host":             "", "port": "", "model": "", "output": "", "display-mode": "", "resume": "", "no-resume": "", "api-key": "",
+}
+
 func resolveMatrixBenchPlan(args cliArgs) (matrixBenchPlan, error) {
-	extra := launchFlags(strings.Fields(opt(args, "extra-bench-args")))
-	for _, name := range []string{"max-tokens", "contexts"} {
-		if _, ok := extra[name]; ok {
-			return matrixBenchPlan{}, cliError{"invalid_option", "Pass --" + name + " directly, not inside --extra-bench-args.", []string{"lmx checks --contexts and --max-tokens against the server's context window before the bench starts."}, nil}
+	for name := range launchFlags(strings.Fields(opt(args, "extra-bench-args"))) {
+		lmxFlag, owned := matrixBenchOwnedFlags[name]
+		if !owned {
+			continue
 		}
+		hint := "lmx sets --" + name + " itself."
+		if lmxFlag != "" {
+			hint = "Use lmx's " + lmxFlag + " instead; lmx checks it before the run starts and records it with the matrix."
+		}
+		return matrixBenchPlan{}, cliError{"invalid_option", "--" + name + " cannot go inside --extra-bench-args.", []string{hint}, nil}
 	}
 	maxTokens, err := intOption(args, matrixDefaultMaxTokens, 1, "max-tokens")
 	if err != nil {
@@ -463,11 +500,89 @@ func resolveMatrixBenchPlan(args cliArgs) (matrixBenchPlan, error) {
 	if err != nil {
 		return matrixBenchPlan{}, err
 	}
-	return matrixBenchPlan{Contexts: contexts, MaxTokens: maxTokens}, nil
+	concurrency, err := parseMatrixConcurrency(firstNonEmpty(opt(args, "concurrency"), matrixDefaultConcurrency))
+	if err != nil {
+		return matrixBenchPlan{}, err
+	}
+	// The site's import limits; checked here so a long run is not wasted on an upload it would refuse.
+	if len(contexts) > matrixMaxGridAxis || len(concurrency) > matrixMaxGridAxis || len(contexts)*len(concurrency) > matrixMaxDecodeCells {
+		return matrixBenchPlan{}, cliError{"invalid_option", fmt.Sprintf("The grid has %d contexts × %d concurrency levels; LocalMaxxing accepts up to %d of each and %d decode cells.", len(contexts), len(concurrency), matrixMaxGridAxis, matrixMaxDecodeCells), []string{"Split the sweep into several runs or pass fewer --contexts/--concurrency values."}, nil}
+	}
+	plan := matrixBenchPlan{Contexts: contexts, MaxTokens: maxTokens, Concurrency: concurrency}
+	plan.BenchArgs = []string{"--concurrency", joinInts(concurrency)}
+	if raw := opt(args, "prefill-contexts"); raw != "" {
+		if plan.PrefillContexts, err = parseMatrixContextsFor("prefill-contexts", raw); err != nil {
+			return matrixBenchPlan{}, err
+		}
+		plan.BenchArgs = append(plan.BenchArgs, "--prefill-contexts", joinMatrixContexts(plan.PrefillContexts))
+	}
+	for _, option := range matrixGridOptions {
+		if option.boolean {
+			if hasFlag(args, option.lmx) {
+				plan.BenchArgs = append(plan.BenchArgs, option.bench)
+			}
+			continue
+		}
+		if opt(args, option.lmx) == "" {
+			continue
+		}
+		value, err := intOption(args, 0, option.minimum, option.lmx)
+		if err != nil {
+			return matrixBenchPlan{}, err
+		}
+		plan.BenchArgs = append(plan.BenchArgs, option.bench, strconv.Itoa(value))
+	}
+	conflicts := [][2]string{
+		{"skip-prefill", "prefill-contexts"}, {"skip-prefill", "standalone-prefill"}, {"skip-prefill", "prefill-duration-seconds"},
+		{"request-count", "run-burst"}, {"request-count", "burst-requests"}, {"request-count", "duration-seconds"},
+	}
+	for _, pair := range conflicts {
+		if (hasFlag(args, pair[0]) || opt(args, pair[0]) != "") && (hasFlag(args, pair[1]) || opt(args, pair[1]) != "") {
+			return matrixBenchPlan{}, cliError{"conflicting_options", "--" + pair[0] + " and --" + pair[1] + " cannot be combined.", matrixConflictHints[pair[0]], nil}
+		}
+	}
+	if opt(args, "burst-requests") != "" && !hasFlag(args, "run-burst") {
+		return matrixBenchPlan{}, cliError{"invalid_option", "--burst-requests needs --run-burst.", []string{"Add --run-burst to measure the extra burst grid."}, nil}
+	}
+	if opt(args, "prefill-duration-seconds") != "" && !hasFlag(args, "standalone-prefill") {
+		return matrixBenchPlan{}, cliError{"invalid_option", "--prefill-duration-seconds needs --standalone-prefill.", []string{"By default prefill is measured from the decode warmup requests, which have no separate duration; add --standalone-prefill to time it on its own."}, nil}
+	}
+	return plan, nil
+}
+
+var matrixConflictHints = map[string][]string{
+	"skip-prefill":  {"--skip-prefill measures decode only; drop the prefill options or --skip-prefill."},
+	"request-count": {"--request-count replaces timed decode with a fixed number of requests per cell (burst only); drop --duration-seconds/--run-burst/--burst-requests, or drop --request-count."},
+}
+
+// parseMatrixConcurrency reads --concurrency: positive request counts, no duplicates.
+func parseMatrixConcurrency(list string) ([]int, error) {
+	values, seen := []int{}, map[int]bool{}
+	for _, raw := range strings.Split(list, ",") {
+		value, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || value < 1 || seen[value] {
+			return nil, cliError{"invalid_option", fmt.Sprintf("--concurrency entry %q is not a new positive request count", strings.TrimSpace(raw)), []string{"Pass comma-separated numbers of simultaneous requests, e.g. --concurrency 1,2,4,8."}, nil}
+		}
+		seen[value] = true
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+func joinInts(values []int) string {
+	parts := make([]string, len(values))
+	for i, value := range values {
+		parts[i] = strconv.Itoa(value)
+	}
+	return strings.Join(parts, ",")
 }
 
 // parseMatrixContexts mirrors the bench's parse_token_value: "16k" = 16384.
 func parseMatrixContexts(list string) ([]matrixContextValue, error) {
+	return parseMatrixContextsFor("contexts", list)
+}
+
+func parseMatrixContextsFor(flag, list string) ([]matrixContextValue, error) {
 	values := []matrixContextValue{}
 	for _, raw := range strings.Split(list, ",") {
 		raw = strings.TrimSpace(raw)
@@ -477,7 +592,7 @@ func parseMatrixContexts(list string) ([]matrixContextValue, error) {
 		}
 		parsed, err := strconv.ParseFloat(number, 64)
 		if raw == "" || err != nil || parsed < 0 || (multiplier == 1 && parsed != float64(int(parsed))) {
-			return nil, cliError{"invalid_option", fmt.Sprintf("--contexts entry %q is not a token count", raw), []string{"Pass comma-separated token counts with an optional k suffix, e.g. --contexts 0,4k,16k,32k."}, nil}
+			return nil, cliError{"invalid_option", fmt.Sprintf("--%s entry %q is not a token count", flag, raw), []string{"Pass comma-separated token counts with an optional k suffix, e.g. --" + flag + " 0,4k,16k,32k."}, nil}
 		}
 		values = append(values, matrixContextValue{Raw: raw, Tokens: int(parsed * multiplier)})
 	}
@@ -1176,4 +1291,33 @@ func shellJoin(argv []string) string {
 		quoted[i] = shellQuote(arg)
 	}
 	return strings.Join(quoted, " ")
+}
+
+// matrixPlanStatus describes the grid about to run: what the user asked for,
+// how many decode cells that is, and a lower bound on the timed decode part.
+func matrixPlanStatus(plan matrixBenchPlan, fields map[string]any) map[string]any {
+	cells := len(plan.Contexts) * len(plan.Concurrency)
+	fields["contexts"] = joinMatrixContexts(plan.Contexts)
+	fields["concurrency"] = joinInts(plan.Concurrency)
+	fields["maxTokens"] = plan.MaxTokens
+	fields["decodeCells"] = cells
+	if len(plan.PrefillContexts) > 0 {
+		fields["prefillContexts"] = joinMatrixContexts(plan.PrefillContexts)
+	}
+	if len(plan.BenchArgs) > 2 {
+		fields["benchOptions"] = strings.Join(plan.BenchArgs[2:], " ")
+	}
+	duration := 30
+	for i := 0; i+1 < len(plan.BenchArgs); i++ {
+		if plan.BenchArgs[i] == "--duration" {
+			duration, _ = strconv.Atoi(plan.BenchArgs[i+1])
+		}
+		if plan.BenchArgs[i] == "--request-count" {
+			duration = 0
+		}
+	}
+	if duration > 0 {
+		fields["timedDecodeMinutes"] = fmt.Sprintf("at least %.1f (%d cells × %d s, before skipped cells)", float64(cells*duration)/60, cells, duration)
+	}
+	return fields
 }

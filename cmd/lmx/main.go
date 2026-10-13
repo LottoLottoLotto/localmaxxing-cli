@@ -352,7 +352,7 @@ func isBooleanOption(key string) bool {
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
 		"save-run", "key-stdin", "draft", "strict", "no-upload-datasets", "upload-datasets",
-		"skip-oracle", "remote", "skip-oversize":
+		"skip-oracle", "remote", "skip-oversize", "run-burst", "skip-prefill", "standalone-prefill":
 		return true
 	default:
 		return false
@@ -12224,9 +12224,18 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
                            DFlash / DFlash2 draft KV sliding-window size
   --runs-dir <dir>         Saved speed-test runs directory (default: runs)
   --bench-script <path>    speed-test matrix: local llm_decode_bench.py instead of the pinned download
-  --prefill-contexts <list> speed-test matrix: prefill contexts passed to llm-inference-bench (e.g. 8k,64k)
-  --contexts <list>        speed-test matrix: decode contexts (default: 0,16k,32k,64k,128k)
-  --duration-seconds <n>   speed-test matrix: seconds per decode cell
+  --contexts <list>        speed-test matrix: decode context lengths in tokens, k suffix allowed (default: 0,16k,32k,64k,128k)
+  --concurrency <list>     speed-test matrix: simultaneous requests per decode cell (default: 1,2,4,8,16,32,64,128)
+  --prefill-contexts <list> speed-test matrix: extra prefill-only context lengths (e.g. 8k,64k)
+  --duration-seconds <n>   speed-test matrix: seconds per decode cell (default: 30)
+  --warmup-seconds <n>     speed-test matrix: one-request decode warmup before measuring, 0 to skip (default: 3)
+  --run-burst              speed-test matrix: also measure a short burst grid after sustained decode
+  --burst-requests <n>     speed-test matrix --run-burst: burst requests per concurrency level (default: 5)
+  --request-count <n>      speed-test matrix: burst-only mode, exactly n requests per cell instead of timed decode
+  --skip-prefill           speed-test matrix: measure decode only
+  --standalone-prefill     speed-test matrix: measure prefill cold before decode instead of from decode warmup
+  --prefill-duration-seconds <n>
+                           speed-test matrix: seconds per standalone prefill cell
   --max-tokens <n>         speed-test matrix: output tokens per decode request (default: 8192); context + max tokens must fit max_model_len
   --skip-oversize          speed-test matrix: drop contexts that do not fit the server's max_model_len instead of failing
   --server-command <cmd>   speed-test matrix: serving command to record (managed mode records its own)

@@ -560,3 +560,62 @@ func TestEngineFailureReasonFindsRootCause(t *testing.T) {
 		t.Fatalf("no exception must give no reason, got %q", got)
 	}
 }
+
+func TestResolveMatrixBenchPlanGridOptions(t *testing.T) {
+	plan := func(opts map[string]string, flags ...string) (matrixBenchPlan, error) {
+		set := map[string]bool{}
+		for _, flag := range flags {
+			set[flag] = true
+		}
+		return resolveMatrixBenchPlan(cliArgs{opts: opts, flags: set})
+	}
+	defaults, err := plan(map[string]string{})
+	if err != nil || strings.Join(defaults.BenchArgs, " ") != "--concurrency 1,2,4,8,16,32,64,128" || joinMatrixContexts(defaults.Contexts) != "0,16k,32k,64k,128k" {
+		t.Fatalf("defaults = %+v %v", defaults, err)
+	}
+	custom, err := plan(map[string]string{
+		"contexts": "0,3000,8k", "concurrency": "1,3,6", "prefill-contexts": "2k,12k", "duration-seconds": "10",
+		"warmup-seconds": "0", "burst-requests": "4", "prefill-duration-seconds": "5",
+	}, "run-burst", "standalone-prefill")
+	want := "--concurrency 1,3,6 --prefill-contexts 2k,12k --duration 10 --decode-warmup-seconds 0 --run-burst --burst-requests-per-concurrency 4 --standalone-prefill --prefill-duration 5"
+	if err != nil || strings.Join(custom.BenchArgs, " ") != want || joinMatrixContexts(custom.Contexts) != "0,3000,8k" {
+		t.Fatalf("custom = %q %v", strings.Join(custom.BenchArgs, " "), err)
+	}
+	if burstOnly, err := plan(map[string]string{"request-count": "8"}, "skip-prefill"); err != nil || !strings.Contains(strings.Join(burstOnly.BenchArgs, " "), "--request-count 8 --skip-prefill") {
+		t.Fatalf("burst only = %+v %v", burstOnly, err)
+	}
+	for name, tc := range map[string]struct {
+		opts  map[string]string
+		flags []string
+		code  string
+	}{
+		"zero concurrency":      {map[string]string{"concurrency": "0,2"}, nil, "invalid_option"},
+		"duplicate concurrency": {map[string]string{"concurrency": "2,2"}, nil, "invalid_option"},
+		"bad prefill context":   {map[string]string{"prefill-contexts": "lots"}, nil, "invalid_option"},
+		"zero duration":         {map[string]string{"duration-seconds": "0"}, nil, "invalid_option"},
+		"skip prefill + extras": {map[string]string{"prefill-contexts": "8k"}, []string{"skip-prefill"}, "conflicting_options"},
+		"request count + timed": {map[string]string{"request-count": "4", "duration-seconds": "10"}, nil, "conflicting_options"},
+		"request count + burst": {map[string]string{"request-count": "4"}, []string{"run-burst"}, "conflicting_options"},
+		"burst size, no burst":  {map[string]string{"burst-requests": "4"}, nil, "invalid_option"},
+		"prefill time, no cold": {map[string]string{"prefill-duration-seconds": "5"}, nil, "invalid_option"},
+		"grid in extra args":    {map[string]string{"extra-bench-args": "--concurrency 1,2"}, nil, "invalid_option"},
+		"output in extra args":  {map[string]string{"extra-bench-args": "--output /tmp/x.json"}, nil, "invalid_option"},
+		"grid over site limit":  {map[string]string{"contexts": manyValues(64, "k"), "concurrency": manyValues(33, "")}, nil, "invalid_option"},
+	} {
+		if _, err := plan(tc.opts, tc.flags...); matrixErrorCode(err) != tc.code {
+			t.Errorf("%s: error = %v, want %s", name, err, tc.code)
+		}
+	}
+	if _, err := plan(map[string]string{"extra-bench-args": "--temperature 0.7"}); err != nil {
+		t.Fatalf("bench options lmx does not manage must still pass through: %v", err)
+	}
+}
+
+// manyValues returns "1<suffix>,2<suffix>,...,n<suffix>".
+func manyValues(n int, suffix string) string {
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = strconv.Itoa(i+1) + suffix
+	}
+	return strings.Join(parts, ",")
+}
