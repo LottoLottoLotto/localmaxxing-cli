@@ -2,7 +2,7 @@
 
 ## Remote endpoint speed tests
 
-Use remote mode for an already-running endpoint. FreeToken, NInfer, vLLM, and SGLang use an OpenAI-compatible API (`POST /v1/chat/completions`) and stream by default. Ollama uses its native `/api/generate` API.
+Use remote mode for an already-running endpoint. FreeToken, NInfer, Strata, vLLM, and SGLang use an OpenAI-compatible API (`POST /v1/chat/completions`) and stream by default. Ollama uses its native `/api/generate` API.
 
 ```bash
 lmx speed-test run vllm \
@@ -16,6 +16,7 @@ lmx speed-test run sglang --mode remote --base-url http://server:30000 --hf-id Q
 lmx speed-test run ollama --mode remote --base-url http://server:11434 --served-model qwen3:8b --hf-id Qwen/Qwen3-8B --quantization Q4_K_M
 lmx speed-test run freetoken --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --engine-version 0.3.1 --engine-commit abcdef123456
 lmx speed-test run ninfer --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16
+lmx speed-test run strata --mode remote --base-url http://server:8080/v1 --hf-id Qwen/Qwen3.8-Flash-Next --quantization IQ2_XS
 ```
 
 Defaults: 1 untimed warmup and 3 timed iterations. The submitted summary reports the median, and per-iteration details appear in `samples` / `sampleStats`. Tune with `--warmup` and `--iterations`; `--warmup 0 --iterations 1` is a single shot.
@@ -36,7 +37,7 @@ Important remote flags:
 - `--no-stream`: disable streaming.
 - `--endpoint-timeout-seconds <n>`: remote endpoint timeout; default is 600.
 - `--engine-version <value>`: engine release/version used for the run.
-- `--engine-repository <url>`: source repository used for the run. FreeToken and NInfer default to their canonical GitHub repositories; override this for a fork or mirror.
+- `--engine-repository <url>`: source repository used for the run. FreeToken, NInfer and Strata default to their canonical GitHub repositories; override this for a fork or mirror. Remote Strata runs take `--engine-version` from the server's `/props` when it is omitted.
 - `--engine-build <value>`: build or artifact identifier used for the run.
 - `--engine-commit <hash>`: 7–64 character hexadecimal Git commit used for the run.
 

@@ -228,7 +228,7 @@ The API, CLI, and web editor all use `contentFormat: "gfm"` and format version `
 
 ## Speed tests
 
-### Remote Endpoint (FreeToken, NInfer, vLLM, SGLang, Ollama, custom OpenAI-compatible)
+### Remote Endpoint (FreeToken, NInfer, Strata, vLLM, SGLang, Ollama, custom OpenAI-compatible)
 
 ```bash
 lmx speed-test run vllm \
@@ -256,7 +256,14 @@ lmx speed-test run freetoken \
   --engine-commit abcdef123456
 ```
 
-`freetoken` and `ninfer` default `--engine-repository` to their canonical GitHub repositories. Override it for forks or mirrors. `--engine-version`, `--engine-repository`, `--engine-build`, and `--engine-commit` are saved with the run and forwarded by later dry-run/submission commands.
+[Strata](https://github.com/Niko1221/Strata) (Qwen3.8-Flash-Next on consumer GPUs) serves the same API on port 8080:
+
+```bash
+lmx speed-test run strata --mode remote --base-url http://127.0.0.1:8080/v1 \
+  --hf-id Qwen/Qwen3.8-Flash-Next --quantization IQ2_XS --hardware hardware.json
+```
+
+`freetoken`, `ninfer` and `strata` default `--engine-repository` to their canonical GitHub repositories. For Strata, lmx also reads the engine version from the server's `/props` (`build_info: "Strata 0.1.44"`) when `--engine-version` is not given. Override it for forks or mirrors. `--engine-version`, `--engine-repository`, `--engine-build`, and `--engine-commit` are saved with the run and forwarded by later dry-run/submission commands.
 
 For remote endpoint submissions, `--hardware` must describe the server running the endpoint, not the client machine running `lmx`. Run `lmx hardware --out hardware.json` on that server, or provide an equivalent reviewed hardware JSON for that server. If a remote run already has metrics but lacks hardware, attach it without rerunning: `lmx speed-test add-hardware runs/Model/run.json --hardware hardware.json`.
 

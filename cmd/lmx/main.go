@@ -3734,12 +3734,31 @@ func engineProvenance(engineName string, args cliArgs) (version, repository, bui
 	return version, repository, build, commit, nil
 }
 
+// strataEngineVersion reads the version a Strata server reports in /props
+// ("build_info": "Strata 0.1.44"); empty when it is unavailable.
+func strataEngineVersion(baseURL, apiKey string) string {
+	if baseURL == "" {
+		return ""
+	}
+	value, err := fetchEndpointJSON(openAIBaseURL(baseURL)+"/props", apiKey)
+	if err != nil {
+		return ""
+	}
+	build := strings.TrimSpace(stringValue(asObject(value)["build_info"]))
+	if version, ok := strings.CutPrefix(build, "Strata "); ok {
+		return strings.TrimSpace(version)
+	}
+	return ""
+}
+
 func canonicalEngineRepository(engineName string) string {
 	switch normalizeEngineName(engineName) {
 	case "freetoken":
 		return "https://github.com/FlashML-org/FreeToken"
 	case "ninfer":
 		return "https://github.com/Neroued/ninfer"
+	case "strata":
+		return "https://github.com/Niko1221/Strata"
 	default:
 		return ""
 	}
@@ -5093,6 +5112,9 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 	engineVersion, engineRepository, engineBuild, engineCommit, err := engineProvenance(engineName, args)
 	if err != nil {
 		return nil, err
+	}
+	if engineVersion == "" && engineName == "strata" && mode == "remote" && !hasFlag(args, "dry-run") {
+		engineVersion = strataEngineVersion(opt(args, "base-url"), opt(args, "model-api-key"))
 	}
 
 	builder := benchmarkPayload{
@@ -7802,6 +7824,8 @@ func normalizeEngineName(value string) string {
 		return "freetoken"
 	case "ninfer", "n-infer", "n infer":
 		return "ninfer"
+	case "strata", "strata-engine", "strata engine":
+		return "strata"
 	case "":
 		return ""
 	default:
@@ -12098,7 +12122,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --backend <name>         Speed-test accelerator backend (e.g. cuda, rocm, tt-metal); lm-eval backend for eval lm-eval
   --engine-version <value> Engine release/version used for the speed test
   --engine-repository <url>
-                           Source repository used for the speed test; defaults for FreeToken and NInfer
+                           Source repository used for the speed test; defaults for FreeToken, NInfer and Strata
   --engine-build <value>   Build or artifact identifier used for the speed test
   --engine-commit <hash>   7-64 character hexadecimal Git commit used for the speed test
   --num-fewshot <n>        lm-eval --num_fewshot override

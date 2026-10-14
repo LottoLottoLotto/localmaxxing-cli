@@ -687,6 +687,45 @@ func TestRemoteBenchmarkPayloadSubmitsObservedRunShape(t *testing.T) {
 	}
 }
 
+// A remote Strata run records the canonical repository and the version the
+// server reports in /props; an explicit --engine-version still wins.
+func TestRemoteStrataRunRecordsServerVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[{"id":"Qwen3.8-Flash-Next-IQ2_XS"}]}`)
+		case "/props":
+			fmt.Fprint(w, `{"model_alias":"Qwen3.8-Flash-Next-IQ2_XS","build_info":"Strata 0.1.44"}`)
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hi"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":1}}`)
+			fmt.Fprintln(w, `data: [DONE]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	run := func(extra map[string]string) map[string]any {
+		opts := map[string]string{"mode": "remote", "base-url": server.URL + "/v1", "served-model": "Qwen3.8-Flash-Next-IQ2_XS", "hf-id": "Qwen/Qwen3.8-Flash-Next", "quantization": "IQ2_XS", "hardware": writeBenchmarkHardwareForTest(t), "max-tokens": "4", "warmup": "0", "iterations": "1"}
+		for key, value := range extra {
+			opts[key] = value
+		}
+		payload, err := benchmarkPayloadFromFlags("Strata", cliArgs{opts: opts, flags: map[string]bool{"quiet": true}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return toBenchmarkSubmit(payload)
+	}
+	submit := run(nil)
+	if submit["engineName"] != "strata" || submit["engineRepository"] != "https://github.com/Niko1221/Strata" || submit["engineVersion"] != "0.1.44" {
+		t.Fatalf("Strata provenance = %v / %v / %v", submit["engineName"], submit["engineRepository"], submit["engineVersion"])
+	}
+	if submit := run(map[string]string{"engine-version": "0.1.43-local"}); submit["engineVersion"] != "0.1.43-local" {
+		t.Fatalf("explicit --engine-version overridden: %v", submit["engineVersion"])
+	}
+}
+
 func TestNormalizeEngineNameRecognizesZMLLLMDAliases(t *testing.T) {
 	for _, alias := range []string{"llmd", "ZML", "zml/llmd", "ZML LLMD"} {
 		if got := normalizeEngineName(alias); got != "llmd" {
