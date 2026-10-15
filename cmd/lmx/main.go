@@ -7865,6 +7865,8 @@ func normalizeEngineName(value string) string {
 		return "ninfer"
 	case "strata", "strata-engine", "strata engine":
 		return "strata"
+	case "e", "actual", "actual-e", "actual e", "actual-computer", "actual computer":
+		return "e"
 	case "":
 		return ""
 	default:

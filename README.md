@@ -380,7 +380,7 @@ The API, CLI, and web editor all use `contentFormat: "gfm"` and format version `
 
 ## Speed tests
 
-### Remote Endpoint (FreeToken, NInfer, Strata, vLLM, SGLang, Ollama, custom OpenAI-compatible)
+### Remote Endpoint (FreeToken, NInfer, Strata, Actual e, vLLM, SGLang, Ollama, custom OpenAI-compatible)
 
 ```bash
 lmx speed-test run vllm \
@@ -413,6 +413,14 @@ lmx speed-test run freetoken \
 ```bash
 lmx speed-test run strata --mode remote --base-url http://127.0.0.1:8080/v1 \
   --hf-id Qwen/Qwen3.8-Flash-Next --quantization IQ2_XS --hardware hardware.json
+```
+
+[Actual Computer](https://actual.inc)'s engine **e** (engine name `e`; `actual` also works) serves an OpenAI-compatible API on the address in `actual status --format json` → `api.url`, normally `http://127.0.0.1:8080`. Its model ids are display names, so pass the loaded model's `selector` from `/v1/models` (or `actual models list`) as `--served-model`, and the release you ran as `--engine-version` (`actual --version`):
+
+```bash
+lmx speed-test run e --mode remote --base-url http://127.0.0.1:8080 \
+  --served-model mdl_a81e2d366803a648 --hf-id google/gemma-4-12b-it --quantization Q4_K_M \
+  --engine-version <actual --version> --hardware hardware.json
 ```
 
 `freetoken`, `ninfer` and `strata` default `--engine-repository` to their canonical GitHub repositories. For Strata, lmx also reads the engine version from the server's `/props` (`build_info: "Strata 0.1.44"`) when `--engine-version` is not given. Override it for forks or mirrors. `--engine-version`, `--engine-repository`, `--engine-build`, and `--engine-commit` are saved with the run and forwarded by later dry-run/submission commands.

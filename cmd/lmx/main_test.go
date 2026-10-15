@@ -726,6 +726,35 @@ func TestRemoteStrataRunRecordsServerVersion(t *testing.T) {
 	}
 }
 
+// Actual Computer's engine "e" serves an OpenAI-compatible API whose model ids
+// are display names; a remote run against it is submitted as engine "e".
+func TestRemoteActualERunSubmitsEngineE(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"object":"list","data":[{"id":"Gemma 4 12B IT","selector":"mdl_a81e2d366803a648","owned_by":"actual","loaded":true}]}`)
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hi"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":1}}`)
+			fmt.Fprintln(w, `data: [DONE]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	for _, engine := range []string{"e", "actual", "Actual Computer"} {
+		opts := map[string]string{"mode": "remote", "base-url": server.URL, "served-model": "mdl_a81e2d366803a648", "hf-id": "google/gemma-4-12b-it", "quantization": "Q4_K_M", "hardware": writeBenchmarkHardwareForTest(t), "max-tokens": "4", "warmup": "0", "iterations": "1", "engine-version": "1.2.3"}
+		payload, err := benchmarkPayloadFromFlags(engine, cliArgs{opts: opts, flags: map[string]bool{"quiet": true}})
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		if submit := toBenchmarkSubmit(payload); submit["engineName"] != "e" || submit["engineVersion"] != "1.2.3" {
+			t.Fatalf("%s: engine = %v %v", engine, submit["engineName"], submit["engineVersion"])
+		}
+	}
+}
+
 func TestNormalizeEngineNameRecognizesZMLLLMDAliases(t *testing.T) {
 	for _, alias := range []string{"llmd", "ZML", "zml/llmd", "ZML LLMD"} {
 		if got := normalizeEngineName(alias); got != "llmd" {

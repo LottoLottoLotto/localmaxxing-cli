@@ -2,7 +2,7 @@
 
 ## Remote endpoint speed tests
 
-Use remote mode for an already-running endpoint. FreeToken, NInfer, Strata, vLLM, and SGLang use an OpenAI-compatible API (`POST /v1/chat/completions`) and stream by default. Ollama uses its native `/api/generate` API.
+Use remote mode for an already-running endpoint. FreeToken, NInfer, Strata, Actual Computer's e, vLLM, and SGLang use an OpenAI-compatible API (`POST /v1/chat/completions`) and stream by default. Ollama uses its native `/api/generate` API.
 
 ```bash
 lmx speed-test run vllm \
@@ -17,6 +17,7 @@ lmx speed-test run ollama --mode remote --base-url http://server:11434 --served-
 lmx speed-test run freetoken --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --engine-version 0.3.1 --engine-commit abcdef123456
 lmx speed-test run ninfer --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16
 lmx speed-test run strata --mode remote --base-url http://server:8080/v1 --hf-id Qwen/Qwen3.8-Flash-Next --quantization IQ2_XS
+lmx speed-test run e --mode remote --base-url http://127.0.0.1:8080 --served-model <selector from /v1/models> --hf-id google/gemma-4-12b-it --quantization Q4_K_M --engine-version <actual --version>
 ```
 
 Defaults: 1 untimed warmup and 3 timed iterations. The submitted summary reports the median, and per-iteration details appear in `samples` / `sampleStats`. Tune with `--warmup` and `--iterations`; `--warmup 0 --iterations 1` is a single shot.
