@@ -8,7 +8,9 @@ Raw HTTP API docs are available from the site through `GET /api/agent-context` a
 - `lmx auth`: manage LocalMaxxing API authentication.
 - `lmx hardware`: detect, validate, or template hardware metadata.
 - `lmx setups`: list and pull saved account setups.
-- `lmx model`: search or resolve HuggingFace model IDs.
+- `lmx model`: search or resolve HuggingFace model IDs; `list|show` the local inventory (lmx store, snapshots, HF cache, `--scan-dir`/`LMX_MODEL_DIRS` folders) with details from config.json, safetensors headers and GGUF metadata; `pull|snapshot|snapshots|import|verify|remove` manage downloads (`--download-connections`, `--models-dir`); `load|unload|loaded|logs` serve a local model on a host engine (`--engine`, `--gpus`, `--context-length`, `--port`, `--server-args`, `--server-env-file`, `--no-wait`).
+- `lmx engines set ENGINE PATH [--server-env-file FILE]` / `lmx engines unset ENGINE`: the vLLM binary, SGLang Python or llama-server that `model load` uses.
+- `lmx auth hf --token-stdin|status|logout`: the Hugging Face token (`HF_TOKEN`, else `HF_TOKEN_PATH` / `$HF_HOME/token`, shared with `hf auth login`).
 - `lmx profile`: save and manage reusable CLI defaults.
 - `lmx engines` / `lmx engine`: list engine helpers.
 - `lmx server`: build or run local model server commands.

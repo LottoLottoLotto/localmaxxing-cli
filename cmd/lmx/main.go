@@ -285,6 +285,9 @@ func runWithArgs(args cliArgs) error {
 	case "profile":
 		return handleProfile(positional(args, 1), positional(args, 2), args)
 	case "engines", "engine":
+		if action := positional(args, 1); action == "set" || action == "unset" {
+			return handleEngineConfig(action, positional(args, 2), args)
+		}
 		return handleEngines(args)
 	case "server":
 		return handleServer(positional(args, 1), positional(args, 2), args)
@@ -351,7 +354,7 @@ func isBooleanOption(key string) bool {
 		"no-stream", "missing-only", "all-missing", "cleanup-images", "native-tools", "oracle",
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
-		"save-run", "key-stdin", "draft", "strict", "no-upload-datasets", "upload-datasets",
+		"save-run", "key-stdin", "token-stdin", "no-hf-cache", "no-wait", "draft", "strict", "no-upload-datasets", "upload-datasets",
 		"skip-oracle", "remote", "skip-oversize", "run-burst", "skip-prefill", "standalone-prefill":
 		return true
 	default:
@@ -962,6 +965,8 @@ func handleAuth(args cliArgs) error {
 		return handleAuthKeys(positional(args, 2), positional(args, 3), args)
 	case "whoami":
 		return handleAuthWhoami(args)
+	case "hf":
+		return handleAuthHF(positional(args, 2), args)
 	}
 	if hasFlag(args, "logout") {
 		if err := saveConfig(map[string]any{}); err != nil {
@@ -1628,7 +1633,17 @@ func formatSetupLine(setup map[string]any) string {
 }
 
 func handleEngines(args cliArgs) error {
-	return writeOrPrintJSON("engines", args, map[string]any{"engines": detectInferenceEngines(args)})
+	// Engines set with `lmx engines set` are what `lmx model load` uses; env values stay private.
+	configured := map[string]any{}
+	for name, config := range loadHostEngines() {
+		keys := make([]string, 0, len(config.Env))
+		for key := range config.Env {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		configured[name] = map[string]any{"path": config.Path, "envKeys": keys}
+	}
+	return writeOrPrintJSON("engines", args, map[string]any{"engines": detectInferenceEngines(args), "configured": configured})
 }
 
 func handleServer(action, target string, args cliArgs) error {
@@ -2096,8 +2111,32 @@ func handleModel(action, target string, args cliArgs) error {
 		return writeOrPrintJSON("models", args, value)
 	case "resolve-remote", "resolve":
 		return handleModelResolveRemote(args)
+	case "list":
+		return handleModelList(args)
+	case "show":
+		return handleModelShow(target, args)
+	case "load":
+		return handleModelLoad(target, args)
+	case "unload":
+		return handleModelUnload(target, args)
+	case "loaded", "ps":
+		return handleModelLoaded(args)
+	case "logs":
+		return handleModelLogs(target, args)
+	case "import":
+		return handleModelImport(target, args)
+	case "pull":
+		return handleModelPull(target, args)
+	case "snapshot":
+		return handleModelSnapshot(target, args)
+	case "snapshots":
+		return handleModelSnapshots(target, positional(args, 3), args)
+	case "verify":
+		return handleModelVerify(target, args)
+	case "remove":
+		return handleModelRemove(target, args)
 	default:
-		return errors.New("Unknown model command. Use search or resolve-remote.")
+		return errors.New("Unknown model command. Use list, show, load, unload, loaded, logs, pull, snapshot, snapshots, import, verify, remove, search, or resolve-remote.")
 	}
 }
 
@@ -12014,6 +12053,9 @@ var usageExamples = []string{
 	`lmx auth --key-stdin`,
 	`lmx auth login`,
 	`lmx auth logout`,
+	`lmx auth hf --token-stdin   (paste a token from https://huggingface.co/settings/tokens, then Enter)`,
+	`lmx auth hf status`,
+	`lmx auth hf logout`,
 	`lmx auth keys list`,
 	`lmx auth keys create --name "my key"`,
 	`lmx auth keys revoke <id>`,
@@ -12071,6 +12113,23 @@ var usageExamples = []string{
 	`lmx eval suite search reasoning --out reasoning-suites.json`,
 	`lmx eval suite show <approved-suite-slug> --out suite.json`,
 	`lmx model search qwen3-8b --out models.json`,
+	`lmx model list`,
+	`lmx model list --scan-dir ~/models --kind directory`,
+	`lmx model show Qwen/Qwen3-8B`,
+	`lmx model pull org/model --revision main --file model.gguf --dry-run`,
+	`lmx model pull org/model --revision <commit> --file model.gguf --yes`,
+	`lmx model snapshot org/model --revision main --exclude "*.bin,*.h5" --dry-run`,
+	`lmx model snapshot org/model --revision <commit> --yes`,
+	`lmx model snapshots list`,
+	`lmx model import /models/model.gguf`,
+	`lmx model verify <id>`,
+	`lmx model remove <id> --yes`,
+	`lmx engines set vllm ~/vllm/bin/vllm --server-env-file vllm-env.json`,
+	`lmx model load Qwen3-0.6B --scan-dir ~/models`,
+	`lmx model load LFM2.5-2.6B-GGUF/LFM2.5-2.6B-Q4_K_M --context-length 8192 --gpus 0`,
+	`lmx model loaded`,
+	`lmx model logs qwen3-0.6b --follow`,
+	`lmx model unload qwen3-0.6b`,
 	`lmx eval storage upload traces.jsonl --kind artifact --format jsonl --out artifact-bundle.json`,
 	`lmx eval storage download <storageKey> --out traces.jsonl`,
 	`lmx eval lm-eval <approved-suite-slug> --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run`,
@@ -12313,6 +12372,20 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --compact                Emit one-line JSON instead of indented JSON
   --section <path>         Select one dotted path from lmx context
   --key-stdin              Read and persist an API key from stdin
+  --token-stdin            lmx auth hf: read a Hugging Face token from stdin, validate it, and save it where huggingface_hub reads it
+  --models-dir <path>      Model store (LMX_MODELS_DIR, then XDG data directory)
+  --revision <ref>         HuggingFace revision; pull/snapshot resolve it to an exact commit
+  --exclude <globs>        Snapshot exclude patterns, comma-separated (with --include)
+  --download-connections <n> Parallel HTTP streams for model pull/snapshot (default 8, max 32; 1 = one stream per file)
+  --scan-dir <dirs>         lmx model list/show/load: also list model folders under these comma-separated directories (also LMX_MODEL_DIRS)
+  --no-hf-cache            lmx model list/show/load: skip the Hugging Face cache
+  --gpus <ids>              lmx model load: CUDA_VISIBLE_DEVICES for the server; several GPUs also set tensor parallelism
+  --server-args <json>     lmx model load: extra engine arguments as a JSON string array; never shell evaluated
+  --server-env-file <path> lmx model load / engines set: JSON object of environment values for the server
+  --no-wait                lmx model load: return once started instead of waiting for /v1/models
+  --ready-timeout-seconds <n> lmx model load: wait this long for /v1/models (default 900)
+  --stop-timeout-seconds <n> lmx model unload: SIGTERM grace before SIGKILL (default 30)
+  --lines <n>              lmx model logs: recent log lines (default 50)
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
   --hardware <path>        JSON hardware object required when submitting
   --quantization <label>   Quantization label (auto-detected from the endpoint for remote speed-test and eval-shard runs when omitted)
@@ -12389,7 +12462,7 @@ var commandDescriptions = map[string]string{
 	"skill":                   "Print or install the bundled agent skill that documents the CLI.",
 	"skill print":             "Print the bundled SKILL.md to stdout (or --out <path>).",
 	"skill install":           "Write the bundled skill files into a skills directory (default .claude/skills).",
-	"model":                   "Search or resolve HuggingFace model IDs.",
+	"model":                   "List, show, download, load and unload local models; search or resolve HuggingFace model IDs.",
 	"model search":            "Search LocalMaxxing model records.",
 	"model resolve-remote":    "Resolve a remote endpoint alias to likely HF candidates.",
 	"eval":                    "Discover, run, and submit evaluation suites.",
@@ -12430,7 +12503,7 @@ var commandDescriptions = map[string]string{
 	"eval train rl run":      "Validate an online GRPO manifest and plan or execute its embedded Python trainer.",
 	"kvcache":                "Run KV-cache and context-length sweeps.",
 	"profile":                "Save and manage reusable CLI defaults.",
-	"auth":                   "Manage LocalMaxxing API authentication.",
+	"auth":                   "Manage LocalMaxxing API authentication and the Hugging Face token (auth hf).",
 	"server":                 "Build or run local model server commands.",
 }
 

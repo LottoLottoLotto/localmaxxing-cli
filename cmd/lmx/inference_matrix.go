@@ -1081,15 +1081,11 @@ func matrixQuantizationFromModel(argv []string, hfID string, args cliArgs) (stri
 		resolution["configError"] = err.Error()
 	}
 	resolution["config"] = configSource
-	if qc := asObject(config["quantization_config"]); qc != nil {
-		method := strings.ToLower(stringValue(qc["quant_method"]))
-		if method == "modelopt" {
-			method = map[string]string{"FP8": "fp8", "NVFP4": "modelopt_fp4"}[strings.ToUpper(stringValue(qc["quant_algo"]))]
-		}
-		if quant := matrixQuantMethods[method]; quant != "" {
+	if quant, unresolved, present := configQuantMethod(config); present {
+		if quant != "" {
 			return matrixQuantResolved(resolution, quant, "config_quantization")
 		}
-		resolution["unresolved"] = "config.json quantization_config " + firstNonEmpty(stringValue(qc["quant_method"]), "(no quant_method)") + " does not name one weight format"
+		resolution["unresolved"] = unresolved
 		return "", resolution
 	}
 	if value := strings.ToLower(flags["dtype"]); value != "" && value != "auto" {
@@ -1098,8 +1094,7 @@ func matrixQuantizationFromModel(argv []string, hfID string, args cliArgs) (stri
 			return matrixQuantResolved(resolution, quant, "launch_dtype")
 		}
 	}
-	dtype := strings.ToLower(firstNonEmpty(stringValue(config["torch_dtype"]), stringValue(config["dtype"])))
-	if quant := matrixDtypes[dtype]; quant != "" {
+	if quant := configDtype(config); quant != "" {
 		return matrixQuantResolved(resolution, quant, "config_dtype")
 	}
 	return "", resolution
@@ -1108,6 +1103,29 @@ func matrixQuantizationFromModel(argv []string, hfID string, args cliArgs) (stri
 func matrixQuantResolved(resolution map[string]any, quant, source string) (string, map[string]any) {
 	resolution["trusted"], resolution["trustedSource"] = quant, source
 	return quant, resolution
+}
+
+// configQuantMethod maps config.json quantization_config to one weight format.
+// present is false without a quantization_config; quant is empty (with a
+// reason) when the method spans several formats.
+func configQuantMethod(config map[string]any) (quant, unresolved string, present bool) {
+	qc := asObject(config["quantization_config"])
+	if qc == nil {
+		return "", "", false
+	}
+	method := strings.ToLower(stringValue(qc["quant_method"]))
+	if method == "modelopt" {
+		method = map[string]string{"FP8": "fp8", "NVFP4": "modelopt_fp4"}[strings.ToUpper(stringValue(qc["quant_algo"]))]
+	}
+	if quant := matrixQuantMethods[method]; quant != "" {
+		return quant, "", true
+	}
+	return "", "config.json quantization_config " + firstNonEmpty(stringValue(qc["quant_method"]), "(no quant_method)") + " does not name one weight format", true
+}
+
+// configDtype maps config.json torch_dtype/dtype to BF16/FP16/FP32.
+func configDtype(config map[string]any) string {
+	return matrixDtypes[strings.ToLower(firstNonEmpty(stringValue(config["torch_dtype"]), stringValue(config["dtype"])))]
 }
 
 // launchFlags reads --name value and --name=value pairs from a server argv.

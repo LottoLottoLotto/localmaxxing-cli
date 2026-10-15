@@ -193,6 +193,158 @@ lmx setups pull --id <setupId> --out hardware.json
 
 `setups pull` selects by `--id`, case-insensitive `--name`, or `--default`; with no selector it uses your default setup, or the only setup when you have exactly one. Without `--out` it prints the hardware JSON to stdout.
 
+## Local models
+
+Register existing files without copying them, or download a specific HuggingFace
+artifact at an immutable revision. These commands do not publish anything to
+LocalMaxxing and require no LocalMaxxing account.
+
+```bash
+lmx model list                       # every local model, with details
+lmx model list --scan-dir ~/models   # also plain model folders (or set LMX_MODEL_DIRS)
+lmx model show Qwen/Qwen3-8B         # all details and files for one model
+lmx model import /models/model.gguf
+lmx model list --json
+lmx model verify <artifact-id>
+
+# Resolve the revision and preview the exact file, bytes, destination and hash.
+lmx model pull org/model --revision main --file model.gguf --dry-run
+# Use the resolved commit from the plan to keep the reviewed download immutable.
+lmx model pull org/model --revision <commit> --file model.gguf --yes
+lmx model remove <artifact-id> --yes
+```
+
+`model list` shows one table of every local model: files registered with lmx,
+lmx snapshots, revisions in the Hugging Face cache (`HF_HUB_CACHE`/`HF_HOME`,
+skip with `--no-hf-cache`), and model folders under `--scan-dir` or
+`LMX_MODEL_DIRS` (comma- or colon-separated; each folder and its immediate
+subfolders). Columns: name, format, quantization, parameters, size, context
+length, status, source and lmx ID. Details are read from the files only — no
+download, no code: `config.json` (architecture, context, layers, experts,
+dtype or quantization scheme such as FP8, GPTQ, W4A16, MXFP4), safetensors
+headers (exact parameter count for unquantized weights) and GGUF metadata
+(architecture, context, layers, quant type, parameter count). Each GGUF quant
+in a folder is its own entry; split GGUFs are grouped. Status flags `partial`
+when safetensors shards or GGUF split parts are missing, `missing` when a
+registered file is gone, and `loaded <url>` while `lmx model load` serves it. Folders without weights are hidden unless `--all`; `--kind
+file|snapshot|hf-cache|directory` filters. `model show <name, ID, ID prefix or
+path>` adds revision, path, hashes and the file list. `--json` returns the same
+fields (`models[]` with `id`, `kind`, `path`, `status`, …).
+
+Without `--yes`, pull only prints a plan. `--dry-run` takes precedence over
+`--yes`; `--out plan.json` may explicitly save the plan without changing model
+storage. Completed files are checked against upstream LFS SHA256 or Git blob
+hashes when available; otherwise the record explicitly reports only local
+SHA256 integrity.
+
+Downloads use up to `--download-connections` parallel HTTP streams (default 8,
+max 32). Files of 64 MiB or more are split into byte ranges fetched
+concurrently; snapshots also download several files at once, sharing the same
+stream limit. Progress (`model_download_progress`, MiB received and MiB/s) is
+printed every 10 seconds. An interrupted download keeps `<file>.part` plus a
+`<file>.part.chunks` progress record and resumes only the missing ranges; each
+range is retried up to 3 times before the run stops. `--download-connections 1`
+uses one stream per file.
+
+Storage precedence is `--models-dir`, `LMX_MODELS_DIR`,
+`$XDG_DATA_HOME/localmaxxing/models`, then `~/.local/share/localmaxxing/models`.
+Existing exact-revision HuggingFace cache files are verified and reused without
+copying (`HF_HUB_CACHE`, `HF_HOME`, or the default HF cache).
+Removing an imported/cache-backed registration preserves its source; removing a
+managed download deletes only that artifact and its registration.
+
+A killed model download may leave a `<destination>.lock`: remove it only after
+confirming no operation is active on that artifact. Verification reads the
+entire file and can take time for large models.
+
+### Loading and unloading models
+
+`lmx model load` starts any model from `lmx model list` on the engine that fits
+it and returns once it answers on an OpenAI-compatible URL; `unload` stops it.
+
+```bash
+lmx engines set vllm ~/vllm/bin/vllm --server-env-file vllm-env.json   # once per engine
+lmx engines set sglang ~/sglang/bin/python
+lmx model load Qwen3-0.6B                                   # safetensors → vLLM (SGLang if no vLLM)
+lmx model load LFM2.5-2.6B-GGUF/LFM2.5-2.6B-Q4_K_M --gpus 0 # GGUF → llama.cpp, all layers on GPU
+lmx model load Qwen3-0.6B --engine sglang --context-length 8192
+lmx model loaded                                            # name, engine, URL, ready/loading/exited
+lmx model logs qwen3-0.6b --follow
+lmx model unload qwen3-0.6b                                 # or --all
+```
+
+- **Engine choice:** GGUF goes to llama.cpp; safetensors/PyTorch weights go to
+  vLLM, or SGLang when only SGLang is set up. `--engine` overrides (llama.cpp
+  only serves GGUF, vLLM/SGLang not GGUF here). Engines come from
+  `lmx engines set <engine> <path>` (vLLM binary, the Python that has SGLang,
+  or llama-server; optional `--server-env-file` JSON of environment values
+  for that engine), else `vllm` / `llama-server` / a `python3` with SGLang on
+  `PATH`. Settings live in `~/.config/localmaxxing/engines.json` (0600);
+  `lmx engines` shows them and `lmx engines unset <engine>` removes one.
+- **Server:** binds `127.0.0.1` (`--host` to change) on the engine's default
+  port (vLLM 8000, SGLang 30000, llama.cpp 8080) or the next free one
+  (`--port` to pin). Clients use the repository name, the folder name, or for
+  GGUF the file stem as the model name (`--served-model` to change).
+  `--context-length`, `--gpus 0,1` (sets `CUDA_VISIBLE_DEVICES` and tensor
+  parallelism), `--server-args '["--gpu-memory-utilization","0.5"]'` and
+  `--server-env-file` pass through. The saved Hugging Face token is given to
+  the server's environment.
+- **Lifecycle:** the server runs in its own session, so it keeps running after
+  lmx exits; its log is `~/.local/share/localmaxxing/loaded/<name>.log`.
+  `load` waits up to `--ready-timeout-seconds` (900) for `/v1/models`; if the
+  engine exits, the wait times out or you press Ctrl-C, the server is stopped
+  and the log tail is printed. `--no-wait` returns at once. Loading a model
+  that is already loaded reports the running server; `--name` loads a second
+  copy. `unload` sends SIGTERM to the server's process group and SIGKILL after
+  `--stop-timeout-seconds` (30). `lmx model list` marks loaded models with
+  their URL.
+- vLLM reserves 90% of GPU memory by default; to run several models on one GPU
+  lower it with `--server-args '["--gpu-memory-utilization","0.4"]'` (SGLang:
+  `--mem-fraction-static`).
+
+### Hugging Face token
+
+A token is needed for gated/private repositories and raises Hugging Face's rate
+limits. lmx uses the same token as the `hf` CLI, vLLM, SGLang and transformers:
+`HF_TOKEN`, else the file at `HF_TOKEN_PATH`, else `$HF_HOME/token`
+(default `~/.cache/huggingface/token`). If you already ran `hf auth login`, lmx
+uses that login.
+
+```bash
+lmx auth hf --token-stdin   # paste a token from huggingface.co/settings/tokens
+lmx auth hf status          # which token is active, and its account
+lmx auth hf logout          # delete the saved token file
+```
+
+`--token-stdin` checks the token against the Hub before saving and refuses a
+rejected one. It is written to the token file readable only by you (0600),
+never to lmx's own config. Servers started by `lmx model load` receive the saved
+token as `HF_TOKEN` in their environment only; it never appears in argv, plans
+or reports. The token is separate from LocalMaxxing auth.
+
+### Complete model snapshots
+
+```bash
+lmx model snapshot org/model --revision main --exclude "*.bin,*.h5" --dry-run
+lmx model snapshot org/model --revision <resolved-commit> --exclude "*.bin,*.h5" --yes
+lmx model snapshots list
+lmx model snapshots verify <snapshot-id>
+lmx model snapshots remove <snapshot-id> --yes
+```
+
+Without filters, the plan includes **all repository files**, potentially
+including several weight variants. Review filenames and total bytes before
+authorizing. Include/exclude patterns are comma-separated; `*` matches within a
+path component and `**` spans directories. Filters do not validate model
+semantics: retain the configuration, tokenizer, weight index and shards your
+engine needs. Each selected file must have an upstream hash.
+
+Snapshots preserve relative filenames using links to shared verified artifacts.
+An interrupted snapshot remains incomplete; rerun the same pinned revision and
+selection to resume. Only completed snapshots can be selected for serving.
+Removal preserves shared artifacts/cache files, and referenced artifacts cannot
+be removed until their snapshots are removed.
+
 ## Model reports
 
 Agents and users edit the same standardized GitHub Flavored Markdown document. Fetch the live machine-readable contract, generate a template, and create a private draft for browser review:
