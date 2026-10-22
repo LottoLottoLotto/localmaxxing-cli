@@ -12122,6 +12122,7 @@ var usageExamples = []string{
 	`lmx model pull org/model --revision <commit> --file model.gguf --yes`,
 	`lmx model snapshot org/model --revision main --exclude "*.bin,*.h5" --dry-run`,
 	`lmx model snapshot org/model --revision <commit> --yes`,
+	`lmx model snapshot Qwen/Qwen3-0.6B --source pirateface --yes`,
 	`lmx model snapshots list`,
 	`lmx model import /models/model.gguf`,
 	`lmx model verify <id>`,
@@ -12379,6 +12380,8 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --revision <ref>         HuggingFace revision; pull/snapshot resolve it to an exact commit
   --exclude <globs>        Snapshot exclude patterns, comma-separated (with --include)
   --download-connections <n> Parallel HTTP streams for model pull/snapshot (default 8, max 32; 1 = one stream per file)
+  --source <name>          lmx model pull/snapshot: huggingface (default) or pirateface, which downloads from the Pirate Face BitTorrent swarm and checks every file against Hugging Face's hash, falling back to Hugging Face
+  --pirateface-url <url>   Pirate Face base URL for --source pirateface (also LMX_PIRATEFACE_URL; default https://pirateface.co)
   --scan-dir <dirs>         lmx model list/show/load: also list model folders under these comma-separated directories (also LMX_MODEL_DIRS)
   --no-hf-cache            lmx model list/show/load: skip the Hugging Face cache
   --gpus <ids>              lmx model load: CUDA_VISIBLE_DEVICES for the server; several GPUs also set tensor parallelism

@@ -246,6 +246,24 @@ printed every 10 seconds. An interrupted download keeps `<file>.part` plus a
 range is retried up to 3 times before the run stops. `--download-connections 1`
 uses one stream per file.
 
+`--source pirateface` downloads from the [Pirate Face](https://pirateface.co)
+BitTorrent swarm instead, for models Pirate Face lists:
+
+```bash
+lmx model snapshot Qwen/Qwen3-0.6B --source pirateface --yes
+```
+
+lmx looks the repository up on Pirate Face, downloads its pinned revision unless
+`--revision` is given, and fetches the selected files from peers with a built-in
+torrent client. Every file is then checked against Hugging Face's own hash (LFS
+SHA256 or Git blob hash), exactly like a Hugging Face download; a file that fails,
+is missing from the torrent, or is not delivered because the swarm stalls for
+30 seconds comes from Hugging Face. Unlisted models download from Hugging Face.
+Like any torrent client, lmx shares pieces while downloading and peers can see
+your IP address; it never asks your router to open ports. Swarm progress lives in
+`<models-dir>/torrents/` until the command finishes, so an interrupted download
+resumes. `--pirateface-url` / `LMX_PIRATEFACE_URL` override the Pirate Face address.
+
 Storage precedence is `--models-dir`, `LMX_MODELS_DIR`,
 `$XDG_DATA_HOME/localmaxxing/models`, then `~/.local/share/localmaxxing/models`.
 Existing exact-revision HuggingFace cache files are verified and reused without

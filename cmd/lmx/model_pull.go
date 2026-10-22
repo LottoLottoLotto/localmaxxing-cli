@@ -55,7 +55,11 @@ func handleModelPull(target string, args cliArgs) error {
 	}
 	client := modelPullHTTPClient()
 	defer client.CloseIdleConnections()
-	source, err := resolveModelPull(client, base.String(), target, file, opt(args, "revision"))
+	listing, revision, err := pirateFaceListingFor(args, client, target)
+	if err != nil {
+		return err
+	}
+	source, err := resolveModelPull(client, base.String(), target, file, revision)
 	if err != nil {
 		return err
 	}
@@ -63,7 +67,7 @@ func handleModelPull(target string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	plan := map[string]any{"action": "plan", "source": source, "destination": destination, "downloadRequiresYes": true, "upstreamVerified": false}
+	plan := map[string]any{"action": "plan", "source": source, "destination": destination, "downloadRequiresYes": true, "upstreamVerified": false, "pirateFace": pirateFacePlan(listing)}
 	if hasFlag(args, "dry-run") || !hasFlag(args, "yes") {
 		return writeOrPrintJSON("model_pull", args, plan)
 	}
@@ -74,6 +78,11 @@ func handleModelPull(target string, args cliArgs) error {
 		return err
 	}
 	stopProgress := downloader.reportProgress(10 * time.Second)
+	if downloader.swarm, err = runPirateFaceSwarm(downloader, root, listing, []modelPullSource{source}); err != nil {
+		stopProgress()
+		return err
+	}
+	defer downloader.swarm.cleanup(ctx)
 	artifact, action, err := acquireModelPull(downloader, root, source)
 	stopProgress()
 	if err != nil {
@@ -137,6 +146,12 @@ func acquireModelPull(downloader *modelDownloader, root string, source modelPull
 		}
 	}
 	part := destination + ".part"
+	if digest, ok := downloader.swarm.take(downloader.args, source, part); ok {
+		if err := os.Rename(part, destination); err != nil {
+			return empty, "", err
+		}
+		return register(destination, digest, "downloaded_pirateface", true)
+	}
 	if err := downloader.fetch(source, part); err != nil {
 		return empty, "", err
 	}

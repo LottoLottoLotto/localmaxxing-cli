@@ -196,7 +196,11 @@ func handleModelSnapshot(target string, args cliArgs) error {
 	}
 	client := modelPullHTTPClient()
 	defer client.CloseIdleConnections()
-	commit, siblings, err := resolveModelPullRevision(client, base.String(), target, opt(args, "revision"))
+	listing, revision, err := pirateFaceListingFor(args, client, target)
+	if err != nil {
+		return err
+	}
+	commit, siblings, err := resolveModelPullRevision(client, base.String(), target, revision)
 	if err != nil {
 		return err
 	}
@@ -234,7 +238,7 @@ func handleModelSnapshot(target string, args cliArgs) error {
 	}
 	snapshot.Path = filepath.Join(dir, "model")
 	if hasFlag(args, "dry-run") || !hasFlag(args, "yes") {
-		return writeOrPrintJSON("model_snapshot", args, map[string]any{"action": "plan", "snapshot": snapshot, "include": include, "exclude": exclude, "downloadRequiresYes": true})
+		return writeOrPrintJSON("model_snapshot", args, map[string]any{"action": "plan", "snapshot": snapshot, "include": include, "exclude": exclude, "downloadRequiresYes": true, "pirateFace": pirateFacePlan(listing)})
 	}
 	unlock, err := acquireModelSnapshotMutation(root)
 	if err != nil {
@@ -296,6 +300,16 @@ func handleModelSnapshot(target string, args cliArgs) error {
 	}
 	// Files download concurrently; the downloader caps total streams. A failed
 	// file leaves the snapshot incomplete while the others keep their progress.
+	stopProgress := downloader.reportProgress(10 * time.Second)
+	sources := make([]modelPullSource, len(snapshot.Files))
+	for i, file := range snapshot.Files {
+		sources[i] = file.modelPullSource
+	}
+	if downloader.swarm, err = runPirateFaceSwarm(downloader, root, listing, sources); err != nil {
+		stopProgress()
+		return fmt.Errorf("snapshot %s remains incomplete; rerun to resume: %w", snapshot.ID, err)
+	}
+	defer downloader.swarm.cleanup(ctx)
 	acquired := make([]modelArtifact, len(snapshot.Files))
 	failures := make([]error, len(snapshot.Files))
 	work := make(chan int)
@@ -313,7 +327,6 @@ func handleModelSnapshot(target string, args cliArgs) error {
 			}
 		}()
 	}
-	stopProgress := downloader.reportProgress(10 * time.Second)
 	for i := range snapshot.Files {
 		work <- i
 	}
