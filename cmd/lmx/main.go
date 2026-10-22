@@ -355,7 +355,7 @@ func isBooleanOption(key string) bool {
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
 		"save-run", "key-stdin", "token-stdin", "no-hf-cache", "no-wait", "draft", "strict", "no-upload-datasets", "upload-datasets",
-		"skip-oracle", "remote", "skip-oversize", "run-burst", "skip-prefill", "standalone-prefill":
+		"skip-oracle", "remote", "skip-oversize", "run-burst", "skip-prefill", "standalone-prefill", "upload", "no-dht":
 		return true
 	default:
 		return false
@@ -2131,12 +2131,18 @@ func handleModel(action, target string, args cliArgs) error {
 		return handleModelSnapshot(target, args)
 	case "snapshots":
 		return handleModelSnapshots(target, positional(args, 3), args)
+	case "seed":
+		return handleModelSeed(target, args)
+	case "seeding":
+		return handleModelSeeding(args)
+	case "unseed":
+		return handleModelUnseed(target, args)
 	case "verify":
 		return handleModelVerify(target, args)
 	case "remove":
 		return handleModelRemove(target, args)
 	default:
-		return errors.New("Unknown model command. Use list, show, load, unload, loaded, logs, pull, snapshot, snapshots, import, verify, remove, search, or resolve-remote.")
+		return errors.New("Unknown model command. Use list, show, load, unload, loaded, logs, pull, snapshot, snapshots, seed, seeding, unseed, import, verify, remove, search, or resolve-remote.")
 	}
 }
 
@@ -12122,7 +12128,12 @@ var usageExamples = []string{
 	`lmx model pull org/model --revision <commit> --file model.gguf --yes`,
 	`lmx model snapshot org/model --revision main --exclude "*.bin,*.h5" --dry-run`,
 	`lmx model snapshot org/model --revision <commit> --yes`,
+	`lmx model snapshot Qwen/Qwen3-0.6B --source pirateface --yes`,
 	`lmx model snapshots list`,
+	`lmx model seed Qwen/Qwen3-0.6B --upload-limit 5MB --seed-time 2h`,
+	`lmx model seed --all --detach --upload-limit 2MB`,
+	`lmx model seeding`,
+	`lmx model unseed all`,
 	`lmx model import /models/model.gguf`,
 	`lmx model verify <id>`,
 	`lmx model remove <id> --yes`,
@@ -12200,7 +12211,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --artifact-limit <n>     Eval-shard traces to submit (0 = all; >0 samples); rejected by terminal submit, which includes every task
   --task-dir <dir>        Terminal eval bundle directory (one bundle or parent of bundles)
   --run-dir <dir>         Durable terminal run checkpoint; writes run.json, atomic per-task results, traces, and final result.json
-  --detach                Launch a terminal run as a durable background worker; requires --run-dir and cannot be combined with --dry-run
+  --detach                Launch a terminal run as a durable background worker (requires --run-dir; not with --dry-run); lmx model seed: keep seeding in the background, see lmx model seeding, stop with lmx model unseed
   --follow                Continue streaming terminal events until the persisted job reaches a terminal state
   --dataset <slug>        Terminal eval dataset slug; required for deferred submit
   --shard-index <n>       Deferred terminal submit: retry only shard N from a full checkpoint, or identify an isolated shard
@@ -12379,6 +12390,15 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --revision <ref>         HuggingFace revision; pull/snapshot resolve it to an exact commit
   --exclude <globs>        Snapshot exclude patterns, comma-separated (with --include)
   --download-connections <n> Parallel HTTP streams for model pull/snapshot (default 8, max 32; 1 = one stream per file)
+  --source <name>          lmx model pull/snapshot: huggingface (default) or pirateface, which downloads from the Pirate Face BitTorrent swarm and checks every file against Hugging Face's hash, falling back to Hugging Face
+  --pirateface-url <url>   Pirate Face base URL for --source pirateface (also LMX_PIRATEFACE_URL; default https://pirateface.co)
+  --upload                 --source pirateface: share pieces with other peers while downloading (off by default)
+  --seed-ratio <r>         pull/snapshot --source pirateface: keep seeding after the download until uploaded = r × model size; lmx model seed: stop there
+  --seed-time <duration>   Same, bounded by time (e.g. 30m, 2h); with both, whichever comes first
+  --upload-limit <rate>    Torrent upload cap, e.g. 5MB or 500KB per second (default unlimited)
+  --download-limit <rate>  Torrent download cap (default unlimited)
+  --listen-port <n>        Torrent listening port (default random); open it yourself for better connectivity
+  --no-dht                 Find torrent peers through trackers only
   --scan-dir <dirs>         lmx model list/show/load: also list model folders under these comma-separated directories (also LMX_MODEL_DIRS)
   --no-hf-cache            lmx model list/show/load: skip the Hugging Face cache
   --gpus <ids>              lmx model load: CUDA_VISIBLE_DEVICES for the server; several GPUs also set tensor parallelism

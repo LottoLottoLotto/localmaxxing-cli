@@ -46,6 +46,8 @@ type modelDownloader struct {
 	args        cliArgs
 	planned     atomic.Int64
 	received    atomic.Int64
+	// swarm holds files Pirate Face delivered (--source pirateface), or nil.
+	swarm *pirateFaceSwarm
 }
 
 func newModelDownloader(ctx context.Context, client *http.Client, args cliArgs) (*modelDownloader, error) {
