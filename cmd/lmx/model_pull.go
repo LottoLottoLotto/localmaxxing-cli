@@ -88,7 +88,10 @@ func handleModelPull(target string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	return writeOrPrintJSON("model_pull", args, map[string]any{"action": action, "source": source, "artifact": artifact})
+	if err := writeOrPrintJSON("model_pull", args, map[string]any{"action": action, "source": source, "artifact": artifact}); err != nil {
+		return err
+	}
+	return seedAfterDownload(args, root, listing, map[string]modelArtifact{source.File: artifact})
 }
 
 // acquireModelPull is shared by single-file pulls and full repository snapshots.

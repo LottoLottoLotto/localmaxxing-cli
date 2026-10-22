@@ -262,7 +262,10 @@ func handleModelSnapshot(target string, args cliArgs) error {
 			if err := verifyModelSnapshot(existing, true); err != nil {
 				return err
 			}
-			return writeOrPrintJSON("model_snapshot", args, map[string]any{"action": "already_present", "snapshot": existing})
+			if err := writeOrPrintJSON("model_snapshot", args, map[string]any{"action": "already_present", "snapshot": existing}); err != nil {
+				return err
+			}
+			return seedAfterDownload(args, root, listing, snapshotArtifacts(existing))
 		}
 		// Retain previously recorded artifact targets when resuming owned links.
 		for i := range snapshot.Files {
@@ -390,7 +393,20 @@ func handleModelSnapshot(target string, args cliArgs) error {
 	if err := os.Remove(filepath.Join(dir, "pending.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return writeOrPrintJSON("model_snapshot", args, map[string]any{"action": "ready", "snapshot": snapshot})
+	if err := writeOrPrintJSON("model_snapshot", args, map[string]any{"action": "ready", "snapshot": snapshot}); err != nil {
+		return err
+	}
+	return seedAfterDownload(args, root, listing, snapshotArtifacts(snapshot))
+}
+
+func snapshotArtifacts(snapshot modelSnapshot) map[string]modelArtifact {
+	files := map[string]modelArtifact{}
+	for _, file := range snapshot.Files {
+		if file.Artifact != nil {
+			files[file.File] = *file.Artifact
+		}
+	}
+	return files
 }
 
 func validateModelSnapshot(root string, snapshot modelSnapshot) error {

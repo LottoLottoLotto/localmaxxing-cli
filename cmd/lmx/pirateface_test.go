@@ -19,7 +19,7 @@ import (
 
 // seedPirateFaceTorrent seeds files from a local client and returns a magnet that
 // names the seeder as a peer (x.pe), so no tracker or DHT is needed.
-func seedPirateFaceTorrent(t *testing.T, files map[string]string) (magnet, infohash string) {
+func seedPirateFaceTorrent(t *testing.T, files map[string]string) (magnet, infohash string, seeder *torrent.Client) {
 	t.Helper()
 	dir := t.TempDir()
 	content := filepath.Join(dir, "model")
@@ -51,7 +51,7 @@ func seedPirateFaceTorrent(t *testing.T, files map[string]string) (magnet, infoh
 	config.DisableIPv6 = true
 	config.Logger = quietTorrentLogger()
 	config.NoDefaultPortForwarding = true
-	seeder, err := torrent.NewClient(config)
+	seeder, err = torrent.NewClient(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func seedPirateFaceTorrent(t *testing.T, files map[string]string) (magnet, infoh
 	hash := mi.HashInfoBytes()
 	link := mi.Magnet(&hash, &info)
 	link.Params = url.Values{"x.pe": {fmt.Sprintf("127.0.0.1:%d", seeder.LocalPort())}}
-	return link.String(), hash.HexString()
+	return link.String(), hash.HexString(), seeder
 }
 
 // pirateFaceTestServers starts a Hugging Face server (counting file downloads) and a
@@ -110,7 +110,7 @@ func TestModelSnapshotFromPirateFaceSwarmVerifiesAgainstHuggingFace(t *testing.T
 		"tokenizer.json":    `{"vocab":{"x"}}`,
 	}
 	upstream["README.md"] = "readme"
-	magnet, infohash := seedPirateFaceTorrent(t, torrentFiles)
+	magnet, infohash, _ := seedPirateFaceTorrent(t, torrentFiles)
 	var listed []map[string]string
 	for name := range torrentFiles {
 		listed = append(listed, map[string]string{"path": name, "sha256": modelPullTestSource(torrentFiles[name]).ExpectedHash})
@@ -148,7 +148,7 @@ func TestModelSnapshotRejectsSwarmBytesThatFailHuggingFaceHash(t *testing.T) {
 	upstream := map[string]string{"model.safetensors": strings.Repeat("good", 5000)}
 	// The listing claims Hugging Face's SHA-256, but the swarm serves other bytes.
 	bad := map[string]string{"model.safetensors": strings.Repeat("evil", 5000)}
-	magnet, infohash := seedPirateFaceTorrent(t, bad)
+	magnet, infohash, _ := seedPirateFaceTorrent(t, bad)
 	listed := []map[string]string{{"path": "model.safetensors", "sha256": modelPullTestSource(upstream["model.safetensors"]).ExpectedHash}}
 	hfDownloads := map[string]int{}
 	hf, pf := pirateFaceTestServers(t, upstream, map[string]any{"repoId": "owner/model", "seeders": 1, "files": listed, "infohash": infohash, "magnet": magnet}, hfDownloads)

@@ -6,17 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
-	alog "github.com/anacrolix/log"
 	"github.com/anacrolix/torrent"
-	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
 )
 
@@ -137,6 +135,7 @@ func pirateFaceListingFor(args cliArgs, client *http.Client, repo string) (*pira
 // verify them against Hugging Face's hashes and move them into the store.
 type pirateFaceSwarm struct {
 	dir   string
+	mu    sync.Mutex        // snapshot workers take files concurrently
 	files map[string]string // repository file -> path under dir
 }
 
@@ -146,11 +145,13 @@ func (s *pirateFaceSwarm) take(args cliArgs, source modelPullSource, part string
 	if s == nil {
 		return "", false
 	}
+	s.mu.Lock()
 	path, ok := s.files[source.File]
+	delete(s.files, source.File)
+	s.mu.Unlock()
 	if !ok {
 		return "", false
 	}
-	delete(s.files, source.File)
 	digest, err := verifyModelPullFile(path, source)
 	if err != nil {
 		os.Remove(path)
@@ -218,45 +219,38 @@ func runPirateFaceSwarm(d *modelDownloader, root string, listing *pirateFaceList
 	if err := os.MkdirAll(swarm.dir, 0o755); err != nil {
 		return nil, err
 	}
-	completion, err := storage.NewBoltPieceCompletion(swarm.dir)
+	options, err := parseTorrentOptions(d.args)
 	if err != nil {
-		return nil, fmt.Errorf("torrent progress database: %w", err)
+		return nil, err
 	}
-	config := torrent.NewDefaultClientConfig()
-	config.DataDir = swarm.dir
-	config.DefaultStorage = storage.NewFileOpts(storage.NewFileClientOpts{ClientBaseDir: swarm.dir, PieceCompletion: completion})
-	config.ListenPort = 0
-	config.Seed = false
-	config.Logger = quietTorrentLogger()
-	// Never ask the router to open ports (UPnP/NAT-PMP).
-	config.NoDefaultPortForwarding = true
-	client, err := torrent.NewClient(config)
+	completion, err := pieceCompletionFor(swarm.dir)
+	if err != nil {
+		return nil, err
+	}
+	client, err := newTorrentClient(swarm.dir, options, options.Upload || options.seedAfterDownload())
 	if err != nil {
 		completion.Close()
-		return nil, fmt.Errorf("start torrent client: %w", err)
+		return nil, err
 	}
 	defer func() {
 		client.Close()
 		<-client.Closed()
 		completion.Close()
 	}()
-	t, err := client.AddMagnet(listing.Magnet)
+	spec, err := torrentSpecFor(root, listing.Infohash, listing.Magnet)
+	if err != nil {
+		return nil, err
+	}
+	spec.Storage = storage.NewFileOpts(storage.NewFileClientOpts{ClientBaseDir: swarm.dir, PieceCompletion: completion})
+	t, _, err := client.AddTorrentSpec(spec)
 	if err != nil {
 		return nil, fmt.Errorf("Pirate Face magnet: %w", err)
 	}
-	// Peers named in the magnet itself (x.pe, BEP 9) are tried alongside trackers and DHT.
-	if magnet, err := metainfo.ParseMagnetUri(listing.Magnet); err == nil {
-		var peers []torrent.PeerInfo
-		for _, hostPort := range magnet.Params["x.pe"] {
-			if addr, err := net.ResolveTCPAddr("tcp", hostPort); err == nil {
-				peers = append(peers, torrent.PeerInfo{Addr: addr, Source: torrent.PeerSourceDirect})
-			}
-		}
-		t.AddPeers(peers)
-	}
+	addMagnetPeers(t, listing.Magnet)
 	printStatus(d.args, "pirateface_swarm_start", map[string]any{"files": len(wanted), "seeders": listing.Seeders})
 	select {
 	case <-t.GotInfo():
+		saveTorrentMeta(root, t)
 	case <-d.ctx.Done():
 		return nil, d.ctx.Err()
 	case <-time.After(pirateFaceInfoTimeout):
@@ -336,11 +330,4 @@ func pirateFacePlan(listing *pirateFaceListing) map[string]any {
 		return nil
 	}
 	return map[string]any{"revision": listing.Revision, "seeders": listing.Seeders, "infohash": listing.Infohash, "files": len(listing.Files)}
-}
-
-// quietTorrentLogger discards the torrent library's logging; lmx reports progress itself.
-func quietTorrentLogger() alog.Logger {
-	logger := alog.Default
-	logger.SetHandlers(alog.DiscardHandler)
-	return logger
 }

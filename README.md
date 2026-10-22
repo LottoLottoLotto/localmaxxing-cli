@@ -259,10 +259,37 @@ torrent client. Every file is then checked against Hugging Face's own hash (LFS
 SHA256 or Git blob hash), exactly like a Hugging Face download; a file that fails,
 is missing from the torrent, or is not delivered because the swarm stalls for
 30 seconds comes from Hugging Face. Unlisted models download from Hugging Face.
-Like any torrent client, lmx shares pieces while downloading and peers can see
-your IP address; it never asks your router to open ports. Swarm progress lives in
+lmx uploads nothing unless asked: by default it only downloads (peers can still
+see your IP address, as with any torrent client), stops when the command ends, and
+never asks your router to open ports. Swarm progress lives in
 `<models-dir>/torrents/` until the command finishes, so an interrupted download
 resumes. `--pirateface-url` / `LMX_PIRATEFACE_URL` override the Pirate Face address.
+
+Torrent settings, for downloads and seeding:
+
+| Option | Effect |
+|---|---|
+| `--upload` | Share pieces with other peers while downloading |
+| `--seed-ratio R` | After the download, keep seeding until you uploaded R × the model's size |
+| `--seed-time 2h` | After the download, keep seeding for this long (with `--seed-ratio`, whichever comes first) |
+| `--upload-limit 5MB` / `--download-limit 20MB` | Rate caps per second (`KB`, `MB`, `GB`, `KiB`, `MiB`, `GiB`; default unlimited) |
+| `--listen-port N` | Fixed listening port (default random); forward it yourself for better connectivity |
+| `--no-dht` | Find peers through trackers only |
+
+Seed models you already downloaded, straight from the model store (no second copy;
+the files are checked against the torrent first and never written to):
+
+```bash
+lmx model seed Qwen/Qwen3-0.6B --upload-limit 5MB --seed-time 2h   # foreground; Ctrl-C stops
+lmx model seed --all --detach --upload-limit 2MB                    # every listed snapshot, in the background
+lmx model seeding                                                   # what is seeding, peers, uploaded, ratio
+lmx model unseed all                                                # stop (or --all)
+```
+
+`model seed` takes a snapshot ID or repository and seeds snapshots Pirate Face lists
+at the same revision. Without `--seed-ratio` / `--seed-time` it runs until stopped.
+Torrent metadata is cached in `<models-dir>/torrent-meta/` after a download, so
+seeding works even when no other peer is online.
 
 Storage precedence is `--models-dir`, `LMX_MODELS_DIR`,
 `$XDG_DATA_HOME/localmaxxing/models`, then `~/.local/share/localmaxxing/models`.
