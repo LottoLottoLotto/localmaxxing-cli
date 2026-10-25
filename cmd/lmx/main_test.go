@@ -637,6 +637,74 @@ func TestMeasureOpenAIEndpointReadsPromptFileAndTrustsUsage(t *testing.T) {
 	}
 }
 
+func TestMeasureOpenAIEndpointCanonicalPromptEvidenceAndPerRequestDraftCounters(t *testing.T) {
+	canonical, ok := embeddedCanonicalPrompt("reasoning-v1")
+	if !ok {
+		t.Fatal("reasoning-v1 is not embedded")
+	}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[{"id":"served-model"}]}`)
+		case "/v1/chat/completions":
+			requests++
+			// every request: 300 output tokens from 100 verify windows of 3 drafts, 200 accepted
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"Part 1: batteries"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":348,"completion_tokens":300},"timings":{"draft_n":300,"draft_n_accepted":200,"predicted_n":300}}`)
+			fmt.Fprintln(w, `data: [DONE]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	metrics, err := measureOpenAIEndpoint(cliArgs{
+		opts: map[string]string{
+			"api-url":          server.URL, // no canonical prompts there: the embedded copy is used
+			"base-url":         server.URL,
+			"served-model":     "served-model",
+			"canonical-prompt": "reasoning-v1",
+			"max-tokens":       "300",
+			"warmup":           "1",
+			"iterations":       "3",
+		},
+		flags: map[string]bool{"quiet": true},
+	}, "org/model")
+	if err != nil {
+		t.Fatalf("measureOpenAIEndpoint returned error: %v", err)
+	}
+	if requests != 4 {
+		t.Fatalf("requests = %d, want 1 warmup + 3 timed", requests)
+	}
+	if metrics["promptSha256"] != sha256Hex(canonical.Text) || !strings.Contains(stringValue(metrics["promptSample"]), "robotics club") {
+		t.Fatalf("prompt evidence = %v / %q, want the canonical prompt's hash and text", metrics["promptSha256"], metrics["promptSample"])
+	}
+	if stringValue(metrics["outputSample"]) == "" || metrics["engineTimingsRaw"] == nil {
+		t.Fatalf("output sample %q / engine timings %v, want both captured", metrics["outputSample"], metrics["engineTimingsRaw"])
+	}
+	flags := asObject(metrics["engineFlags"])
+	if flags["promptSource"] != "canonical:reasoning-v1" || flags["canonicalPromptId"] != "reasoning-v1" {
+		t.Fatalf("prompt flags = %v / %v", flags["promptSource"], flags["canonicalPromptId"])
+	}
+	// one request's counters, like outputTokens: summing the 3 timed requests (900 / 600) fails the server's
+	// accepted + drafted / specNumTokens ~ outputTokens check
+	if flags["specDraftTokens"] != 300 || flags["specAcceptedTokens"] != 200 {
+		t.Fatalf("draft counters = %v drafted / %v accepted, want 300 / 200 per request", flags["specDraftTokens"], flags["specAcceptedTokens"])
+	}
+}
+
+func TestCanonicalPromptRejectsOtherPromptOptions(t *testing.T) {
+	_, _, err := remoteSpeedTestPrompt(cliArgs{opts: map[string]string{"canonical-prompt": "reasoning-v1", "prompt": "x"}, flags: map[string]bool{}})
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("err = %v, want the canonical prompt to refuse --prompt", err)
+	}
+	if err := validateOptionNames(cliArgs{provided: map[string]bool{"canonical-prompt": true}}); err != nil {
+		t.Fatalf("--canonical-prompt rejected as an unknown option: %v", err)
+	}
+}
+
 func TestRemoteBenchmarkPayloadSubmitsObservedRunShape(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

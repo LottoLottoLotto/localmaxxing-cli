@@ -6461,6 +6461,16 @@ func decodeThroughput(probe chatProbe, outputTokens int) (float64, string, bool)
 func remoteSpeedTestPrompt(args cliArgs) (string, string, error) {
 	inline := opt(args, "prompt")
 	path := opt(args, "prompt-file")
+	if canonicalID := opt(args, "canonical-prompt"); canonicalID != "" {
+		if inline != "" || path != "" || opt(args, "prompt-tokens") != "" {
+			return "", "", cliError{"invalid_option", "--canonical-prompt cannot be combined with --prompt, --prompt-file, or --prompt-tokens", []string{"Verified runs must use the canonical prompt text unchanged; drop the other prompt options."}, nil}
+		}
+		prompt, err := resolveCanonicalPrompt(args, canonicalID)
+		if err != nil {
+			return "", "", err
+		}
+		return prompt.Text, "canonical:" + prompt.ID, nil
+	}
 	if inline != "" && path != "" {
 		return "", "", cliError{"invalid_option", "--prompt and --prompt-file cannot be used together", []string{"Pass prompt text with --prompt or load it with --prompt-file, not both."}, nil}
 	}
@@ -6613,6 +6623,10 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	promptTokenSource := ""
 	outputTokenSource := ""
 	outputText := ""
+	lastRequestPrompt := ""
+	var lastUsage, lastTimings map[string]any
+	llamaSpec := specMetrics{}
+	specBefore, haveSpecBefore := scrapeSpecMetrics(baseURL, opt(args, "model-api-key"))
 	decodeSource := ""
 	samples := make([]map[string]any, 0, iterations*concurrency)
 	ttftValues := []float64{}
@@ -6673,6 +6687,10 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 			groupOutputTokens += outputTokens
 			outputTokenSource = outputResult.Source
 			outputText = probe.outputText
+			lastRequestPrompt = requestPrompts[requestIndex]
+			lastUsage = probe.usage
+			lastTimings = probe.timings
+			llamaSpec.addLlamaTimings(probe.timings)
 			sample := map[string]any{"iteration": i + 1, "request": requestIndex + 1, "promptTokens": float64(samplePromptTokens), "outputTokens": float64(outputTokens)}
 			outputTokenValues = append(outputTokenValues, float64(outputTokens))
 			if value, source, ok := decodeThroughput(probe, outputTokens); ok {
@@ -6716,17 +6734,34 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	}
 	promptTokens := medianOf(promptTokenValues)
 	printStatus(args, "token_count_source", map[string]any{"prompt": promptTokenSource, "output": outputTokenSource, "promptTokens": promptTokens})
+	engineFlags := map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": concurrency, "promptSource": promptSource, "promptFile": opt(args, "prompt-file"), "prefixCacheBust": "leading_nonce_per_request"}
+	if id := opt(args, "canonical-prompt"); id != "" {
+		engineFlags["canonicalPromptId"] = id
+	}
+	// Draft counters are reported per request, like outputTokens (the median request): the server checks
+	// specAcceptedTokens + specDraftTokens / specNumTokens against outputTokens.
+	measured := iterations * concurrency
+	if llamaSpec.hasCounters {
+		applySpecMetrics(engineFlags, llamaSpec.perRequest(measured))
+	} else if specAfter, ok := scrapeSpecMetrics(baseURL, opt(args, "model-api-key")); ok {
+		if haveSpecBefore {
+			applySpecMetrics(engineFlags, specMetricsDelta(specBefore, specAfter).perRequest(measured))
+		} else {
+			applySpecMetrics(engineFlags, specAfter.gaugesOnly())
+		}
+	}
 	metrics := map[string]any{
 		"prompt":       prompt,
 		"outputText":   outputText,
 		"promptTokens": promptTokens,
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": concurrency, "promptSource": promptSource, "promptFile": opt(args, "prompt-file"), "prefixCacheBust": "leading_nonce_per_request"},
+		"engineFlags":  engineFlags,
 		"tokenSources": map[string]any{"prompt": promptTokenSource, "output": outputTokenSource},
 		"timingSource": "client_observed_http",
 		"metricSource": "remote_endpoint",
 		"ttftSource":   "unavailable_no_stream",
 		"batchSize":    float64(concurrency),
 	}
+	addRunEvidence(metrics, prompt, lastRequestPrompt, outputText, mergeEngineTimings(map[string]any{"usage": lastUsage, "timings": lastTimings}))
 	if contextLength := firstJSONNumber(servedModelInfo, "max_model_len", "maxModelLen", "context_length", "contextLength", "context_window", "contextWindow", "num_ctx", "numCtx"); contextLength > 0 {
 		metrics["contextLength"] = contextLength
 	}
@@ -6826,6 +6861,7 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	ttftValues := []float64{}
 	samples := make([]map[string]any, 0, iterations)
 	outputText := ""
+	var lastTimings map[string]any
 	for i := 0; i < iterations; i++ {
 		response, elapsed, err := ollamaGenerate(args, baseURL, body, timeout)
 		if err != nil {
@@ -6870,18 +6906,29 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 			ttftValues = append(ttftValues, value)
 		}
 		samples = append(samples, sample)
+		lastTimings = map[string]any{}
+		for _, key := range []string{"eval_count", "eval_duration", "prompt_eval_count", "prompt_eval_duration", "total_duration", "load_duration"} {
+			if value, ok := response[key]; ok && value != nil {
+				lastTimings[key] = value
+			}
+		}
 		printStatus(args, "ollama_iteration_complete", map[string]any{"iteration": i + 1, "iterations": iterations, "tokSOut": sample["tokSOut"], "ttftMs": sample["ttftMs"]})
+	}
+	engineFlags := map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": 1, "promptSource": promptSource, "promptFile": opt(args, "prompt-file")}
+	if id := opt(args, "canonical-prompt"); id != "" {
+		engineFlags["canonicalPromptId"] = id
 	}
 	metrics := map[string]any{
 		"prompt":       prompt,
 		"outputText":   outputText,
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": 1, "promptSource": promptSource, "promptFile": opt(args, "prompt-file")},
+		"engineFlags":  engineFlags,
 		"tokenSources": map[string]any{"prompt": "ollama_prompt_eval_count", "output": "ollama_eval_count"},
 		"timingSource": "ollama_native_api",
 		"metricSource": "remote_endpoint",
 		"ttftSource":   "unavailable_ollama_nonstreaming",
 		"batchSize":    float64(1),
 	}
+	addRunEvidence(metrics, prompt, prompt, outputText, mergeEngineTimings(map[string]any{"ollama": lastTimings}))
 	if len(promptTokenValues) > 0 {
 		metrics["promptTokens"] = medianOf(promptTokenValues)
 	}
@@ -11701,6 +11748,9 @@ func submitPayload(endpoint string, dryRun bool, label string, args cliArgs, pay
 		fields["url"] = receipt
 	}
 	printInfo(args, status, fields)
+	if label == "speed_test" {
+		printVerificationResult(args, value)
+	}
 	if dryRun && humanOutput(args) {
 		fmt.Println("Dry-run passed. Submit with:")
 		if label == "speed_test" {
@@ -12082,6 +12132,7 @@ var usageExamples = []string{
 	`lmx server dry-run vllm --hf-id Qwen/Qwen3-8B --quantization fp16`,
 	`lmx server dry-run llama.cpp --model-path model.gguf`,
 	`lmx speed-test run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --dry-run`,
+	`lmx speed-test run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --canonical-prompt reasoning-v1`,
 	`lmx speed-test run vllm --mode local --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind throughput --benchmark-output vllm.json --dry-run`,
 	`lmx speed-test run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run`,
 	`lmx speed-test run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --model-path model.gguf --dry-run`,
@@ -12258,6 +12309,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --model-api-key <key>    Optional bearer token for the remote speed-test endpoint
   --prompt <text>          Inline prompt for the remote endpoint speed test
   --prompt-file <path>     Read the remote prompt from a file; use - for stdin
+  --canonical-prompt <id>  Measure on a LocalMaxxing canonical prompt (e.g. reasoning-v1) for a Verified run: the prompt text, prompt/output samples and engine timings are captured for server-side verification
   --max-tokens <n>         Max generated tokens (eval shard default: 0 = no cap, let the model finish)
   --endpoint-timeout-seconds <n> Timeout for remote endpoint speed tests (default: 600)
   --warmup <n>             Untimed warmup requests before remote endpoint measurement (default: 1)

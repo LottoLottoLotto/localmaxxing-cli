@@ -154,7 +154,7 @@ Ordinary submissions may be accepted without a verified-run badge. For verificat
 
 Explicit engine-flag zero and false values survive `dry-run` and `submit`, including zero accepted speculative tokens, sampling settings, and disabled caching/batching options. Absent or null flags remain omitted; unknown/internal keys are not forwarded. Sampling belongs in `engineFlags`: older top-level `temperature` and `topP` values are moved there only when that nested key is absent, so explicit nested settings take precedence.
 
-The CLI preserves supplied evidence; it does not create missing measurements or guarantee a badge. Read `verification.verified` and `verification.issues` in the dry-run response, and `verifiedRun` and `verificationIssues` in the submission response. A successful submission is not necessarily a verified run.
+Remote endpoint runs (`--mode remote`) capture this evidence themselves: `--canonical-prompt <id>` sends a LocalMaxxing canonical prompt unchanged (the embedded copy, or the server's when it differs), every run records the prompt and output hashes and samples and the last timed request's `usage`/`timings`, and speculative counters (llama.cpp `timings.draft_n` / `draft_n_accepted`, else vLLM/SGLang `/metrics` deltas over the timed requests) are written as per-request means, the unit of `outputTokens`. Otherwise the CLI preserves supplied evidence; it does not create missing measurements or guarantee a badge. `dry-run` and `submit` print the server's verdict (`verified_run`); the full response holds `verification.verified` / `verification.issues` (dry-run) and `verifiedRun` / `verificationIssues` (submission). A successful submission is not necessarily a verified run.
 
 The live contract is authoritative:
 
