@@ -731,6 +731,12 @@ func importHarborTask(taskDir, out, version string) error {
 }
 
 func runTerminalEval(args cliArgs, forceOracle bool) error {
+	// Every dataset run gets a durable checkpoint: resumable, listed by eval runs, submittable later.
+	if ds := positional(args, 3); ds != "" && !forceOracle && opt(args, "run-dir") == "" && opt(args, "task-dir") == "" &&
+		!hasFlag(args, "dry-run") && !hasFlag(args, "detached-child") {
+		args.opts["run-dir"] = defaultTerminalRunDir(args, ds)
+		printStatus(args, "terminal_run_dir_default", map[string]any{"runDir": args.opts["run-dir"]})
+	}
 	if hasFlag(args, "detach") && !hasFlag(args, "detached-child") {
 		return startDetachedTerminalEval(args)
 	}
@@ -802,10 +808,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		if rawBaseURL != "" {
 			baseURL = openAIBaseURL(rawBaseURL)
 			servedModel := opt(args, "served-model")
-			if dryRun {
-				callModel = firstNonEmpty(servedModel, declaredModel, "local")
-				resolvedQuant = opt(args, "quantization")
-			} else {
+			{ // a dry run detects too, so a preflight reports the quantization a run would submit
 				var servedModelInfo map[string]any
 				if servedModel == "" {
 					if detected, info, derr := detectTerminalServedModel(ctx, baseURL, opt(args, "model-api-key"), declaredModel); derr == nil {
@@ -889,11 +892,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		if declaredModel == "" {
 			return cliError{"missing_model", "eval terminal publication requires --model <HuggingFace model id>", []string{"Pass --model org/name so the submission records a real model.", "Use lmx model search <name> to find the canonical id."}, nil}
 		}
-		hardwarePath := opt(args, "hardware")
-		if hardwarePath == "" {
-			return cliError{"missing_hardware", "eval terminal publication requires --hardware hardware.json", []string{"Run lmx hardware --out hardware.json and pass --hardware hardware.json."}, nil}
-		}
-		hardware, err = readJSON(hardwarePath)
+		hardware, err = resolveEvalHardware(args, baseURL, opt(args, "run-dir"))
 		if err != nil {
 			return err
 		}
@@ -902,6 +901,14 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		}
 		if rawBaseURL != "" && opt(args, "quantization") == "" && resolvedQuant == "" {
 			return cliError{"model_detection_failed", "Could not verify the local endpoint model/quantization before terminal execution.", []string{"Keep the model endpoint running.", "Or pass --quantization and --quant-format explicitly if the endpoint cannot expose model metadata."}, map[string]any{"baseUrl": baseURL}}
+		}
+	} else if runDir := opt(args, "run-dir"); runDir != "" && baseURL != "" && dataset != "" {
+		// Not submitting now: record this host's description so eval terminal submit <run-dir> can publish the
+		// run later with an identical checkpoint fingerprint (best effort; a remote endpoint has none).
+		if hw, herr := resolveEvalHardware(args, baseURL, runDir); herr == nil {
+			hardware = hw
+		} else {
+			printStatus(args, "hardware_not_saved", map[string]any{"reason": herr.Error()})
 		}
 	}
 
@@ -912,6 +919,11 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 		if err != nil {
 			return err
 		}
+	}
+	if dataset != "" && !dryRun {
+		writeEvalRunMeta(opt(args, "run-dir"), map[string]any{"dataset": dataset, "model": hfID, "servedModel": callModel,
+			"quantization": resolvedQuant, "quantFormat": resolvedQuantFormat, "baseUrl": baseURL, "submit": submit,
+			"thinkingLevel": cfg.thinkingLevel, "options": replayableTerminalOptions(args)})
 	}
 	var coverageBefore map[string]any
 	if dataset != "" && localDir == "" && (submit || dryRun) && opt(args, "shard") == "" {
@@ -1381,6 +1393,12 @@ func openTerminalLiveCheckpoint(args cliArgs, dataset string, shardIndex int, bu
 			return nil, nil, cliError{"checkpoint_invalid", "Could not decode the terminal run checkpoint.", []string{"Repair or replace run.json, or choose a new --run-dir."}, map[string]any{"path": statePath, "error": err.Error()}}
 		}
 		store.state = savedState
+		if terminalHardwareAddedOnly(store.state.FingerprintFields, fingerprintFields) {
+			// The run did not know its hardware (remote endpoint, ambiguous host); describing it now, for the
+			// submission, changes nothing the run measured. A different hardware value still mismatches.
+			store.state.Fingerprint, store.state.FingerprintFields = fingerprint, fingerprintFields
+			printStatus(args, "terminal_checkpoint_hardware_added", map[string]any{"runDir": root})
+		}
 		if store.state.Version != terminalLiveCheckpointVersion || store.state.Fingerprint != fingerprint || !slicesEqual(store.state.TaskIDs, taskIDs) {
 			details := map[string]any{"runDir": root, "expectedFingerprint": store.state.Fingerprint, "actualFingerprint": fingerprint}
 			if changedFields := terminalChangedFingerprintFields(store.state.FingerprintFields, fingerprintFields); len(changedFields) > 0 {
@@ -1824,6 +1842,11 @@ func submitTerminalEval(args cliArgs) error {
 	}
 	if !info.IsDir() {
 		return cliError{"checkpoint_invalid", "The terminal checkpoint path is not a directory.", []string{"Pass the directory containing summary.json and the per-task JSON files."}, map[string]any{"runDir": runDir}}
+	}
+	if _, err := os.Stat(filepath.Join(root, "lmx-run.json")); err == nil {
+		if _, err := os.Stat(filepath.Join(root, "summary.json")); errors.Is(err, os.ErrNotExist) {
+			return submitRecordedTerminalRun(args, root)
+		}
 	}
 	dataset := opt(args, "dataset")
 	if dataset == "" {

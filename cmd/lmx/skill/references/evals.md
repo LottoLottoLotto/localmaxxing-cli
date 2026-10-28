@@ -6,12 +6,44 @@ Use eval commands to measure quality / accuracy rather than speed.
 
 ```bash
 lmx eval dataset list
-lmx eval dataset show hellaswag
-lmx eval shard hellaswag --base-url http://localhost:8000 --questions 3 --dry-run
+lmx eval coverage --model Qwen/Qwen3-8B --quantization Q4_K_M --quant-format gguf
 ```
 
-Shard datasets and registered suites are separate catalogs. HellaSwag and GSM8K
-use `eval shard`; terminal task datasets use `eval terminal`. An empty
+`eval coverage` shows, for one model/quantization, every approved dataset's
+runner, covered shards, pooled score and the exact command for the next missing
+shard.
+
+## Run any dataset: `eval run <dataset>`
+
+```bash
+lmx eval run terminal-bench-4-0 --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --submit
+lmx eval run gsm8k --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --missing-only --submit
+lmx eval runs                              # local terminal runs: state, passed, submitted
+lmx eval terminal submit <run-dir>         # publish a completed run made without --submit
+```
+
+`eval run <slug>` picks the runner from the dataset: agentic / terminal datasets
+(Terminal-Bench 2.1 and 4.0, CRUDBench) go to `eval terminal run`, question sets
+(GSM8K, HellaSwag, ARC, HumanEval+, MBPP+) to `eval shard`; every option of that
+runner applies. A slug that is not an approved dataset is run as a suite.
+
+- Hardware: `--hardware hardware.json` wins. Otherwise lmx detects this
+  machine — only for a loopback `--base-url`, since it cannot describe a remote
+  server. With several accelerator stacks (e.g. CUDA and Tenstorrent) it refuses
+  until `--backend cuda|rocm|tt-metal` says which one serves the model.
+- Quantization and format are read from the endpoint (llama.cpp GGUF name)
+  when possible, also in `--dry-run`; pass `--quantization`/`--quant-format`
+  when the server does not expose them.
+- Terminal runs without `--run-dir` get `runs/evals/<dataset>/<model>-<time>`
+  (`--runs-dir` changes the root), so every run is resumable, listed by
+  `eval runs`, and keeps `hardware.json` and `lmx-run.json` (its options, no
+  secrets). `eval terminal submit <run-dir>` replays those options with
+  `--submit`: scored tasks are reused, nothing reruns.
+- `--submit --dry-run` never uploads; it only checks what a submission needs.
+- `eval terminal cancel <run-dir>` on a foreground run that was killed removes
+  the task containers it left behind; a live foreground run is stopped with Ctrl-C.
+
+Shard datasets and registered suites are separate catalogs; an empty
 `eval suite list` does not mean evals are unavailable. Only use suite commands
 with approved slugs returned by the suite catalog on the selected API instance.
 

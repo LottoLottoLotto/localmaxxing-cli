@@ -717,18 +717,27 @@ included in TTFT. No prefill rate is reported for a fully cached prompt.
 
 ## Evals
 
-Discover approved shard datasets first:
+One command runs any approved LocalMaxxing dataset and publishes it:
 
 ```bash
-lmx eval dataset list
-lmx eval dataset show hellaswag
-lmx eval shard hellaswag --base-url http://localhost:8000 --questions 3 --dry-run
+lmx eval coverage --model Qwen/Qwen3-8B --quantization Q4_K_M --quant-format gguf   # what is covered, what to run next
+lmx eval run terminal-bench-4-0 --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --submit
+lmx eval run gsm8k --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --missing-only --submit
+lmx eval runs                                  # local terminal runs and their state
+lmx eval terminal submit <run-dir>             # publish a completed run made without --submit
 ```
 
-Shard datasets and registered suites are separate catalogs. HellaSwag and GSM8K
-use `eval shard`, not `eval run` or `eval lm-eval`. An empty `eval suite list`
-does not mean evals are unavailable. Terminal datasets use `eval terminal`.
-The suite examples below require an approved suite on the selected API instance.
+`eval run` sends Terminal-Bench and CRUDBench to the terminal runner and question
+sets (GSM8K, HellaSwag, ARC, HumanEval+, MBPP+) to `eval shard`. For a local
+endpoint it detects the hardware (pass `--backend cuda|rocm|tt-metal` when the
+machine has more than one accelerator stack; `--hardware hardware.json` for a
+remote one) and the quantization. Terminal runs are kept under
+`runs/evals/<dataset>/` and resume where they stopped. `--submit --dry-run`
+never uploads.
+
+Shard datasets and registered suites are separate catalogs; an empty
+`eval suite list` does not mean evals are unavailable. The suite examples below
+require an approved suite on the selected API instance.
 
 ### Run a custom suite against a local endpoint
 

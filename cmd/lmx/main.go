@@ -317,7 +317,22 @@ func runWithArgs(args cliArgs) error {
 		case "lm-eval":
 			return handleLmEval(positional(args, 2), args)
 		case "run":
+			// Approved datasets (Terminal-Bench, CRUDBench, GSM8K, ...) run with the runner they need;
+			// anything else is a registered suite.
+			if slug := positional(args, 2); slug != "" {
+				d, ok, err := datasetBySlug(args, slug)
+				if err != nil {
+					return err
+				}
+				if ok {
+					return runEvalDataset(d, args)
+				}
+			}
 			return handleEvalRun(positional(args, 2), args)
+		case "coverage":
+			return handleEvalCoverage(args)
+		case "runs":
+			return handleEvalRuns(args)
 		case "pull":
 			return handleEvalPull(positional(args, 2), args)
 		case "submit":
@@ -1902,25 +1917,33 @@ func runLongCommand(commandSnippet string) error {
 }
 
 func detectHardware(args cliArgs) map[string]any {
-	base := map[string]any{"hwClass": "CPU_ONLY", "cpu": detectCPU(), "os": runtime.GOOS, "cpuThreads": runtime.NumCPU()}
+	base := map[string]any{"hwClass": "CPU_ONLY", "cpu": detectCPU(), "os": hostOSName(), "cpuThreads": runtime.NumCPU()}
+	if gb := hostRAMGb(); gb > 0 {
+		base["ramGb"] = gb
+	}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		base["hwClass"] = "UNIFIED"
 		base["chipVendor"] = "Apple"
 		applyAppleHardware(base)
 	}
-	preferTenstorrent := strings.EqualFold(opt(args, "backend"), "tt-metal")
-	if preferTenstorrent {
+	tenstorrent := func() {
+		if applyTenstorrentBoards(base, sysfsTenstorrentBoards()) {
+			return
+		}
 		if out, err := exec.Command("tt-smi", "-s").Output(); err == nil {
 			applyTenstorrentSMIHardware(base, string(out))
 		}
+	}
+	if strings.EqualFold(opt(args, "backend"), "tt-metal") {
+		tenstorrent()
 		return base
 	}
 	if out, err := exec.Command("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits").Output(); err == nil {
 		applyNvidiaSMIHardware(base, string(out))
 	} else if out, err := exec.Command("rocm-smi", "--showproductname", "--showmeminfo", "vram", "--csv").Output(); err == nil {
 		applyRocmSMIHardware(base, string(out))
-	} else if out, err := exec.Command("tt-smi", "-s").Output(); err == nil {
-		applyTenstorrentSMIHardware(base, string(out))
+	} else {
+		tenstorrent()
 	}
 	return base
 }
@@ -2054,22 +2077,11 @@ func applyTenstorrentSMIHardware(base map[string]any, output string) bool {
 	if err := json.Unmarshal([]byte(output), &telemetry); err != nil {
 		return false
 	}
-	count := 0
+	types := make([]string, 0, len(telemetry.DeviceInfo))
 	for _, device := range telemetry.DeviceInfo {
-		switch strings.ToLower(strings.TrimSpace(device.BoardInfo.BoardType)) {
-		case "p150", "p150a":
-			count++
-		}
+		types = append(types, device.BoardInfo.BoardType)
 	}
-	if count == 0 {
-		return false
-	}
-	base["hwClass"] = "DISCRETE_GPU"
-	base["gpuName"] = "Tenstorrent P150"
-	base["gpuCount"] = count
-	base["vramGb"] = 32.0
-	base["totalVramGb"] = 32.0 * float64(count)
-	return true
+	return applyTenstorrentBoards(base, types)
 }
 
 func round1(n float64) float64 { return math.Round(n*10) / 10 }
@@ -8969,7 +8981,21 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		return err
 	}
 	baseURL := openAIBaseURL(rawBaseURL)
-	submit := hasFlag(args, "submit")
+	// --dry-run never uploads, even with --submit: it checks what a submission needs, then runs unsubmitted.
+	submit := hasFlag(args, "submit") && !hasFlag(args, "dry-run")
+	if hasFlag(args, "submit") && hasFlag(args, "dry-run") {
+		if apiKey(args) == "" {
+			return missingAPIKey("--api-key or LMX_API_KEY is required for eval shard --submit")
+		}
+		if opt(args, "model") == "" {
+			return cliError{"missing_model", "eval shard --submit requires --model <HuggingFace model id>", []string{"Pass --model org/name so the submission records a real model."}, nil}
+		}
+		hw, err := resolveEvalHardware(args, baseURL, "")
+		if err != nil {
+			return err
+		}
+		printStatus(args, "eval_shard_submit_preflight", map[string]any{"dataset": dataset, "model": opt(args, "model"), "hardware": asObject(hw)["gpuName"], "submit": "not with --dry-run"})
+	}
 
 	requestedQuestions, err := intOption(args, 0, 1, "questions")
 	if err != nil {
@@ -9121,7 +9147,14 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		tempExplicit:   tempExplicit,
 	}
 
+	var shardHardware any
 	if submit {
+		// Resolved before any question runs, so a missing description never wastes a shard.
+		hw, hwErr := resolveEvalHardware(args, baseURL, "")
+		if hwErr != nil {
+			return hwErr
+		}
+		shardHardware = hw
 		hfIDForCoverage := hfID
 		if hfIDForCoverage != "" {
 			coverageValue, covErr := fetchEvalShardCoverage(dataset, hfIDForCoverage, resolvedQuant, resolvedQuantFormat, args)
@@ -9303,14 +9336,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	if declaredModel == "" {
 		return cliError{"missing_model", "eval shard --submit requires --model <HuggingFace model id>", []string{"Pass --model org/name so the submission records a real model.", "Use lmx model search <name> to find the canonical id."}, nil}
 	}
-	hardwarePath := opt(args, "hardware")
-	if hardwarePath == "" {
-		return cliError{"missing_hardware", "eval shard --submit requires --hardware hardware.json", []string{"Run lmx hardware --out hardware.json and pass --hardware hardware.json."}, nil}
-	}
-	hardware, err := readJSON(hardwarePath)
-	if err != nil {
-		return err
-	}
+	hardware := shardHardware
 	if len(submitResults) == 0 {
 		return cliError{"no_scored_questions", "Every question failed to score, so there is nothing to submit.", []string{"Check that the endpoint is reachable and returns completions.", "Inspect failures with --out results.json."}, nil}
 	}
@@ -12206,6 +12232,11 @@ var usageExamples = []string{
 	`lmx eval suite submissions`,
 	`lmx eval suite resubmit <id> --file my-eval.json`,
 	`lmx eval execute <suiteSlug> --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --submit`,
+	`lmx eval coverage --model Qwen/Qwen3-8B --quantization Q4_K_M --quant-format gguf`,
+	`lmx eval run terminal-bench-4-0 --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --submit`,
+	`lmx eval run gsm8k --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --missing-only --submit`,
+	`lmx eval runs`,
+	`lmx eval terminal submit runs/evals/terminal-bench-4-0/Qwen-Qwen3-8B-20261028-101500`,
 	`lmx eval shard gsm8k --base-url http://localhost:8000 --questions 200 --dry-run`,
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --questions 200 --dry-run`,
 	`lmx eval shard gsm8k --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
@@ -12242,7 +12273,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --profile <name>         Load saved defaults from lmx profile save
   --model <hfId>           HuggingFace model ID
   --hf-id <hfId>           Canonical HuggingFace model ID for deferred terminal submit
-  --backend <name>         Speed-test accelerator backend (e.g. cuda, rocm, tt-metal); lm-eval backend for eval lm-eval
+  --backend <name>         Accelerator backend (cuda, rocm, tt-metal): picks the hardware lmx detects for a local endpoint; lm-eval backend for eval lm-eval
   --engine-version <value> Engine release/version used for the speed test
   --engine-repository <url>
                            Source repository used for the speed test; defaults for FreeToken, NInfer and Strata
@@ -12370,7 +12401,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --spec-draft-tp <n>      Draft model tensor-parallel degree
   --spec-draft-window-size <n>
                            DFlash / DFlash2 draft KV sliding-window size
-  --runs-dir <dir>         Saved speed-test runs directory (default: runs)
+  --runs-dir <dir>         Saved speed-test runs directory, and eval runs under <dir>/evals (default: runs)
   --bench-script <path>    speed-test matrix: local llm_decode_bench.py instead of the pinned download
   --contexts <list>        speed-test matrix: decode context lengths in tokens, k suffix allowed (default: 0,16k,32k,64k,128k)
   --concurrency <list>     speed-test matrix: simultaneous requests per decode cell (default: 1,2,4,8,16,32,64,128)
@@ -12539,7 +12570,7 @@ var commandDescriptions = map[string]string{
 	"model":                   "List, show, download, load and unload local models; search or resolve HuggingFace model IDs.",
 	"model search":            "Search LocalMaxxing model records.",
 	"model resolve-remote":    "Resolve a remote endpoint alias to likely HF candidates.",
-	"eval":                    "Discover, run, and submit evaluation suites.",
+	"eval":                    "Run LocalMaxxing evals (Terminal-Bench, CRUDBench, GSM8K, ...) on an endpoint, track coverage and runs, submit results.",
 	"eval publish": "Publish through one guarded command. Accepts CSV, JSONL, JSON arrays, suite manifests, imported terminal bundles, and raw Harbor/Terminal-Bench directories.\n\n" +
 		"Automatically detects safe column mappings, validates structure, audits quality, runs the authenticated server preflight before uploads, and submits as PENDING for review. Inline datasets upload automatically. Terminal publication requires Pro, Docker, a public --source-url, and oracle-verifies every task before upload. Use --dry-run first when desired.",
 	"eval dataset":           "Discover approved shard datasets separately from registered eval suites.",
