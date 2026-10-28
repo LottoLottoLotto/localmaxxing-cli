@@ -913,7 +913,6 @@ fi
 		oracle:         false,
 		agentExecution: "routed-shell",
 		agentCommand:   `docker exec "$LMX_TERMINAL_CONTAINER" sh -c 'echo agent-pass > /app/result.txt'`,
-		cleanupImages:  true,
 	}
 	result := runTerminalTask(context.Background(), task, bundle, "", "", cfg)
 	if result.errCode != "" || !result.scored || !result.pass {
@@ -2740,7 +2739,6 @@ func TestRunTerminalTaskRemovesContainerBeforeCleaningBuiltImage(t *testing.T) {
 	result := runTerminalTask(context.Background(), task, bundleDir, server.URL, "fixture-model", terminalConfig{
 		args:            parseArgs([]string{"eval", "terminal", "run", "--quiet"}),
 		shellMode:       "stateless",
-		cleanupImages:   true,
 		agentTimeoutSec: 10,
 		endpointTimeout: time.Second,
 	})
@@ -4464,5 +4462,104 @@ func TestUploadTerminalBundleDoesNotDuplicateHoistedMetadata(t *testing.T) {
 	args := parseArgs([]string{"eval", "terminal", "publish", "--api-url", server.URL, "--api-key", "bhk_test"})
 	if _, err := uploadTerminalBundle(args, "task.tar.gz", []byte("data"), hash); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTerminalTaskImagesAreContentNamedAndKeptOnlyOnRequest(t *testing.T) {
+	newBundle := func(dockerfile string) string {
+		dir := t.TempDir()
+		mustMkdir(t, filepath.Join(dir, "tests"))
+		mustWrite(t, filepath.Join(dir, "Dockerfile"), dockerfile)
+		mustWrite(t, filepath.Join(dir, "tests", "test.sh"), "fixture verifier")
+		return dir
+	}
+	run := func(bundleDir string, keep bool) []string {
+		dockerLog := installFakeTerminalDocker(t, "")
+		server, _ := newTerminalExecutionFixtureServer(t)
+		task := terminalTask{
+			ID: "image-policy", Instruction: "Complete the fixture",
+			Image:    terminalImage{Dockerfile: "Dockerfile", Context: "."},
+			Agent:    terminalAgentConfig{MaxTurns: 1},
+			Verifier: terminalVerifierConfig{Command: "fixture-verifier", RewardFile: "/logs/verifier/reward.txt"},
+		}
+		result := runTerminalTask(context.Background(), task, bundleDir, server.URL, "fixture-model", terminalConfig{
+			args: parseArgs([]string{"eval", "terminal", "run", "--quiet"}), shellMode: "stateless",
+			agentTimeoutSec: 10, endpointTimeout: time.Second, keepImages: keep,
+		})
+		if !result.scored {
+			t.Fatalf("fixture task result = %+v", result)
+		}
+		data, err := os.ReadFile(dockerLog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Split(strings.TrimSpace(string(data)), "\n")
+	}
+	tagOf := func(commands []string) string {
+		for _, c := range commands {
+			if f := strings.Fields(c); len(f) >= 3 && f[0] == "build" && f[1] == "-t" {
+				return f[2]
+			}
+		}
+		t.Fatalf("no image build in %v", commands)
+		return ""
+	}
+	removes := func(commands []string) bool {
+		for _, c := range commands {
+			if strings.HasPrefix(c, "rmi ") {
+				return true
+			}
+		}
+		return false
+	}
+
+	first := run(newBundle("FROM scratch\n"), true)
+	if removes(first) {
+		t.Fatalf("--keep-images removed the task image: %v", first)
+	}
+	second := run(newBundle("FROM scratch\n"), false)
+	if tagOf(first) != tagOf(second) {
+		t.Fatalf("identical task contexts in different bundle dirs must share one image: %s vs %s", tagOf(first), tagOf(second))
+	}
+	if !removes(second) {
+		t.Fatalf("the task image must be removed by default: %v", second)
+	}
+	if changed := run(newBundle("FROM busybox\n"), false); tagOf(changed) == tagOf(first) {
+		t.Fatal("a changed task context must not reuse the old image")
+	}
+}
+
+func TestTerminalBuildCacheRecordsSinceSelectsOnlyThisBuildsReclaimableRecords(t *testing.T) {
+	du := `{"CreatedAt":"2026-10-28 12:00:00.5 +0000 UTC","ID":"before","Reclaimable":true}
+{"CreatedAt":"2026-10-28 12:10:00.123456789 +0000 UTC","ID":"mine","Reclaimable":true}
+{"CreatedAt":"2026-10-28 12:10:01 +0000 UTC","ID":"in-use","Reclaimable":false}
+not json
+{"CreatedAt":"2026-10-28 06:20:00 -0600 CST","ID":"mine-other-zone","Reclaimable":true}`
+	since := time.Date(2026, 10, 28, 12, 9, 0, 0, time.UTC)
+	got := terminalBuildCacheRecordsSince(du, since)
+	if strings.Join(got, ",") != "mine,mine-other-zone" {
+		t.Fatalf("records = %v, want only reclaimable records created since the build started", got)
+	}
+}
+
+func TestTerminalBuildCacheRecordsArePrunedChildrenFirst(t *testing.T) {
+	// buildx du lists parents before children; a parent with children frees nothing when pruned.
+	du := `{"CreatedAt":"2026-10-28 12:10:00 +0000 UTC","ID":"base","Reclaimable":true,"Parents":["old"]}
+{"CreatedAt":"2026-10-28 12:10:01 +0000 UTC","ID":"step1","Reclaimable":true,"Parents":["base"]}
+{"CreatedAt":"2026-10-28 12:10:02 +0000 UTC","ID":"step2","Reclaimable":true,"Parents":["step1"]}
+{"CreatedAt":"2026-10-28 12:10:02 +0000 UTC","ID":"verifier-step","Reclaimable":true,"Parents":["base"]}
+{"CreatedAt":"2026-10-28 11:00:00 +0000 UTC","ID":"old","Reclaimable":true}`
+	got := terminalBuildCacheRecordsSince(du, time.Date(2026, 10, 28, 12, 9, 0, 0, time.UTC))
+	pos := map[string]int{}
+	for i, id := range got {
+		pos[id] = i
+	}
+	if len(got) != 4 {
+		t.Fatalf("records = %v, want the four records of this build", got)
+	}
+	for child, parent := range map[string]string{"step2": "step1", "step1": "base", "verifier-step": "base"} {
+		if pos[child] > pos[parent] {
+			t.Fatalf("records = %v: %s must be pruned before its parent %s", got, child, parent)
+		}
 	}
 }

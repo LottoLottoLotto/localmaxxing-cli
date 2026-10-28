@@ -366,7 +366,7 @@ func isBooleanOption(key string) bool {
 	case "help", "json-status", "dry-run", "quiet", "logout", "no-browser", "default",
 		"submit", "print", "json", "verbose", "yes", "force", "rerun",
 		"include-server-metadata", "enable-prefix-caching", "flash-attn", "no-flash-attn",
-		"no-stream", "missing-only", "all-missing", "cleanup-images", "native-tools", "oracle",
+		"no-stream", "missing-only", "all-missing", "keep-images", "native-tools", "oracle",
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
 		"save-run", "key-stdin", "token-stdin", "no-hf-cache", "no-wait", "draft", "strict", "no-upload-datasets", "upload-datasets",
@@ -12309,7 +12309,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --command-timeout <sec> Terminal per-shell-command timeout (default: 300 seconds, capped by remaining agent time)
   --endpoint-timeout-seconds <n> Terminal model request timeout (default: 600; first attempt reserves retry time)
   --trace-dir <dir>       Save per-terminal-task traces locally: transcript.md, verifier.txt, prompt.txt, result.json, and external agent logs
-  --cleanup-images        Remove locally built terminal task images after each task
+  --keep-images           Keep the terminal task images lmx builds and their build cache (default: both removed after each task)
   --native-tools          Send the built-in shell function to compatible chat endpoints and execute returned tool calls
   --shell-mode <mode>     Terminal eval built-in harness shell: persistent (default, one shared shell) or stateless (fresh shell per command)
   --oracle                Run terminal task solution/solve.sh instead of the model agent
@@ -12586,7 +12586,7 @@ var commandDescriptions = map[string]string{
 	"eval suite submissions": "List your suite and sharded-dataset review status and admin notes.",
 	"eval suite resubmit":    "Replace and return a pending or rejected suite to review.",
 	"eval suite withdraw":    "Permanently remove an unused pending or rejected submission.",
-	"eval run":               "Run an approved suite locally and write/submit a run payload.",
+	"eval run":               "Run an approved dataset (terminal or question shards) or suite against an endpoint and optionally submit it.",
 	"eval lm-eval":           "Run the external lm-eval harness and write a suite run payload; --dry-run still executes the harness before server validation.",
 	"eval pull":              "Download a suite + datasets for offline runs and inspection.",
 	"eval submit":            "Submit a previously saved run payload (deferred submit).",
@@ -12598,8 +12598,8 @@ var commandDescriptions = map[string]string{
 	"eval terminal run":      "Preflight, run, resume, or detach a Terminal-Bench task selection.",
 	"eval terminal status":   "Read a durable terminal run snapshot, including worker and task progress.",
 	"eval terminal logs":     "Replay canonical terminal JSONL events; --follow waits through job completion.",
-	"eval terminal cancel":   "Request cooperative cancellation; --force terminates the detached worker immediately.",
-	"eval terminal submit":   "Validate a completed checkpoint, batch canonical Terminal-Bench 2.1/CRUDbench shards, or retry only --shard-index N with stable full-checkpoint identity.",
+	"eval terminal cancel":   "Cancel a detached run (--force terminates its worker), or clean up the containers of a killed foreground run.",
+	"eval terminal submit":   "Publish a completed run directory from eval run/terminal run, or validate and submit an imported checkpoint (Terminal-Bench 2.1/CRUDbench batching, --shard-index N retries).",
 	"eval train":             "Prepare verifier-filtered training data from eval results or run an explicit local trainer.",
 	"eval train prepare":     "Export passing OMP trajectories as conversational SFT JSONL and failures as diagnostics.",
 	"eval train run":         "Expand and optionally execute an explicit local training command from a prepared manifest.",

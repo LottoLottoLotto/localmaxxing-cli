@@ -264,10 +264,12 @@ Useful Terminal-Bench flags include `--task-dir`, `--run-dir`, `--resume`,
 `--dataset`, `--hf-id`, `--shard-index`, `--max-turns`, `--agent-timeout`,
 `--agent`, `--agent-cmd`, `--agent-execution`, `--agent-name`,
 `--container-base-url`, `--command-timeout`, `--endpoint-timeout-seconds`,
-`--trace-dir`, `--cleanup-images`, `--shell-mode`, `--native-tools`,
+`--trace-dir`, `--keep-images`, `--shell-mode`, `--native-tools`,
 `--json-status`, `--json`, and `--oracle`. `--native-tools` sends the built-in
 shell function to compatible chat endpoints. `--agent terminus-2` uses the
-release-binary-embedded Harbor adapter.
+release-binary-embedded Harbor adapter. After each task lmx removes the images
+it built and the build cache those builds created (a task can need several GB);
+`--keep-images` keeps both for repeated runs of the same tasks.
 
 
 ## Eval-derived training

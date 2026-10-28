@@ -97,7 +97,7 @@ Eval shards and Terminal-Bench:
 - `--command-timeout <sec>`: terminal per-shell-command timeout; default 300 seconds, capped by the remaining whole-agent time.
 - `--endpoint-timeout-seconds <n>`: Terminal model request timeout; default 600 seconds. The first attempt reserves part of the remaining task budget for retry.
 - `--trace-dir <dir>`: save per-task `transcript.md`, `verifier.txt`, `prompt.txt`, `instruction.txt`, `result.json` with `wallTimeMs`/`tokenUsage`, and external agent logs.
-- `--cleanup-images`: remove locally built terminal task images after each task.
+- `--keep-images`: keep the terminal task images lmx builds, and their build cache (default: after each task lmx removes the image it built and the build-cache records that build created, since a task can need several GB). Kept images are named by their build context and reused by later runs.
 - `--shell-mode <mode>`: `persistent` or `stateless`; default `persistent`.
 - `--oracle`: run terminal task `solution/solve.sh` instead of the model agent.
 - `--llama-scorer <path>`: local helper for `llama_cpp_loglikelihood` scoring.
