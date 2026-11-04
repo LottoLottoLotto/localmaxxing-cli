@@ -2732,6 +2732,7 @@ func handleBenchmark(action, target string, args cliArgs) error {
 				return err
 			}
 			apiPayload := toBenchmarkSubmit(payload)
+			setSubmittedWith(apiPayload, "speed-test run")
 			return submitPayload(endpoint, hasFlag(args, "dry-run"), "speed_test", args, apiPayload, firstNonEmpty(out, runPath))
 		}
 		if humanOutput(args) {
@@ -2770,7 +2771,16 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		endpoint = "/api/speed-tests/dry-run"
 	}
 	apiPayload := toBenchmarkSubmit(payload)
+	setSubmittedWith(apiPayload, "speed-test "+action)
 	return submitPayload(endpoint, action == "dry-run", "speed_test", args, apiPayload, target)
+}
+
+// setSubmittedWith records the client on the run ("lmx v0.1.56 speed-test run"), unless the
+// payload already names the tool that produced it.
+func setSubmittedWith(payload map[string]any, command string) {
+	if stringValue(payload["submittedWith"]) == "" {
+		payload["submittedWith"] = "lmx " + version + " " + command
+	}
 }
 
 func handleBenchmarkSubmissions(action, runID string, args cliArgs) error {
@@ -5355,7 +5365,7 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 		"contextLength", "batchSize",
 		"ttftMs", "tokSOut", "tokSPrefill", "tokSTotal",
 		"peakVramGb", "gpuPowerWatts", "hardwareCost", "prefillTokens", "notes",
-		"promptSha256", "promptSample", "outputSha256", "outputSample", "engineTimingsRaw",
+		"promptSha256", "promptSample", "outputSha256", "outputSample", "engineTimingsRaw", "submittedWith",
 	} {
 		if v, ok := payload[key]; ok && (submitValuePresent(v) || (v != nil && (key == "promptTokens" || key == "outputTokens" || key == "prefillTokens"))) {
 			out[key] = v
@@ -11797,6 +11807,13 @@ func addBenchmarkReceiptFields(fields map[string]any, value any) {
 		if obj[key] != nil {
 			fields[key] = obj[key]
 		}
+	}
+	if stringValue(obj["status"]) == "SUSPICIOUS" {
+		fields["review"] = "stored as suspicious and hidden from leaderboards: " + stringValue(obj["suspiciousReason"])
+	}
+	// Dry-run: the run would be stored as suspicious because its model file is not in the repository.
+	if modelFile := asObject(obj["modelFile"]); stringValue(modelFile["status"]) == "mismatch" {
+		fields["modelFile"] = "would be stored as suspicious: " + stringValue(modelFile["reason"])
 	}
 }
 
