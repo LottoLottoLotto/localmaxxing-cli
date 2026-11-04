@@ -532,6 +532,8 @@ lmx speed-test submit speed-test.json
 
 Use `--out <path>` to set the output file, `--json-status` for machine-readable progress, and `--quiet` to suppress output.
 
+Submissions record the client as `submittedWith` (for example `lmx v0.1.56 speed-test submit`). When the launch command names a GGUF file (`-m`, `--model`, `--hf-file`) or an `-hf` repository, localmaxxing.com checks it belongs to the submitted `--hf-id` repository or is the same model; otherwise the run is stored as suspicious and hidden from leaderboards. `dry-run` reports it first as `modelFile: would be stored as suspicious: …`, and `submit` prints the reason under `review:`. Resubmit under the repository that contains the file.
+
 Local speed-test commands run without a time limit by default; pass `--command-timeout-seconds <n>` to abort hung runs.
 
 ## Saved Profiles and Runs
