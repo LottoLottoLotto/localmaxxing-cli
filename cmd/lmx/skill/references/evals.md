@@ -269,7 +269,11 @@ Useful Terminal-Bench flags include `--task-dir`, `--run-dir`, `--resume`,
 shell function to compatible chat endpoints. `--agent terminus-2` uses the
 release-binary-embedded Harbor adapter. After each task lmx removes the images
 it built and the build cache those builds created (a task can need several GB);
-`--keep-images` keeps both for repeated runs of the same tasks.
+`--keep-images` keeps both for repeated runs of the same tasks. A task that is
+cancelled or fails to start also removes the containers and images Docker
+finished creating after lmx stopped waiting (for a few seconds, at most 30). A
+build step cancelled mid-run can stay pinned in BuildKit's cache, where no prune
+frees it, until the Docker daemon restarts.
 
 
 ## Eval-derived training

@@ -3029,43 +3029,86 @@ func selectMissingTerminalShard(ctx context.Context, args cliArgs, dataset, hfID
 	return terminalArgsWithOption(args, "shard", selected), coverage, nil
 }
 
+// terminalBundleDownloadAttempts bounds retries of one bundle download; each attempt presigns a fresh URL.
+var terminalBundleDownloadAttempts = 3
+
+// terminalBundleRetryDelay is the pause before attempt n+1 (n starting at 1).
+var terminalBundleRetryDelay = func(n int) time.Duration { return time.Duration(n*n) * 2 * time.Second }
+
 func downloadTerminalBundle(ctx context.Context, args cliArgs, tmp, id, key, wantHash string) (string, error) {
-	value, err := fetchJSONContext(ctx, "GET", apiURL(args)+"/api/benchmarks/storage/download-url?key="+url.QueryEscape(key), apiKey(args), nil)
-	if err != nil {
+	var data []byte
+	for attempt := 1; ; attempt++ {
+		var retryable bool
+		var err error
+		data, retryable, err = fetchTerminalBundle(ctx, args, id, key)
+		if err == nil {
+			break
+		}
 		if ctx.Err() != nil {
 			return "", terminalCancelledError(ctx)
 		}
-		return "", cliError{"bundle_download_failed", fmt.Sprintf("Could not presign terminal bundle download: %v", err), []string{"Check that the dataset is approved and the bundle key exists."}, map[string]any{"taskId": id, "bundle_key": key, "error": err.Error()}}
+		if !retryable || attempt >= terminalBundleDownloadAttempts {
+			return "", err
+		}
+		printStatus(args, "terminal_bundle_download_retry", map[string]any{"taskId": id, "attempt": attempt + 1, "error": err.Error()})
+		select {
+		case <-ctx.Done():
+			return "", terminalCancelledError(ctx)
+		case <-time.After(terminalBundleRetryDelay(attempt)):
+		}
 	}
-	if ctx.Err() != nil {
-		return "", terminalCancelledError(ctx)
+	return extractTerminalBundle(ctx, data, tmp, id, key, wantHash)
+}
+
+// terminalAPIErrorRetryable reports whether a fetchJSON failure is transient: no answer at all, or a
+// 5xx/429 status (api_error messages start with the status, e.g. "503 Service Unavailable: ...").
+func terminalAPIErrorRetryable(err error) bool {
+	var apiErr cliError
+	if !errors.As(err, &apiErr) {
+		return true
+	}
+	switch apiErr.Code {
+	case "network_error":
+		return true
+	case "api_error":
+		return strings.HasPrefix(apiErr.Message, "5") || strings.HasPrefix(apiErr.Message, "429 ")
+	}
+	return false
+}
+
+// fetchTerminalBundle presigns and downloads one bundle. retryable marks transient failures: transport
+// errors, interrupted bodies, and 5xx/429 answers from either the API or object storage.
+func fetchTerminalBundle(ctx context.Context, args cliArgs, id, key string) ([]byte, bool, error) {
+	value, err := fetchJSONContext(ctx, "GET", apiURL(args)+"/api/benchmarks/storage/download-url?key="+url.QueryEscape(key), apiKey(args), nil)
+	if err != nil {
+		retryable := terminalAPIErrorRetryable(err)
+		return nil, retryable, cliError{"bundle_download_failed", fmt.Sprintf("Could not presign terminal bundle download: %v", err), []string{"Check that the dataset is approved and the bundle key exists."}, map[string]any{"taskId": id, "bundle_key": key, "error": err.Error()}}
 	}
 	downloadURL := stringValue(asObject(value)["downloadUrl"])
 	if downloadURL == "" {
-		return "", cliError{"bundle_download_failed", "Presign response did not include downloadUrl.", []string{"Check the LocalMaxxing API response."}, value}
+		return nil, false, cliError{"bundle_download_failed", "Presign response did not include downloadUrl.", []string{"Check the LocalMaxxing API response."}, value}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
-		return "", cliError{"bundle_download_failed", fmt.Sprintf("Could not prepare terminal bundle download: %v", err), []string{"Check the signed download URL returned by the LocalMaxxing API."}, map[string]any{"taskId": id, "bundle_key": key}}
+		return nil, false, cliError{"bundle_download_failed", fmt.Sprintf("Could not prepare terminal bundle download: %v", err), []string{"Check the signed download URL returned by the LocalMaxxing API."}, map[string]any{"taskId": id, "bundle_key": key}}
 	}
 	res, err := apiHTTPClient.Do(req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return "", terminalCancelledError(ctx)
-		}
-		return "", cliError{"bundle_download_failed", fmt.Sprintf("Could not download terminal bundle: %v", err), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key}}
+		return nil, true, cliError{"bundle_download_failed", fmt.Sprintf("Could not download terminal bundle: %v", err), []string{"Check network access to object storage and retry."}, map[string]any{"taskId": id, "bundle_key": key}}
 	}
 	defer res.Body.Close()
 	data, readErr := io.ReadAll(res.Body)
 	if readErr != nil {
-		if ctx.Err() != nil {
-			return "", terminalCancelledError(ctx)
-		}
-		return "", cliError{"bundle_download_failed", fmt.Sprintf("Could not read terminal bundle download: %v", readErr), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key}}
+		return nil, true, cliError{"bundle_download_failed", fmt.Sprintf("Could not read terminal bundle download: %v", readErr), []string{"Check network access to object storage and retry."}, map[string]any{"taskId": id, "bundle_key": key}}
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", cliError{"bundle_download_failed", fmt.Sprintf("Terminal bundle download returned %s", res.Status), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key, "body": truncateString(string(data), 4096)}}
+		retryable := res.StatusCode >= 500 || res.StatusCode == http.StatusTooManyRequests
+		return nil, retryable, cliError{"bundle_download_failed", fmt.Sprintf("Terminal bundle download returned %s", res.Status), []string{"Retry; signed URLs expire quickly."}, map[string]any{"taskId": id, "bundle_key": key, "body": truncateString(string(data), 4096)}}
 	}
+	return data, false, nil
+}
+
+func extractTerminalBundle(ctx context.Context, data []byte, tmp, id, key, wantHash string) (string, error) {
 	if wantHash != "" {
 		sum := sha256.Sum256(data)
 		got := hex.EncodeToString(sum[:])
@@ -3271,6 +3314,8 @@ func startTerminalTaskEnvironment(ctx context.Context, task terminalTask, bundle
 	startArgs = append(startArgs, imageRef, "sleep", "infinity")
 	out, code, timedOut, runErr := runCommand(ctx, 60*time.Second, "docker", startArgs...)
 	if runErr != nil || timedOut || code != 0 {
+		// A killed `docker run -d` may still have created the container; it would hold the image.
+		_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
 		cleanupTerminalImage(cleanupImage, cfg.keepImages)
 		return nil, terminalCommandError("container_start_failed", "Could not start terminal task container.", "docker", startArgs, code, out, timedOut)
 	}
@@ -3291,12 +3336,7 @@ func startTerminalVerifierEnvironment(ctx context.Context, task terminalTask, bu
 	if _, err := os.Stat(dockerfile); err != nil {
 		return startTerminalTaskEnvironment(ctx, task, bundleDir, cfg)
 	}
-	verifierTask := task
-	verifierTask.ID += "-verifier"
-	verifierTask.Image = terminalImage{
-		Dockerfile: "tests/Dockerfile", Context: "tests",
-		BuildTimeoutSec: firstPositive(task.Verifier.BuildTimeoutSec, task.Image.BuildTimeoutSec),
-	}
+	verifierTask := terminalVerifierImageTask(task)
 	imageStart := time.Now()
 	imageRef, cleanupImage, err := resolveTerminalImage(ctx, verifierTask, bundleDir)
 	if err != nil {
@@ -3327,6 +3367,7 @@ func startTerminalVerifierEnvironment(ctx context.Context, task terminalTask, bu
 	startArgs = append(startArgs, imageRef, "sleep", "infinity")
 	out, code, timedOut, runErr := runCommand(ctx, 60*time.Second, "docker", startArgs...)
 	if runErr != nil || timedOut || code != 0 {
+		_, _, _, _ = runCommand(context.Background(), 30*time.Second, "docker", "rm", "-f", containerName)
 		cleanupTerminalImage(cleanupImage, cfg.keepImages)
 		return nil, terminalCommandError("verifier_container_start_failed", "Could not start terminal verifier container.", "docker", startArgs, code, out, timedOut)
 	}
@@ -3401,20 +3442,25 @@ func startTerminalComposeEnvironment(ctx context.Context, task terminalTask, bun
 	upArgs := append(append([]string(nil), composeArgs...), "up", "--detach", "--build", "--wait")
 	timeout := time.Duration(firstPositive(task.Image.BuildTimeoutSec, 600)+300) * time.Second
 	imageStart := time.Now()
-	out, code, timedOut, runErr := runCommand(ctx, timeout, "docker", upArgs...)
-	if runErr != nil || timedOut || code != 0 {
+	// Every teardown, failed starts included, removes the images compose built unless --keep-images.
+	composeDown := func() {
 		downArgs := append(append([]string(nil), composeArgs...), "down", "--volumes", "--remove-orphans")
+		if !cfg.keepImages {
+			downArgs = append(downArgs, "--rmi", "local")
+		}
 		_, _, _, _ = runCommand(context.Background(), 2*time.Minute, "docker", downArgs...)
 		_ = os.RemoveAll(tempDir)
+	}
+	out, code, timedOut, runErr := runCommand(ctx, timeout, "docker", upArgs...)
+	if runErr != nil || timedOut || code != 0 {
+		composeDown()
 		return nil, terminalCommandError("compose_start_failed", "Could not start Docker Compose task services.", "docker", upArgs, code, out, timedOut)
 	}
 	psArgs := append(append([]string(nil), composeArgs...), "ps", "--quiet", "main")
 	mainOut, mainCode, mainTimedOut, mainErr := runCommand(ctx, 30*time.Second, "docker", psArgs...)
 	containerName := strings.TrimSpace(mainOut)
 	if mainErr != nil || mainTimedOut || mainCode != 0 || containerName == "" {
-		downArgs := append(append([]string(nil), composeArgs...), "down", "--volumes", "--remove-orphans")
-		_, _, _, _ = runCommand(context.Background(), 2*time.Minute, "docker", downArgs...)
-		_ = os.RemoveAll(tempDir)
+		composeDown()
 		return nil, terminalCommandError("container_lookup_failed", "Could not resolve the Docker Compose main service.", "docker", psArgs, mainCode, mainOut, mainTimedOut)
 	}
 	printStatus(cfg.args, "terminal_image_resolved", map[string]any{"taskId": task.ID, "mode": imageMode(task.Image), "ms": time.Since(imageStart).Milliseconds()})
@@ -3423,14 +3469,7 @@ func startTerminalComposeEnvironment(ctx context.Context, task terminalTask, bun
 		containerName: containerName,
 		composeArgs:   composeArgs,
 		cleanup: func() {
-			once.Do(func() {
-				downArgs := append(append([]string(nil), composeArgs...), "down", "--volumes", "--remove-orphans")
-				if !cfg.keepImages {
-					downArgs = append(downArgs, "--rmi", "local")
-				}
-				_, _, _, _ = runCommand(context.Background(), 2*time.Minute, "docker", downArgs...)
-				_ = os.RemoveAll(tempDir)
-			})
+			once.Do(composeDown)
 		},
 	}, nil
 }
@@ -3570,8 +3609,24 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 	// Registered first, so it runs after every environment cleanup below: the task and verifier images share
 	// build steps, so their cache only becomes reclaimable once both images are gone.
 	defer func() {
-		if !cfg.keepImages {
-			pruneTerminalBuildCache(started)
+		// An interrupted or failed start leaves the Docker daemon finishing what lmx's killed client asked
+		// for: BuildKit completes and tags a build, `docker run -d` still creates and starts its container.
+		// lmx never learns of those, so it removes this task's labelled containers and built tags until the
+		// daemon is quiet. Containers go even with --keep-images: nothing reuses them.
+		interrupted := ctx.Err() != nil || result.errCode == "image_build_failed" || result.errCode == "compose_start_failed" ||
+			result.errCode == "container_start_failed" || result.errCode == "verifier_container_start_failed"
+		var leftovers terminalTaskLeftovers
+		if interrupted {
+			leftovers = terminalTaskLeftovers{runLabel: cfg.runLabel, taskID: task.ID}
+			if !cfg.keepImages {
+				leftovers.images = terminalTaskBuiltImageTags(task, bundleDir)
+			}
+		}
+		switch {
+		case interrupted:
+			cleanupTerminalTaskLeftovers(started, terminalTaskCleanupSettle, leftovers, !cfg.keepImages)
+		case !cfg.keepImages:
+			cleanupTerminalTaskLeftovers(started, 0, leftovers, true)
 		}
 	}()
 	result = terminalTaskResult{instruction: task.ID, prompt: terminalSystemPrompt, turnsUnreported: cfg.oracle || cfg.agentCommand != ""}
@@ -3587,6 +3642,15 @@ func runTerminalTask(ctx context.Context, task terminalTask, bundleDir, baseURL,
 		result.errCode = "docker_unavailable"
 		result.errText = err.Error()
 		return result
+	}
+	if cfg.oracle {
+		// Checked before the image build: a dataset that withholds solutions (published benchmarks do)
+		// would otherwise spend a full build per task on an answer known up front.
+		if _, err := os.Stat(filepath.Join(bundleDir, "solution", "solve.sh")); err != nil {
+			result.errCode, result.errText = cliErrorCodeText(cliError{"bundle_invalid", "Oracle mode requires solution/solve.sh.", []string{"Import a harbor task with solution/ or do not use --oracle."}, map[string]any{"taskId": task.ID, "bundleDir": bundleDir}})
+			result.wallTimeMs = time.Since(started).Milliseconds()
+			return persistTerminalTaskErrorTrace(task, result, cfg)
+		}
 	}
 	environment, err := startTerminalTaskEnvironment(ctx, task, bundleDir, cfg)
 	if err != nil {
@@ -3713,19 +3777,56 @@ func resolveTerminalImage(ctx context.Context, task terminalTask, bundleDir stri
 		return task.Image.Prebuilt, "", nil
 	}
 	ctxPath := filepath.Join(bundleDir, task.Image.Context)
-	// Named by the build context's content: a kept image is reused by the next run of the same task
-	// instead of piling up a new multi-GB copy per run.
-	contextHash, err := hashTerminalBuildContext(ctxPath)
+	tag, err := terminalBuiltImageTag(task, bundleDir)
 	if err != nil {
 		return "", "", cliError{"image_build_failed", "Could not read the terminal task build context.", []string{"Check the task bundle is complete."}, map[string]any{"taskId": task.ID, "context": ctxPath, "error": err.Error()}}
 	}
-	tag := "lmx-tb-" + sanitizeDockerName(task.ID) + "-" + contextHash
 	timeout := time.Duration(firstPositive(task.Image.BuildTimeoutSec, 600)) * time.Second
 	out, code, timedOut, err := runCommand(ctx, timeout, "docker", "build", "-t", tag, ctxPath)
 	if err != nil || timedOut || code != 0 {
 		return "", "", terminalCommandError("image_build_failed", "Could not build terminal task image.", "docker", []string{"build", "-t", tag, ctxPath}, code, out, timedOut)
 	}
 	return tag, tag, nil
+}
+
+// terminalBuiltImageTag is the tag lmx builds task's image under. It is named by the build context's
+// content, so a kept image is reused by the next run of the same task instead of piling up a new
+// multi-GB copy per run, and an interrupted run knows which tag its build may still produce.
+func terminalBuiltImageTag(task terminalTask, bundleDir string) (string, error) {
+	contextHash, err := hashTerminalBuildContext(filepath.Join(bundleDir, task.Image.Context))
+	if err != nil {
+		return "", err
+	}
+	return "lmx-tb-" + sanitizeDockerName(task.ID) + "-" + contextHash, nil
+}
+
+// terminalVerifierImageTask describes the separate verifier image built from tests/Dockerfile.
+func terminalVerifierImageTask(task terminalTask) terminalTask {
+	verifierTask := task
+	verifierTask.ID += "-verifier"
+	verifierTask.Image = terminalImage{
+		Dockerfile: "tests/Dockerfile", Context: "tests",
+		BuildTimeoutSec: firstPositive(task.Verifier.BuildTimeoutSec, task.Image.BuildTimeoutSec),
+	}
+	return verifierTask
+}
+
+// terminalTaskBuiltImageTags lists the Dockerfile-built tags a task can produce (task and verifier image).
+func terminalTaskBuiltImageTags(task terminalTask, bundleDir string) []string {
+	var tags []string
+	candidates := []terminalTask{task}
+	if _, err := os.Stat(filepath.Join(bundleDir, "tests", "Dockerfile")); err == nil && task.Verifier.EnvironmentMode == "separate" {
+		candidates = append(candidates, terminalVerifierImageTask(task))
+	}
+	for _, candidate := range candidates {
+		if candidate.Image.Prebuilt != "" {
+			continue
+		}
+		if tag, err := terminalBuiltImageTag(candidate, bundleDir); err == nil {
+			tags = append(tags, tag)
+		}
+	}
+	return tags
 }
 
 //go:embed terminus2-routed-shell.py
@@ -4511,9 +4612,6 @@ func runTerminalAgentLoopSession(ctx context.Context, task terminalTask, contain
 // task's [solution].env, bounded by the agent timeout. A non-zero exit or
 // timeout does not abort the trial — harbor records it and still verifies.
 func runOracleSolution(ctx context.Context, task terminalTask, bundleDir, containerName string, cfg terminalConfig) (string, error) {
-	if _, err := os.Stat(filepath.Join(bundleDir, "solution", "solve.sh")); err != nil {
-		return "", cliError{"bundle_invalid", "Oracle mode requires solution/solve.sh.", []string{"Import a harbor task with solution/ or do not use --oracle."}, map[string]any{"taskId": task.ID, "bundleDir": bundleDir}}
-	}
 	out, code, timedOut, err := runCommand(ctx, 120*time.Second, "docker", "cp", filepath.Join(bundleDir, "solution")+"/.", containerName+":/solution")
 	if err != nil || timedOut || code != 0 {
 		return "", terminalCommandError("command_exec_failed", "Could not copy oracle solution into container.", "docker", []string{"cp", filepath.Join(bundleDir, "solution") + "/.", containerName + ":/solution"}, code, out, timedOut)
@@ -5862,30 +5960,89 @@ func cleanupTerminalImage(image string, keep bool) {
 	}
 }
 
-// pruneTerminalBuildCache removes reclaimable build-cache records created since a task started. Removing
-// images alone frees almost nothing: BuildKit keeps their layers in a cache whose default garbage
-// collection only starts past 10% of the disk. Records still referenced (an image of a concurrent task,
-// a running build) are not reclaimable and stay. Best effort: without buildx nothing is removed.
-func pruneTerminalBuildCache(since time.Time) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	out, code, timedOut, err := runCommand(ctx, time.Minute, "docker", "buildx", "du", "--format", "json")
-	if err != nil || timedOut || code != 0 {
-		return
+// terminalTaskCleanupSettle bounds how long an interrupted task waits for the Docker daemon to settle.
+const terminalTaskCleanupSettle = 30 * time.Second
+
+// terminalTaskLeftovers names what an interrupted task may have left behind without lmx knowing.
+type terminalTaskLeftovers struct {
+	runLabel string // with taskID: containers labelled localmaxxing.run/localmaxxing.task
+	taskID   string
+	images   []string // tags the task builds
+}
+
+// sweep removes the leftovers that exist now and reports how many it found.
+func (l terminalTaskLeftovers) sweep(ctx context.Context) int {
+	found := 0
+	if l.runLabel != "" && l.taskID != "" {
+		out, code, _, err := runCommand(ctx, 30*time.Second, "docker", "ps", "-aq", "--filter", "label=localmaxxing.run="+l.runLabel, "--filter", "label=localmaxxing.task="+l.taskID)
+		if err == nil && code == 0 {
+			for _, id := range strings.Fields(out) {
+				found++
+				_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "rm", "-f", id)
+			}
+		}
 	}
-	for _, id := range terminalBuildCacheRecordsSince(out, since) {
-		if ctx.Err() != nil {
+	for _, image := range l.images {
+		if _, code, _, err := runCommand(ctx, 2*time.Minute, "docker", "rmi", image); err == nil && code == 0 {
+			found++
+		}
+	}
+	return found
+}
+
+// cleanupTerminalTaskLeftovers removes a task's leftovers and, with pruneCache, the reclaimable build-cache
+// records created since it started. Removing images alone frees almost nothing: BuildKit keeps their
+// layers in a cache whose default garbage collection only starts past 10% of the disk. Records still
+// referenced (an image of a concurrent task, a running build) are not reclaimable and stay. With
+// settle > 0 it repeats, up to settle, until two consecutive passes remove nothing and see the same
+// number of referenced records: a daemon still finishing work changes that number, while a step BuildKit
+// pins after its build was cancelled never becomes reclaimable (no prune frees it) and must not hold
+// the wait to the deadline. Best effort: Docker errors end it quietly.
+func cleanupTerminalTaskLeftovers(since time.Time, settle time.Duration, leftovers terminalTaskLeftovers, pruneCache bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute+settle)
+	defer cancel()
+	deadline := time.Now().Add(settle)
+	quiet, lastReferenced := 0, -1
+	for {
+		removed, referenced := leftovers.sweep(ctx), 0
+		if pruneCache {
+			out, code, timedOut, err := runCommand(ctx, time.Minute, "docker", "buildx", "du", "--format", "json")
+			if err != nil || timedOut || code != 0 {
+				return
+			}
+			var ids []string
+			ids, referenced = terminalBuildCacheRecordsSince(out, since)
+			for _, id := range ids {
+				if ctx.Err() != nil {
+					return
+				}
+				_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "builder", "prune", "-f", "--filter", "id="+id)
+			}
+			removed += len(ids)
+		}
+		if removed == 0 && referenced == lastReferenced {
+			quiet++
+		} else {
+			quiet = 0
+		}
+		lastReferenced = referenced
+		if settle == 0 || quiet >= 2 || time.Now().After(deadline) {
 			return
 		}
-		_, _, _, _ = runCommand(ctx, 30*time.Second, "docker", "builder", "prune", "-f", "--filter", "id="+id)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 
 // terminalBuildCacheRecordsSince selects reclaimable records from `docker buildx du --format json`
 // (one JSON object per line) created at or after since, children before parents: BuildKit removes nothing
 // from a record that still has children, so pruning a parent first frees 0 B. The "id" prune filter
-// takes one value, so callers prune them one by one in this order.
-func terminalBuildCacheRecordsSince(du string, since time.Time) []string {
+// takes one value, so callers prune them one by one in this order. referenced counts the window's
+// records that are not reclaimable yet.
+func terminalBuildCacheRecordsSince(du string, since time.Time) (ids []string, referenced int) {
 	var selected []string
 	parents := map[string][]string{}
 	for _, line := range strings.Split(du, "\n") {
@@ -5895,11 +6052,15 @@ func terminalBuildCacheRecordsSince(du string, since time.Time) []string {
 			Reclaimable bool
 			Parents     []string
 		}
-		if json.Unmarshal([]byte(strings.TrimSpace(line)), &record) != nil || record.ID == "" || !record.Reclaimable {
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &record) != nil || record.ID == "" {
 			continue
 		}
 		created, err := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", record.CreatedAt)
 		if err != nil || created.Before(since.Add(-2*time.Second)) {
+			continue
+		}
+		if !record.Reclaimable {
+			referenced++
 			continue
 		}
 		selected = append(selected, record.ID)
@@ -5929,7 +6090,7 @@ func terminalBuildCacheRecordsSince(du string, since time.Time) []string {
 	for _, id := range selected {
 		visit(id)
 	}
-	return ordered
+	return ordered, referenced
 }
 
 // hashTerminalBuildContext is a short digest of every path, mode and file content under dir.

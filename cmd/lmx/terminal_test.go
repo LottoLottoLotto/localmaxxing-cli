@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -4536,9 +4537,12 @@ func TestTerminalBuildCacheRecordsSinceSelectsOnlyThisBuildsReclaimableRecords(t
 not json
 {"CreatedAt":"2026-10-28 06:20:00 -0600 CST","ID":"mine-other-zone","Reclaimable":true}`
 	since := time.Date(2026, 10, 28, 12, 9, 0, 0, time.UTC)
-	got := terminalBuildCacheRecordsSince(du, since)
+	got, referenced := terminalBuildCacheRecordsSince(du, since)
 	if strings.Join(got, ",") != "mine,mine-other-zone" {
 		t.Fatalf("records = %v, want only reclaimable records created since the build started", got)
+	}
+	if referenced != 1 {
+		t.Fatalf("referenced = %d, want 1: the window's in-use record keeps an interrupted prune waiting", referenced)
 	}
 }
 
@@ -4549,7 +4553,7 @@ func TestTerminalBuildCacheRecordsArePrunedChildrenFirst(t *testing.T) {
 {"CreatedAt":"2026-10-28 12:10:02 +0000 UTC","ID":"step2","Reclaimable":true,"Parents":["step1"]}
 {"CreatedAt":"2026-10-28 12:10:02 +0000 UTC","ID":"verifier-step","Reclaimable":true,"Parents":["base"]}
 {"CreatedAt":"2026-10-28 11:00:00 +0000 UTC","ID":"old","Reclaimable":true}`
-	got := terminalBuildCacheRecordsSince(du, time.Date(2026, 10, 28, 12, 9, 0, 0, time.UTC))
+	got, _ := terminalBuildCacheRecordsSince(du, time.Date(2026, 10, 28, 12, 9, 0, 0, time.UTC))
 	pos := map[string]int{}
 	for i, id := range got {
 		pos[id] = i
@@ -4561,5 +4565,114 @@ func TestTerminalBuildCacheRecordsArePrunedChildrenFirst(t *testing.T) {
 		if pos[child] > pos[parent] {
 			t.Fatalf("records = %v: %s must be pruned before its parent %s", got, child, parent)
 		}
+	}
+}
+
+func TestInterruptedTaskRemovesExactlyTheImagesItBuilds(t *testing.T) {
+	dockerLog := installFakeTerminalDocker(t, "")
+	bundleDir := t.TempDir()
+	mustMkdir(t, filepath.Join(bundleDir, "tests"))
+	mustWrite(t, filepath.Join(bundleDir, "Dockerfile"), "FROM scratch\n")
+	mustWrite(t, filepath.Join(bundleDir, "tests", "Dockerfile"), "FROM busybox\n")
+	mustWrite(t, filepath.Join(bundleDir, "tests", "test.sh"), "fixture verifier")
+	server, _ := newTerminalExecutionFixtureServer(t)
+	task := terminalTask{
+		ID: "built-tags", Instruction: "Complete the fixture",
+		Image:    terminalImage{Dockerfile: "Dockerfile", Context: "."},
+		Agent:    terminalAgentConfig{MaxTurns: 1},
+		Verifier: terminalVerifierConfig{Command: "fixture-verifier", RewardFile: "/logs/verifier/reward.txt", EnvironmentMode: "separate"},
+	}
+	runTerminalTask(context.Background(), task, bundleDir, server.URL, "fixture-model", terminalConfig{
+		args: parseArgs([]string{"eval", "terminal", "run", "--quiet"}), shellMode: "stateless",
+		agentTimeoutSec: 10, endpointTimeout: time.Second,
+	})
+	data, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var built []string
+	for _, command := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if f := strings.Fields(command); len(f) >= 3 && f[0] == "build" && f[1] == "-t" {
+			built = append(built, f[2])
+		}
+	}
+	// A cancel can land after BuildKit tagged an image but before lmx learned of it, so the interrupted
+	// cleanup must name every tag the task builds, verifier image included.
+	if got := terminalTaskBuiltImageTags(task, bundleDir); len(built) != 2 || strings.Join(got, ",") != strings.Join(built, ",") {
+		t.Fatalf("interrupted-cleanup tags = %v, built tags = %v", got, built)
+	}
+}
+
+func TestTerminalBundleDownloadRetriesTransientStorageFailures(t *testing.T) {
+	restoreDelay := terminalBundleRetryDelay
+	terminalBundleRetryDelay = func(int) time.Duration { return 0 }
+	defer func() { terminalBundleRetryDelay = restoreDelay }()
+	archive := terminalTestBundleArchive(t, "retry-task")
+	for _, test := range []struct {
+		name      string
+		failures  []int // status for each failing storage GET before success
+		wantErr   bool
+		wantFetch int
+	}{
+		{name: "503 twice then served", failures: []int{503, 503}, wantFetch: 3},
+		{name: "403 is final", failures: []int{403, 403, 403}, wantErr: true, wantFetch: 1},
+		{name: "503 on every attempt", failures: []int{503, 503, 503, 503}, wantErr: true, wantFetch: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var fetches, presigns int
+			var mu sync.Mutex
+			serverURL := ""
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch r.URL.Path {
+				case "/api/benchmarks/storage/download-url":
+					presigns++
+					_ = json.NewEncoder(w).Encode(map[string]any{"downloadUrl": serverURL + "/object"})
+				case "/object":
+					fetches++
+					if fetches <= len(test.failures) {
+						w.WriteHeader(test.failures[fetches-1])
+						return
+					}
+					_, _ = w.Write(archive)
+				}
+			}))
+			defer server.Close()
+			serverURL = server.URL
+			args := cliArgs{opts: map[string]string{"api-url": server.URL, "api-key": "bhk_test"}, flags: map[string]bool{"quiet": true}}
+			dir, err := downloadTerminalBundle(context.Background(), args, t.TempDir(), "retry-task", "bundles/retry-task.tar.gz", "")
+			if (err != nil) != test.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, test.wantErr)
+			}
+			if fetches != test.wantFetch || presigns != test.wantFetch {
+				t.Fatalf("storage fetches = %d, presigns = %d, want %d each (every attempt presigns a fresh URL)", fetches, presigns, test.wantFetch)
+			}
+			if !test.wantErr {
+				if _, statErr := os.Stat(filepath.Join(dir, "task.json")); statErr != nil {
+					t.Fatalf("extracted bundle missing task.json in %s: %v", dir, statErr)
+				}
+			}
+		})
+	}
+}
+
+func TestOracleTaskWithoutSolutionFailsBeforeBuildingItsImage(t *testing.T) {
+	dockerLog := installFakeTerminalDocker(t, "")
+	bundleDir := t.TempDir()
+	mustMkdir(t, filepath.Join(bundleDir, "tests"))
+	mustWrite(t, filepath.Join(bundleDir, "Dockerfile"), "FROM scratch\n")
+	mustWrite(t, filepath.Join(bundleDir, "tests", "test.sh"), "fixture verifier")
+	task := terminalTask{ID: "no-solution", Instruction: "x", Image: terminalImage{Dockerfile: "Dockerfile", Context: "."},
+		Verifier: terminalVerifierConfig{Command: "fixture-verifier", RewardFile: "/logs/verifier/reward.txt"}}
+	result := runTerminalTask(context.Background(), task, bundleDir, "", "", terminalConfig{
+		args: parseArgs([]string{"eval", "terminal", "run", "--quiet"}), oracle: true,
+	})
+	if result.errCode != "bundle_invalid" || result.scored {
+		t.Fatalf("result = %+v, want unscored bundle_invalid", result)
+	}
+	data, _ := os.ReadFile(dockerLog)
+	if strings.Contains(string(data), "build ") || strings.Contains(string(data), "run ") {
+		t.Fatalf("docker was asked to build or run for a task oracle mode cannot score:\n%s", data)
 	}
 }
