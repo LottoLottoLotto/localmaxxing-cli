@@ -3,160 +3,41 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 )
 
-// `lmx model load` starts a local model on the engine that fits its format
-// (GGUF → llama.cpp, safetensors → vLLM, else SGLang) as a background server,
-// waits until it answers /v1/models, and records it; `unload` stops it and
-// `loaded` lists what runs. Engines are the host's own (`lmx engines set` or
-// PATH); managed installations keep using `lmx server`.
+// `lmx model load` registers a model from `lmx model list` with substrate and
+// has the substrate gateway start it, so every model is served at one
+// endpoint and addressed by name. `unload` stops it, `loaded` lists running
+// instances, `logs` shows an instance's log. Engines, GPU placement,
+// Tenstorrent chip swapping and restarts are substrate's (see substrate.go).
 
-// ── Engine configuration (~/.config/localmaxxing/engines.json) ──────────────
+// substrateNamePattern is substrate's model-name rule.
+var substrateNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
-type hostEngineConfig struct {
-	Path string            `json:"path"`          // vllm binary, sglang python, or llama-server
-	Env  map[string]string `json:"env,omitempty"` // extra environment for this engine's servers
-}
-
-func hostEnginesFile() string {
-	return filepath.Join(filepath.Dir(configFile()), "engines.json")
-}
-
-func loadHostEngines() map[string]hostEngineConfig {
-	engines := map[string]hostEngineConfig{}
-	if data, err := os.ReadFile(hostEnginesFile()); err == nil {
-		_ = json.Unmarshal(data, &engines)
+func loadedName(value string) string {
+	value = strings.ToLower(value)
+	if slash := strings.LastIndex(value, "/"); slash >= 0 && slash < len(value)-1 {
+		value = value[slash+1:]
 	}
-	return engines
-}
-
-func saveHostEngines(engines map[string]hostEngineConfig) error {
-	if err := os.MkdirAll(filepath.Dir(hostEnginesFile()), 0o700); err != nil {
-		return err
+	value = regexp.MustCompile(`[^a-z0-9._-]+`).ReplaceAllString(value, "-")
+	value = strings.Trim(value, "-._")
+	if len(value) > 64 {
+		value = value[:64]
 	}
-	data, err := json.MarshalIndent(engines, "", "  ")
-	if err != nil {
-		return err
+	if value == "" {
+		value = "model"
 	}
-	return os.WriteFile(hostEnginesFile(), append(data, '\n'), 0o600)
-}
-
-var loadableEngines = []string{"vllm", "sglang", "llama.cpp"}
-
-// handleEngineConfig: `lmx engines set <engine> <path> [--server-env-file env.json]` / `unset <engine>`.
-func handleEngineConfig(action, engine string, args cliArgs) error {
-	engine = normalizeEngineName(engine)
-	if !containsString(loadableEngines, engine) {
-		return cliError{"invalid_engine", "Engine must be vllm, sglang or llama.cpp.", []string{"lmx engines set vllm ~/vllm/bin/vllm", "lmx engines set sglang ~/sglang/bin/python", "lmx engines set llama.cpp ~/llama.cpp/build/bin/llama-server"}, nil}
-	}
-	engines := loadHostEngines()
-	if action == "unset" {
-		delete(engines, engine)
-		if err := saveHostEngines(engines); err != nil {
-			return err
-		}
-		printInfo(args, "engine_unset", map[string]any{"engine": engine, "path": hostEnginesFile()})
-		return nil
-	}
-	path := positional(args, 3)
-	if path == "" {
-		return cliError{"missing_path", "engines set requires the engine executable.", []string{"vllm: the vllm binary; sglang: the Python with sglang installed; llama.cpp: llama-server."}, nil}
-	}
-	absolute, err := filepath.Abs(expandHome(path))
-	if err != nil {
-		return err
-	}
-	if info, err := os.Stat(absolute); err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
-		return cliError{"engine_not_executable", absolute + " is not an executable file.", nil, nil}
-	}
-	config := hostEngineConfig{Path: absolute}
-	if envFile := opt(args, "server-env-file"); envFile != "" {
-		data, err := os.ReadFile(envFile)
-		if err != nil {
-			return err
-		}
-		if err := json.Unmarshal(data, &config.Env); err != nil {
-			return errors.New("--server-env-file must be a JSON object of string values")
-		}
-	}
-	engines[engine] = config
-	if err := saveHostEngines(engines); err != nil {
-		return err
-	}
-	envKeys := make([]string, 0, len(config.Env))
-	for key := range config.Env {
-		envKeys = append(envKeys, key)
-	}
-	sort.Strings(envKeys)
-	printInfo(args, "engine_set", map[string]any{"engine": engine, "path": absolute, "env": strings.Join(envKeys, ","), "saved": hostEnginesFile()})
-	return nil
-}
-
-// hostEngineExecutable resolves an engine's executable: configured, else PATH.
-func hostEngineExecutable(engine string) (string, map[string]string, bool) {
-	if config, ok := loadHostEngines()[engine]; ok && config.Path != "" {
-		return config.Path, config.Env, true
-	}
-	switch engine {
-	case "vllm":
-		if path, ok := lookupExecutable("vllm"); ok {
-			return path, nil, true
-		}
-	case "llama.cpp":
-		if path, ok := lookupExecutable("llama-server"); ok {
-			return path, nil, true
-		}
-	case "sglang":
-		if path, ok := lookupExecutable("python3"); ok && hasPythonModule(path, "sglang") {
-			return path, nil, true
-		}
-	}
-	return "", nil, false
-}
-
-// chooseLoadEngine picks the engine for a model: --engine, else GGUF →
-// llama.cpp and safetensors/PyTorch → vLLM, falling back to SGLang.
-func chooseLoadEngine(entry modelInventoryEntry, requested string) (string, error) {
-	if requested != "" {
-		engine := normalizeEngineName(requested)
-		if !containsString(loadableEngines, engine) {
-			return "", fmt.Errorf("--engine must be vllm, sglang or llama.cpp")
-		}
-		if engine == "llama.cpp" && entry.Format != "gguf" {
-			return "", fmt.Errorf("llama.cpp serves GGUF files; %s is %s", entry.Name, dash(entry.Format))
-		}
-		if engine != "llama.cpp" && entry.Format == "gguf" {
-			return "", fmt.Errorf("%s does not serve GGUF here; load it with llama.cpp", engine)
-		}
-		return engine, nil
-	}
-	switch entry.Format {
-	case "gguf":
-		return "llama.cpp", nil
-	case "safetensors", "pytorch", "mixed":
-		if _, _, ok := hostEngineExecutable("vllm"); ok {
-			return "vllm", nil
-		}
-		if _, _, ok := hostEngineExecutable("sglang"); ok {
-			return "sglang", nil
-		}
-		return "vllm", nil // reported as missing below, with setup hints
-	}
-	return "", fmt.Errorf("%s has no loadable weights (format %s)", entry.Name, dash(entry.Format))
+	return value
 }
 
 // jsonStringArrayOption parses an option holding a JSON array of strings, such
@@ -178,186 +59,219 @@ func jsonStringArrayOption(args cliArgs, key string) ([]string, error) {
 	return result, nil
 }
 
-var engineDefaultPorts = map[string]int{"vllm": 8000, "sglang": 30000, "llama.cpp": 8080}
-
-// loadServerArgv builds the exact server argv; no shell is involved.
-func loadServerArgv(engine, executable, modelPath, served, host string, port int, args cliArgs, gpuCount int) ([]string, error) {
+// modelRegistrationArgs maps lmx options to `substrate model add` flags. Engine
+// arguments after -- are engine-specific, so substrate requires --engine with them.
+func modelRegistrationArgs(args cliArgs) ([]string, error) {
+	var flags []string
+	for option, flag := range map[string]string{
+		"engine": "--engine", "context-length": "--ctx", "gpus": "--gpus", "gpu-layers": "--gpu-layers",
+		"tensor-parallel": "--tp", "mem-fraction": "--mem-fraction", "idle-unload": "--idle-unload",
+	} {
+		if value := opt(args, option); value != "" {
+			flags = append(flags, flag, value)
+		}
+	}
+	sortFlagPairs(flags)
 	extra, err := jsonStringArrayOption(args, "server-args")
 	if err != nil {
 		return nil, err
 	}
-	portText := strconv.Itoa(port)
-	var argv []string
-	switch engine {
-	case "vllm":
-		argv = []string{executable, "serve", modelPath, "--host", host, "--port", portText, "--served-model-name", served}
-		if value := opt(args, "context-length"); value != "" {
-			argv = append(argv, "--max-model-len", value)
-		}
-		if gpuCount > 1 && !containsString(extra, "--tensor-parallel-size") && !containsString(extra, "-tp") {
-			argv = append(argv, "--tensor-parallel-size", strconv.Itoa(gpuCount))
-		}
-	case "sglang":
-		argv = []string{executable, "-m", "sglang.launch_server", "--model-path", modelPath, "--host", host, "--port", portText, "--served-model-name", served}
-		if value := opt(args, "context-length"); value != "" {
-			argv = append(argv, "--context-length", value)
-		}
-		if gpuCount > 1 && !containsString(extra, "--tp") && !containsString(extra, "--tp-size") {
-			argv = append(argv, "--tp", strconv.Itoa(gpuCount))
-		}
-	case "llama.cpp":
-		argv = []string{executable, "-m", modelPath, "--host", host, "--port", portText, "--alias", served}
-		if value := opt(args, "context-length"); value != "" {
-			argv = append(argv, "-c", value)
-		}
-		if !containsString(extra, "-ngl") && !containsString(extra, "--n-gpu-layers") && !containsString(extra, "--gpu-layers") {
-			argv = append(argv, "-ngl", firstNonEmpty(opt(args, "gpu-layers"), "999"))
-		}
-	default:
-		return nil, fmt.Errorf("unsupported engine %s", engine)
+	if len(extra) > 0 {
+		flags = append(append(flags, "--"), extra...)
 	}
-	return append(argv, extra...), nil
+	return flags, nil
 }
 
-// ── Loaded-model registry ($XDG_DATA_HOME/localmaxxing/loaded) ──────────────
-
-type loadedModel struct {
-	Name            string   `json:"name"`
-	ModelID         string   `json:"modelId"`
-	ModelName       string   `json:"modelName"`
-	ModelPath       string   `json:"modelPath"`
-	Engine          string   `json:"engine"`
-	Argv            []string `json:"argv"`
-	EnvKeys         []string `json:"envKeys,omitempty"`
-	GPUs            string   `json:"gpus,omitempty"`
-	Host            string   `json:"host"`
-	Port            int      `json:"port"`
-	BaseURL         string   `json:"baseUrl"`
-	ServedModel     string   `json:"servedModel"`
-	PID             int      `json:"pid"`
-	ProcessIdentity string   `json:"processIdentity"`
-	LogPath         string   `json:"logPath"`
-	StartedAt       string   `json:"startedAt"`
-	ReadyAt         string   `json:"readyAt,omitempty"`
-}
-
-func loadedRoot() (string, error) {
-	base := os.Getenv("XDG_DATA_HOME")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
+// sortFlagPairs orders --flag value pairs by flag so registrations are stable.
+func sortFlagPairs(flags []string) {
+	for i := 0; i+2 < len(flags); i += 2 {
+		for j := i + 2; j+1 < len(flags); j += 2 {
+			if flags[j] < flags[i] {
+				flags[i], flags[j] = flags[j], flags[i]
+				flags[i+1], flags[j+1] = flags[j+1], flags[i+1]
+			}
 		}
-		base = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(base, "localmaxxing", "loaded"), nil
 }
 
-var loadedNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
-
-func loadedName(value string) string {
-	value = strings.ToLower(value)
-	if slash := strings.LastIndex(value, "/"); slash >= 0 && slash < len(value)-1 {
-		value = value[slash+1:]
-	}
-	value = regexp.MustCompile(`[^a-z0-9._-]+`).ReplaceAllString(value, "-")
-	value = strings.Trim(value, "-._")
-	if len(value) > 64 {
-		value = value[:64]
-	}
-	if value == "" {
-		value = "model"
-	}
-	return value
-}
-
-func readLoadedModels() ([]loadedModel, error) {
-	root, err := loadedRoot()
-	if err != nil {
-		return nil, err
-	}
-	files, err := filepath.Glob(filepath.Join(root, "*.json"))
-	if err != nil {
-		return nil, err
-	}
-	models := []loadedModel{}
-	for _, file := range files {
-		var model loadedModel
-		data, err := os.ReadFile(file)
-		if err != nil || json.Unmarshal(data, &model) != nil || !loadedNamePattern.MatchString(model.Name) {
-			continue
-		}
-		models = append(models, model)
-	}
-	sort.Slice(models, func(i, j int) bool { return models[i].Name < models[j].Name })
-	return models, nil
-}
-
-func writeLoadedModel(model loadedModel) error {
-	root, err := loadedRoot()
+func handleModelLoad(target string, args cliArgs) error {
+	entry, err := resolveInventoryModel(target, args)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return err
+	if entry.Status != "available" && entry.Status != "ready" {
+		return cliError{"model_not_loadable", entry.Name + " is " + entry.Status + ".", []string{firstNonEmpty(entry.SourceError, "Run lmx model show "+target+".")}, nil}
 	}
-	data, err := json.MarshalIndent(model, "", "  ")
+	name := firstNonEmpty(opt(args, "name"), loadedName(entry.Name))
+	if !substrateNamePattern.MatchString(name) {
+		return cliError{"invalid_name", "--name must start with a letter or digit and use letters, digits, '.', '_', ':' or '-' (max 128).", nil, nil}
+	}
+	registration, err := modelRegistrationArgs(args)
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(root, "."+model.Name+".json.tmp")
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(root, model.Name+".json"))
-}
-
-func removeLoadedModel(name string) error {
-	root, err := loadedRoot()
+	models, err := substrateModels(args)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(filepath.Join(root, name+".json")); err != nil && !os.IsNotExist(err) {
+	var existing *substrateModel
+	for i := range models {
+		if models[i].Name == name {
+			existing = &models[i]
+		}
+	}
+	switch {
+	case existing != nil && existing.Source != entry.Path:
+		return cliError{"name_in_use", "The gateway already serves " + existing.Source + " as " + name + ".", []string{"Pass --name <other name>, or lmx model unload " + name + " --forget first."}, nil}
+	case existing == nil || len(registration) > 0:
+		argv := append([]string{"model", "add", name, entry.Path}, registration...)
+		if existing != nil {
+			argv = append(argv[:4], append([]string{"--force"}, argv[4:]...)...)
+		}
+		if _, err := runSubstrate(args, argv...); err != nil {
+			return err
+		}
+		printStatus(args, "model_registered", map[string]any{"name": name, "source": entry.Path})
+	}
+	base, err := startGateway(args)
+	if err != nil {
 		return err
 	}
+	timeout, err := intOption(args, 900, 1, "ready-timeout-seconds")
+	if err != nil {
+		return err
+	}
+	printStatus(args, "model_loading", map[string]any{"name": name, "model": entry.Name, "gateway": base + "/v1"})
+	instance, err := gatewayEnsure(base, name, time.Duration(timeout)*time.Second)
+	if err != nil {
+		if failure, ok := err.(cliError); ok {
+			failure.Hints = append(failure.Hints, "Engine log: lmx model logs "+name, "The model stays registered; the gateway starts it on the next request (lmx model unload "+name+" --forget removes it).")
+			return failure
+		}
+		return err
+	}
+	if !humanOutput(args) || opt(args, "out") != "" {
+		return writeOrPrintJSON("model_load", args, map[string]any{"name": name, "gateway": base + "/v1", "instance": instance})
+	}
+	fmt.Printf("Loaded %s on %s → %s/v1 as %q\n", entry.Name, instance.Engine, base, name)
+	fmt.Printf("  try:    curl %s/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":%q,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}'\n", base, name)
+	fmt.Printf("  logs:   lmx model logs %s\n  unload: lmx model unload %s\n", name, name)
 	return nil
 }
 
-func (m loadedModel) alive() bool {
-	return m.PID > 0 && processMatchesIdentity(m.PID, m.ProcessIdentity)
+func handleModelUnload(target string, args cliArgs) error {
+	targets := args.positional[min(len(args.positional), 2):]
+	if hasFlag(args, "all") {
+		instances, err := substrateInstances(args)
+		if err != nil {
+			return err
+		}
+		targets = nil
+		for _, instance := range instances {
+			targets = append(targets, instance.ID)
+		}
+	} else if target == "" {
+		return cliError{"missing_model", "model unload requires a loaded model name (or --all).", []string{"Run lmx model loaded."}, nil}
+	}
+	base := gatewayURL(args)
+	up := gatewayUp(base)
+	stopped := []string{}
+	for _, id := range targets {
+		if up {
+			// The gateway lets in-flight requests finish before stopping.
+			if err := gatewayCall(base, http.MethodPost, "/substrate/v1/stop", map[string]any{"id": id}, nil, 3*time.Minute); err != nil {
+				return err
+			}
+		} else if _, err := runSubstrate(args, "stop", id); err != nil {
+			return err
+		}
+		stopped = append(stopped, id)
+	}
+	if hasFlag(args, "forget") && !hasFlag(args, "all") {
+		for _, name := range targets {
+			if _, err := runSubstrate(args, "model", "rm", name); err != nil {
+				return err
+			}
+		}
+	}
+	fields := map[string]any{"unloaded": strings.Join(stopped, ", ")}
+	if len(stopped) == 0 {
+		fields["unloaded"] = "nothing was running"
+	}
+	if !hasFlag(args, "forget") {
+		fields["note"] = "Registered models start again on their next request; --forget unregisters."
+	}
+	printInfo(args, "model_unloaded", fields)
+	return nil
 }
 
-// probeLoaded reports "ready" when the server lists models, "loading" while
-// its process runs, and "exited" once it is gone.
-func probeLoaded(m loadedModel, timeout time.Duration) string {
-	if !m.alive() {
-		return "exited"
+func handleModelLoaded(args cliArgs) error {
+	base := gatewayURL(args)
+	var instances []substrateInstance
+	if gatewayUp(base) {
+		var result []struct {
+			Instance substrateInstance `json:"instance"`
+			Status   string            `json:"status"`
+		}
+		if err := gatewayCall(base, http.MethodGet, "/substrate/v1/instances", nil, &result, 10*time.Second); err != nil {
+			return err
+		}
+		for _, entry := range result {
+			entry.Instance.Status = entry.Status
+			instances = append(instances, entry.Instance)
+		}
+	} else {
+		var err error
+		if instances, err = substrateInstances(args); err != nil {
+			return err
+		}
 	}
-	client := &http.Client{Timeout: timeout}
-	response, err := client.Get(m.BaseURL + "/v1/models")
-	if err != nil {
-		return "loading"
+	if !humanOutput(args) || opt(args, "out") != "" {
+		return writeOrPrintJSON("model_loaded", args, map[string]any{"gateway": base + "/v1", "gatewayUp": gatewayUp(base), "instances": instances})
 	}
-	defer response.Body.Close()
-	var body struct {
-		Data []any `json:"data"`
+	if len(instances) == 0 {
+		fmt.Println("No models loaded. Load one with lmx model load <name>.")
+		return nil
 	}
-	if response.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&body) == nil && len(body.Data) > 0 {
-		return "ready"
+	writer := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(writer, "NAME\tENGINE\tDEVICE\tSTATUS\tOWNER\tUP\tINSTANCE URL")
+	for _, instance := range instances {
+		device := "-"
+		if len(instance.GPUs) > 0 {
+			device = "gpu:" + joinInts(instance.GPUs)
+		} else if len(instance.Devices) > 0 {
+			device = "tt:" + joinInts(instance.Devices)
+		}
+		up := "-"
+		if !instance.StartedAt.IsZero() {
+			up = time.Since(instance.StartedAt).Round(time.Second).String()
+		}
+		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", instance.Name, instance.Engine, device, firstNonEmpty(instance.Status, "running"), instance.Owner, up, instance.BaseURL)
 	}
-	return "loading"
+	writer.Flush()
+	fmt.Printf("\nAll models: %s/v1 (model = NAME)\n", base)
+	return nil
 }
 
-func portFree(host string, port int, taken map[int]bool) bool {
-	if taken[port] {
-		return false
+func handleModelLogs(target string, args cliArgs) error {
+	if target == "" {
+		return cliError{"missing_model", "model logs requires a loaded model name.", []string{"Run lmx model loaded."}, nil}
 	}
-	listener, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	bin, err := substrateBin(args)
 	if err != nil {
-		return false
+		return err
 	}
-	listener.Close()
-	return true
+	lines, err := intOption(args, 50, 1, "lines")
+	if err != nil {
+		return err
+	}
+	argv := []string{"logs", target, "-n", strconv.Itoa(lines)}
+	if hasFlag(args, "follow") {
+		argv = append(argv, "-f")
+	}
+	cmd := exec.Command(bin, argv...)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd.Run()
 }
 
 func tailFile(path string, lines int) []string {
@@ -403,359 +317,6 @@ func resolveInventoryModel(target string, args cliArgs) (modelInventoryEntry, er
 		return modelInventoryEntry{}, cliError{"ambiguous_model", target + " matches several local models; pass an ID.", ids, nil}
 	}
 	return matches[0], nil
-}
-
-func handleModelLoad(target string, args cliArgs) error {
-	entry, err := resolveInventoryModel(target, args)
-	if err != nil {
-		return err
-	}
-	if entry.Status != "available" && entry.Status != "ready" {
-		return cliError{"model_not_loadable", entry.Name + " is " + entry.Status + ".", []string{firstNonEmpty(entry.SourceError, "Run lmx model show "+target+".")}, nil}
-	}
-	engine, err := chooseLoadEngine(entry, opt(args, "engine"))
-	if err != nil {
-		return cliError{"engine_not_supported", err.Error(), nil, nil}
-	}
-	executable, engineEnv, ok := hostEngineExecutable(engine)
-	if !ok {
-		hint := map[string]string{"vllm": "lmx engines set vllm /path/to/venv/bin/vllm", "sglang": "lmx engines set sglang /path/to/venv/bin/python", "llama.cpp": "lmx engines set llama.cpp /path/to/llama-server"}[engine]
-		return cliError{"engine_not_found", engine + " was not found for " + entry.Name + ".", []string{"Point lmx at it once: " + hint, "Or pick another engine with --engine."}, nil}
-	}
-	name := opt(args, "name")
-	if name == "" {
-		name = loadedName(entry.Name)
-	}
-	if !loadedNamePattern.MatchString(name) {
-		return cliError{"invalid_name", "--name must be lowercase letters, digits, '.', '_' or '-' (max 64).", nil, nil}
-	}
-	loaded, err := readLoadedModels()
-	if err != nil {
-		return err
-	}
-	taken := map[int]bool{}
-	for _, other := range loaded {
-		running := other.alive()
-		if other.Name == name {
-			if running {
-				if other.ModelPath == entry.Path {
-					printInfo(args, "model_already_loaded", map[string]any{"name": other.Name, "baseUrl": other.BaseURL, "servedModel": other.ServedModel, "status": probeLoaded(other, 2*time.Second)})
-					return nil
-				}
-				return cliError{"name_in_use", "A different model is loaded as " + name + ".", []string{"Pass --name, or lmx model unload " + name + " first."}, nil}
-			}
-			_ = removeLoadedModel(other.Name)
-			continue
-		}
-		if running {
-			taken[other.Port] = true
-		}
-	}
-	host := firstNonEmpty(opt(args, "host"), "127.0.0.1")
-	port := 0
-	if value := opt(args, "port"); value != "" {
-		port, err = strconv.Atoi(value)
-		if err != nil || port < 1 || port > 65535 {
-			return cliError{"invalid_option", "--port must be 1-65535.", nil, nil}
-		}
-		if !portFree(host, port, taken) {
-			return cliError{"port_in_use", fmt.Sprintf("Port %d is already in use.", port), []string{"Omit --port to pick a free one."}, nil}
-		}
-	} else {
-		for candidate := engineDefaultPorts[engine]; candidate < engineDefaultPorts[engine]+100; candidate++ {
-			if portFree(host, candidate, taken) {
-				port = candidate
-				break
-			}
-		}
-		if port == 0 {
-			return cliError{"port_in_use", "No free port near the engine default.", []string{"Pass --port."}, nil}
-		}
-	}
-	gpus := opt(args, "gpus")
-	gpuCount := 0
-	if gpus != "" {
-		gpuCount = len(strings.Split(gpus, ","))
-	}
-	// Clients address the server by this name: the repo, or for a GGUF its file stem.
-	served := firstNonEmpty(entry.Repo, entry.Name)
-	if entry.Format == "gguf" {
-		served = entry.Name[strings.LastIndex(entry.Name, "/")+1:]
-	}
-	served = firstNonEmpty(opt(args, "served-model"), served)
-	modelPath := entry.Path
-	argv, err := loadServerArgv(engine, executable, modelPath, served, host, port, args, gpuCount)
-	if err != nil {
-		return err
-	}
-	probeHost := host
-	if host == "0.0.0.0" || host == "::" {
-		probeHost = "127.0.0.1"
-	}
-	record := loadedModel{
-		Name: name, ModelID: entry.ID, ModelName: entry.Name, ModelPath: modelPath, Engine: engine, Argv: argv, GPUs: gpus,
-		Host: host, Port: port, BaseURL: "http://" + net.JoinHostPort(probeHost, strconv.Itoa(port)), ServedModel: served,
-		StartedAt: time.Now().UTC().Format(time.RFC3339),
-	}
-	environment := os.Environ()
-	extraEnv := map[string]string{}
-	for key, value := range engineEnv {
-		extraEnv[key] = value
-	}
-	if envFile := opt(args, "server-env-file"); envFile != "" {
-		data, err := os.ReadFile(envFile)
-		if err != nil {
-			return err
-		}
-		var values map[string]string
-		if err := json.Unmarshal(data, &values); err != nil {
-			return errors.New("--server-env-file must be a JSON object of string values")
-		}
-		for key, value := range values {
-			extraEnv[key] = value
-		}
-	}
-	if gpus != "" {
-		extraEnv["CUDA_VISIBLE_DEVICES"] = gpus
-	}
-	for key, value := range extraEnv {
-		environment = append(environment, key+"="+value)
-		record.EnvKeys = append(record.EnvKeys, key)
-	}
-	sort.Strings(record.EnvKeys)
-	environment = withHuggingFaceToken(environment)
-
-	if hasFlag(args, "dry-run") {
-		return writeOrPrintJSON("model_load_plan", args, record)
-	}
-	root, err := loadedRoot()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return err
-	}
-	record.LogPath = filepath.Join(root, name+".log")
-	logFile, err := os.OpenFile(record.LogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Env, cmd.Stdout, cmd.Stderr, cmd.Stdin = environment, logFile, logFile, nil
-	configureDetachedCommand(cmd) // own session: outlives lmx, stopped as a group
-	if err := cmd.Start(); err != nil {
-		logFile.Close()
-		return fmt.Errorf("start %s: %w", engine, err)
-	}
-	logFile.Close()
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
-	record.PID = cmd.Process.Pid
-	if record.ProcessIdentity, err = captureProcessIdentity(record.PID); err != nil {
-		_ = signalDetachedProcess(record.PID, true)
-		return fmt.Errorf("could not record the server process: %w", err)
-	}
-	if err := writeLoadedModel(record); err != nil {
-		_ = signalDetachedProcess(record.PID, true)
-		return err
-	}
-	printStatus(args, "model_loading", map[string]any{"name": name, "model": entry.Name, "engine": engine, "baseUrl": record.BaseURL, "log": record.LogPath})
-	if hasFlag(args, "no-wait") {
-		return finishModelLoad(args, record, "loading")
-	}
-
-	timeout, err := intOption(args, 900, 1, "ready-timeout-seconds")
-	if err != nil {
-		return err
-	}
-	ctx, stop := terminalSignalContext()
-	defer stop()
-	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
-	fail := func(reason string) error {
-		_ = stopLoadedModel(record, 30*time.Second)
-		_ = removeLoadedModel(record.Name)
-		return cliError{"model_load_failed", reason, append([]string{"Server log " + record.LogPath + " (last lines):"}, tailFile(record.LogPath, 25)...), nil}
-	}
-	for {
-		select {
-		case err := <-exited:
-			return fail(fmt.Sprintf("%s exited before it was ready (%v).", engine, err))
-		case <-ctx.Done():
-			return fail("Interrupted; the server was stopped.")
-		case <-time.After(time.Second):
-		}
-		if probeLoaded(record, 2*time.Second) == "ready" {
-			break
-		}
-		if time.Now().After(deadline) {
-			return fail(fmt.Sprintf("%s was not ready after %d s; pass --ready-timeout-seconds for slow first starts.", engine, timeout))
-		}
-	}
-	record.ReadyAt = time.Now().UTC().Format(time.RFC3339)
-	if err := writeLoadedModel(record); err != nil {
-		return err
-	}
-	return finishModelLoad(args, record, "ready")
-}
-
-func finishModelLoad(args cliArgs, record loadedModel, status string) error {
-	if !humanOutput(args) || opt(args, "out") != "" {
-		return writeOrPrintJSON("model_load", args, map[string]any{"status": status, "loaded": record})
-	}
-	fmt.Printf("%s %s on %s → %s (served as %q)\n", map[string]string{"ready": "Loaded", "loading": "Loading"}[status], record.ModelName, record.Engine, record.BaseURL+"/v1", record.ServedModel)
-	fmt.Printf("  try:    curl %s/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":%q,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}'\n", record.BaseURL, record.ServedModel)
-	fmt.Printf("  logs:   lmx model logs %s\n  unload: lmx model unload %s\n", record.Name, record.Name)
-	return nil
-}
-
-// stopLoadedModel terminates the server's process group, escalating to SIGKILL.
-func stopLoadedModel(m loadedModel, grace time.Duration) error {
-	if !m.alive() {
-		return nil
-	}
-	if err := signalDetachedProcess(m.PID, false); err != nil {
-		return err
-	}
-	deadline := time.Now().Add(grace)
-	for time.Now().Before(deadline) {
-		if !m.alive() {
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if err := signalDetachedProcess(m.PID, true); err != nil {
-		return err
-	}
-	for i := 0; i < 50 && m.alive(); i++ {
-		time.Sleep(100 * time.Millisecond)
-	}
-	if m.alive() {
-		return fmt.Errorf("%s (pid %d) did not exit", m.Name, m.PID)
-	}
-	return nil
-}
-
-func selectLoaded(loaded []loadedModel, target string) []loadedModel {
-	var matches []loadedModel
-	for _, m := range loaded {
-		if target == m.Name || strings.EqualFold(target, m.ModelName) || target == m.ModelID || target == m.ModelPath || target == strconv.Itoa(m.Port) || target == m.ServedModel {
-			matches = append(matches, m)
-		}
-	}
-	return matches
-}
-
-func handleModelUnload(target string, args cliArgs) error {
-	loaded, err := readLoadedModels()
-	if err != nil {
-		return err
-	}
-	targets := loaded
-	if !hasFlag(args, "all") {
-		if target == "" {
-			return cliError{"missing_model", "model unload requires a loaded name, model or port (or --all).", []string{"Run lmx model loaded."}, nil}
-		}
-		targets = selectLoaded(loaded, target)
-		if len(targets) == 0 {
-			return cliError{"model_not_loaded", target + " is not loaded.", []string{"Run lmx model loaded."}, nil}
-		}
-	}
-	grace, err := intOption(args, 30, 1, "stop-timeout-seconds")
-	if err != nil {
-		return err
-	}
-	unloaded := []string{}
-	for _, m := range targets {
-		if err := stopLoadedModel(m, time.Duration(grace)*time.Second); err != nil {
-			return err
-		}
-		if err := removeLoadedModel(m.Name); err != nil {
-			return err
-		}
-		unloaded = append(unloaded, m.Name)
-	}
-	printInfo(args, "model_unloaded", map[string]any{"unloaded": strings.Join(unloaded, ", ")})
-	return nil
-}
-
-type loadedStatus struct {
-	loadedModel
-	Status string `json:"status"`
-}
-
-func handleModelLoaded(args cliArgs) error {
-	loaded, err := readLoadedModels()
-	if err != nil {
-		return err
-	}
-	rows := make([]loadedStatus, 0, len(loaded))
-	for _, m := range loaded {
-		rows = append(rows, loadedStatus{m, probeLoaded(m, 2*time.Second)})
-	}
-	if !humanOutput(args) || opt(args, "out") != "" {
-		return writeOrPrintJSON("model_loaded", args, map[string]any{"loaded": rows})
-	}
-	if len(rows) == 0 {
-		fmt.Println("No models loaded. Load one with lmx model load <name>.")
-		return nil
-	}
-	writer := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "NAME\tMODEL\tENGINE\tURL\tSTATUS\tPID\tUP")
-	for _, row := range rows {
-		up := "-"
-		if started, err := time.Parse(time.RFC3339, row.StartedAt); err == nil && row.Status != "exited" {
-			up = time.Since(started).Round(time.Second).String()
-		}
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n", row.Name, row.ModelName, row.Engine, row.BaseURL+"/v1", row.Status, row.PID, up)
-	}
-	writer.Flush()
-	return nil
-}
-
-func handleModelLogs(target string, args cliArgs) error {
-	loaded, err := readLoadedModels()
-	if err != nil {
-		return err
-	}
-	matches := selectLoaded(loaded, target)
-	if len(matches) != 1 {
-		return cliError{"model_not_loaded", "No single loaded model matches " + target + ".", []string{"Run lmx model loaded."}, nil}
-	}
-	lines, err := intOption(args, 50, 1, "lines")
-	if err != nil {
-		return err
-	}
-	for _, line := range tailFile(matches[0].LogPath, lines) {
-		fmt.Println(line)
-	}
-	if !hasFlag(args, "follow") {
-		return nil
-	}
-	file, err := os.Open(matches[0].LogPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	file.Seek(0, io.SeekEnd)
-	ctx, stop := terminalSignalContext()
-	defer stop()
-	reader := bufio.NewReader(file)
-	for ctx.Err() == nil {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			fmt.Print(line)
-		}
-		if err != nil {
-			if !matches[0].alive() {
-				return nil
-			}
-			select {
-			case <-ctx.Done():
-			case <-time.After(500 * time.Millisecond):
-			}
-		}
-	}
-	return nil
 }
 
 // matchInventory selects entries by exact ID, then name/path/repo, then ID prefix.

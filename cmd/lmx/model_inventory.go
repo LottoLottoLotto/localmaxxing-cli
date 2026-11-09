@@ -51,7 +51,7 @@ type modelInventoryEntry struct {
 	Layers             int64                `json:"layers,omitempty"`
 	Experts            int64                `json:"experts,omitempty"`
 	ExpertsPerToken    int64                `json:"expertsPerToken,omitempty"`
-	LoadedAt           []string             `json:"loadedAt,omitempty"` // base URLs of lmx model load servers
+	LoadedAs           []string             `json:"loadedAs,omitempty"` // gateway model names of running substrate instances
 	SHA256             string               `json:"sha256,omitempty"`
 	Managed            bool                 `json:"managed,omitempty"`
 	Integrity          string               `json:"integrity,omitempty"`
@@ -96,7 +96,7 @@ func modelInventory(args cliArgs) (string, []modelInventoryEntry, error) {
 	for _, dir := range modelScanDirs(args) {
 		entries = append(entries, scanDirEntries(dir)...)
 	}
-	markModelUsage(entries)
+	markModelUsage(args, entries)
 	sort.SliceStable(entries, func(i, j int) bool {
 		if !strings.EqualFold(entries[i].Name, entries[j].Name) {
 			return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
@@ -754,19 +754,20 @@ func readGGUFSummary(path string) (map[string]any, int64, error) {
 	return meta, params, nil
 }
 
-// markModelUsage records which lmx model load servers serve each entry.
-func markModelUsage(entries []modelInventoryEntry) {
-	loaded, err := readLoadedModels()
+// markModelUsage marks entries that a substrate instance is serving, by name.
+// Without substrate the listing simply has no marks.
+func markModelUsage(args cliArgs, entries []modelInventoryEntry) {
+	if _, err := substrateBin(args); err != nil {
+		return
+	}
+	instances, err := substrateInstances(args)
 	if err != nil {
 		return
 	}
-	for _, m := range loaded {
-		if !m.alive() {
-			continue
-		}
+	for _, instance := range instances {
 		for i := range entries {
-			if entries[i].Path == m.ModelPath {
-				entries[i].LoadedAt = append(entries[i].LoadedAt, m.BaseURL)
+			if entries[i].Path == instance.Model {
+				entries[i].LoadedAs = append(entries[i].LoadedAs, instance.Name)
 			}
 		}
 	}
@@ -854,8 +855,8 @@ func handleModelList(args cliArgs) error {
 			context = formatModelContext(entry.ContextLength)
 		}
 		status := entry.Status
-		if len(entry.LoadedAt) > 0 {
-			status = "loaded " + strings.Join(entry.LoadedAt, ",")
+		if len(entry.LoadedAs) > 0 {
+			status = "loaded as " + strings.Join(entry.LoadedAs, ",")
 		}
 		// lmx IDs are needed for verify/remove/serving; other entries are shown by
 		// name, with the full ID only when the name alone is ambiguous.
@@ -944,7 +945,7 @@ func handleModelShow(target string, args cliArgs) error {
 	if entry.Kind == "file" {
 		row("Upstream verified", fmt.Sprint(entry.UpstreamVerified))
 	}
-	row("Loaded at", strings.Join(entry.LoadedAt, ", "))
+	row("Loaded as", strings.Join(entry.LoadedAs, ", "))
 	writer.Flush()
 	if len(entry.Files) > 1 {
 		fmt.Println("\nFiles:")

@@ -17,6 +17,9 @@ func modelStoreTestArgs(t *testing.T) cliArgs {
 	t.Setenv("HF_HUB_CACHE", filepath.Join(dir, "hf-hub"))
 	t.Setenv("LMX_MODEL_DIRS", "")
 	t.Setenv("LMX_DEPLOYMENTS_DIR", filepath.Join(dir, "servers"))
+	// Keep the host's substrate and gateway out of model listings.
+	t.Setenv("LMX_SUBSTRATE_BIN", filepath.Join(dir, "no-substrate"))
+	t.Setenv("LMX_GATEWAY_URL", "http://127.0.0.1:1")
 	return cliArgs{opts: map[string]string{"models-dir": filepath.Join(dir, "models"), "out": filepath.Join(dir, "result.json")}, flags: map[string]bool{}}
 }
 

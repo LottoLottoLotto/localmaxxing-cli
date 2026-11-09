@@ -226,7 +226,7 @@ headers (exact parameter count for unquantized weights) and GGUF metadata
 (architecture, context, layers, quant type, parameter count). Each GGUF quant
 in a folder is its own entry; split GGUFs are grouped. Status flags `partial`
 when safetensors shards or GGUF split parts are missing, `missing` when a
-registered file is gone, and `loaded <url>` while `lmx model load` serves it. Folders without weights are hidden unless `--all`; `--kind
+registered file is gone, and `loaded as <name>` while a substrate instance serves it. Folders without weights are hidden unless `--all`; `--kind
 file|snapshot|hf-cache|directory` filters. `model show <name, ID, ID prefix or
 path>` adds revision, path, hashes and the file list. `--json` returns the same
 fields (`models[]` with `id`, `kind`, `path`, `status`, …).
@@ -259,48 +259,61 @@ entire file and can take time for large models.
 
 ### Loading and unloading models
 
-`lmx model load` starts any model from `lmx model list` on the engine that fits
-it and returns once it answers on an OpenAI-compatible URL; `unload` stops it.
+lmx serves local models through [substrate](https://github.com/LottoLottoLotto/substrate),
+an engine gateway: one OpenAI/Anthropic-compatible endpoint (default
+`http://127.0.0.1:7777/v1`) that routes each request by its `model` field to a
+llama.cpp, vLLM, SGLang or Strata instance, starts registered models on
+demand and places them on GPUs (and Tenstorrent chips). lmx needs the
+`substrate` binary on `PATH` (or `--substrate-bin` / `LMX_SUBSTRATE_BIN`);
+engine paths live in substrate's config (`substrate engine set`, `substrate doctor`).
 
 ```bash
-lmx engines set vllm ~/vllm/bin/vllm --server-env-file vllm-env.json   # once per engine
-lmx engines set sglang ~/sglang/bin/python
-lmx model load Qwen3-0.6B                                   # safetensors → vLLM (SGLang if no vLLM)
-lmx model load LFM2.5-2.6B-GGUF/LFM2.5-2.6B-Q4_K_M --gpus 0 # GGUF → llama.cpp, all layers on GPU
-lmx model load Qwen3-0.6B --engine sglang --context-length 8192
-lmx model loaded                                            # name, engine, URL, ready/loading/exited
+lmx gateway start                                   # substrate serve in the background (--service: systemd user unit)
+lmx model load Qwen3-0.6B --mem-fraction 0.4        # safetensors → vLLM/SGLang
+lmx model load LFM2.5-2.6B-GGUF/LFM2.5-2.6B-Q4_K_M  # GGUF → llama.cpp
+lmx model loaded                                    # running instances: engine, GPU, status
+curl http://127.0.0.1:7777/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3-0.6b","messages":[{"role":"user","content":"Hi"}]}'
 lmx model logs qwen3-0.6b --follow
-lmx model unload qwen3-0.6b                                 # or --all
+lmx model unload qwen3-0.6b                         # or --all; --forget also unregisters
+lmx gateway status                                  # registered models and what runs
+lmx gateway stop
 ```
 
-- **Engine choice:** GGUF goes to llama.cpp; safetensors/PyTorch weights go to
-  vLLM, or SGLang when only SGLang is set up. `--engine` overrides (llama.cpp
-  only serves GGUF, vLLM/SGLang not GGUF here). Engines come from
-  `lmx engines set <engine> <path>` (vLLM binary, the Python that has SGLang,
-  or llama-server; optional `--server-env-file` JSON of environment values
-  for that engine), else `vllm` / `llama-server` / a `python3` with SGLang on
-  `PATH`. Settings live in `~/.config/localmaxxing/engines.json` (0600);
-  `lmx engines` shows them and `lmx engines unset <engine>` removes one.
-- **Server:** binds `127.0.0.1` (`--host` to change) on the engine's default
-  port (vLLM 8000, SGLang 30000, llama.cpp 8080) or the next free one
-  (`--port` to pin). Clients use the repository name, the folder name, or for
-  GGUF the file stem as the model name (`--served-model` to change).
-  `--context-length`, `--gpus 0,1` (sets `CUDA_VISIBLE_DEVICES` and tensor
-  parallelism), `--server-args '["--gpu-memory-utilization","0.5"]'` and
-  `--server-env-file` pass through. The saved Hugging Face token is given to
-  the server's environment.
-- **Lifecycle:** the server runs in its own session, so it keeps running after
-  lmx exits; its log is `~/.local/share/localmaxxing/loaded/<name>.log`.
-  `load` waits up to `--ready-timeout-seconds` (900) for `/v1/models`; if the
-  engine exits, the wait times out or you press Ctrl-C, the server is stopped
-  and the log tail is printed. `--no-wait` returns at once. Loading a model
-  that is already loaded reports the running server; `--name` loads a second
-  copy. `unload` sends SIGTERM to the server's process group and SIGKILL after
-  `--stop-timeout-seconds` (30). `lmx model list` marks loaded models with
-  their URL.
-- vLLM reserves 90% of GPU memory by default; to run several models on one GPU
-  lower it with `--server-args '["--gpu-memory-utilization","0.4"]'` (SGLang:
-  `--mem-fraction-static`).
+- **load** registers the model from `lmx model list` with substrate
+  (`substrate model add`) under `--name`, default the repository/folder name or
+  GGUF file stem, lowercased, then asks the gateway to start it and waits up to
+  `--ready-timeout-seconds` (900). It starts the gateway if needed. Loading a
+  model that is already registered reuses its registration; options given
+  again replace it. A name already used by a different model is refused.
+- **Options** map to substrate's unified flags: `--engine`, `--context-length`,
+  `--gpus 0,1`, `--tensor-parallel`, `--gpu-layers`, `--mem-fraction`,
+  `--idle-unload 15m`; `--server-args '["--seed","1"]'` passes engine
+  arguments (needs `--engine`). Without `--engine` substrate picks the best
+  installed engine for the format; without `--gpus` it places the model by
+  free memory and may evict idle models.
+- **unload** stops the instance after in-flight requests finish. Registered
+  models start again on their next request; `--forget` unregisters.
+  `lmx model list` marks models a substrate instance is serving (`loaded as <name>`).
+- **Gateway process:** `lmx gateway start` runs `substrate serve` detached on
+  the host/port from substrate's `config.yaml` (log
+  `~/.local/share/localmaxxing/gateway.log`); if substrate's systemd service is
+  installed it starts that instead. `--gateway-url` / `LMX_GATEWAY_URL` points
+  lmx at another gateway; `SUBSTRATE_API_KEY` authenticates when it has keys.
+  Stopping the gateway leaves models running.
+
+#### Benchmarks and evals through the gateway
+
+While the gateway is up, commands that talk to an endpoint and get no
+`--base-url` use it: remote speed tests (`--mode remote`), remote KV-cache
+sweeps, `eval shard`, `eval execute`, `eval terminal run` and
+`model resolve-remote`. The gateway model is `--served-model`, else the one
+registered for `--hf-id` / `--model` (same name, or a source in that
+repository's HF cache or folder); lmx makes it ready before measuring so no
+cold start lands in the results, and records the instance's engine.
+`speed-test matrix run` measures the engine instance's own URL so the gateway's
+queueing does not shape the concurrency curve. `--no-gateway` or an explicit
+`--base-url` turns this off.
 
 ### Hugging Face token
 
@@ -318,9 +331,9 @@ lmx auth hf logout          # delete the saved token file
 
 `--token-stdin` checks the token against the Hub before saving and refuses a
 rejected one. It is written to the token file readable only by you (0600),
-never to lmx's own config. Servers started by `lmx model load` receive the saved
-token as `HF_TOKEN` in their environment only; it never appears in argv, plans
-or reports. The token is separate from LocalMaxxing auth.
+never to lmx's own config. A gateway started by `lmx gateway start` receives the
+saved token as `HF_TOKEN` in its environment only (and passes it to the engines
+it starts); it never appears in argv, plans or reports. The token is separate from LocalMaxxing auth.
 
 ### Complete model snapshots
 

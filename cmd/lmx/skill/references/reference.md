@@ -8,8 +8,8 @@ Raw HTTP API docs are available from the site through `GET /api/agent-context` a
 - `lmx auth`: manage LocalMaxxing API authentication.
 - `lmx hardware`: detect, validate, or template hardware metadata.
 - `lmx setups`: list and pull saved account setups.
-- `lmx model`: search or resolve HuggingFace model IDs; `list|show` the local inventory (lmx store, snapshots, HF cache, `--scan-dir`/`LMX_MODEL_DIRS` folders) with details from config.json, safetensors headers and GGUF metadata; `pull|snapshot|snapshots|import|verify|remove` manage downloads (`--download-connections`, `--models-dir`); `load|unload|loaded|logs` serve a local model on a host engine (`--engine`, `--gpus`, `--context-length`, `--port`, `--server-args`, `--server-env-file`, `--no-wait`).
-- `lmx engines set ENGINE PATH [--server-env-file FILE]` / `lmx engines unset ENGINE`: the vLLM binary, SGLang Python or llama-server that `model load` uses.
+- `lmx model`: search or resolve HuggingFace model IDs; `list|show` the local inventory (lmx store, snapshots, HF cache, `--scan-dir`/`LMX_MODEL_DIRS` folders) with details from config.json, safetensors headers and GGUF metadata; `pull|snapshot|snapshots|import|verify|remove` manage downloads (`--download-connections`, `--models-dir`); `load|unload|loaded|logs` serve a local model through the substrate gateway (`--name`, `--engine`, `--gpus`, `--context-length`, `--tensor-parallel`, `--gpu-layers`, `--mem-fraction`, `--idle-unload`, `--server-args`; unload `--all`, `--forget`).
+- `lmx gateway start [--service]|stop|status|logs`: the substrate gateway, one endpoint for every loaded model (`--gateway-url`/`LMX_GATEWAY_URL`, `--substrate-bin`/`LMX_SUBSTRATE_BIN`). Endpoint commands without `--base-url` route through it while it is up; `--no-gateway` disables.
 - `lmx auth hf --token-stdin|status|logout`: the Hugging Face token (`HF_TOKEN`, else `HF_TOKEN_PATH` / `$HF_HOME/token`, shared with `hf auth login`).
 - `lmx profile`: save and manage reusable CLI defaults.
 - `lmx engines` / `lmx engine`: list engine helpers.

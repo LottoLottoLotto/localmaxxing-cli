@@ -225,6 +225,11 @@ func runWithArgs(args cliArgs) error {
 	}
 	normalizeEndpointArgs(&args)
 	cmd := positional(args, 0)
+	if !wantsHelp(args) && !hasFlag(args, "dry-run") {
+		if err := applyGatewayDefault(&args); err != nil {
+			return err
+		}
+	}
 	if cmd == "" {
 		usage()
 		return nil
@@ -285,10 +290,9 @@ func runWithArgs(args cliArgs) error {
 	case "profile":
 		return handleProfile(positional(args, 1), positional(args, 2), args)
 	case "engines", "engine":
-		if action := positional(args, 1); action == "set" || action == "unset" {
-			return handleEngineConfig(action, positional(args, 2), args)
-		}
 		return handleEngines(args)
+	case "gateway":
+		return handleGateway(positional(args, 1), args)
 	case "server":
 		return handleServer(positional(args, 1), positional(args, 2), args)
 	case "endpoint":
@@ -339,7 +343,7 @@ func runWithArgs(args cliArgs) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "speed-test", "report", "auth", "hardware", "setups", "context", "calculate", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "skill", "update", "version", "commands":
+	case "eval", "speed-test", "report", "auth", "hardware", "setups", "context", "calculate", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "skill", "update", "version", "commands", "gateway":
 		return true
 	default:
 		return false
@@ -354,7 +358,7 @@ func isBooleanOption(key string) bool {
 		"no-stream", "missing-only", "all-missing", "cleanup-images", "native-tools", "oracle",
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
-		"save-run", "key-stdin", "token-stdin", "no-hf-cache", "no-wait", "draft", "strict", "no-upload-datasets", "upload-datasets",
+		"save-run", "key-stdin", "token-stdin", "no-hf-cache", "service", "no-gateway", "forget", "draft", "strict", "no-upload-datasets", "upload-datasets",
 		"skip-oracle", "remote", "skip-oversize", "run-burst", "skip-prefill", "standalone-prefill":
 		return true
 	default:
@@ -1633,17 +1637,7 @@ func formatSetupLine(setup map[string]any) string {
 }
 
 func handleEngines(args cliArgs) error {
-	// Engines set with `lmx engines set` are what `lmx model load` uses; env values stay private.
-	configured := map[string]any{}
-	for name, config := range loadHostEngines() {
-		keys := make([]string, 0, len(config.Env))
-		for key := range config.Env {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		configured[name] = map[string]any{"path": config.Path, "envKeys": keys}
-	}
-	return writeOrPrintJSON("engines", args, map[string]any{"engines": detectInferenceEngines(args), "configured": configured})
+	return writeOrPrintJSON("engines", args, map[string]any{"engines": detectInferenceEngines(args)})
 }
 
 func handleServer(action, target string, args cliArgs) error {
@@ -12124,12 +12118,16 @@ var usageExamples = []string{
 	`lmx model import /models/model.gguf`,
 	`lmx model verify <id>`,
 	`lmx model remove <id> --yes`,
-	`lmx engines set vllm ~/vllm/bin/vllm --server-env-file vllm-env.json`,
-	`lmx model load Qwen3-0.6B --scan-dir ~/models`,
-	`lmx model load LFM2.5-2.6B-GGUF/LFM2.5-2.6B-Q4_K_M --context-length 8192 --gpus 0`,
+	`lmx gateway start`,
+	`lmx gateway start --service`,
+	`lmx gateway status`,
+	`lmx model load Qwen3-0.6B --scan-dir ~/models --mem-fraction 0.4`,
+	`lmx model load LFM2.5-2.6B-GGUF/LFM2.5-2.6B-Q4_K_M --context-length 8192 --gpu-layers all`,
 	`lmx model loaded`,
 	`lmx model logs qwen3-0.6b --follow`,
 	`lmx model unload qwen3-0.6b`,
+	`lmx speed-test run --mode remote --hf-id Qwen/Qwen3-0.6B --quantization BF16 --hardware hardware.json   (through the gateway)`,
+	`lmx gateway stop`,
 	`lmx eval storage upload traces.jsonl --kind artifact --format jsonl --out artifact-bundle.json`,
 	`lmx eval storage download <storageKey> --out traces.jsonl`,
 	`lmx eval lm-eval <approved-suite-slug> --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run`,
@@ -12379,13 +12377,17 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --download-connections <n> Parallel HTTP streams for model pull/snapshot (default 8, max 32; 1 = one stream per file)
   --scan-dir <dirs>         lmx model list/show/load: also list model folders under these comma-separated directories (also LMX_MODEL_DIRS)
   --no-hf-cache            lmx model list/show/load: skip the Hugging Face cache
-  --gpus <ids>              lmx model load: CUDA_VISIBLE_DEVICES for the server; several GPUs also set tensor parallelism
-  --server-args <json>     lmx model load: extra engine arguments as a JSON string array; never shell evaluated
-  --server-env-file <path> lmx model load / engines set: JSON object of environment values for the server
-  --no-wait                lmx model load: return once started instead of waiting for /v1/models
-  --ready-timeout-seconds <n> lmx model load: wait this long for /v1/models (default 900)
-  --stop-timeout-seconds <n> lmx model unload: SIGTERM grace before SIGKILL (default 30)
-  --lines <n>              lmx model logs: recent log lines (default 50)
+  --gpus <ids>              lmx model load: pin GPUs (as nvidia-smi numbers them); otherwise substrate places the model
+  --mem-fraction <f>       lmx model load: GPU memory fraction vLLM/SGLang may claim (0-1)
+  --idle-unload <duration> lmx model load: stop the model after this long without requests (e.g. 15m)
+  --server-args <json>     lmx model load: engine arguments as a JSON string array (needs --engine); never shell evaluated
+  --ready-timeout-seconds <n> lmx model load / gateway routing: wait this long for the model to be ready (default 900)
+  --forget                 lmx model unload: also unregister the model from the gateway
+  --lines <n>              lmx model logs / gateway logs: recent log lines (default 50)
+  --gateway-url <url>      substrate gateway (LMX_GATEWAY_URL; default: substrate config, else http://127.0.0.1:7777)
+  --substrate-bin <path>   substrate executable (LMX_SUBSTRATE_BIN; default: PATH)
+  --service                lmx gateway start: install and start substrate's systemd user service
+  --no-gateway             Do not route an endpoint command through the running gateway when --base-url is omitted
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
   --hardware <path>        JSON hardware object required when submitting
   --quantization <label>   Quantization label (auto-detected from the endpoint for remote speed-test and eval-shard runs when omitted)
@@ -12463,6 +12465,7 @@ var commandDescriptions = map[string]string{
 	"skill print":             "Print the bundled SKILL.md to stdout (or --out <path>).",
 	"skill install":           "Write the bundled skill files into a skills directory (default .claude/skills).",
 	"model":                   "List, show, download, load and unload local models; search or resolve HuggingFace model IDs.",
+	"gateway":                 "Run the substrate gateway: one OpenAI/Anthropic-compatible endpoint that routes requests to every loaded model by name.",
 	"model search":            "Search LocalMaxxing model records.",
 	"model resolve-remote":    "Resolve a remote endpoint alias to likely HF candidates.",
 	"eval":                    "Discover, run, and submit evaluation suites.",
