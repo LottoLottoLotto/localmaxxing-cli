@@ -358,6 +358,108 @@ selection to resume. Only completed snapshots can be selected for serving.
 Removal preserves shared artifacts/cache files, and referenced artifacts cannot
 be removed until their snapshots are removed.
 
+## Rentals
+
+Owners rent out local inference; renters use it through LocalMaxxing, which
+handles access, capacity and billing. **Hosting needs LocalMaxxing Pro**
+(<https://www.localmaxxing.com/pro>); **renting needs credits** (free listings
+need none). Create a listing on the site first (`/rentals/new`).
+
+```bash
+lmx rent list                      # public listings
+lmx rent list --mine               # your listings, all statuses (needs your API key)
+
+# Host: serve listings from this machine (default target: the substrate gateway)
+lmx rent host <listingId>
+lmx rent host <listingId> <listingId2> --target http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-8B --model Qwen/Qwen3-0.6B --max-concurrency 4
+
+# Rent: a local OpenAI-compatible base URL for a listing
+lmx rent connect <listingId> --port 8000   # then use http://127.0.0.1:8000/v1
+```
+
+`lmx rent host` makes one **outbound** connection to the LocalMaxxing relay
+(`wss://<api-url host>/relay/v1/agent`; override with `--relay-url` or
+`LMX_RELAY_URL`; `ws://` is refused except to localhost, since it would send
+your API key unencrypted) using your saved API key; no port forwarding or
+public endpoint is needed. Renter requests arrive over that connection and go
+to `--target` (default: the substrate gateway, `lmx gateway start`). The host
+enforces locally:
+
+- only `POST /v1/chat/completions`, `POST /v1/completions`,
+  `POST /v1/embeddings` and `GET /v1/models` (everything else is 404, so a
+  target's admin API is never reachable);
+- the `model` must be one of the advertised models: `--model` (repeatable or
+  comma-separated); by default, for the substrate gateway, only the models
+  running now (`lmx model loaded`; registered but stopped models are not rented
+  out, since the gateway would start them on demand), and for any other target
+  every id its `/v1/models` lists. `GET /v1/models` answers with exactly that
+  list. Bodies with a duplicate key or a case variant of `model` (`Model`,
+  `MODEL`) are refused with 400, and the target receives the body re-encoded
+  with that single `model` key, so every parser sees the checked model;
+- renter headers are dropped except `Content-Type`, `Accept`, `User-Agent`;
+- at most `--max-concurrency` (default 4) requests at a time; more get 429.
+
+Target keys: renter requests carry `--target-key` / `LMX_RENT_TARGET_KEY` (if
+set) to the target. `SUBSTRATE_API_KEY` (an admin key) is used only to discover
+the running models and is never sent with renter traffic. For a keyed substrate
+gateway, create a client key limited to the models you rent out, so the
+gateway enforces the model list and limits too:
+
+```bash
+substrate key add rentals --models 'qwen3-8b,qwen3-0.6b' --rpm 600   # prints the key once
+LMX_RENT_TARGET_KEY=<that key> SUBSTRATE_API_KEY=<admin key> lmx rent host <listingId>
+```
+
+It reconnects with jittered exponential backoff (up to 60s) after network
+errors, and stops with a fix when the account is not Pro (`pro_required`), the
+key is invalid, a listing is missing or not yours, or the key or plan was
+revoked while it was connecting (`revoked`). Ctrl-C finishes in-flight
+requests, then exits (press again to exit immediately). Only `ACTIVE` listings
+receive traffic.
+
+`lmx rent connect` listens on `--host`/`--port` (default `127.0.0.1:8000`) and
+forwards exactly `POST /v1/chat/completions`, `POST /v1/completions`,
+`POST /v1/embeddings` and `GET /v1/models` to
+`<api-url>/api/rentals/<listingId>/v1/...` with your API key (and
+`--rental-token` as `x-rental-token`), streaming responses. Because it attaches
+your key, it refuses requests whose `Host` is not `127.0.0.1:<port>`,
+`localhost:<port>`, `[::1]:<port>` or the `--host` address (DNS rebinding),
+and any request with an `Origin` header (web pages). `--host 0.0.0.0`/`::` is
+refused; a specific non-loopback `--host` works but prints a warning: anyone
+who can reach it spends your credits.
+
+### Billing
+
+Listings price three kinds of token in credits per 1k (1 credit = $0.01):
+input (prompt) tokens, cached input tokens (prompt tokens served from the
+host's prefix cache; empty = input price, never above it), and output tokens.
+Chat completions, completions and embeddings are billed; `GET /v1/models` is
+free. The site reserves the most a request can cost up front (prompt bound by
+the request size and the listing's context length, plus `max_tokens` × `n`)
+and refunds the rest when it settles.
+
+The host's reported `usage` is checked against what the site can measure:
+output tokens can't exceed the text actually returned, prompt tokens can't
+exceed the request size, and cached tokens can't exceed the prompt. Without
+usage, counts fall back to lower bounds, so hosts are always paid at most what
+an honest report would earn. A renter who disconnects mid-stream pays for the
+prompt and the output already delivered.
+
+Cache hits are billed only when the engine reports them in
+`usage.prompt_tokens_details.cached_tokens`:
+
+| Engine | Reports cache hits |
+|---|---|
+| llama.cpp | by default |
+| vLLM | with `--enable-prompt-tokens-details` |
+| SGLang | with `--enable-cache-report` |
+
+Without it every prompt token is billed at the input price, so set the flag
+(for substrate: `lmx model load … --engine vllm --server-args
+'["--enable-prompt-tokens-details"]'`) if your listing advertises a cached price.
+Media must be sent inline (`data:` URLs); remote media URLs are refused.
+
 ## Model reports
 
 Agents and users edit the same standardized GitHub Flavored Markdown document. Fetch the live machine-readable contract, generate a template, and create a private draft for browser review:
@@ -926,6 +1028,108 @@ lmx eval suite resubmit <submission-id> \
 
 The lower-level `eval suite init`, `import`, `validate`, `audit`, `check`, and
 `submit` commands remain available for authors who need full control.
+
+## Rental relay (deployment)
+
+`cmd/lmx-relay` is the transport between the site and `lmx rent host` agents.
+It listens on two ports:
+
+- **public** `LMX_RELAY_ADDR` (default `:8080`): only `GET /relay/v1/agent`
+  (WebSocket, subprotocol `lmx-relay.v1`, yamux streams) and `GET /healthz`;
+- **internal** `LMX_RELAY_INTERNAL_ADDR` (default `:8081`): only
+  `/internal/forward`, `/internal/agents?listing=` and
+  `/internal/agents/revoke` (`{"ownerId":...}` or `{"apiKeyHash":"<sha256 hex
+  of the bhk_ key>"}`), called by the site with
+  `Authorization: Bearer $RELAY_INTERNAL_SECRET`.
+
+The relay authorizes agents with the site's
+`/api/internal/relay/authorize` using `Authorization: Bearer
+$RELAY_AUTHORIZE_SECRET`. It keeps agents in memory (no database),
+re-authorizes each agent every 5 minutes (three failed attempts in a row
+disconnect it; it reconnects once the site answers) and drains on SIGTERM.
+Relay errors carry `X-Lmx-Relay-Error: <code>`; agent response headers are
+never passed on except a normalized `Content-Type` (`application/json` or
+`text/event-stream; charset=utf-8`). Agent responses are capped at 64 KiB / 100
+header fields, 32 MiB (JSON) and 256 MiB (event streams). A response whose
+body does not reach its end (agent failure, size cap, renter gone) is aborted,
+never ended cleanly. Requests go to the least-loaded agent below its advertised
+`--max-concurrency`; when every agent of a listing is full the relay answers
+503 `no_agent`. An agent that sends anything on a request stream after its
+response is disconnected, and a closed request stream is freed after 5
+seconds even if the agent never closes its side. Keys and accounts revoked
+through `/internal/agents/revoke` are remembered for 10 minutes, so an agent
+whose authorization was already in flight is refused (`revoked`) instead of
+registering.
+
+| Variable | Meaning |
+| --- | --- |
+| `LMX_RELAY_ADDR` | public listen address (default `:8080`) |
+| `LMX_RELAY_INTERNAL_ADDR` | internal listen address (default `:8081`) |
+| `RELAY_INTERNAL_SECRET` | site → relay bearer (required) |
+| `RELAY_AUTHORIZE_SECRET` | relay → site bearer (required) |
+| `LMX_SITE_URL` | site origin for `/api/internal/relay/authorize` (required) |
+| `LMX_RELAY_MAX_HANDSHAKES` | unauthenticated agent connections, from the upgrade until the agent registers or is refused; the control stream and hello must arrive within 5 seconds (default 256) |
+| `LMX_RELAY_MAX_HANDSHAKES_PER_IP` | unauthenticated agent connections per client IPv4 address or IPv6 /64 (default 2) |
+| `LMX_RELAY_MAX_AGENTS` | registered agents (default 2000) |
+| `LMX_RELAY_MAX_AGENTS_PER_IP` | agent connections per client IPv4 address or IPv6 /64, handshakes included (default 20) |
+| `LMX_RELAY_MAX_AGENTS_PER_KEY` | registered agents per API key (default 8) |
+| `LMX_RELAY_MAX_AGENTS_PER_OWNER` | registered agents per account (default 32) |
+| `LMX_RELAY_CLIENT_IP_HEADER` | header holding the client address when a CDN sits in front of the proxy, e.g. `CF-Connecting-IP` (default unset: rightmost `X-Forwarded-For`) |
+| `LMX_RELAY_DRAIN_SECONDS` | SIGTERM grace for in-flight requests (default 60) |
+
+Both secrets must be at least 32 characters and not a placeholder; the relay
+refuses to start otherwise. Generate each with `openssl rand -hex 32` and set
+the same values on the site. Requests that are not a valid WebSocket upgrade
+(GET, `Connection: Upgrade`, `Upgrade: websocket`, version 13, a valid key,
+subprotocol `lmx-relay.v1`) and over-limit agent connections are refused
+before the upgrade; each client address (IPv6: /64) may also start at most 10
+connections per minute (each one authorizes with the site); the rate limit
+tracks at most 100,000 addresses and forgets the least recently seen one when
+full. The client
+address is the TCP peer, or, when the peer is a private/loopback address (the
+reverse proxy), `LMX_RELAY_CLIENT_IP_HEADER` if set and valid, else the
+rightmost `X-Forwarded-For` entry.
+
+```bash
+docker build -f cmd/lmx-relay/Dockerfile -t lmx-relay .
+docker run -d --name lmx-relay --network <site network> \
+  -e RELAY_INTERNAL_SECRET=... -e RELAY_AUTHORIZE_SECRET=... \
+  -e LMX_SITE_URL=http://site:3000 lmx-relay
+```
+
+Do not publish either port with `-p`. Route only port 8080 through Traefik
+(Docker labels; no path stripping, WebSockets pass through):
+
+```yaml
+labels:
+  - traefik.http.routers.lmx-relay.rule=Host(`www.localmaxxing.com`) && PathPrefix(`/relay`)
+  - traefik.http.services.lmx-relay.loadbalancer.server.port=8080
+```
+
+Traefik appends the address it received the connection from to
+`X-Forwarded-For`, which is right when clients connect to Traefik directly. If
+Cloudflare (or another CDN) proxies the hostname, that address is a CDN edge
+shared by many hosts, so every agent behind one edge would share the per-IP
+limits. Set `LMX_RELAY_CLIENT_IP_HEADER=CF-Connecting-IP` then, and only accept
+origin traffic from Cloudflare (Cloudflare overwrites that header, but a client
+reaching Traefik directly could forge it):
+
+```bash
+docker run ... -e LMX_RELAY_CLIENT_IP_HEADER=CF-Connecting-IP lmx-relay
+```
+
+The site reaches the internal port over the private Docker network:
+`RELAY_INTERNAL_URL=http://lmx-relay:8081`. Run one relay instance: agents and
+forwards must meet in the same process.
+
+Local end to end (`ws://` is accepted for localhost only):
+
+```bash
+export RELAY_INTERNAL_SECRET=$(openssl rand -hex 32) RELAY_AUTHORIZE_SECRET=$(openssl rand -hex 32)
+LMX_SITE_URL=http://localhost:3000 go run ./cmd/lmx-relay
+lmx rent host <listingId> --api-url http://localhost:3000 --relay-url ws://localhost:8080/relay/v1/agent
+lmx rent connect <listingId> --api-url http://localhost:3000 --port 8001
+```
 
 ## Development
 

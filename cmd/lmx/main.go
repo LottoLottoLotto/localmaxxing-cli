@@ -59,6 +59,7 @@ type cliArgs struct {
 	flags        map[string]bool
 	provided     map[string]bool
 	setValues    []string
+	repeated     map[string][]string // every value of each option, in order (for repeatable options)
 	jsonPrinted  *bool
 	jsonFallback *any
 }
@@ -291,6 +292,8 @@ func runWithArgs(args cliArgs) error {
 		return handleProfile(positional(args, 1), positional(args, 2), args)
 	case "engines", "engine":
 		return handleEngines(args)
+	case "rent":
+		return handleRent(positional(args, 1), args)
 	case "gateway":
 		return handleGateway(positional(args, 1), args)
 	case "server":
@@ -343,7 +346,7 @@ func runWithArgs(args cliArgs) error {
 
 func knownTopLevel(cmd string) bool {
 	switch cmd {
-	case "eval", "speed-test", "report", "auth", "hardware", "setups", "context", "calculate", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "skill", "update", "version", "commands", "gateway":
+	case "eval", "speed-test", "report", "auth", "hardware", "setups", "context", "calculate", "model", "profile", "engines", "engine", "server", "endpoint", "kvcache", "skill", "update", "version", "commands", "gateway", "rent":
 		return true
 	default:
 		return false
@@ -359,7 +362,7 @@ func isBooleanOption(key string) bool {
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
 		"save-run", "key-stdin", "token-stdin", "no-hf-cache", "service", "no-gateway", "forget", "draft", "strict", "no-upload-datasets", "upload-datasets",
-		"skip-oracle", "remote", "skip-oversize", "run-burst", "skip-prefill", "standalone-prefill":
+		"skip-oracle", "remote", "skip-oversize", "run-burst", "skip-prefill", "standalone-prefill", "mine":
 		return true
 	default:
 		return false
@@ -369,7 +372,7 @@ func isBooleanOption(key string) bool {
 func parseArgs(argv []string) cliArgs {
 	printed := false
 	var fallback any
-	args := cliArgs{opts: map[string]string{}, flags: map[string]bool{}, provided: map[string]bool{}, jsonPrinted: &printed, jsonFallback: &fallback}
+	args := cliArgs{opts: map[string]string{}, flags: map[string]bool{}, provided: map[string]bool{}, repeated: map[string][]string{}, jsonPrinted: &printed, jsonFallback: &fallback}
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
 		if !strings.HasPrefix(arg, "--") {
@@ -383,6 +386,7 @@ func parseArgs(argv []string) cliArgs {
 				args.setValues = append(args.setValues, key[eq+1:])
 			} else {
 				args.opts[key[:eq]] = key[eq+1:]
+				args.repeated[key[:eq]] = append(args.repeated[key[:eq]], key[eq+1:])
 			}
 			continue
 		}
@@ -403,6 +407,7 @@ func parseArgs(argv []string) cliArgs {
 			args.setValues = append(args.setValues, argv[i+1])
 		} else {
 			args.opts[key] = argv[i+1]
+			args.repeated[key] = append(args.repeated[key], argv[i+1])
 		}
 		i++
 	}
@@ -12128,6 +12133,11 @@ var usageExamples = []string{
 	`lmx model unload qwen3-0.6b`,
 	`lmx speed-test run --mode remote --hf-id Qwen/Qwen3-0.6B --quantization BF16 --hardware hardware.json   (through the gateway)`,
 	`lmx gateway stop`,
+	`lmx rent list`,
+	`lmx rent list --mine --json`,
+	`lmx rent host <listingId>`,
+	`lmx rent host <listingId> <listingId2> --target http://127.0.0.1:8000 --model Qwen/Qwen3-8B --max-concurrency 4`,
+	`lmx rent connect <listingId> --port 8000`,
 	`lmx eval storage upload traces.jsonl --kind artifact --format jsonl --out artifact-bundle.json`,
 	`lmx eval storage download <storageKey> --out traces.jsonl`,
 	`lmx eval lm-eval <approved-suite-slug> --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run`,
@@ -12388,6 +12398,11 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --substrate-bin <path>   substrate executable (LMX_SUBSTRATE_BIN; default: PATH)
   --service                lmx gateway start: install and start substrate's systemd user service
   --no-gateway             Do not route an endpoint command through the running gateway when --base-url is omitted
+  --target <url>           lmx rent host: local OpenAI-compatible server to serve rentals from (default: the substrate gateway; without --model, rents out only its running models)
+  --relay-url <wss-url>    lmx rent host: relay WebSocket URL (LMX_RELAY_URL; default: wss://<api-url host>/relay/v1/agent; ws:// only for localhost)
+  --target-key <key>       lmx rent host: bearer sent with renter requests to --target (LMX_RENT_TARGET_KEY; SUBSTRATE_API_KEY is used only to discover models)
+  --rental-token <token>   lmx rent connect: send as x-rental-token on every rental request
+  --mine                   lmx rent list: list your own listings (all statuses; needs your API key)
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
   --hardware <path>        JSON hardware object required when submitting
   --quantization <label>   Quantization label (auto-detected from the endpoint for remote speed-test and eval-shard runs when omitted)
@@ -12466,6 +12481,10 @@ var commandDescriptions = map[string]string{
 	"skill install":           "Write the bundled skill files into a skills directory (default .claude/skills).",
 	"model":                   "List, show, download, load and unload local models; search or resolve HuggingFace model IDs.",
 	"gateway":                 "Run the substrate gateway: one OpenAI/Anthropic-compatible endpoint that routes requests to every loaded model by name.",
+	"rent":                    "Rent out local inference (host, needs Pro) or use a rented listing locally (connect, needs credits).",
+	"rent host":               "Serve your listings from this machine through the LocalMaxxing relay over one outbound connection.",
+	"rent connect":            "Expose a rented listing as a local OpenAI-compatible base URL using your API key.",
+	"rent list":               "List public rental listings, or your own with --mine.",
 	"model search":            "Search LocalMaxxing model records.",
 	"model resolve-remote":    "Resolve a remote endpoint alias to likely HF candidates.",
 	"eval":                    "Discover, run, and submit evaluation suites.",
@@ -12557,6 +12576,7 @@ Command groups:
   profile     Manage reusable defaults
   server      Build or run model server commands
   setups      Pull saved hardware setups
+  rent        Host rentals from this machine or connect to a rented listing
   skill       Print or install the embedded agent skill
   update      Update the installed release
 

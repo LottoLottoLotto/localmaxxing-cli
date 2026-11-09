@@ -265,9 +265,9 @@ func commandAuthentication(name string) string {
 	switch {
 	case strings.HasPrefix(name, "report create"), strings.HasPrefix(name, "report edit"), strings.HasPrefix(name, "report image"), strings.HasPrefix(name, "report publish"), strings.HasPrefix(name, "report unpublish"), strings.HasPrefix(name, "report delete"):
 		return "required"
-	case strings.HasPrefix(name, "auth keys"), strings.Contains(name, "submit"), name == "setups", strings.HasPrefix(name, "setups "):
+	case strings.HasPrefix(name, "auth keys"), strings.Contains(name, "submit"), name == "setups", strings.HasPrefix(name, "setups "), name == "rent host", name == "rent connect":
 		return "required"
-	case name == "auth", name == "report", name == "report list", name == "report show", name == "eval lm-eval":
+	case name == "auth", name == "report", name == "report list", name == "report show", name == "eval lm-eval", name == "rent", name == "rent list":
 		return "optional"
 	default:
 		return "none"
@@ -290,6 +290,12 @@ func commandSideEffects(name string) []string {
 		return []string{"may execute workloads, write checkpoints, or submit results"}
 	case name == "hardware" || strings.HasPrefix(name, "hardware "):
 		return []string{"may probe host hardware or write metadata"}
+	case name == "rent host":
+		return []string{"holds an outbound relay connection and serves renter requests to the local target (only POST /v1/chat/completions, /v1/completions, /v1/embeddings and GET /v1/models, advertised models only) until Ctrl-C, which drains in-flight requests"}
+	case name == "rent connect":
+		return []string{"listens on a local port (loopback by default) and forwards POST /v1/chat/completions, /v1/completions, /v1/embeddings and GET /v1/models to the rental proxy with your API key; refuses other Host headers and browser (Origin) requests; renter requests spend credits"}
+	case name == "rent list":
+		return []string{"performs a read-only network request"}
 	case name == "context":
 		return []string{"performs a read-only network request"}
 	default:
