@@ -435,6 +435,31 @@ func TestHandleEvalShardSubmitsPassFail(t *testing.T) {
 	}
 }
 
+func TestHandleEvalShardDryRunNeverSubmits(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LMX_API_KEY", "")
+	rows := []map[string]any{{"question_id": "gsm8k:1", "input": "5 + 5?", "gold": "10"}}
+	var posted map[string]any
+	srv := shardTestServer(t, rows, "The final answer is 10.", &posted)
+	defer srv.Close()
+	hwFile := filepath.Join(t.TempDir(), "hardware.json")
+	writeJSON(hwFile, map[string]any{"hwClass": "DISCRETE_GPU", "gpuName": "RTX 3090", "gpuCount": 1, "vramGb": 24})
+	args := cliArgs{
+		opts:  map[string]string{"api-url": srv.URL, "base-url": srv.URL, "model": "Qwen/Qwen3-8B", "questions": "1", "hardware": hwFile, "api-key": "bhk_test"},
+		flags: map[string]bool{"quiet": true, "submit": true, "dry-run": true},
+	}
+	if err := handleEvalShard("gsm8k", args); err != nil {
+		t.Fatalf("handleEvalShard --submit --dry-run: %v", err)
+	}
+	if posted != nil {
+		t.Fatal("--dry-run uploaded results")
+	}
+	delete(args.opts, "api-key")
+	if err := handleEvalShard("gsm8k", args); err == nil {
+		t.Fatal("a submission preflight without an API key passed")
+	}
+}
+
 func TestHandleEvalShardRejectsCoveredShardWithoutRerun(t *testing.T) {
 	rows := []map[string]any{{"question_id": "gsm8k:1", "input": "5 + 5?", "gold": "10"}}
 	var blob strings.Builder

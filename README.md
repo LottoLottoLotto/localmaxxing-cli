@@ -246,6 +246,51 @@ printed every 10 seconds. An interrupted download keeps `<file>.part` plus a
 range is retried up to 3 times before the run stops. `--download-connections 1`
 uses one stream per file.
 
+`--source pirateface` downloads from the [Pirate Face](https://pirateface.co)
+BitTorrent swarm instead, for models Pirate Face lists:
+
+```bash
+lmx model snapshot Qwen/Qwen3-0.6B --source pirateface --yes
+```
+
+lmx looks the repository up on Pirate Face, downloads its pinned revision unless
+`--revision` is given, and fetches the selected files from peers with a built-in
+torrent client. Every file is then checked against Hugging Face's own hash (LFS
+SHA256 or Git blob hash), exactly like a Hugging Face download; a file that fails,
+is missing from the torrent, or is not delivered because the swarm stalls for
+30 seconds comes from Hugging Face. Unlisted models download from Hugging Face.
+lmx uploads nothing unless asked: by default it only downloads (peers can still
+see your IP address, as with any torrent client), stops when the command ends, and
+never asks your router to open ports. Swarm progress lives in
+`<models-dir>/torrents/` until the command finishes, so an interrupted download
+resumes. `--pirateface-url` / `LMX_PIRATEFACE_URL` override the Pirate Face address.
+
+Torrent settings, for downloads and seeding:
+
+| Option | Effect |
+|---|---|
+| `--upload` | Share pieces with other peers while downloading |
+| `--seed-ratio R` | After the download, keep seeding until you uploaded R × the model's size |
+| `--seed-time 2h` | After the download, keep seeding for this long (with `--seed-ratio`, whichever comes first) |
+| `--upload-limit 5MB` / `--download-limit 20MB` | Rate caps per second (`KB`, `MB`, `GB`, `KiB`, `MiB`, `GiB`; default unlimited) |
+| `--listen-port N` | Fixed listening port (default random); forward it yourself for better connectivity |
+| `--no-dht` | Find peers through trackers only |
+
+Seed models you already downloaded, straight from the model store (no second copy;
+the files are checked against the torrent first and never written to):
+
+```bash
+lmx model seed Qwen/Qwen3-0.6B --upload-limit 5MB --seed-time 2h   # foreground; Ctrl-C stops
+lmx model seed --all --detach --upload-limit 2MB                    # every listed snapshot, in the background
+lmx model seeding                                                   # what is seeding, peers, uploaded, ratio
+lmx model unseed all                                                # stop (or --all)
+```
+
+`model seed` takes a snapshot ID or repository and seeds snapshots Pirate Face lists
+at the same revision. Without `--seed-ratio` / `--seed-time` it runs until stopped.
+Torrent metadata is cached in `<models-dir>/torrent-meta/` after a download, so
+seeding works even when no other peer is online.
+
 Storage precedence is `--models-dir`, `LMX_MODELS_DIR`,
 `$XDG_DATA_HOME/localmaxxing/models`, then `~/.local/share/localmaxxing/models`.
 Existing exact-revision HuggingFace cache files are verified and reused without
@@ -495,7 +540,7 @@ The API, CLI, and web editor all use `contentFormat: "gfm"` and format version `
 
 ## Speed tests
 
-### Remote Endpoint (FreeToken, NInfer, Strata, vLLM, SGLang, Ollama, custom OpenAI-compatible)
+### Remote Endpoint (FreeToken, NInfer, Strata, Actual e, vLLM, SGLang, Ollama, custom OpenAI-compatible)
 
 ```bash
 lmx speed-test run vllm \
@@ -528,6 +573,14 @@ lmx speed-test run freetoken \
 ```bash
 lmx speed-test run strata --mode remote --base-url http://127.0.0.1:8080/v1 \
   --hf-id Qwen/Qwen3.8-Flash-Next --quantization IQ2_XS --hardware hardware.json
+```
+
+[Actual Computer](https://actual.inc)'s engine **e** (engine name `e`; `actual` also works) serves an OpenAI-compatible API on the address in `actual status --format json` → `api.url`, normally `http://127.0.0.1:8080`. Its model ids are display names, so pass the loaded model's `selector` from `/v1/models` (or `actual models list`) as `--served-model`, and the release you ran as `--engine-version` (`actual --version`):
+
+```bash
+lmx speed-test run e --mode remote --base-url http://127.0.0.1:8080 \
+  --served-model mdl_a81e2d366803a648 --hf-id google/gemma-4-12b-it --quantization Q4_K_M \
+  --engine-version <actual --version> --hardware hardware.json
 ```
 
 `freetoken`, `ninfer` and `strata` default `--engine-repository` to their canonical GitHub repositories. For Strata, lmx also reads the engine version from the server's `/props` (`build_info: "Strata 0.1.44"`) when `--engine-version` is not given. Override it for forks or mirrors. `--engine-version`, `--engine-repository`, `--engine-build`, and `--engine-commit` are saved with the run and forwarded by later dry-run/submission commands.
@@ -593,6 +646,8 @@ lmx speed-test submit speed-test.json
 ```
 
 Use `--out <path>` to set the output file, `--json-status` for machine-readable progress, and `--quiet` to suppress output.
+
+Submissions record the client as `submittedWith` (for example `lmx v0.1.56 speed-test submit`). When the launch command names a GGUF file (`-m`, `--model`, `--hf-file`) or an `-hf` repository, localmaxxing.com checks it belongs to the submitted `--hf-id` repository or is the same model; otherwise the run is stored as suspicious and hidden from leaderboards. `dry-run` reports it first as `modelFile: would be stored as suspicious: …`, and `submit` prints the reason under `review:`. Resubmit under the repository that contains the file.
 
 Local speed-test commands run without a time limit by default; pass `--command-timeout-seconds <n>` to abort hung runs.
 
@@ -779,18 +834,27 @@ included in TTFT. No prefill rate is reported for a fully cached prompt.
 
 ## Evals
 
-Discover approved shard datasets first:
+One command runs any approved LocalMaxxing dataset and publishes it:
 
 ```bash
-lmx eval dataset list
-lmx eval dataset show hellaswag
-lmx eval shard hellaswag --base-url http://localhost:8000 --questions 3 --dry-run
+lmx eval coverage --model Qwen/Qwen3-8B --quantization Q4_K_M --quant-format gguf   # what is covered, what to run next
+lmx eval run terminal-bench-4-0 --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --submit
+lmx eval run gsm8k --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --missing-only --submit
+lmx eval runs                                  # local terminal runs and their state
+lmx eval terminal submit <run-dir>             # publish a completed run made without --submit
 ```
 
-Shard datasets and registered suites are separate catalogs. HellaSwag and GSM8K
-use `eval shard`, not `eval run` or `eval lm-eval`. An empty `eval suite list`
-does not mean evals are unavailable. Terminal datasets use `eval terminal`.
-The suite examples below require an approved suite on the selected API instance.
+`eval run` sends Terminal-Bench and CRUDBench to the terminal runner and question
+sets (GSM8K, HellaSwag, ARC, HumanEval+, MBPP+) to `eval shard`. For a local
+endpoint it detects the hardware (pass `--backend cuda|rocm|tt-metal` when the
+machine has more than one accelerator stack; `--hardware hardware.json` for a
+remote one) and the quantization. Terminal runs are kept under
+`runs/evals/<dataset>/` and resume where they stopped. `--submit --dry-run`
+never uploads.
+
+Shard datasets and registered suites are separate catalogs; an empty
+`eval suite list` does not mean evals are unavailable. The suite examples below
+require an approved suite on the selected API instance.
 
 ### Run a custom suite against a local endpoint
 

@@ -324,7 +324,22 @@ func runWithArgs(args cliArgs) error {
 		case "lm-eval":
 			return handleLmEval(positional(args, 2), args)
 		case "run":
+			// Approved datasets (Terminal-Bench, CRUDBench, GSM8K, ...) run with the runner they need;
+			// anything else is a registered suite.
+			if slug := positional(args, 2); slug != "" {
+				d, ok, err := datasetBySlug(args, slug)
+				if err != nil {
+					return err
+				}
+				if ok {
+					return runEvalDataset(d, args)
+				}
+			}
 			return handleEvalRun(positional(args, 2), args)
+		case "coverage":
+			return handleEvalCoverage(args)
+		case "runs":
+			return handleEvalRuns(args)
 		case "pull":
 			return handleEvalPull(positional(args, 2), args)
 		case "submit":
@@ -358,11 +373,11 @@ func isBooleanOption(key string) bool {
 	case "help", "json-status", "dry-run", "quiet", "logout", "no-browser", "default",
 		"submit", "print", "json", "verbose", "yes", "force", "rerun",
 		"include-server-metadata", "enable-prefix-caching", "flash-attn", "no-flash-attn",
-		"no-stream", "missing-only", "all-missing", "cleanup-images", "native-tools", "oracle",
+		"no-stream", "missing-only", "all-missing", "keep-images", "native-tools", "oracle",
 		"detach", "detached-child", "follow", "execute", "allow-benchmark-training",
 		"sandbox-use-sudo", "sandbox-relaxed-security", "version", "all", "compact",
 		"save-run", "key-stdin", "token-stdin", "no-hf-cache", "service", "no-gateway", "forget", "draft", "strict", "no-upload-datasets", "upload-datasets",
-		"skip-oracle", "remote", "skip-oversize", "run-burst", "skip-prefill", "standalone-prefill", "mine":
+		"skip-oracle", "remote", "skip-oversize", "run-burst", "skip-prefill", "standalone-prefill", "mine", "upload", "no-dht":
 		return true
 	default:
 		return false
@@ -1901,25 +1916,33 @@ func runLongCommand(commandSnippet string) error {
 }
 
 func detectHardware(args cliArgs) map[string]any {
-	base := map[string]any{"hwClass": "CPU_ONLY", "cpu": detectCPU(), "os": runtime.GOOS, "cpuThreads": runtime.NumCPU()}
+	base := map[string]any{"hwClass": "CPU_ONLY", "cpu": detectCPU(), "os": hostOSName(), "cpuThreads": runtime.NumCPU()}
+	if gb := hostRAMGb(); gb > 0 {
+		base["ramGb"] = gb
+	}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		base["hwClass"] = "UNIFIED"
 		base["chipVendor"] = "Apple"
 		applyAppleHardware(base)
 	}
-	preferTenstorrent := strings.EqualFold(opt(args, "backend"), "tt-metal")
-	if preferTenstorrent {
+	tenstorrent := func() {
+		if applyTenstorrentBoards(base, sysfsTenstorrentBoards()) {
+			return
+		}
 		if out, err := exec.Command("tt-smi", "-s").Output(); err == nil {
 			applyTenstorrentSMIHardware(base, string(out))
 		}
+	}
+	if strings.EqualFold(opt(args, "backend"), "tt-metal") {
+		tenstorrent()
 		return base
 	}
 	if out, err := exec.Command("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits").Output(); err == nil {
 		applyNvidiaSMIHardware(base, string(out))
 	} else if out, err := exec.Command("rocm-smi", "--showproductname", "--showmeminfo", "vram", "--csv").Output(); err == nil {
 		applyRocmSMIHardware(base, string(out))
-	} else if out, err := exec.Command("tt-smi", "-s").Output(); err == nil {
-		applyTenstorrentSMIHardware(base, string(out))
+	} else {
+		tenstorrent()
 	}
 	return base
 }
@@ -2053,22 +2076,11 @@ func applyTenstorrentSMIHardware(base map[string]any, output string) bool {
 	if err := json.Unmarshal([]byte(output), &telemetry); err != nil {
 		return false
 	}
-	count := 0
+	types := make([]string, 0, len(telemetry.DeviceInfo))
 	for _, device := range telemetry.DeviceInfo {
-		switch strings.ToLower(strings.TrimSpace(device.BoardInfo.BoardType)) {
-		case "p150", "p150a":
-			count++
-		}
+		types = append(types, device.BoardInfo.BoardType)
 	}
-	if count == 0 {
-		return false
-	}
-	base["hwClass"] = "DISCRETE_GPU"
-	base["gpuName"] = "Tenstorrent P150"
-	base["gpuCount"] = count
-	base["vramGb"] = 32.0
-	base["totalVramGb"] = 32.0 * float64(count)
-	return true
+	return applyTenstorrentBoards(base, types)
 }
 
 func round1(n float64) float64 { return math.Round(n*10) / 10 }
@@ -2130,12 +2142,18 @@ func handleModel(action, target string, args cliArgs) error {
 		return handleModelSnapshot(target, args)
 	case "snapshots":
 		return handleModelSnapshots(target, positional(args, 3), args)
+	case "seed":
+		return handleModelSeed(target, args)
+	case "seeding":
+		return handleModelSeeding(args)
+	case "unseed":
+		return handleModelUnseed(target, args)
 	case "verify":
 		return handleModelVerify(target, args)
 	case "remove":
 		return handleModelRemove(target, args)
 	default:
-		return errors.New("Unknown model command. Use list, show, load, unload, loaded, logs, pull, snapshot, snapshots, import, verify, remove, search, or resolve-remote.")
+		return errors.New("Unknown model command. Use list, show, load, unload, loaded, logs, pull, snapshot, snapshots, seed, seeding, unseed, import, verify, remove, search, or resolve-remote.")
 	}
 }
 
@@ -2713,6 +2731,7 @@ func handleBenchmark(action, target string, args cliArgs) error {
 				return err
 			}
 			apiPayload := toBenchmarkSubmit(payload)
+			setSubmittedWith(apiPayload, "speed-test run")
 			return submitPayload(endpoint, hasFlag(args, "dry-run"), "speed_test", args, apiPayload, firstNonEmpty(out, runPath))
 		}
 		if humanOutput(args) {
@@ -2751,7 +2770,16 @@ func handleBenchmark(action, target string, args cliArgs) error {
 		endpoint = "/api/speed-tests/dry-run"
 	}
 	apiPayload := toBenchmarkSubmit(payload)
+	setSubmittedWith(apiPayload, "speed-test "+action)
 	return submitPayload(endpoint, action == "dry-run", "speed_test", args, apiPayload, target)
+}
+
+// setSubmittedWith records the client on the run ("lmx v0.1.56 speed-test run"), unless the
+// payload already names the tool that produced it.
+func setSubmittedWith(payload map[string]any, command string) {
+	if stringValue(payload["submittedWith"]) == "" {
+		payload["submittedWith"] = "lmx " + version + " " + command
+	}
 }
 
 func handleBenchmarkSubmissions(action, runID string, args cliArgs) error {
@@ -5336,7 +5364,7 @@ func toBenchmarkSubmit(payload map[string]any) map[string]any {
 		"contextLength", "batchSize",
 		"ttftMs", "tokSOut", "tokSPrefill", "tokSTotal",
 		"peakVramGb", "gpuPowerWatts", "hardwareCost", "prefillTokens", "notes",
-		"promptSha256", "promptSample", "outputSha256", "outputSample", "engineTimingsRaw",
+		"promptSha256", "promptSample", "outputSha256", "outputSample", "engineTimingsRaw", "submittedWith",
 	} {
 		if v, ok := payload[key]; ok && (submitValuePresent(v) || (v != nil && (key == "promptTokens" || key == "outputTokens" || key == "prefillTokens"))) {
 			out[key] = v
@@ -6454,6 +6482,16 @@ func decodeThroughput(probe chatProbe, outputTokens int) (float64, string, bool)
 func remoteSpeedTestPrompt(args cliArgs) (string, string, error) {
 	inline := opt(args, "prompt")
 	path := opt(args, "prompt-file")
+	if canonicalID := opt(args, "canonical-prompt"); canonicalID != "" {
+		if inline != "" || path != "" || opt(args, "prompt-tokens") != "" {
+			return "", "", cliError{"invalid_option", "--canonical-prompt cannot be combined with --prompt, --prompt-file, or --prompt-tokens", []string{"Verified runs must use the canonical prompt text unchanged; drop the other prompt options."}, nil}
+		}
+		prompt, err := resolveCanonicalPrompt(args, canonicalID)
+		if err != nil {
+			return "", "", err
+		}
+		return prompt.Text, "canonical:" + prompt.ID, nil
+	}
 	if inline != "" && path != "" {
 		return "", "", cliError{"invalid_option", "--prompt and --prompt-file cannot be used together", []string{"Pass prompt text with --prompt or load it with --prompt-file, not both."}, nil}
 	}
@@ -6606,6 +6644,10 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	promptTokenSource := ""
 	outputTokenSource := ""
 	outputText := ""
+	lastRequestPrompt := ""
+	var lastUsage, lastTimings map[string]any
+	llamaSpec := specMetrics{}
+	specBefore, haveSpecBefore := scrapeSpecMetrics(baseURL, opt(args, "model-api-key"))
 	decodeSource := ""
 	samples := make([]map[string]any, 0, iterations*concurrency)
 	ttftValues := []float64{}
@@ -6666,6 +6708,10 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 			groupOutputTokens += outputTokens
 			outputTokenSource = outputResult.Source
 			outputText = probe.outputText
+			lastRequestPrompt = requestPrompts[requestIndex]
+			lastUsage = probe.usage
+			lastTimings = probe.timings
+			llamaSpec.addLlamaTimings(probe.timings)
 			sample := map[string]any{"iteration": i + 1, "request": requestIndex + 1, "promptTokens": float64(samplePromptTokens), "outputTokens": float64(outputTokens)}
 			outputTokenValues = append(outputTokenValues, float64(outputTokens))
 			if value, source, ok := decodeThroughput(probe, outputTokens); ok {
@@ -6709,17 +6755,34 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	}
 	promptTokens := medianOf(promptTokenValues)
 	printStatus(args, "token_count_source", map[string]any{"prompt": promptTokenSource, "output": outputTokenSource, "promptTokens": promptTokens})
+	engineFlags := map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": concurrency, "promptSource": promptSource, "promptFile": opt(args, "prompt-file"), "prefixCacheBust": "leading_nonce_per_request"}
+	if id := opt(args, "canonical-prompt"); id != "" {
+		engineFlags["canonicalPromptId"] = id
+	}
+	// Draft counters are reported per request, like outputTokens (the median request): the server checks
+	// specAcceptedTokens + specDraftTokens / specNumTokens against outputTokens.
+	measured := iterations * concurrency
+	if llamaSpec.hasCounters {
+		applySpecMetrics(engineFlags, llamaSpec.perRequest(measured))
+	} else if specAfter, ok := scrapeSpecMetrics(baseURL, opt(args, "model-api-key")); ok {
+		if haveSpecBefore {
+			applySpecMetrics(engineFlags, specMetricsDelta(specBefore, specAfter).perRequest(measured))
+		} else {
+			applySpecMetrics(engineFlags, specAfter.gaugesOnly())
+		}
+	}
 	metrics := map[string]any{
 		"prompt":       prompt,
 		"outputText":   outputText,
 		"promptTokens": promptTokens,
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "servedModelSource": servedModelSource, "stream": stream, "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": concurrency, "promptSource": promptSource, "promptFile": opt(args, "prompt-file"), "prefixCacheBust": "leading_nonce_per_request"},
+		"engineFlags":  engineFlags,
 		"tokenSources": map[string]any{"prompt": promptTokenSource, "output": outputTokenSource},
 		"timingSource": "client_observed_http",
 		"metricSource": "remote_endpoint",
 		"ttftSource":   "unavailable_no_stream",
 		"batchSize":    float64(concurrency),
 	}
+	addRunEvidence(metrics, prompt, lastRequestPrompt, outputText, mergeEngineTimings(map[string]any{"usage": lastUsage, "timings": lastTimings}))
 	if contextLength := firstJSONNumber(servedModelInfo, "max_model_len", "maxModelLen", "context_length", "contextLength", "context_window", "contextWindow", "num_ctx", "numCtx"); contextLength > 0 {
 		metrics["contextLength"] = contextLength
 	}
@@ -6819,6 +6882,7 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	ttftValues := []float64{}
 	samples := make([]map[string]any, 0, iterations)
 	outputText := ""
+	var lastTimings map[string]any
 	for i := 0; i < iterations; i++ {
 		response, elapsed, err := ollamaGenerate(args, baseURL, body, timeout)
 		if err != nil {
@@ -6863,18 +6927,29 @@ func measureOllamaEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 			ttftValues = append(ttftValues, value)
 		}
 		samples = append(samples, sample)
+		lastTimings = map[string]any{}
+		for _, key := range []string{"eval_count", "eval_duration", "prompt_eval_count", "prompt_eval_duration", "total_duration", "load_duration"} {
+			if value, ok := response[key]; ok && value != nil {
+				lastTimings[key] = value
+			}
+		}
 		printStatus(args, "ollama_iteration_complete", map[string]any{"iteration": i + 1, "iterations": iterations, "tokSOut": sample["tokSOut"], "ttftMs": sample["ttftMs"]})
+	}
+	engineFlags := map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": 1, "promptSource": promptSource, "promptFile": opt(args, "prompt-file")}
+	if id := opt(args, "canonical-prompt"); id != "" {
+		engineFlags["canonicalPromptId"] = id
 	}
 	metrics := map[string]any{
 		"prompt":       prompt,
 		"outputText":   outputText,
-		"engineFlags":  map[string]any{"mode": "remote", "baseUrl": baseURL, "servedModel": servedModel, "nativeApi": "ollama_generate", "maxTokens": maxTokens, "timeoutSeconds": int(timeout.Seconds()), "warmup": warmup, "iterations": iterations, "concurrency": 1, "promptSource": promptSource, "promptFile": opt(args, "prompt-file")},
+		"engineFlags":  engineFlags,
 		"tokenSources": map[string]any{"prompt": "ollama_prompt_eval_count", "output": "ollama_eval_count"},
 		"timingSource": "ollama_native_api",
 		"metricSource": "remote_endpoint",
 		"ttftSource":   "unavailable_ollama_nonstreaming",
 		"batchSize":    float64(1),
 	}
+	addRunEvidence(metrics, prompt, prompt, outputText, mergeEngineTimings(map[string]any{"ollama": lastTimings}))
 	if len(promptTokenValues) > 0 {
 		metrics["promptTokens"] = medianOf(promptTokenValues)
 	}
@@ -7864,6 +7939,8 @@ func normalizeEngineName(value string) string {
 		return "ninfer"
 	case "strata", "strata-engine", "strata engine":
 		return "strata"
+	case "e", "actual", "actual-e", "actual e", "actual-computer", "actual computer":
+		return "e"
 	case "":
 		return ""
 	default:
@@ -8913,7 +8990,21 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		return err
 	}
 	baseURL := openAIBaseURL(rawBaseURL)
-	submit := hasFlag(args, "submit")
+	// --dry-run never uploads, even with --submit: it checks what a submission needs, then runs unsubmitted.
+	submit := hasFlag(args, "submit") && !hasFlag(args, "dry-run")
+	if hasFlag(args, "submit") && hasFlag(args, "dry-run") {
+		if apiKey(args) == "" {
+			return missingAPIKey("--api-key or LMX_API_KEY is required for eval shard --submit")
+		}
+		if opt(args, "model") == "" {
+			return cliError{"missing_model", "eval shard --submit requires --model <HuggingFace model id>", []string{"Pass --model org/name so the submission records a real model."}, nil}
+		}
+		hw, err := resolveEvalHardware(args, baseURL, "")
+		if err != nil {
+			return err
+		}
+		printStatus(args, "eval_shard_submit_preflight", map[string]any{"dataset": dataset, "model": opt(args, "model"), "hardware": asObject(hw)["gpuName"], "submit": "not with --dry-run"})
+	}
 
 	requestedQuestions, err := intOption(args, 0, 1, "questions")
 	if err != nil {
@@ -9065,7 +9156,14 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		tempExplicit:   tempExplicit,
 	}
 
+	var shardHardware any
 	if submit {
+		// Resolved before any question runs, so a missing description never wastes a shard.
+		hw, hwErr := resolveEvalHardware(args, baseURL, "")
+		if hwErr != nil {
+			return hwErr
+		}
+		shardHardware = hw
 		hfIDForCoverage := hfID
 		if hfIDForCoverage != "" {
 			coverageValue, covErr := fetchEvalShardCoverage(dataset, hfIDForCoverage, resolvedQuant, resolvedQuantFormat, args)
@@ -9247,14 +9345,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	if declaredModel == "" {
 		return cliError{"missing_model", "eval shard --submit requires --model <HuggingFace model id>", []string{"Pass --model org/name so the submission records a real model.", "Use lmx model search <name> to find the canonical id."}, nil}
 	}
-	hardwarePath := opt(args, "hardware")
-	if hardwarePath == "" {
-		return cliError{"missing_hardware", "eval shard --submit requires --hardware hardware.json", []string{"Run lmx hardware --out hardware.json and pass --hardware hardware.json."}, nil}
-	}
-	hardware, err := readJSON(hardwarePath)
-	if err != nil {
-		return err
-	}
+	hardware := shardHardware
 	if len(submitResults) == 0 {
 		return cliError{"no_scored_questions", "Every question failed to score, so there is nothing to submit.", []string{"Check that the endpoint is reachable and returns completions.", "Inspect failures with --out results.json."}, nil}
 	}
@@ -11692,6 +11783,9 @@ func submitPayload(endpoint string, dryRun bool, label string, args cliArgs, pay
 		fields["url"] = receipt
 	}
 	printInfo(args, status, fields)
+	if label == "speed_test" {
+		printVerificationResult(args, value)
+	}
 	if dryRun && humanOutput(args) {
 		fmt.Println("Dry-run passed. Submit with:")
 		if label == "speed_test" {
@@ -11712,6 +11806,13 @@ func addBenchmarkReceiptFields(fields map[string]any, value any) {
 		if obj[key] != nil {
 			fields[key] = obj[key]
 		}
+	}
+	if stringValue(obj["status"]) == "SUSPICIOUS" {
+		fields["review"] = "stored as suspicious and hidden from leaderboards: " + stringValue(obj["suspiciousReason"])
+	}
+	// Dry-run: the run would be stored as suspicious because its model file is not in the repository.
+	if modelFile := asObject(obj["modelFile"]); stringValue(modelFile["status"]) == "mismatch" {
+		fields["modelFile"] = "would be stored as suspicious: " + stringValue(modelFile["reason"])
 	}
 }
 
@@ -12073,6 +12174,7 @@ var usageExamples = []string{
 	`lmx server dry-run vllm --hf-id Qwen/Qwen3-8B --quantization fp16`,
 	`lmx server dry-run llama.cpp --model-path model.gguf`,
 	`lmx speed-test run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --dry-run`,
+	`lmx speed-test run vllm --mode remote --base-url http://server:8000 --hf-id Qwen/Qwen3-8B --quantization fp16 --canonical-prompt reasoning-v1`,
 	`lmx speed-test run vllm --mode local --hf-id Qwen/Qwen3-8B --quantization fp16 --bench-kind throughput --benchmark-output vllm.json --dry-run`,
 	`lmx speed-test run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --command "llama-bench -m model.gguf" --dry-run`,
 	`lmx speed-test run llama.cpp --mode local --hf-id Qwen/Qwen3-8B --quantization Q4_K_M --model-path model.gguf --dry-run`,
@@ -12119,7 +12221,12 @@ var usageExamples = []string{
 	`lmx model pull org/model --revision <commit> --file model.gguf --yes`,
 	`lmx model snapshot org/model --revision main --exclude "*.bin,*.h5" --dry-run`,
 	`lmx model snapshot org/model --revision <commit> --yes`,
+	`lmx model snapshot Qwen/Qwen3-0.6B --source pirateface --yes`,
 	`lmx model snapshots list`,
+	`lmx model seed Qwen/Qwen3-0.6B --upload-limit 5MB --seed-time 2h`,
+	`lmx model seed --all --detach --upload-limit 2MB`,
+	`lmx model seeding`,
+	`lmx model unseed all`,
 	`lmx model import /models/model.gguf`,
 	`lmx model verify <id>`,
 	`lmx model remove <id> --yes`,
@@ -12150,6 +12257,11 @@ var usageExamples = []string{
 	`lmx eval suite submissions`,
 	`lmx eval suite resubmit <id> --file my-eval.json`,
 	`lmx eval execute <suiteSlug> --model <hfId> --base-url http://localhost:8000 --hardware hardware.json --submit`,
+	`lmx eval coverage --model Qwen/Qwen3-8B --quantization Q4_K_M --quant-format gguf`,
+	`lmx eval run terminal-bench-4-0 --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --submit`,
+	`lmx eval run gsm8k --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B --missing-only --submit`,
+	`lmx eval runs`,
+	`lmx eval terminal submit runs/evals/terminal-bench-4-0/Qwen-Qwen3-8B-20261028-101500`,
 	`lmx eval shard gsm8k --base-url http://localhost:8000 --questions 200 --dry-run`,
 	`lmx eval shard hellaswag --base-url http://localhost:8000 --questions 200 --dry-run`,
 	`lmx eval shard gsm8k --base-url http://localhost:8000 --model Qwen/Qwen3-8B --hardware hardware.json --submit`,
@@ -12186,7 +12298,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --profile <name>         Load saved defaults from lmx profile save
   --model <hfId>           HuggingFace model ID
   --hf-id <hfId>           Canonical HuggingFace model ID for deferred terminal submit
-  --backend <name>         Speed-test accelerator backend (e.g. cuda, rocm, tt-metal); lm-eval backend for eval lm-eval
+  --backend <name>         Accelerator backend (cuda, rocm, tt-metal): picks the hardware lmx detects for a local endpoint; lm-eval backend for eval lm-eval
   --engine-version <value> Engine release/version used for the speed test
   --engine-repository <url>
                            Source repository used for the speed test; defaults for FreeToken, NInfer and Strata
@@ -12206,7 +12318,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --artifact-limit <n>     Eval-shard traces to submit (0 = all; >0 samples); rejected by terminal submit, which includes every task
   --task-dir <dir>        Terminal eval bundle directory (one bundle or parent of bundles)
   --run-dir <dir>         Durable terminal run checkpoint; writes run.json, atomic per-task results, traces, and final result.json
-  --detach                Launch a terminal run as a durable background worker; requires --run-dir and cannot be combined with --dry-run
+  --detach                Launch a terminal run as a durable background worker (requires --run-dir; not with --dry-run); lmx model seed: keep seeding in the background, see lmx model seeding, stop with lmx model unseed
   --follow                Continue streaming terminal events until the persisted job reaches a terminal state
   --dataset <slug>        Terminal eval dataset slug; required for deferred submit
   --shard-index <n>       Deferred terminal submit: retry only shard N from a full checkpoint, or identify an isolated shard
@@ -12222,7 +12334,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --command-timeout <sec> Terminal per-shell-command timeout (default: 300 seconds, capped by remaining agent time)
   --endpoint-timeout-seconds <n> Terminal model request timeout (default: 600; first attempt reserves retry time)
   --trace-dir <dir>       Save per-terminal-task traces locally: transcript.md, verifier.txt, prompt.txt, result.json, and external agent logs
-  --cleanup-images        Remove locally built terminal task images after each task
+  --keep-images           Keep the terminal task images lmx builds and their build cache (default: both removed after each task)
   --native-tools          Send the built-in shell function to compatible chat endpoints and execute returned tool calls
   --shell-mode <mode>     Terminal eval built-in harness shell: persistent (default, one shared shell) or stateless (fresh shell per command)
   --oracle                Run terminal task solution/solve.sh instead of the model agent
@@ -12253,6 +12365,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --model-api-key <key>    Optional bearer token for the remote speed-test endpoint
   --prompt <text>          Inline prompt for the remote endpoint speed test
   --prompt-file <path>     Read the remote prompt from a file; use - for stdin
+  --canonical-prompt <id>  Measure on a LocalMaxxing canonical prompt (e.g. reasoning-v1) for a Verified run: the prompt text, prompt/output samples and engine timings are captured for server-side verification
   --max-tokens <n>         Max generated tokens (eval shard default: 0 = no cap, let the model finish)
   --endpoint-timeout-seconds <n> Timeout for remote endpoint speed tests (default: 600)
   --warmup <n>             Untimed warmup requests before remote endpoint measurement (default: 1)
@@ -12313,7 +12426,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --spec-draft-tp <n>      Draft model tensor-parallel degree
   --spec-draft-window-size <n>
                            DFlash / DFlash2 draft KV sliding-window size
-  --runs-dir <dir>         Saved speed-test runs directory (default: runs)
+  --runs-dir <dir>         Saved speed-test runs directory, and eval runs under <dir>/evals (default: runs)
   --bench-script <path>    speed-test matrix: local llm_decode_bench.py instead of the pinned download
   --contexts <list>        speed-test matrix: decode context lengths in tokens, k suffix allowed (default: 0,16k,32k,64k,128k)
   --concurrency <list>     speed-test matrix: simultaneous requests per decode cell (default: 1,2,4,8,16,32,64,128)
@@ -12385,6 +12498,15 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --revision <ref>         HuggingFace revision; pull/snapshot resolve it to an exact commit
   --exclude <globs>        Snapshot exclude patterns, comma-separated (with --include)
   --download-connections <n> Parallel HTTP streams for model pull/snapshot (default 8, max 32; 1 = one stream per file)
+  --source <name>          lmx model pull/snapshot: huggingface (default) or pirateface, which downloads from the Pirate Face BitTorrent swarm and checks every file against Hugging Face's hash, falling back to Hugging Face
+  --pirateface-url <url>   Pirate Face base URL for --source pirateface (also LMX_PIRATEFACE_URL; default https://pirateface.co)
+  --upload                 --source pirateface: share pieces with other peers while downloading (off by default)
+  --seed-ratio <r>         pull/snapshot --source pirateface: keep seeding after the download until uploaded = r × model size; lmx model seed: stop there
+  --seed-time <duration>   Same, bounded by time (e.g. 30m, 2h); with both, whichever comes first
+  --upload-limit <rate>    Torrent upload cap, e.g. 5MB or 500KB per second (default unlimited)
+  --download-limit <rate>  Torrent download cap (default unlimited)
+  --listen-port <n>        Torrent listening port (default random); open it yourself for better connectivity
+  --no-dht                 Find torrent peers through trackers only
   --scan-dir <dirs>         lmx model list/show/load: also list model folders under these comma-separated directories (also LMX_MODEL_DIRS)
   --no-hf-cache            lmx model list/show/load: skip the Hugging Face cache
   --gpus <ids>              lmx model load: pin GPUs (as nvidia-smi numbers them); otherwise substrate places the model
@@ -12487,7 +12609,7 @@ var commandDescriptions = map[string]string{
 	"rent list":               "List public rental listings, or your own with --mine.",
 	"model search":            "Search LocalMaxxing model records.",
 	"model resolve-remote":    "Resolve a remote endpoint alias to likely HF candidates.",
-	"eval":                    "Discover, run, and submit evaluation suites.",
+	"eval":                    "Run LocalMaxxing evals (Terminal-Bench, CRUDBench, GSM8K, ...) on an endpoint, track coverage and runs, submit results.",
 	"eval publish": "Publish through one guarded command. Accepts CSV, JSONL, JSON arrays, suite manifests, imported terminal bundles, and raw Harbor/Terminal-Bench directories.\n\n" +
 		"Automatically detects safe column mappings, validates structure, audits quality, runs the authenticated server preflight before uploads, and submits as PENDING for review. Inline datasets upload automatically. Terminal publication requires Pro, Docker, a public --source-url, and oracle-verifies every task before upload. Use --dry-run first when desired.",
 	"eval dataset":           "Discover approved shard datasets separately from registered eval suites.",
@@ -12503,7 +12625,7 @@ var commandDescriptions = map[string]string{
 	"eval suite submissions": "List your suite and sharded-dataset review status and admin notes.",
 	"eval suite resubmit":    "Replace and return a pending or rejected suite to review.",
 	"eval suite withdraw":    "Permanently remove an unused pending or rejected submission.",
-	"eval run":               "Run an approved suite locally and write/submit a run payload.",
+	"eval run":               "Run an approved dataset (terminal or question shards) or suite against an endpoint and optionally submit it.",
 	"eval lm-eval":           "Run the external lm-eval harness and write a suite run payload; --dry-run still executes the harness before server validation.",
 	"eval pull":              "Download a suite + datasets for offline runs and inspection.",
 	"eval submit":            "Submit a previously saved run payload (deferred submit).",
@@ -12515,8 +12637,8 @@ var commandDescriptions = map[string]string{
 	"eval terminal run":      "Preflight, run, resume, or detach a Terminal-Bench task selection.",
 	"eval terminal status":   "Read a durable terminal run snapshot, including worker and task progress.",
 	"eval terminal logs":     "Replay canonical terminal JSONL events; --follow waits through job completion.",
-	"eval terminal cancel":   "Request cooperative cancellation; --force terminates the detached worker immediately.",
-	"eval terminal submit":   "Validate a completed checkpoint, batch canonical Terminal-Bench 2.1/CRUDbench shards, or retry only --shard-index N with stable full-checkpoint identity.",
+	"eval terminal cancel":   "Cancel a detached run (--force terminates its worker), or clean up the containers of a killed foreground run.",
+	"eval terminal submit":   "Publish a completed run directory from eval run/terminal run, or validate and submit an imported checkpoint (Terminal-Bench 2.1/CRUDbench batching, --shard-index N retries).",
 	"eval train":             "Prepare verifier-filtered training data from eval results or run an explicit local trainer.",
 	"eval train prepare":     "Export passing OMP trajectories as conversational SFT JSONL and failures as diagnostics.",
 	"eval train run":         "Expand and optionally execute an explicit local training command from a prepared manifest.",

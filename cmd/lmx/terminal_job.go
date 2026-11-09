@@ -364,6 +364,10 @@ func terminalStatusSnapshot(root string) (map[string]any, error) {
 			state = process.State
 		}
 	}
+	if processErr != nil && state == "running" && terminalRunWorkerGone(root) {
+		// Foreground run (no process record) whose worker no longer holds run.lock: it was killed.
+		state = "interrupted"
+	}
 	scored, passed, unscored := 0, 0, 0
 	if checkpointErr == nil {
 		for _, taskID := range checkpoint.TaskIDs {
@@ -505,7 +509,10 @@ func terminalCancel(args cliArgs) error {
 	}
 	record, err := loadTerminalProcessRecord(root)
 	if err != nil {
-		return cliError{"terminal_job_missing", "No detached terminal process record exists in this directory.", []string{"Only runs started with --detach can be cancelled by run directory."}, map[string]any{"runDir": root}}
+		if _, statErr := os.Stat(filepath.Join(root, "run.json")); statErr != nil {
+			return cliError{"terminal_job_missing", "No terminal run exists in this directory.", []string{"Pass a directory written by lmx eval run or eval terminal run."}, map[string]any{"runDir": root}}
+		}
+		return cleanupStoppedForegroundTerminalRun(args, root)
 	}
 	alive := processMatchesIdentity(record.PID, record.Identity)
 	if !alive {
@@ -576,4 +583,46 @@ func terminalCancelledError(_ context.Context) error {
 
 func terminalProcessSummary(record terminalProcessRecord) string {
 	return strings.TrimSpace(fmt.Sprintf("pid=%d state=%s", record.PID, record.State))
+}
+
+// cleanupStoppedForegroundTerminalRun removes the task containers a foreground run left behind when its
+// process was killed (SIGKILL, closed terminal). A foreground worker that is still alive holds run.lock and
+// has no process record to signal, so it is refused rather than guessed at.
+func cleanupStoppedForegroundTerminalRun(args cliArgs, root string) error {
+	lock, err := os.OpenFile(filepath.Join(root, "run.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := lockTerminalRunFile(lock); err != nil {
+		return cliError{"terminal_run_foreground", "A foreground terminal worker is still running in this directory.", []string{"Stop it from its terminal (Ctrl-C) — it cleans up its own containers.", "Start runs with --detach to cancel them by run directory."}, map[string]any{"runDir": root}}
+	}
+	defer unlockTerminalRunFile(lock)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := cleanupTerminalRunContainers(ctx, shortHash(root)); err != nil {
+		return err
+	}
+	snapshot, err := terminalStatusSnapshot(root)
+	if err != nil {
+		return err
+	}
+	snapshot["alreadyStopped"] = true
+	snapshot["containersCleaned"] = true
+	return writeOrPrintJSON("terminal_cancel", args, snapshot)
+}
+
+// terminalRunWorkerGone reports whether run.lock exists and no worker holds it. Without a lock file
+// nothing can be proven, so the recorded state stands.
+func terminalRunWorkerGone(root string) bool {
+	lock, err := os.OpenFile(filepath.Join(root, "run.lock"), os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	defer lock.Close()
+	if err := lockTerminalRunFile(lock); err != nil {
+		return false
+	}
+	_ = unlockTerminalRunFile(lock)
+	return true
 }
