@@ -172,3 +172,13 @@ func TestJSONModeEmitsOneDocumentWithoutGuidanceProse(t *testing.T) {
 func errorsAs(err error, target any) bool {
 	return errors.As(err, target)
 }
+
+func TestModelAPIKeyComesFromTheOptionOrTheEnvironment(t *testing.T) {
+	t.Setenv("LMX_MODEL_API_KEY", "from-env")
+	if got := modelAPIKey(parseArgs([]string{"speed-test", "run"})); got != "from-env" {
+		t.Fatalf("without the option: %q", got)
+	}
+	if got := modelAPIKey(parseArgs([]string{"speed-test", "run", "--model-api-key", "from-flag"})); got != "from-flag" {
+		t.Fatalf("the option must win: %q", got)
+	}
+}

@@ -147,6 +147,8 @@ func handleVersion(args cliArgs) error {
 	payload := map[string]any{
 		"version": version, "commit": commit, "buildDate": buildDate,
 		"goVersion": runtime.Version(), "platform": runtime.GOOS + "/" + runtime.GOARCH,
+		// What this build can do beyond its version number, for tools that drive it.
+		"features": []string{"model-api-key-env"},
 	}
 	if hasFlag(args, "json") || hasFlag(args, "json-status") {
 		printJSON(args, payload)

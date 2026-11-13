@@ -449,6 +449,12 @@ func positional(args cliArgs, index int) string {
 func opt(args cliArgs, key string) string   { return args.opts[key] }
 func hasFlag(args cliArgs, key string) bool { return args.flags[key] }
 
+// modelAPIKey is --model-api-key, or LMX_MODEL_API_KEY for a caller that must keep the key off the command
+// line: every user of the host can read a process's arguments.
+func modelAPIKey(args cliArgs) string {
+	return firstNonEmpty(opt(args, "model-api-key"), os.Getenv("LMX_MODEL_API_KEY"))
+}
+
 func wantsHelp(args cliArgs) bool {
 	return hasFlag(args, "help") || sliceContainsString(args.positional, "-h")
 }
@@ -1693,7 +1699,7 @@ func handleEndpoint(action string, args cliArgs) error {
 	candidates := endpointDiscoveryCandidates(args)
 	results := []any{}
 	for _, baseURL := range candidates {
-		model, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), firstNonEmpty(opt(args, "served-model"), opt(args, "model-name")))
+		model, info, err := detectServedModel(baseURL, modelAPIKey(args), firstNonEmpty(opt(args, "served-model"), opt(args, "model-name")))
 		result := map[string]any{"baseUrl": baseURL, "ok": err == nil}
 		if err != nil {
 			result["error"] = err.Error()
@@ -1702,7 +1708,7 @@ func handleEndpoint(action string, args cliArgs) error {
 		}
 		result["servedModel"] = model
 		if hasFlag(args, "include-server-metadata") {
-			if meta := discoverServerMetadata(baseURL, opt(args, "model-api-key"), info); len(meta) > 0 {
+			if meta := discoverServerMetadata(baseURL, modelAPIKey(args), info); len(meta) > 0 {
 				result["serverMetadata"] = meta
 			} else {
 				result["serverMetadataNote"] = "endpoint exposed no opt-in server metadata"
@@ -2163,7 +2169,7 @@ func handleModelResolveRemote(args cliArgs) error {
 		return err
 	}
 	baseURL = openAIBaseURL(baseURL)
-	apiKey := opt(args, "model-api-key")
+	apiKey := modelAPIKey(args)
 	model, info, err := detectServedModel(baseURL, apiKey, firstNonEmpty(opt(args, "served-model"), opt(args, "model-name")))
 	if err != nil {
 		return cliError{"endpoint_unreachable", "Could not read /v1/models from " + baseURL + ".", []string{"Verify --base-url and that the endpoint is running.", err.Error()}, nil}
@@ -4805,7 +4811,7 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 	servedModelSource := "explicit"
 	var servedModelInfo map[string]any
 	if servedModel == "" {
-		if detected, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), hfID); err == nil && detected != "" {
+		if detected, info, err := detectServedModel(baseURL, modelAPIKey(args), hfID); err == nil && detected != "" {
 			servedModel = detected
 			servedModelInfo = info
 			servedModelSource = "v1_models"
@@ -4815,10 +4821,10 @@ func measureRemoteKVCachePoint(args cliArgs, hfID string, level int) (map[string
 			servedModelSource = "hf_id_fallback"
 			printStatus(args, "served_model_fallback", map[string]any{"servedModel": servedModel, "source": servedModelSource, "reason": errString(err)})
 		}
-	} else if _, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), servedModel); err == nil {
+	} else if _, info, err := detectServedModel(baseURL, modelAPIKey(args), servedModel); err == nil {
 		servedModelInfo = info
 	}
-	quantizationResolution := remoteQuantizationResolution(args, baseURL, opt(args, "model-api-key"), opt(args, "quantization"), servedModelInfo)
+	quantizationResolution := remoteQuantizationResolution(args, baseURL, modelAPIKey(args), opt(args, "quantization"), servedModelInfo)
 	var modelResolution map[string]any
 	if modelPath := stringValue(quantizationResolution["modelPath"]); modelPath != "" {
 		modelResolution = remoteModelResolution(args, servedModel, servedModelSource, hfID, modelPath)
@@ -4942,7 +4948,7 @@ func warmRemoteKVCachePrefix(args cliArgs, baseURL, servedModel string, messages
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := opt(args, "model-api-key"); key != "" {
+	if key := modelAPIKey(args); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	res, err := http.DefaultClient.Do(req)
@@ -5180,7 +5186,7 @@ func benchmarkPayloadFromFlags(engine string, args cliArgs) (map[string]any, err
 		return nil, err
 	}
 	if engineVersion == "" && engineName == "strata" && mode == "remote" && !hasFlag(args, "dry-run") {
-		engineVersion = strataEngineVersion(opt(args, "base-url"), opt(args, "model-api-key"))
+		engineVersion = strataEngineVersion(opt(args, "base-url"), modelAPIKey(args))
 	}
 
 	builder := benchmarkPayload{
@@ -6398,7 +6404,7 @@ func timedChatCompletion(args cliArgs, baseURL string, body map[string]any, time
 		return chatProbe{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := opt(args, "model-api-key"); key != "" {
+	if key := modelAPIKey(args); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	res, err := http.DefaultClient.Do(req)
@@ -6566,7 +6572,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	servedModelSource := "explicit"
 	var servedModelInfo map[string]any
 	if servedModel == "" {
-		detected, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), hfID)
+		detected, info, err := detectServedModel(baseURL, modelAPIKey(args), hfID)
 		if err == nil && detected != "" {
 			servedModel = detected
 			servedModelInfo = info
@@ -6577,7 +6583,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 			servedModelSource = "hf_id_fallback"
 			printStatus(args, "served_model_fallback", map[string]any{"servedModel": servedModel, "source": servedModelSource, "reason": errString(err)})
 		}
-	} else if _, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), servedModel); err == nil {
+	} else if _, info, err := detectServedModel(baseURL, modelAPIKey(args), servedModel); err == nil {
 		servedModelInfo = info
 	}
 	prompt, promptSource, err := remoteSpeedTestPrompt(args)
@@ -6627,7 +6633,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	if stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
-	quantizationResolution := remoteQuantizationResolution(args, baseURL, opt(args, "model-api-key"), opt(args, "quantization"), servedModelInfo)
+	quantizationResolution := remoteQuantizationResolution(args, baseURL, modelAPIKey(args), opt(args, "quantization"), servedModelInfo)
 	modelResolution := remoteModelResolution(args, servedModel, servedModelSource, hfID, stringValue(quantizationResolution["modelPath"]))
 	timeout, err := endpointTimeout(args)
 	if err != nil {
@@ -6647,7 +6653,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	lastRequestPrompt := ""
 	var lastUsage, lastTimings map[string]any
 	llamaSpec := specMetrics{}
-	specBefore, haveSpecBefore := scrapeSpecMetrics(baseURL, opt(args, "model-api-key"))
+	specBefore, haveSpecBefore := scrapeSpecMetrics(baseURL, modelAPIKey(args))
 	decodeSource := ""
 	samples := make([]map[string]any, 0, iterations*concurrency)
 	ttftValues := []float64{}
@@ -6764,7 +6770,7 @@ func measureOpenAIEndpoint(args cliArgs, hfID string) (map[string]any, error) {
 	measured := iterations * concurrency
 	if llamaSpec.hasCounters {
 		applySpecMetrics(engineFlags, llamaSpec.perRequest(measured))
-	} else if specAfter, ok := scrapeSpecMetrics(baseURL, opt(args, "model-api-key")); ok {
+	} else if specAfter, ok := scrapeSpecMetrics(baseURL, modelAPIKey(args)); ok {
 		if haveSpecBefore {
 			applySpecMetrics(engineFlags, specMetricsDelta(specBefore, specAfter).perRequest(measured))
 		} else {
@@ -6992,7 +6998,7 @@ func ollamaGenerate(args cliArgs, baseURL string, body map[string]any, timeout t
 		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := opt(args, "model-api-key"); key != "" {
+	if key := modelAPIKey(args); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	res, err := http.DefaultClient.Do(req)
@@ -7113,11 +7119,11 @@ func resolveEvalModelID(args cliArgs, declared string) (string, map[string]any, 
 	explicitRepo := explicitHFRepoID(declared)
 	baseURL := opt(args, "base-url")
 	if baseURL != "" {
-		servedModel, info, err := detectServedModel(baseURL, opt(args, "model-api-key"), firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), declared))
+		servedModel, info, err := detectServedModel(baseURL, modelAPIKey(args), firstNonEmpty(opt(args, "served-model"), opt(args, "model-name"), declared))
 		if err == nil {
 			modelPath := ""
 			normalizedBaseURL := openAIBaseURL(baseURL)
-			if props, err := fetchEndpointJSON(normalizedBaseURL+"/props", opt(args, "model-api-key")); err == nil {
+			if props, err := fetchEndpointJSON(normalizedBaseURL+"/props", modelAPIKey(args)); err == nil {
 				modelPath = stringValue(asObject(props)["model_path"])
 			}
 			if modelPath == "" {
@@ -9063,11 +9069,11 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	servedModel := opt(args, "served-model")
 	var servedModelInfo map[string]any
 	if servedModel == "" {
-		if detected, info, derr := detectServedModel(baseURL, opt(args, "model-api-key"), declaredModel); derr == nil {
+		if detected, info, derr := detectServedModel(baseURL, modelAPIKey(args), declaredModel); derr == nil {
 			servedModel = detected
 			servedModelInfo = info
 		}
-	} else if _, info, derr := detectServedModel(baseURL, opt(args, "model-api-key"), servedModel); derr == nil {
+	} else if _, info, derr := detectServedModel(baseURL, modelAPIKey(args), servedModel); derr == nil {
 		servedModelInfo = info
 	}
 	callModel := firstNonEmpty(servedModel, declaredModel, "local")
@@ -9081,7 +9087,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 	// --quantization, with the trusted value winning. This records the real quant
 	// without the user passing a flag; --quantization still acts as an override
 	// of last resort. Derive the GGUF container format from the model path too.
-	quantResolution := remoteQuantizationResolution(args, baseURL, opt(args, "model-api-key"), opt(args, "quantization"), servedModelInfo)
+	quantResolution := remoteQuantizationResolution(args, baseURL, modelAPIKey(args), opt(args, "quantization"), servedModelInfo)
 	resolvedQuant := firstNonEmpty(stringValue(quantResolution["trusted"]), opt(args, "quantization"))
 	resolvedQuantFormat := opt(args, "quant-format")
 	if resolvedQuantFormat == "" && strings.EqualFold(filepath.Ext(stringValue(quantResolution["modelPath"])), ".gguf") {
@@ -9147,7 +9153,7 @@ func handleEvalShard(dataset string, args cliArgs) error {
 		answerRegex:    shardConfigString(args, evalConfig, "answer-regex", "answerRegex"),
 		promptTemplate: shardConfigString(args, evalConfig, "prompt-template", "promptTemplate"),
 		concurrency:    concurrency,
-		apiKey:         opt(args, "model-api-key"),
+		apiKey:         modelAPIKey(args),
 		scoring:        scoring,
 		dataset:        dataset,
 		nSamples:       nSamples,
@@ -10977,7 +10983,7 @@ func runCustomLocalEval(suite map[string]any, args cliArgs) (map[string]any, err
 			started := time.Now()
 			artifact := map[string]any{"taskKey": stringValue(task["key"]), "itemIndex": i, "promptHash": sha256Hex(prompt), "question": renderEvalQuestion(item), "prompt": prompt}
 			if scoring == "loglikelihood" {
-				score, predicted, gold, err := scoreLoglikelihoodItem(baseURL, model, opt(args, "model-api-key"), doc, item, prompt)
+				score, predicted, gold, err := scoreLoglikelihoodItem(baseURL, model, modelAPIKey(args), doc, item, prompt)
 				if err == nil {
 					artifact["response"] = fmt.Sprintf("argmax=%s gold=%s", predicted, gold)
 					artifact["score"] = score
@@ -10991,7 +10997,7 @@ func runCustomLocalEval(suite map[string]any, args cliArgs) (map[string]any, err
 				artifacts = append(artifacts, artifact)
 				continue
 			}
-			response, err := callOpenAIChat(baseURL, model, prompt, opt(args, "model-api-key"), int(firstNonZero(int(numberField(task, "maxNewTokens")), 256)), evalTemperature(doc), evalTopP(doc), stringSlice(task["stopSequences"]))
+			response, err := callOpenAIChat(baseURL, model, prompt, modelAPIKey(args), int(firstNonZero(int(numberField(task, "maxNewTokens")), 256)), evalTemperature(doc), evalTopP(doc), stringSlice(task["stopSequences"]))
 			if err == nil {
 				artifact["response"] = response
 				var score float64
@@ -12362,7 +12368,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --base-url <url>         OpenAI-compatible model endpoint; accepts host or host/v1
   --mode <mode>            Speed-test mode: remote endpoint or local host command
   --served-model <name>    Model name served by the OpenAI-compatible endpoint
-  --model-api-key <key>    Optional bearer token for the remote speed-test endpoint
+  --model-api-key <key>    Optional bearer token for the model endpoint (or LMX_MODEL_API_KEY, which keeps it off the command line)
   --prompt <text>          Inline prompt for the remote endpoint speed test
   --prompt-file <path>     Read the remote prompt from a file; use - for stdin
   --canonical-prompt <id>  Measure on a LocalMaxxing canonical prompt (e.g. reasoning-v1) for a Verified run: the prompt text, prompt/output samples and engine timings are captured for server-side verification

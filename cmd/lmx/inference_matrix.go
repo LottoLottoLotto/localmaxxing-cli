@@ -322,7 +322,7 @@ func runInferenceMatrixAt(runCtx context.Context, args cliArgs, plan matrixBench
 	if hfID == "" {
 		return cliError{"missing_model", "speed-test matrix run requires --hf-id", []string{"Pass the HuggingFace model ID that the server is serving."}, nil}
 	}
-	modelKey := opt(args, "model-api-key")
+	modelKey := modelAPIKey(args)
 	servedModel, servedInfo, err := detectServedModel(baseURL, modelKey, opt(args, "served-model"))
 	if err != nil {
 		return cliError{"endpoint_unreachable", "Could not list models at " + baseURL + "/v1/models: " + err.Error(), []string{"Start the server first and check --base-url."}, nil}

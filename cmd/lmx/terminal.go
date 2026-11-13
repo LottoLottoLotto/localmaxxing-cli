@@ -812,7 +812,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 			{ // a dry run detects too, so a preflight reports the quantization a run would submit
 				var servedModelInfo map[string]any
 				if servedModel == "" {
-					if detected, info, derr := detectTerminalServedModel(ctx, baseURL, opt(args, "model-api-key"), declaredModel); derr == nil {
+					if detected, info, derr := detectTerminalServedModel(ctx, baseURL, modelAPIKey(args), declaredModel); derr == nil {
 						servedModel = detected
 						servedModelInfo = info
 					} else {
@@ -821,13 +821,13 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 						}
 						printStatus(args, "eval_model_detection_unavailable", map[string]any{"baseUrl": baseURL, "reason": derr.Error()})
 					}
-				} else if _, info, derr := detectTerminalServedModel(ctx, baseURL, opt(args, "model-api-key"), servedModel); derr == nil {
+				} else if _, info, derr := detectTerminalServedModel(ctx, baseURL, modelAPIKey(args), servedModel); derr == nil {
 					servedModelInfo = info
 				} else if ctx.Err() != nil {
 					return terminalCancelledError(ctx)
 				}
 				callModel = firstNonEmpty(servedModel, declaredModel, "local")
-				quantResolution = remoteQuantizationResolutionContext(ctx, args, baseURL, opt(args, "model-api-key"), opt(args, "quantization"), servedModelInfo)
+				quantResolution = remoteQuantizationResolutionContext(ctx, args, baseURL, modelAPIKey(args), opt(args, "quantization"), servedModelInfo)
 				if ctx.Err() != nil {
 					return terminalCancelledError(ctx)
 				}
@@ -854,7 +854,7 @@ func runTerminalEval(args cliArgs, forceOracle bool) error {
 	if err != nil {
 		return err
 	}
-	cfg := terminalConfig{apiKey: opt(args, "model-api-key"), args: args, maxTokens: maxTokens, temperature: floatOption(args, "temperature", 0), topP: floatOption(args, "top-p", 1), commandTimeoutSec: commandTimeout, keepImages: hasFlag(args, "keep-images"), oracle: forceOracle || hasFlag(args, "oracle"), agentCommand: agentCommand, agentExecution: firstNonEmpty(opt(args, "agent-execution"), map[bool]string{true: "routed-shell"}[agentBackend == "terminus-2"], "host"), nativeTools: hasFlag(args, "native-tools"), traceRoot: opt(args, "trace-dir")}
+	cfg := terminalConfig{apiKey: modelAPIKey(args), args: args, maxTokens: maxTokens, temperature: floatOption(args, "temperature", 0), topP: floatOption(args, "top-p", 1), commandTimeoutSec: commandTimeout, keepImages: hasFlag(args, "keep-images"), oracle: forceOracle || hasFlag(args, "oracle"), agentCommand: agentCommand, agentExecution: firstNonEmpty(opt(args, "agent-execution"), map[bool]string{true: "routed-shell"}[agentBackend == "terminus-2"], "host"), nativeTools: hasFlag(args, "native-tools"), traceRoot: opt(args, "trace-dir")}
 	cfg.maxTurns, err = intOption(args, 0, 0, "max-turns")
 	if err != nil {
 		return err
