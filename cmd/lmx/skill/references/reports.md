@@ -48,7 +48,7 @@ lmx report create \
   --json
 ```
 
-Create a private draft for browser review by adding `--draft`. The returned `id` is the canonical report ID. A user can open the report in the web studio and edit the exact same Markdown.
+Create a private draft for browser review by adding `--draft`. The returned `id` is the canonical report ID, and `url` is the report's web page (`https://www.localmaxxing.com/en/models/<org>/<model>/reports/<id>`; a draft opens there for its author only). A user can open the report in the web studio and edit the exact same Markdown. `report list`, `show`, `edit`, `publish` and `unpublish` return the same `url` field.
 
 Attach owned runs with comma-separated IDs:
 

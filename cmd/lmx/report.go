@@ -141,6 +141,35 @@ func commaSeparatedIDs(value string) []string {
 	return ids
 }
 
+func optionalReportMetadata(args cliArgs, body map[string]any, edit bool) {
+	for option, field := range map[string]string{
+		"engine":       "engineName",
+		"quantization": "quantization",
+	} {
+		if value := opt(args, option); value != "" {
+			body[field] = value
+		} else if edit {
+			if _, provided := args.provided[option]; provided {
+				body[field] = ""
+			}
+		}
+	}
+	if hardwareID := opt(args, "hardware-id"); hardwareID != "" {
+		body["hardwareId"] = hardwareID
+	} else if edit {
+		if _, provided := args.provided["hardware-id"]; provided {
+			body["hardwareId"] = nil
+		}
+	}
+	if value := opt(args, "tags"); value != "" {
+		body["tags"] = commaSeparatedIDs(value)
+	} else if edit {
+		if _, provided := args.provided["tags"]; provided {
+			body["tags"] = []string{}
+		}
+	}
+}
+
 func createModelReport(args cliArgs) error {
 	endpoint, err := modelReportsURL(args)
 	if err != nil {
@@ -164,11 +193,52 @@ func createModelReport(args cliArgs) error {
 		"evalRunIds":      commaSeparatedIDs(opt(args, "eval-run-ids")),
 		"published":       !hasFlag(args, "draft"),
 	}
+	optionalReportMetadata(args, body, false)
 	value, err := fetchJSON("POST", endpoint, apiKey(args), body)
 	if err != nil {
 		return err
 	}
-	return writeOrPrintJSON("report_created", args, value)
+	return writeOrPrintJSON("report_created", args, withReportPageURL(args, value, opt(args, "model")))
+}
+
+// reportPageURL is the public web page of a report: /en/models/<org>/<model>/reports/<id>. It is empty when the
+// response carries no report id or no model id (and no fallback model was given).
+func reportPageURL(args cliArgs, report map[string]any, fallbackModel string) string {
+	id := stringValue(report["id"])
+	hfID := ""
+	if model, ok := report["model"].(map[string]any); ok {
+		hfID = stringValue(model["hfId"])
+	}
+	if hfID == "" {
+		hfID = strings.TrimSpace(fallbackModel)
+	}
+	parts := strings.Split(hfID, "/")
+	if id == "" || len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return apiURL(args) + "/en/models/" + url.PathEscape(parts[0]) + "/" + url.PathEscape(parts[1]) + "/reports/" + url.PathEscape(id)
+}
+
+// withReportPageURL adds "url" (the report's web page) to a report response, or to every report of a list response.
+func withReportPageURL(args cliArgs, value any, fallbackModel string) any {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	if reports, ok := object["reports"].([]any); ok {
+		for _, item := range reports {
+			if report, ok := item.(map[string]any); ok {
+				if page := reportPageURL(args, report, fallbackModel); page != "" {
+					report["url"] = page
+				}
+			}
+		}
+		return object
+	}
+	if page := reportPageURL(args, object, fallbackModel); page != "" {
+		object["url"] = page
+	}
+	return object
 }
 
 func listModelReports(args cliArgs) error {
@@ -180,7 +250,7 @@ func listModelReports(args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	return writeOrPrintJSON("reports", args, value)
+	return writeOrPrintJSON("reports", args, withReportPageURL(args, value, opt(args, "model")))
 }
 
 func requireReportID(target string) (string, error) {
@@ -200,7 +270,7 @@ func showModelReport(target string, args cliArgs) error {
 	if err != nil {
 		return err
 	}
-	return writeOrPrintJSON("report", args, value)
+	return writeOrPrintJSON("report", args, withReportPageURL(args, value, ""))
 }
 
 func editModelReport(target string, args cliArgs) error {
@@ -228,14 +298,15 @@ func editModelReport(target string, args cliArgs) error {
 	if _, provided := args.provided["eval-run-ids"]; provided {
 		body["evalRunIds"] = commaSeparatedIDs(opt(args, "eval-run-ids"))
 	}
+	optionalReportMetadata(args, body, true)
 	if len(body) == 0 {
-		return cliError{"empty_update", "Report edit did not specify any changes.", []string{"Pass --title, --summary, --content-file, --content, --benchmark-run-ids, or --eval-run-ids."}, nil}
+		return cliError{"empty_update", "Report edit did not specify any changes.", []string{"Pass report content, metadata, or evidence options to update the report."}, nil}
 	}
 	value, err := fetchJSON("PATCH", apiURL(args)+"/api/reports/"+id, apiKey(args), body)
 	if err != nil {
 		return err
 	}
-	return writeOrPrintJSON("report_updated", args, value)
+	return writeOrPrintJSON("report_updated", args, withReportPageURL(args, value, ""))
 }
 
 func setModelReportPublication(target string, published bool, args cliArgs) error {
@@ -253,7 +324,7 @@ func setModelReportPublication(target string, published bool, args cliArgs) erro
 	if err != nil {
 		return err
 	}
-	return writeOrPrintJSON(title, args, value)
+	return writeOrPrintJSON(title, args, withReportPageURL(args, value, ""))
 }
 
 func deleteModelReport(target string, args cliArgs) error {

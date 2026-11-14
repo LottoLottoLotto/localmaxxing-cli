@@ -42,7 +42,7 @@ func TestReportCreateAndEditUseCanonicalGFMContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "result.json")
-	if err := run([]string{"report", "create", "--api-url", server.URL, "--api-key", "bhk_test", "--model", "Qwen/Qwen3.8-27B", "--title", "Agent report", "--summary", "A standardized report created by an agent.", "--content-file", contentPath, "--benchmark-run-ids", "run-a,run-a,run-b", "--draft", "--out", out}); err != nil {
+	if err := run([]string{"report", "create", "--api-url", server.URL, "--api-key", "bhk_test", "--model", "Qwen/Qwen3.8-27B", "--title", "Agent report", "--summary", "A standardized report created by an agent.", "--content-file", contentPath, "--engine", "FreeToken", "--quantization", "BF16", "--tags", "moe,bf16,moe", "--benchmark-run-ids", "run-a,run-a,run-b", "--draft", "--out", out}); err != nil {
 		t.Fatalf("report create: %v", err)
 	}
 	if createBody["contentFormat"] != "gfm" || createBody["published"] != false {
@@ -55,8 +55,15 @@ func TestReportCreateAndEditUseCanonicalGFMContract(t *testing.T) {
 	if !ok || len(runs) != 2 || runs[0] != "run-a" || runs[1] != "run-b" {
 		t.Fatalf("benchmarkRunIds = %#v", createBody["benchmarkRunIds"])
 	}
+	if createBody["engineName"] != "FreeToken" || createBody["quantization"] != "BF16" {
+		t.Fatalf("report metadata = %#v", createBody)
+	}
+	tags, ok := createBody["tags"].([]any)
+	if !ok || len(tags) != 2 || tags[0] != "moe" || tags[1] != "bf16" {
+		t.Fatalf("tags = %#v", createBody["tags"])
+	}
 
-	if err := run([]string{"report", "edit", "report-1", "--api-url", server.URL, "--api-key", "bhk_test", "--content-file", contentPath, "--eval-run-ids=", "--out", out}); err != nil {
+	if err := run([]string{"report", "edit", "report-1", "--api-url", server.URL, "--api-key", "bhk_test", "--content-file", contentPath, "--engine=", "--quantization", "BF16", "--tags=", "--eval-run-ids=", "--out", out}); err != nil {
 		t.Fatalf("report edit: %v", err)
 	}
 	if editBody["content"] != createBody["content"] {
@@ -64,6 +71,80 @@ func TestReportCreateAndEditUseCanonicalGFMContract(t *testing.T) {
 	}
 	if values, ok := editBody["evalRunIds"].([]any); !ok || len(values) != 0 {
 		t.Fatalf("evalRunIds = %#v", editBody["evalRunIds"])
+	}
+	if editBody["engineName"] != "" || editBody["quantization"] != "BF16" {
+		t.Fatalf("edit metadata = %#v", editBody)
+	}
+	if values, ok := editBody["tags"].([]any); !ok || len(values) != 0 {
+		t.Fatalf("edit tags = %#v", editBody["tags"])
+	}
+}
+
+func TestReportResponsesCarryPageURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/api/models/Liquid AI/LFM3-1.7B/reports":
+			// No model object in the response: the page URL falls back to --model.
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"id":"r1"}`)
+		case r.Method == "GET" && r.URL.Path == "/api/models/Liquid AI/LFM3-1.7B/reports":
+			_, _ = io.WriteString(w, `{"reports":[{"id":"r1","model":{"hfId":"Liquid AI/LFM3-1.7B"}},{"id":"r2"}]}`)
+		case r.Method == "POST" && r.URL.Path == "/api/reports/r1/publication":
+			_, _ = io.WriteString(w, `{"id":"r1","model":{"hfId":"Liquid AI/LFM3-1.7B"},"publishedAt":"2026-11-14T00:00:00Z"}`)
+		case r.Method == "GET" && r.URL.Path == "/api/reports/r9":
+			_, _ = io.WriteString(w, `{"id":"r9"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	read := func(name string) map[string]any {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var value map[string]any
+		if err := json.Unmarshal(data, &value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	page := server.URL + "/en/models/Liquid%20AI/LFM3-1.7B/reports/r1"
+	base := []string{"--api-url", server.URL, "--api-key", "bhk_test"}
+
+	if err := run(append([]string{"report", "create", "--model", "Liquid AI/LFM3-1.7B", "--title", "Page URL", "--summary", "A report whose response has no model.", "--content", "## Body", "--out", filepath.Join(dir, "create.json")}, base...)); err != nil {
+		t.Fatalf("report create: %v", err)
+	}
+	if got := read("create.json")["url"]; got != page {
+		t.Fatalf("create url = %#v, want %q", got, page)
+	}
+
+	if err := run(append([]string{"report", "publish", "r1", "--out", filepath.Join(dir, "publish.json")}, base...)); err != nil {
+		t.Fatalf("report publish: %v", err)
+	}
+	if got := read("publish.json")["url"]; got != page {
+		t.Fatalf("publish url = %#v, want %q", got, page)
+	}
+
+	if err := run(append([]string{"report", "list", "--model", "Liquid AI/LFM3-1.7B", "--out", filepath.Join(dir, "list.json")}, base...)); err != nil {
+		t.Fatalf("report list: %v", err)
+	}
+	reports := read("list.json")["reports"].([]any)
+	if got := reports[0].(map[string]any)["url"]; got != page {
+		t.Fatalf("list url = %#v, want %q", got, page)
+	}
+	if got := reports[1].(map[string]any)["url"]; got != server.URL+"/en/models/Liquid%20AI/LFM3-1.7B/reports/r2" {
+		t.Fatalf("list fallback url = %#v", got)
+	}
+
+	// A response without any model id and no --model gives no URL rather than a wrong one.
+	if err := run(append([]string{"report", "show", "r9", "--out", filepath.Join(dir, "show.json")}, base...)); err != nil {
+		t.Fatalf("report show: %v", err)
+	}
+	if _, ok := read("show.json")["url"]; ok {
+		t.Fatal("show without a model id must not invent a url")
 	}
 }
 
@@ -129,7 +210,9 @@ func TestReportCommandsAreAgentDiscoverable(t *testing.T) {
 			t.Fatalf("command schema omitted %q", command)
 		}
 	}
-	if !strings.Contains(text, `"name":"content-file"`) {
-		t.Fatal("command schema omitted --content-file")
+	for _, option := range []string{"content-file", "quantization", "hardware-id", "tags"} {
+		if !strings.Contains(text, `"name":"`+option+`"`) {
+			t.Fatalf("command schema omitted --%s", option)
+		}
 	}
 }
