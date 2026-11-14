@@ -226,7 +226,7 @@ headers (exact parameter count for unquantized weights) and GGUF metadata
 (architecture, context, layers, quant type, parameter count). Each GGUF quant
 in a folder is its own entry; split GGUFs are grouped. Status flags `partial`
 when safetensors shards or GGUF split parts are missing, `missing` when a
-registered file is gone, and `loaded as <name>` while a substrate instance serves it. Folders without weights are hidden unless `--all`; `--kind
+registered file is gone, and `loaded as <name>` while an emx instance serves it. Folders without weights are hidden unless `--all`; `--kind
 file|snapshot|hf-cache|directory` filters. `model show <name, ID, ID prefix or
 path>` adds revision, path, hashes and the file list. `--json` returns the same
 fields (`models[]` with `id`, `kind`, `path`, `status`, …).
@@ -304,16 +304,16 @@ entire file and can take time for large models.
 
 ### Loading and unloading models
 
-lmx serves local models through [substrate](https://github.com/LottoLottoLotto/substrate),
+lmx serves local models through [EndpointMaxxing](https://github.com/LottoLottoLotto/endpointmaxxing) (`emx`),
 an engine gateway: one OpenAI/Anthropic-compatible endpoint (default
 `http://127.0.0.1:7777/v1`) that routes each request by its `model` field to a
 llama.cpp, vLLM, SGLang or Strata instance, starts registered models on
 demand and places them on GPUs (and Tenstorrent chips). lmx needs the
-`substrate` binary on `PATH` (or `--substrate-bin` / `LMX_SUBSTRATE_BIN`);
-engine paths live in substrate's config (`substrate engine set`, `substrate doctor`).
+`emx` binary on `PATH` (or `--emx-bin` / `LMX_EMX_BIN`);
+engine paths live in emx's config (`emx engine set`, `emx doctor`).
 
 ```bash
-lmx gateway start                                   # substrate serve in the background (--service: systemd user unit)
+lmx gateway start                                   # emx serve in the background (--service: systemd user unit)
 lmx model load Qwen3-0.6B --mem-fraction 0.4        # safetensors → vLLM/SGLang
 lmx model load LFM2.5-2.6B-GGUF/LFM2.5-2.6B-Q4_K_M  # GGUF → llama.cpp
 lmx model loaded                                    # running instances: engine, GPU, status
@@ -325,26 +325,26 @@ lmx gateway status                                  # registered models and what
 lmx gateway stop
 ```
 
-- **load** registers the model from `lmx model list` with substrate
-  (`substrate model add`) under `--name`, default the repository/folder name or
+- **load** registers the model from `lmx model list` with emx
+  (`emx model add`) under `--name`, default the repository/folder name or
   GGUF file stem, lowercased, then asks the gateway to start it and waits up to
   `--ready-timeout-seconds` (900). It starts the gateway if needed. Loading a
   model that is already registered reuses its registration; options given
   again replace it. A name already used by a different model is refused.
-- **Options** map to substrate's unified flags: `--engine`, `--context-length`,
+- **Options** map to emx's unified flags: `--engine`, `--context-length`,
   `--gpus 0,1`, `--tensor-parallel`, `--gpu-layers`, `--mem-fraction`,
   `--idle-unload 15m`; `--server-args '["--seed","1"]'` passes engine
-  arguments (needs `--engine`). Without `--engine` substrate picks the best
+  arguments (needs `--engine`). Without `--engine` emx picks the best
   installed engine for the format; without `--gpus` it places the model by
   free memory and may evict idle models.
 - **unload** stops the instance after in-flight requests finish. Registered
   models start again on their next request; `--forget` unregisters.
-  `lmx model list` marks models a substrate instance is serving (`loaded as <name>`).
-- **Gateway process:** `lmx gateway start` runs `substrate serve` detached on
-  the host/port from substrate's `config.yaml` (log
-  `~/.local/share/localmaxxing/gateway.log`); if substrate's systemd service is
+  `lmx model list` marks models an emx instance is serving (`loaded as <name>`).
+- **Gateway process:** `lmx gateway start` runs `emx serve` detached on
+  the host/port from emx's `config.yaml` (log
+  `~/.local/share/localmaxxing/gateway.log`); if emx's systemd service is
   installed it starts that instead. `--gateway-url` / `LMX_GATEWAY_URL` points
-  lmx at another gateway; `SUBSTRATE_API_KEY` authenticates when it has keys.
+  lmx at another gateway; `EMX_API_KEY` authenticates when it has keys.
   Stopping the gateway leaves models running.
 
 #### Benchmarks and evals through the gateway
@@ -414,7 +414,7 @@ need none). Create a listing on the site first (`/rentals/new`).
 lmx rent list                      # public listings
 lmx rent list --mine               # your listings, all statuses (needs your API key)
 
-# Host: serve listings from this machine (default target: the substrate gateway)
+# Host: serve listings from this machine (default target: the emx gateway)
 lmx rent host <listingId>
 lmx rent host <listingId> <listingId2> --target http://127.0.0.1:8000 \
   --model Qwen/Qwen3-8B --model Qwen/Qwen3-0.6B --max-concurrency 4
@@ -428,14 +428,14 @@ lmx rent connect <listingId> --port 8000   # then use http://127.0.0.1:8000/v1
 `LMX_RELAY_URL`; `ws://` is refused except to localhost, since it would send
 your API key unencrypted) using your saved API key; no port forwarding or
 public endpoint is needed. Renter requests arrive over that connection and go
-to `--target` (default: the substrate gateway, `lmx gateway start`). The host
+to `--target` (default: the emx gateway, `lmx gateway start`). The host
 enforces locally:
 
 - only `POST /v1/chat/completions`, `POST /v1/completions`,
   `POST /v1/embeddings` and `GET /v1/models` (everything else is 404, so a
   target's admin API is never reachable);
 - the `model` must be one of the advertised models: `--model` (repeatable or
-  comma-separated); by default, for the substrate gateway, only the models
+  comma-separated); by default, for the emx gateway, only the models
   running now (`lmx model loaded`; registered but stopped models are not rented
   out, since the gateway would start them on demand), and for any other target
   every id its `/v1/models` lists. `GET /v1/models` answers with exactly that
@@ -446,14 +446,14 @@ enforces locally:
 - at most `--max-concurrency` (default 4) requests at a time; more get 429.
 
 Target keys: renter requests carry `--target-key` / `LMX_RENT_TARGET_KEY` (if
-set) to the target. `SUBSTRATE_API_KEY` (an admin key) is used only to discover
-the running models and is never sent with renter traffic. For a keyed substrate
+set) to the target. `EMX_API_KEY` (an admin key) is used only to discover
+the running models and is never sent with renter traffic. For a keyed emx
 gateway, create a client key limited to the models you rent out, so the
 gateway enforces the model list and limits too:
 
 ```bash
-substrate key add rentals --models 'qwen3-8b,qwen3-0.6b' --rpm 600   # prints the key once
-LMX_RENT_TARGET_KEY=<that key> SUBSTRATE_API_KEY=<admin key> lmx rent host <listingId>
+emx key add rentals --models 'qwen3-8b,qwen3-0.6b' --rpm 600   # prints the key once
+LMX_RENT_TARGET_KEY=<that key> EMX_API_KEY=<admin key> lmx rent host <listingId>
 ```
 
 It reconnects with jittered exponential backoff (up to 60s) after network
@@ -501,7 +501,7 @@ Cache hits are billed only when the engine reports them in
 | SGLang | with `--enable-cache-report` |
 
 Without it every prompt token is billed at the input price, so set the flag
-(for substrate: `lmx model load … --engine vllm --server-args
+(for emx: `lmx model load … --engine vllm --server-args
 '["--enable-prompt-tokens-details"]'`) if your listing advertises a cached price.
 Media must be sent inline (`data:` URLs); remote media URLs are refused.
 

@@ -112,7 +112,7 @@ type rentHostConfig struct {
 	Listings       []string
 	Target         string // OpenAI-compatible base URL, no /v1
 	TargetKey      string // bearer for forwarded renter requests (--target-key, LMX_RENT_TARGET_KEY)
-	DiscoveryKey   string // bearer for model discovery only (SUBSTRATE_API_KEY)
+	DiscoveryKey   string // bearer for model discovery only (EMX_API_KEY)
 	Models         []string
 	MaxConcurrency int
 	SiteURL        string // for hints
@@ -146,7 +146,7 @@ func handleRentHost(args cliArgs) error {
 	}
 	cfg := rentHostConfig{
 		RelayURL: relayURL, APIKey: key, Listings: listings, Target: target,
-		TargetKey: firstNonEmpty(opt(args, "target-key"), os.Getenv("LMX_RENT_TARGET_KEY")), DiscoveryKey: os.Getenv("SUBSTRATE_API_KEY"),
+		TargetKey: firstNonEmpty(opt(args, "target-key"), os.Getenv("LMX_RENT_TARGET_KEY")), DiscoveryKey: os.Getenv("EMX_API_KEY"),
 		MaxConcurrency: maxConcurrency, SiteURL: apiURL(args),
 		Client: &http.Client{}, Status: func(event string, fields map[string]any) { printStatus(args, event, fields) },
 	}
@@ -160,7 +160,7 @@ func handleRentHost(args cliArgs) error {
 	}
 	if cfg.TargetKey == "" && cfg.DiscoveryKey != "" {
 		cfg.Status("rent_host_target_key_unset", map[string]any{
-			"note": "SUBSTRATE_API_KEY is used only to discover models; renter requests reach --target without a key. If the target needs one, set LMX_RENT_TARGET_KEY (or --target-key) to a client key limited to the rented models: substrate key add rentals --models '" + strings.Join(cfg.Models, ",") + "'.",
+			"note": "EMX_API_KEY is used only to discover models; renter requests reach --target without a key. If the target needs one, set LMX_RENT_TARGET_KEY (or --target-key) to a client key limited to the rented models: emx key add rentals --models '" + strings.Join(cfg.Models, ",") + "'.",
 		})
 	}
 
@@ -200,19 +200,19 @@ func rentTargetGet(cfg rentHostConfig, path string) (*http.Response, context.Can
 }
 
 // rentTargetModels picks the models to advertise when --model is omitted. A
-// substrate gateway starts any registered model on demand, so for one only
+// emx gateway starts any registered model on demand, so for one only
 // the models running now are advertised; other targets advertise /v1/models.
 func rentTargetModels(cfg rentHostConfig) ([]string, error) {
-	// Right after a load, substrate's health probe can briefly report an
+	// Right after a load, emx's health probe can briefly report an
 	// instance as unhealthy; wait a little for it instead of failing.
 	deadline := time.Now().Add(rentDiscoveryWait)
 	for {
-		models, isSubstrate, transient, err := rentSubstrateRunningModels(cfg)
-		if isSubstrate && transient && err != nil && time.Now().Before(deadline) {
+		models, isEMX, transient, err := rentEMXRunningModels(cfg)
+		if isEMX && transient && err != nil && time.Now().Before(deadline) {
 			time.Sleep(time.Second)
 			continue
 		}
-		if isSubstrate {
+		if isEMX {
 			return models, err
 		}
 		break
@@ -247,11 +247,11 @@ func rentTargetModels(cfg rentHostConfig) ([]string, error) {
 // rentDiscoveryWait bounds how long discovery waits for unhealthy instances.
 var rentDiscoveryWait = 20 * time.Second
 
-// rentSubstrateRunningModels lists the names of ready or starting instances
-// when the target answers substrate's management API (isSubstrate); transient
+// rentEMXRunningModels lists the names of ready or starting instances
+// when the target answers emx's management API (isEMX); transient
 // reports instances whose health probe currently fails.
-func rentSubstrateRunningModels(cfg rentHostConfig) (models []string, isSubstrate, transient bool, err error) {
-	res, cancel, err := rentTargetGet(cfg, "/substrate/v1/instances")
+func rentEMXRunningModels(cfg rentHostConfig) (models []string, isEMX, transient bool, err error) {
+	res, cancel, err := rentTargetGet(cfg, "/emx/v1/instances")
 	if err != nil {
 		return nil, false, false, nil
 	}
@@ -260,8 +260,8 @@ func rentSubstrateRunningModels(cfg rentHostConfig) (models []string, isSubstrat
 	switch res.StatusCode {
 	case http.StatusOK:
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return nil, true, false, cliError{"target_models_failed", "The substrate gateway at " + cfg.Target + " needs an admin key to list its running models.", []string{
-			"export SUBSTRATE_API_KEY=<admin key> and retry.",
+		return nil, true, false, cliError{"target_models_failed", "The emx gateway at " + cfg.Target + " needs an admin key to list its running models.", []string{
+			"export EMX_API_KEY=<admin key> and retry.",
 			"Or name the models to rent out with --model <name>.",
 		}, nil}
 	default:
@@ -285,7 +285,7 @@ func rentSubstrateRunningModels(cfg rentHostConfig) (models []string, isSubstrat
 		}
 	}
 	if len(models) == 0 {
-		return nil, true, transient, cliError{"no_running_models", "No model is running on the substrate gateway at " + cfg.Target + "; registered models are not rented out until loaded.", []string{
+		return nil, true, transient, cliError{"no_running_models", "No model is running on the emx gateway at " + cfg.Target + "; registered models are not rented out until loaded.", []string{
 			"Load one first: lmx model load <name>.",
 			"Or name the models to rent out with --model <name> (the gateway starts them on the first rental request).",
 		}, nil}

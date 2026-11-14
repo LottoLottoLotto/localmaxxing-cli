@@ -12515,20 +12515,20 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --no-dht                 Find torrent peers through trackers only
   --scan-dir <dirs>         lmx model list/show/load: also list model folders under these comma-separated directories (also LMX_MODEL_DIRS)
   --no-hf-cache            lmx model list/show/load: skip the Hugging Face cache
-  --gpus <ids>              lmx model load: pin GPUs (as nvidia-smi numbers them); otherwise substrate places the model
+  --gpus <ids>              lmx model load: pin GPUs (as nvidia-smi numbers them); otherwise emx places the model
   --mem-fraction <f>       lmx model load: GPU memory fraction vLLM/SGLang may claim (0-1)
   --idle-unload <duration> lmx model load: stop the model after this long without requests (e.g. 15m)
   --server-args <json>     lmx model load: engine arguments as a JSON string array (needs --engine); never shell evaluated
   --ready-timeout-seconds <n> lmx model load / gateway routing: wait this long for the model to be ready (default 900)
   --forget                 lmx model unload: also unregister the model from the gateway
   --lines <n>              lmx model logs / gateway logs: recent log lines (default 50)
-  --gateway-url <url>      substrate gateway (LMX_GATEWAY_URL; default: substrate config, else http://127.0.0.1:7777)
-  --substrate-bin <path>   substrate executable (LMX_SUBSTRATE_BIN; default: PATH)
-  --service                lmx gateway start: install and start substrate's systemd user service
+  --gateway-url <url>      emx gateway (LMX_GATEWAY_URL; default: emx config, else http://127.0.0.1:7777)
+  --emx-bin <path>   emx executable (LMX_EMX_BIN; default: PATH)
+  --service                lmx gateway start: install and start emx's systemd user service
   --no-gateway             Do not route an endpoint command through the running gateway when --base-url is omitted
-  --target <url>           lmx rent host: local OpenAI-compatible server to serve rentals from (default: the substrate gateway; without --model, rents out only its running models)
+  --target <url>           lmx rent host: local OpenAI-compatible server to serve rentals from (default: the emx gateway; without --model, rents out only its running models)
   --relay-url <wss-url>    lmx rent host: relay WebSocket URL (LMX_RELAY_URL; default: wss://<api-url host>/relay/v1/agent; ws:// only for localhost)
-  --target-key <key>       lmx rent host: bearer sent with renter requests to --target (LMX_RENT_TARGET_KEY; SUBSTRATE_API_KEY is used only to discover models)
+  --target-key <key>       lmx rent host: bearer sent with renter requests to --target (LMX_RENT_TARGET_KEY; EMX_API_KEY is used only to discover models)
   --rental-token <token>   lmx rent connect: send as x-rental-token on every rental request
   --mine                   lmx rent list: list your own listings (all statuses; needs your API key)
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
@@ -12608,7 +12608,7 @@ var commandDescriptions = map[string]string{
 	"skill print":             "Print the bundled SKILL.md to stdout (or --out <path>).",
 	"skill install":           "Write the bundled skill files into a skills directory (default .claude/skills).",
 	"model":                   "List, show, download, load and unload local models; search or resolve HuggingFace model IDs.",
-	"gateway":                 "Run the substrate gateway: one OpenAI/Anthropic-compatible endpoint that routes requests to every loaded model by name.",
+	"gateway":                 "Run the emx gateway: one OpenAI/Anthropic-compatible endpoint that routes requests to every loaded model by name.",
 	"rent":                    "Rent out local inference (host, needs Pro) or use a rented listing locally (connect, needs credits).",
 	"rent host":               "Serve your listings from this machine through the LocalMaxxing relay over one outbound connection.",
 	"rent connect":            "Expose a rented listing as a local OpenAI-compatible base URL using your API key.",

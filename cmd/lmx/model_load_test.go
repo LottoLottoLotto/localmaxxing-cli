@@ -13,11 +13,11 @@ import (
 	"testing"
 )
 
-// fakeSubstrate stands in for the substrate CLI: it keeps registered models in a
+// fakeEMX stands in for the emx CLI: it keeps registered models in a
 // JSON state file, records every invocation, and answers with --json output.
-const fakeSubstrate = `#!/usr/bin/env python3
+const fakeEMX = `#!/usr/bin/env python3
 import json, os, sys
-state_path = os.environ["FAKE_SUBSTRATE_STATE"]
+state_path = os.environ["FAKE_EMX_STATE"]
 state = json.load(open(state_path)) if os.path.exists(state_path) else {"models": [], "calls": [], "instances": []}
 argv = [a for a in sys.argv[1:] if a != "--json"]
 state["calls"].append(sys.argv[1:])
@@ -61,7 +61,7 @@ type fakeGateway struct {
 func (g *fakeGateway) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
-	mux.HandleFunc("POST /substrate/v1/ensure", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /emx/v1/ensure", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Model string `json:"model"`
 		}
@@ -71,7 +71,7 @@ func (g *fakeGateway) handler() http.Handler {
 		g.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]any{"instance": map[string]any{"id": body.Model + "." + g.engine, "name": body.Model, "engine": g.engine, "base_url": g.baseURL, "model": g.modelPath}, "status": "ready"})
 	})
-	mux.HandleFunc("GET /substrate/v1/instances", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /emx/v1/instances", func(w http.ResponseWriter, r *http.Request) {
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		list := []any{}
@@ -80,7 +80,7 @@ func (g *fakeGateway) handler() http.Handler {
 		}
 		json.NewEncoder(w).Encode(list)
 	})
-	mux.HandleFunc("POST /substrate/v1/stop", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /emx/v1/stop", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ID string `json:"id"`
 		}
@@ -93,37 +93,37 @@ func (g *fakeGateway) handler() http.Handler {
 	return mux
 }
 
-type substrateTestEnv struct {
+type emxTestEnv struct {
 	args    cliArgs
 	state   string
 	gateway *fakeGateway
 	server  *httptest.Server
 }
 
-func newSubstrateTestEnv(t *testing.T) *substrateTestEnv {
+func newEMXTestEnv(t *testing.T) *emxTestEnv {
 	t.Helper()
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 is required for the fake substrate")
+		t.Skip("python3 is required for the fake emx")
 	}
 	args := modelStoreTestArgs(t)
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "substrate")
-	if err := os.WriteFile(bin, []byte(fakeSubstrate), 0o755); err != nil {
+	bin := filepath.Join(dir, "emx")
+	if err := os.WriteFile(bin, []byte(fakeEMX), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	state := filepath.Join(dir, "state.json")
-	t.Setenv("LMX_SUBSTRATE_BIN", bin)
-	t.Setenv("FAKE_SUBSTRATE_STATE", state)
-	t.Setenv("SUBSTRATE_API_KEY", "")
+	t.Setenv("LMX_EMX_BIN", bin)
+	t.Setenv("FAKE_EMX_STATE", state)
+	t.Setenv("EMX_API_KEY", "")
 	gateway := &fakeGateway{engine: "llama.cpp", baseURL: "http://127.0.0.1:41000"}
 	server := httptest.NewServer(gateway.handler())
 	t.Cleanup(server.Close)
 	t.Setenv("LMX_GATEWAY_URL", server.URL)
 	args.flags["quiet"] = true
-	return &substrateTestEnv{args: args, state: state, gateway: gateway, server: server}
+	return &emxTestEnv{args: args, state: state, gateway: gateway, server: server}
 }
 
-func (e *substrateTestEnv) calls(t *testing.T) [][]string {
+func (e *emxTestEnv) calls(t *testing.T) [][]string {
 	t.Helper()
 	var state struct {
 		Calls [][]string `json:"calls"`
@@ -133,7 +133,7 @@ func (e *substrateTestEnv) calls(t *testing.T) [][]string {
 	return state.Calls
 }
 
-func (e *substrateTestEnv) addCalls(t *testing.T) [][]string {
+func (e *emxTestEnv) addCalls(t *testing.T) [][]string {
 	var adds [][]string
 	for _, call := range e.calls(t) {
 		if len(call) > 1 && call[0] == "model" && call[1] == "add" {
@@ -143,11 +143,11 @@ func (e *substrateTestEnv) addCalls(t *testing.T) [][]string {
 	return adds
 }
 
-// A local model is registered with substrate (lmx options mapped to its flags,
+// A local model is registered with emx (lmx options mapped to its flags,
 // engine arguments after --) and started by the gateway; loading it again
 // reuses the registration, and a different model cannot take the same name.
 func TestModelLoadRegistersAndEnsuresThroughGateway(t *testing.T) {
-	env := newSubstrateTestEnv(t)
+	env := newEMXTestEnv(t)
 	scan := t.TempDir()
 	os.MkdirAll(filepath.Join(scan, "tiny-gguf"), 0o755)
 	model := filepath.Join(scan, "tiny-gguf", "tiny-Q4_K_M.gguf")
@@ -162,7 +162,7 @@ func TestModelLoadRegistersAndEnsuresThroughGateway(t *testing.T) {
 	adds := env.addCalls(t)
 	want := []string{"model", "add", "tiny-q4_k_m", model, "--ctx", "8192", "--engine", "llama.cpp", "--json", "--", "--seed", "1"}
 	if len(adds) != 1 || strings.Join(adds[0], " ") != strings.Join(want, " ") {
-		t.Fatalf("substrate model add = %v, want %v", adds, want)
+		t.Fatalf("emx model add = %v, want %v", adds, want)
 	}
 	if len(env.gateway.ensured) != 1 || env.gateway.ensured[0] != "tiny-q4_k_m" {
 		t.Fatalf("gateway ensure = %v", env.gateway.ensured)
@@ -192,7 +192,7 @@ func TestModelLoadRegistersAndEnsuresThroughGateway(t *testing.T) {
 // Unload stops through the gateway (in-flight requests finish first); --forget
 // also unregisters so the gateway cannot start it again on demand.
 func TestModelUnloadThroughGateway(t *testing.T) {
-	env := newSubstrateTestEnv(t)
+	env := newEMXTestEnv(t)
 	env.args.positional = []string{"model", "unload", "qwen3-0.6b"}
 	env.args.flags["forget"] = true
 	if err := handleModelUnload("qwen3-0.6b", env.args); err != nil {
@@ -215,7 +215,7 @@ func TestModelUnloadThroughGateway(t *testing.T) {
 // and the engine comes from its instance. Matrix runs get the instance's own
 // URL; local-mode speed tests and explicit --base-url are left alone.
 func TestGatewayDefaultRoutesEndpointCommands(t *testing.T) {
-	env := newSubstrateTestEnv(t)
+	env := newEMXTestEnv(t)
 	env.gateway.engine, env.gateway.baseURL = "vllm", "http://127.0.0.1:41001"
 	hub := filepath.Join(t.TempDir(), "hub", "models--Qwen--Qwen3-0.6B", "snapshots", strings.Repeat("a", 40))
 	state := map[string]any{"models": []any{map[string]any{"name": "qwen3-0.6b", "source": hub}}, "calls": []any{}, "instances": []any{}}
@@ -253,10 +253,10 @@ func TestGatewayDefaultRoutesEndpointCommands(t *testing.T) {
 	}
 }
 
-func TestGatewayURLFromSubstrateConfig(t *testing.T) {
+func TestGatewayURLFromEMXConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("LMX_GATEWAY_URL", "")
-	t.Setenv("SUBSTRATE_HOME", home)
+	t.Setenv("EMX_HOME", home)
 	if got := gatewayURL(cliArgs{}); got != defaultGatewayURL {
 		t.Fatalf("no config: %q", got)
 	}

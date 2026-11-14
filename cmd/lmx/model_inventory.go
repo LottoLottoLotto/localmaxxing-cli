@@ -51,7 +51,7 @@ type modelInventoryEntry struct {
 	Layers             int64                `json:"layers,omitempty"`
 	Experts            int64                `json:"experts,omitempty"`
 	ExpertsPerToken    int64                `json:"expertsPerToken,omitempty"`
-	LoadedAs           []string             `json:"loadedAs,omitempty"` // gateway model names of running substrate instances
+	LoadedAs           []string             `json:"loadedAs,omitempty"` // gateway model names of running emx instances
 	SHA256             string               `json:"sha256,omitempty"`
 	Managed            bool                 `json:"managed,omitempty"`
 	Integrity          string               `json:"integrity,omitempty"`
@@ -754,13 +754,13 @@ func readGGUFSummary(path string) (map[string]any, int64, error) {
 	return meta, params, nil
 }
 
-// markModelUsage marks entries that a substrate instance is serving, by name.
-// Without substrate the listing simply has no marks.
+// markModelUsage marks entries that an emx instance is serving, by name.
+// Without emx the listing simply has no marks.
 func markModelUsage(args cliArgs, entries []modelInventoryEntry) {
-	if _, err := substrateBin(args); err != nil {
+	if _, err := emxBin(args); err != nil {
 		return
 	}
-	instances, err := substrateInstances(args)
+	instances, err := emxInstances(args)
 	if err != nil {
 		return
 	}

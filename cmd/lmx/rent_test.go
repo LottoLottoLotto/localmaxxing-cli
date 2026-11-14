@@ -629,9 +629,9 @@ func TestRentTargetModelsDefaults(t *testing.T) {
 	instancesStatus.Store(http.StatusOK)
 	instances.Store(`[{"instance":{"name":"running-a"},"status":"ready"},{"instance":{"name":"warming-b"},"status":"starting"},{"instance":{"name":"old-c"},"status":"exited"},{"instance":{"name":"running-a"},"status":"ready"}]`)
 	var gotKey atomic.Value
-	substrate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	emx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/substrate/v1/instances":
+		case "/emx/v1/instances":
 			gotKey.Store(r.Header.Get("Authorization"))
 			w.WriteHeader(int(instancesStatus.Load()))
 			fmt.Fprint(w, instances.Load().(string))
@@ -641,7 +641,7 @@ func TestRentTargetModelsDefaults(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer substrate.Close()
+	defer emx.Close()
 	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
 			http.NotFound(w, r)
@@ -651,10 +651,10 @@ func TestRentTargetModelsDefaults(t *testing.T) {
 	}))
 	defer plain.Close()
 
-	cfg := rentHostConfig{Target: substrate.URL, DiscoveryKey: "admin-key", TargetKey: "inference-key", Client: &http.Client{}}
+	cfg := rentHostConfig{Target: emx.URL, DiscoveryKey: "admin-key", TargetKey: "inference-key", Client: &http.Client{}}
 	models, err := rentTargetModels(cfg)
 	if err != nil || strings.Join(models, ",") != "running-a,warming-b" {
-		t.Fatalf("substrate models = %v (%v), want only running instances", models, err)
+		t.Fatalf("emx models = %v (%v), want only running instances", models, err)
 	}
 	if gotKey.Load() != "Bearer admin-key" {
 		t.Fatalf("instances auth = %v", gotKey.Load())
@@ -667,7 +667,7 @@ func TestRentTargetModelsDefaults(t *testing.T) {
 	}
 
 	instancesStatus.Store(http.StatusUnauthorized)
-	if _, err := rentTargetModels(cfg); !errors.As(err, &cliErr) || !strings.Contains(strings.Join(cliErr.Hints, " "), "SUBSTRATE_API_KEY") {
+	if _, err := rentTargetModels(cfg); !errors.As(err, &cliErr) || !strings.Contains(strings.Join(cliErr.Hints, " "), "EMX_API_KEY") {
 		t.Fatalf("keyed gateway: err = %v", err)
 	}
 

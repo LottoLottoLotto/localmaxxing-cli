@@ -15,14 +15,14 @@ import (
 	"time"
 )
 
-// `lmx model load` registers a model from `lmx model list` with substrate and
-// has the substrate gateway start it, so every model is served at one
+// `lmx model load` registers a model from `lmx model list` with emx and
+// has the emx gateway start it, so every model is served at one
 // endpoint and addressed by name. `unload` stops it, `loaded` lists running
 // instances, `logs` shows an instance's log. Engines, GPU placement,
-// Tenstorrent chip swapping and restarts are substrate's (see substrate.go).
+// Tenstorrent chip swapping and restarts are emx's (see emx.go).
 
-// substrateNamePattern is substrate's model-name rule.
-var substrateNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+// emxNamePattern is emx's model-name rule.
+var emxNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 func loadedName(value string) string {
 	value = strings.ToLower(value)
@@ -59,8 +59,8 @@ func jsonStringArrayOption(args cliArgs, key string) ([]string, error) {
 	return result, nil
 }
 
-// modelRegistrationArgs maps lmx options to `substrate model add` flags. Engine
-// arguments after -- are engine-specific, so substrate requires --engine with them.
+// modelRegistrationArgs maps lmx options to `emx model add` flags. Engine
+// arguments after -- are engine-specific, so emx requires --engine with them.
 func modelRegistrationArgs(args cliArgs) ([]string, error) {
 	var flags []string
 	for option, flag := range map[string]string{
@@ -103,18 +103,18 @@ func handleModelLoad(target string, args cliArgs) error {
 		return cliError{"model_not_loadable", entry.Name + " is " + entry.Status + ".", []string{firstNonEmpty(entry.SourceError, "Run lmx model show "+target+".")}, nil}
 	}
 	name := firstNonEmpty(opt(args, "name"), loadedName(entry.Name))
-	if !substrateNamePattern.MatchString(name) {
+	if !emxNamePattern.MatchString(name) {
 		return cliError{"invalid_name", "--name must start with a letter or digit and use letters, digits, '.', '_', ':' or '-' (max 128).", nil, nil}
 	}
 	registration, err := modelRegistrationArgs(args)
 	if err != nil {
 		return err
 	}
-	models, err := substrateModels(args)
+	models, err := emxModels(args)
 	if err != nil {
 		return err
 	}
-	var existing *substrateModel
+	var existing *emxModel
 	for i := range models {
 		if models[i].Name == name {
 			existing = &models[i]
@@ -128,7 +128,7 @@ func handleModelLoad(target string, args cliArgs) error {
 		if existing != nil {
 			argv = append(argv[:4], append([]string{"--force"}, argv[4:]...)...)
 		}
-		if _, err := runSubstrate(args, argv...); err != nil {
+		if _, err := runEMX(args, argv...); err != nil {
 			return err
 		}
 		printStatus(args, "model_registered", map[string]any{"name": name, "source": entry.Path})
@@ -162,7 +162,7 @@ func handleModelLoad(target string, args cliArgs) error {
 func handleModelUnload(target string, args cliArgs) error {
 	targets := args.positional[min(len(args.positional), 2):]
 	if hasFlag(args, "all") {
-		instances, err := substrateInstances(args)
+		instances, err := emxInstances(args)
 		if err != nil {
 			return err
 		}
@@ -179,17 +179,17 @@ func handleModelUnload(target string, args cliArgs) error {
 	for _, id := range targets {
 		if up {
 			// The gateway lets in-flight requests finish before stopping.
-			if err := gatewayCall(base, http.MethodPost, "/substrate/v1/stop", map[string]any{"id": id}, nil, 3*time.Minute); err != nil {
+			if err := gatewayCall(base, http.MethodPost, "/emx/v1/stop", map[string]any{"id": id}, nil, 3*time.Minute); err != nil {
 				return err
 			}
-		} else if _, err := runSubstrate(args, "stop", id); err != nil {
+		} else if _, err := runEMX(args, "stop", id); err != nil {
 			return err
 		}
 		stopped = append(stopped, id)
 	}
 	if hasFlag(args, "forget") && !hasFlag(args, "all") {
 		for _, name := range targets {
-			if _, err := runSubstrate(args, "model", "rm", name); err != nil {
+			if _, err := runEMX(args, "model", "rm", name); err != nil {
 				return err
 			}
 		}
@@ -207,13 +207,13 @@ func handleModelUnload(target string, args cliArgs) error {
 
 func handleModelLoaded(args cliArgs) error {
 	base := gatewayURL(args)
-	var instances []substrateInstance
+	var instances []emxInstance
 	if gatewayUp(base) {
 		var result []struct {
-			Instance substrateInstance `json:"instance"`
-			Status   string            `json:"status"`
+			Instance emxInstance `json:"instance"`
+			Status   string      `json:"status"`
 		}
-		if err := gatewayCall(base, http.MethodGet, "/substrate/v1/instances", nil, &result, 10*time.Second); err != nil {
+		if err := gatewayCall(base, http.MethodGet, "/emx/v1/instances", nil, &result, 10*time.Second); err != nil {
 			return err
 		}
 		for _, entry := range result {
@@ -222,7 +222,7 @@ func handleModelLoaded(args cliArgs) error {
 		}
 	} else {
 		var err error
-		if instances, err = substrateInstances(args); err != nil {
+		if instances, err = emxInstances(args); err != nil {
 			return err
 		}
 	}
@@ -257,7 +257,7 @@ func handleModelLogs(target string, args cliArgs) error {
 	if target == "" {
 		return cliError{"missing_model", "model logs requires a loaded model name.", []string{"Run lmx model loaded."}, nil}
 	}
-	bin, err := substrateBin(args)
+	bin, err := emxBin(args)
 	if err != nil {
 		return err
 	}

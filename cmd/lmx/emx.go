@@ -19,34 +19,34 @@ import (
 	"time"
 )
 
-// lmx serves models through substrate (github.com/LottoLottoLotto/substrate):
+// lmx serves models through emx (github.com/LottoLottoLotto/endpointmaxxing):
 // one OpenAI/Anthropic-compatible gateway that routes every request by its
 // `model` field to the right engine, starts registered models on demand and
-// places them on GPUs and Tenstorrent chips. lmx drives the `substrate`
+// places them on GPUs and Tenstorrent chips. lmx drives the `emx`
 // binary and the gateway's management API; it runs no engines itself.
 
 const defaultGatewayURL = "http://127.0.0.1:7777"
 
-// substrateBin finds the substrate executable: --substrate-bin,
-// LMX_SUBSTRATE_BIN, then PATH.
-func substrateBin(args cliArgs) (string, error) {
-	if path := firstNonEmpty(opt(args, "substrate-bin"), os.Getenv("LMX_SUBSTRATE_BIN")); path != "" {
+// emxBin finds the emx executable: --emx-bin,
+// LMX_EMX_BIN, then PATH.
+func emxBin(args cliArgs) (string, error) {
+	if path := firstNonEmpty(opt(args, "emx-bin"), os.Getenv("LMX_EMX_BIN")); path != "" {
 		return expandHome(path), nil
 	}
-	if path, ok := lookupExecutable("substrate"); ok {
+	if path, ok := lookupExecutable("emx"); ok {
 		return path, nil
 	}
-	return "", cliError{"substrate_not_found", "substrate was not found.", []string{
-		"Install it (github.com/LottoLottoLotto/substrate): go build -o ~/.local/bin/substrate ./cmd/substrate",
-		"Or point lmx at it with --substrate-bin <path> or LMX_SUBSTRATE_BIN.",
+	return "", cliError{"emx_not_found", "emx was not found.", []string{
+		"Install it (github.com/LottoLottoLotto/endpointmaxxing): go build -o ~/.local/bin/emx ./cmd/emx",
+		"Or point lmx at it with --emx-bin <path> or LMX_EMX_BIN.",
 	}, nil}
 }
 
-// runSubstrate runs `substrate <argv...> --json` and returns stdout. Failures
-// become cliErrors carrying substrate's stable code (not_found, conflict,
-// capacity, …) as substrate_<code>.
-func runSubstrate(args cliArgs, argv ...string) ([]byte, error) {
-	bin, err := substrateBin(args)
+// runEMX runs `emx <argv...> --json` and returns stdout. Failures
+// become cliErrors carrying emx's stable code (not_found, conflict,
+// capacity, …) as emx_<code>.
+func runEMX(args cliArgs, argv ...string) ([]byte, error) {
+	bin, err := emxBin(args)
 	if err != nil {
 		return nil, err
 	}
@@ -66,11 +66,11 @@ func runSubstrate(args cliArgs, argv ...string) ([]byte, error) {
 		}
 		for _, output := range [][]byte{stdout.Bytes(), stderr.Bytes()} {
 			if json.Unmarshal(bytes.TrimSpace(output), &failure) == nil && failure.Error != "" {
-				return nil, cliError{"substrate_" + firstNonEmpty(failure.Code, "error"), failure.Error, nil, map[string]any{"command": append([]string{"substrate"}, argv...)}}
+				return nil, cliError{"emx_" + firstNonEmpty(failure.Code, "error"), failure.Error, nil, map[string]any{"command": append([]string{"emx"}, argv...)}}
 			}
 		}
 		message := strings.TrimSpace(firstNonEmpty(stderr.String(), stdout.String(), err.Error()))
-		return nil, cliError{"substrate_error", "substrate " + strings.Join(argv, " ") + ": " + message, nil, nil}
+		return nil, cliError{"emx_error", "emx " + strings.Join(argv, " ") + ": " + message, nil, nil}
 	}
 	return stdout.Bytes(), nil
 }
@@ -87,12 +87,12 @@ func indexOf(values []string, target string) int {
 // ── Gateway address and API ─────────────────────────────────────────────────
 
 // gatewayURL is the gateway base URL (no /v1): --gateway-url, LMX_GATEWAY_URL,
-// else the gateway host/port in substrate's config.yaml, else 127.0.0.1:7777.
+// else the gateway host/port in emx's config.yaml, else 127.0.0.1:7777.
 func gatewayURL(args cliArgs) string {
 	if value := firstNonEmpty(opt(args, "gateway-url"), os.Getenv("LMX_GATEWAY_URL")); value != "" {
 		return openAIBaseURL(value)
 	}
-	host, port := substrateGatewayConfig()
+	host, port := emxGatewayConfig()
 	if host == "" && port == "" {
 		return defaultGatewayURL
 	}
@@ -105,9 +105,9 @@ func gatewayURL(args cliArgs) string {
 	return "http://" + net.JoinHostPort(host, port)
 }
 
-// substrateConfigPath mirrors substrate's own lookup (SUBSTRATE_HOME, then XDG).
-func substrateConfigPath() string {
-	if root := os.Getenv("SUBSTRATE_HOME"); root != "" {
+// emxConfigPath mirrors emx's own lookup (EMX_HOME, then XDG).
+func emxConfigPath() string {
+	if root := os.Getenv("EMX_HOME"); root != "" {
 		return filepath.Join(root, "config", "config.yaml")
 	}
 	base := os.Getenv("XDG_CONFIG_HOME")
@@ -118,14 +118,14 @@ func substrateConfigPath() string {
 		}
 		base = filepath.Join(home, ".config")
 	}
-	return filepath.Join(base, "substrate", "config.yaml")
+	return filepath.Join(base, "emx", "config.yaml")
 }
 
-// substrateGatewayConfig reads gateway.host and gateway.port from config.yaml.
+// emxGatewayConfig reads gateway.host and gateway.port from config.yaml.
 // Only those two scalars of the top-level gateway block are needed, so a line
 // scan replaces a YAML dependency.
-func substrateGatewayConfig() (host, port string) {
-	file, err := os.Open(substrateConfigPath())
+func emxGatewayConfig() (host, port string) {
+	file, err := os.Open(emxConfigPath())
 	if err != nil {
 		return "", ""
 	}
@@ -169,7 +169,7 @@ func gatewayUp(base string) bool {
 	return response.StatusCode == http.StatusOK
 }
 
-// gatewayCall sends a management API request. SUBSTRATE_API_KEY authenticates
+// gatewayCall sends a management API request. EMX_API_KEY authenticates
 // when the gateway has keys (management needs an admin key).
 func gatewayCall(base, method, path string, body any, out any, timeout time.Duration) error {
 	var reader io.Reader
@@ -187,12 +187,12 @@ func gatewayCall(base, method, path string, body any, out any, timeout time.Dura
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := os.Getenv("SUBSTRATE_API_KEY"); key != "" {
+	if key := os.Getenv("EMX_API_KEY"); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	response, err := (&http.Client{}).Do(req)
 	if err != nil {
-		return cliError{"gateway_unreachable", "The substrate gateway at " + base + " did not answer: " + err.Error(), []string{"Start it with lmx gateway start."}, nil}
+		return cliError{"gateway_unreachable", "The emx gateway at " + base + " did not answer: " + err.Error(), []string{"Start it with lmx gateway start."}, nil}
 	}
 	defer response.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(response.Body, 8<<20))
@@ -210,7 +210,7 @@ func gatewayCall(base, method, path string, body any, out any, timeout time.Dura
 		}
 		hints := []string{}
 		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-			hints = append(hints, "The gateway has API keys: export SUBSTRATE_API_KEY=<admin key>.")
+			hints = append(hints, "The gateway has API keys: export EMX_API_KEY=<admin key>.")
 		}
 		return cliError{"gateway_" + strings.ToLower(strings.ReplaceAll(http.StatusText(response.StatusCode), " ", "_")), fmt.Sprintf("gateway %s %s: %s", method, path, message), hints, map[string]any{"status": response.StatusCode}}
 	}
@@ -220,7 +220,7 @@ func gatewayCall(base, method, path string, body any, out any, timeout time.Dura
 	return json.Unmarshal(data, out)
 }
 
-type substrateInstance struct {
+type emxInstance struct {
 	ID          string     `json:"id"`
 	Name        string     `json:"name"`
 	Engine      string     `json:"engine"`
@@ -237,7 +237,7 @@ type substrateInstance struct {
 	Devices     []int      `json:"devices"`
 }
 
-type substrateModel struct {
+type emxModel struct {
 	Name   string `json:"name"`
 	Source string `json:"source"`
 	Format string `json:"format"`
@@ -246,38 +246,38 @@ type substrateModel struct {
 	Engine string `json:"engine"`
 }
 
-func substrateInstances(args cliArgs) ([]substrateInstance, error) {
-	out, err := runSubstrate(args, "ps")
+func emxInstances(args cliArgs) ([]emxInstance, error) {
+	out, err := runEMX(args, "ps")
 	if err != nil {
 		return nil, err
 	}
-	var instances []substrateInstance
+	var instances []emxInstance
 	if err := json.Unmarshal(out, &instances); err != nil {
-		return nil, fmt.Errorf("substrate ps: %w", err)
+		return nil, fmt.Errorf("emx ps: %w", err)
 	}
 	return instances, nil
 }
 
-func substrateModels(args cliArgs) ([]substrateModel, error) {
-	out, err := runSubstrate(args, "model", "list")
+func emxModels(args cliArgs) ([]emxModel, error) {
+	out, err := runEMX(args, "model", "list")
 	if err != nil {
 		return nil, err
 	}
-	var models []substrateModel
+	var models []emxModel
 	if err := json.Unmarshal(out, &models); err != nil {
-		return nil, fmt.Errorf("substrate model list: %w", err)
+		return nil, fmt.Errorf("emx model list: %w", err)
 	}
 	return models, nil
 }
 
 // gatewayEnsure makes the gateway start (or reuse) a ready instance of model.
 // The gateway owns it, so placement may evict it later and idle unload applies.
-func gatewayEnsure(base, model string, timeout time.Duration) (substrateInstance, error) {
+func gatewayEnsure(base, model string, timeout time.Duration) (emxInstance, error) {
 	var result struct {
-		Instance substrateInstance `json:"instance"`
+		Instance emxInstance `json:"instance"`
 	}
 	body := map[string]any{"model": model, "timeout": timeout.String()}
-	err := gatewayCall(base, http.MethodPost, "/substrate/v1/ensure", body, &result, timeout+time.Minute)
+	err := gatewayCall(base, http.MethodPost, "/emx/v1/ensure", body, &result, timeout+time.Minute)
 	return result.Instance, err
 }
 
@@ -316,10 +316,10 @@ func readGatewayRecord() (gatewayRecord, bool) {
 	return record, record.PID > 0 && processMatchesIdentity(record.PID, record.ProcessIdentity)
 }
 
-// gatewayService reports the substrate systemd user service: whether its unit
+// gatewayService reports the emx systemd user service: whether its unit
 // is installed and whether it is active.
 func gatewayService(args cliArgs) (installed, active bool) {
-	out, err := runSubstrate(args, "service", "status")
+	out, err := runEMX(args, "service", "status")
 	if err != nil {
 		return false, false
 	}
@@ -330,7 +330,7 @@ func gatewayService(args cliArgs) (installed, active bool) {
 	return stringValue(status["LoadState"]) == "loaded", stringValue(status["ActiveState"]) == "active"
 }
 
-// startGateway runs `substrate serve` detached (its own session, so it outlives
+// startGateway runs `emx serve` detached (its own session, so it outlives
 // lmx; engines it starts run in their own sessions too) and waits for /health.
 func startGateway(args cliArgs) (string, error) {
 	base := gatewayURL(args)
@@ -338,12 +338,12 @@ func startGateway(args cliArgs) (string, error) {
 		return base, nil
 	}
 	if installed, _ := gatewayService(args); installed {
-		if out, err := exec.Command("systemctl", "--user", "start", "substrate").CombinedOutput(); err != nil {
-			return "", cliError{"gateway_start_failed", "systemctl --user start substrate: " + strings.TrimSpace(string(out)), nil, nil}
+		if out, err := exec.Command("systemctl", "--user", "start", "emx").CombinedOutput(); err != nil {
+			return "", cliError{"gateway_start_failed", "systemctl --user start emx: " + strings.TrimSpace(string(out)), nil, nil}
 		}
 		return base, waitGateway(base, 60*time.Second, nil, "")
 	}
-	bin, err := substrateBin(args)
+	bin, err := emxBin(args)
 	if err != nil {
 		return "", err
 	}
@@ -370,7 +370,7 @@ func startGateway(args cliArgs) (string, error) {
 	configureDetachedCommand(cmd)
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
-		return "", fmt.Errorf("start substrate serve: %w", err)
+		return "", fmt.Errorf("start emx serve: %w", err)
 	}
 	logFile.Close()
 	exited := make(chan error, 1)
@@ -403,7 +403,7 @@ func waitGateway(base string, timeout time.Duration, exited chan error, logPath 
 		}
 		select {
 		case err := <-exited:
-			return cliError{"gateway_start_failed", fmt.Sprintf("substrate serve exited (%v).", err), append([]string{"Gateway log " + logPath + ":"}, tailFile(logPath, 15)...), nil}
+			return cliError{"gateway_start_failed", fmt.Sprintf("emx serve exited (%v).", err), append([]string{"Gateway log " + logPath + ":"}, tailFile(logPath, 15)...), nil}
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
@@ -416,13 +416,13 @@ func handleGateway(action string, args cliArgs) error {
 	case "start":
 		if hasFlag(args, "service") {
 			argv := []string{"service", "install", "--enable"}
-			if _, err := runSubstrate(args, argv...); err != nil {
+			if _, err := runEMX(args, argv...); err != nil {
 				return err
 			}
 			if err := waitGateway(base, 60*time.Second, nil, ""); err != nil {
 				return err
 			}
-			printInfo(args, "gateway_service_started", map[string]any{"url": base + "/v1", "service": "systemctl --user status substrate", "boot": "run loginctl enable-linger $USER to keep it running after logout"})
+			printInfo(args, "gateway_service_started", map[string]any{"url": base + "/v1", "service": "systemctl --user status emx", "boot": "run loginctl enable-linger $USER to keep it running after logout"})
 			return nil
 		}
 		wasUp := gatewayUp(base)
@@ -446,14 +446,14 @@ func handleGateway(action string, args cliArgs) error {
 			return nil
 		}
 		if _, active := gatewayService(args); active {
-			if out, err := exec.Command("systemctl", "--user", "stop", "substrate").CombinedOutput(); err != nil {
-				return cliError{"gateway_stop_failed", "systemctl --user stop substrate: " + strings.TrimSpace(string(out)), nil, nil}
+			if out, err := exec.Command("systemctl", "--user", "stop", "emx").CombinedOutput(); err != nil {
+				return cliError{"gateway_stop_failed", "systemctl --user stop emx: " + strings.TrimSpace(string(out)), nil, nil}
 			}
-			printInfo(args, "gateway_stopped", map[string]any{"url": base, "service": "substrate", "note": "Loaded models keep running; lmx model unload --all stops them."})
+			printInfo(args, "gateway_stopped", map[string]any{"url": base, "service": "emx", "note": "Loaded models keep running; lmx model unload --all stops them."})
 			return nil
 		}
 		if gatewayUp(base) {
-			return cliError{"gateway_not_owned", "A gateway answers at " + base + " but lmx did not start it.", []string{"Stop it where it was started (its terminal, or systemctl --user stop substrate)."}, nil}
+			return cliError{"gateway_not_owned", "A gateway answers at " + base + " but lmx did not start it.", []string{"Stop it where it was started (its terminal, or systemctl --user stop emx)."}, nil}
 		}
 		printInfo(args, "gateway_not_running", map[string]any{"url": base})
 		return nil
@@ -471,7 +471,7 @@ func handleGateway(action string, args cliArgs) error {
 			return nil
 		}
 		if installed, _ := gatewayService(args); installed {
-			argv := []string{"--user", "-u", "substrate", "-n", strconv.Itoa(lines), "--no-pager"}
+			argv := []string{"--user", "-u", "emx", "-n", strconv.Itoa(lines), "--no-pager"}
 			if hasFlag(args, "follow") {
 				argv = append(argv, "-f")
 			}
@@ -479,7 +479,7 @@ func handleGateway(action string, args cliArgs) error {
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			return cmd.Run()
 		}
-		return cliError{"gateway_log_unavailable", "No gateway log: lmx did not start a gateway and no substrate service is installed.", nil, nil}
+		return cliError{"gateway_log_unavailable", "No gateway log: lmx did not start a gateway and no emx service is installed.", nil, nil}
 	}
 	return cliError{"unknown_command", "Unknown gateway command " + action + ".", []string{"Use lmx gateway start [--service], stop, status or logs."}, nil}
 }
@@ -490,14 +490,14 @@ func gatewayStatus(args cliArgs, base string) error {
 	if record, alive := readGatewayRecord(); alive {
 		managedBy = fmt.Sprintf("lmx (pid %d)", record.PID)
 	} else if installed, active := gatewayService(args); active {
-		managedBy = "systemd user service substrate"
+		managedBy = "systemd user service emx"
 	} else if up {
 		managedBy = "external"
 	} else if installed {
 		managedBy = "systemd service installed, inactive"
 	}
-	models, modelsErr := substrateModels(args)
-	instances, instancesErr := substrateInstances(args)
+	models, modelsErr := emxModels(args)
+	instances, instancesErr := emxInstances(args)
 	status := map[string]any{"url": base + "/v1", "up": up, "managedBy": managedBy, "models": models, "instances": instances}
 	if modelsErr != nil {
 		status["error"] = modelsErr.Error()
@@ -512,7 +512,7 @@ func gatewayStatus(args cliArgs, base string) error {
 	if modelsErr != nil {
 		return modelsErr
 	}
-	running := map[string]substrateInstance{}
+	running := map[string]emxInstance{}
 	for _, instance := range instances {
 		running[instance.Name] = instance
 	}
@@ -534,14 +534,14 @@ func gatewayStatus(args cliArgs, base string) error {
 
 // ── Routing lmx's own traffic through the gateway ───────────────────────────
 
-// gatewayEngineNames maps substrate engine ids to LocalMaxxing engine names.
+// gatewayEngineNames maps emx engine ids to LocalMaxxing engine names.
 var gatewayEngineNames = map[string]string{"llama.cpp": "llama.cpp", "vllm": "vllm", "tt-vllm": "vllm", "sglang": "sglang", "strata": "strata"}
 
 // gatewayModelFor picks the gateway model that serves hfID: a registered
 // model named like it, or one whose source is that repository (or its HF
 // cache folder or a folder named after it).
 func gatewayModelFor(args cliArgs, hfID string) (string, error) {
-	models, err := substrateModels(args)
+	models, err := emxModels(args)
 	if err != nil {
 		return "", err
 	}
