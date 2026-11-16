@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -30,7 +31,9 @@ import (
 // LocalMaxxing relay over one outbound connection (no public endpoint), and
 // `lmx rent connect` exposes a rented listing as a local OpenAI-compatible
 // base URL. The site authorizes, meters and bills; the relay only carries
-// bytes; the host enforces its own route allowlist and model list.
+// bytes; the host enforces its own route allowlist and, per listing, the
+// models the listing offers (each priced on its own on the site). `lmx rent
+// publish` sets a listing's models and prices from the emx gateway's.
 
 func handleRent(action string, args cliArgs) error {
 	if action == "host" || action == "connect" {
@@ -44,10 +47,12 @@ func handleRent(action string, args cliArgs) error {
 		return handleRentConnect(args)
 	case "list", "ls":
 		return handleRentList(args)
+	case "publish":
+		return handleRentPublish(args)
 	case "":
-		return cliError{"missing_subcommand", "lmx rent needs a subcommand.", []string{"Use lmx rent host <listingId>, lmx rent connect <listingId>, or lmx rent list [--mine]."}, nil}
+		return cliError{"missing_subcommand", "lmx rent needs a subcommand.", []string{"Use lmx rent host <listingId>, lmx rent connect <listingId>, lmx rent publish <listingId>, or lmx rent list [--mine]."}, nil}
 	}
-	return cliError{"unknown_subcommand", "Unknown rent subcommand: " + action, []string{"Use lmx rent host, lmx rent connect, or lmx rent list."}, map[string]any{"subcommand": action}}
+	return cliError{"unknown_subcommand", "Unknown rent subcommand: " + action, []string{"Use lmx rent host, lmx rent connect, lmx rent publish, or lmx rent list."}, map[string]any{"subcommand": action}}
 }
 
 // optValues returns every value of a repeatable option, also splitting
@@ -125,6 +130,79 @@ type rentHostConfig struct {
 	BackoffMax     time.Duration
 	Client         *http.Client
 	Status         func(event string, fields map[string]any)
+	// Offers holds the models each hosted listing offers, as the site says (refreshed while hosting).
+	Offers *rentListingOffers
+}
+
+// rentListingOffers is, per listing, the models it offers renters. A request through a listing is served
+// only for a model that listing offers and this host serves: a listing priced for one model can never be
+// used to reach another.
+type rentListingOffers struct {
+	mu      sync.RWMutex
+	byID    map[string][]string
+	fetched time.Time
+}
+
+func (o *rentListingOffers) set(byID map[string][]string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.byID, o.fetched = byID, time.Now()
+}
+
+// allowed returns the models served through listing: offered by it and served here.
+func (o *rentListingOffers) allowed(listing string, served []string) []string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	out := []string{}
+	for _, model := range o.byID[listing] {
+		if sliceContainsString(served, model) {
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
+// rentFetchOffers asks the site which models each of the given listings offers (the owner's listings,
+// authenticated with the owner's API key).
+func rentFetchOffers(client *http.Client, siteURL, apiKey string, listings []string) (map[string][]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(siteURL, "/")+"/api/rentals/mine", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s/api/rentals/mine returned HTTP %d", strings.TrimRight(siteURL, "/"), res.StatusCode)
+	}
+	var mine struct {
+		Listings []struct {
+			ID     string `json:"id"`
+			Models []struct {
+				Model string `json:"model"`
+			} `json:"models"`
+		} `json:"listings"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 8<<20)).Decode(&mine); err != nil {
+		return nil, fmt.Errorf("reading your listings: %w", err)
+	}
+	out := map[string][]string{}
+	for _, l := range mine.Listings {
+		if !sliceContainsString(listings, l.ID) {
+			continue
+		}
+		models := []string{}
+		for _, m := range l.Models {
+			models = append(models, m.Model)
+		}
+		out[l.ID] = models
+	}
+	return out, nil
 }
 
 func handleRentHost(args cliArgs) error {
@@ -162,6 +240,32 @@ func handleRentHost(args cliArgs) error {
 		}
 		cfg.Models = models
 	}
+	offers, err := rentFetchOffers(cfg.Client, cfg.SiteURL, cfg.APIKey, cfg.Listings)
+	if err != nil {
+		return cliError{"listing_models_failed", "Could not read the models your listings offer: " + err.Error(), []string{"Check --api-url and your API key (lmx rent list --mine)."}, nil}
+	}
+	cfg.Offers = &rentListingOffers{}
+	cfg.Offers.set(offers)
+	for _, listing := range cfg.Listings {
+		offered, ok := offers[listing]
+		if !ok {
+			return cliError{"not_your_listing", "Listing " + listing + " is not one of yours.", []string{"See your listings with lmx rent list --mine."}, nil}
+		}
+		missing := []string{}
+		for _, model := range offered {
+			if !sliceContainsString(cfg.Models, model) {
+				missing = append(missing, model)
+			}
+		}
+		switch {
+		case len(offered) == 0:
+			cfg.Status("rent_host_listing_without_models", map[string]any{"listing": listing,
+				"note": "This listing offers no model, so renters cannot use it. Set its models and prices: lmx rent publish " + listing})
+		case len(missing) > 0:
+			cfg.Status("rent_host_models_not_served", map[string]any{"listing": listing, "models": strings.Join(missing, ", "),
+				"note": "The listing offers these models but this host does not serve them; renters asking for them are refused. Load them, or update the listing (lmx rent publish " + listing + ")."})
+		}
+	}
 	if cfg.TargetKey == "" && cfg.DiscoveryKey != "" {
 		cfg.Status("rent_host_target_key_unset", map[string]any{
 			"note": "EMX_API_KEY is used only to discover models; renter requests reach --target without a key. If the target needs one, set LMX_RENT_TARGET_KEY (or --target-key) to a client key limited to the rented models: emx key add rentals --models '" + strings.Join(cfg.Models, ",") + "'.",
@@ -179,6 +283,19 @@ func handleRentHost(args cliArgs) error {
 		stop()
 		<-signals
 		os.Exit(130)
+	}()
+	// The owner may change a listing's models and prices while hosting (lmx rent publish): follow them.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(rentOffersRefresh):
+			}
+			if offers, err := rentFetchOffers(cfg.Client, cfg.SiteURL, cfg.APIKey, cfg.Listings); err == nil {
+				cfg.Offers.set(offers)
+			}
+		}
 	}()
 	return runRentHost(ctx, cfg)
 }
@@ -247,6 +364,9 @@ func rentTargetModels(cfg rentHostConfig) ([]string, error) {
 	}
 	return models, nil
 }
+
+// rentOffersRefresh is how often a host re-reads which models its listings offer.
+var rentOffersRefresh = 30 * time.Second
 
 // rentDiscoveryWait bounds how long discovery waits for unhealthy instances.
 var rentDiscoveryWait = 20 * time.Second
@@ -615,8 +735,13 @@ func (h *rentHost) handle(out io.Writer, reader *bufio.Reader, req *http.Request
 	if !relayproto.AllowedRoute(req.Method, req.URL.Path) {
 		return writeRentError(out, http.StatusNotFound, "not_found", "rentals serve only POST /v1/chat/completions, /v1/completions, /v1/embeddings and GET /v1/models"), ""
 	}
+	listing := req.Header.Get(relayproto.HeaderListing)
+	served := h.cfg.Models
+	if h.cfg.Offers != nil {
+		served = h.cfg.Offers.allowed(listing, h.cfg.Models)
+	}
 	if req.URL.Path == "/v1/models" {
-		return writeRentModels(out, h.cfg.Models), ""
+		return writeRentModels(out, served), ""
 	}
 	if len(body) > relayproto.MaxRequestBody {
 		return writeRentError(out, http.StatusRequestEntityTooLarge, "body_too_large", "request body is too large"), ""
@@ -625,8 +750,8 @@ func (h *rentHost) handle(out io.Writer, reader *bufio.Reader, req *http.Request
 	if err != nil {
 		return writeRentError(out, http.StatusBadRequest, "invalid_request", err.Error()), ""
 	}
-	if !sliceContainsString(h.cfg.Models, model) {
-		return writeRentError(out, http.StatusBadRequest, "model_not_available", fmt.Sprintf("model %q is not served by this host; available: %s", model, strings.Join(h.cfg.Models, ", "))), model
+	if !sliceContainsString(served, model) {
+		return writeRentError(out, http.StatusBadRequest, "model_not_available", fmt.Sprintf("model %q is not offered through this listing by this host; available: %s", model, strings.Join(served, ", "))), model
 	}
 	select {
 	case h.slots <- struct{}{}:

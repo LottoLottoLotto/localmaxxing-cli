@@ -751,3 +751,66 @@ func TestRentListShowsInputCachedOutputPrices(t *testing.T) {
 		t.Fatalf("--json must pass through a null cached price, got %#v", payload.Listings[1])
 	}
 }
+
+// A host serving two models for two listings: each listing reaches only the models it offers, so a
+// listing priced for the small model can never be used for the big one.
+func TestRentHostServesOnlyEachListingsModels(t *testing.T) {
+	var targetHits atomic.Int32
+	f := newRentFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	const second = "lst_two"
+	authorize := f.authorize
+	f.authorize = func(apiKey string, listings []string) (int, any) {
+		_, payload := authorize(apiKey, []string{rentTestListing})
+		p := payload.(map[string]any)
+		p["listings"] = []map[string]any{{"id": rentTestListing, "status": "ACTIVE", "maxConcurrency": 4}, {"id": second, "status": "ACTIVE", "maxConcurrency": 4}}
+		return http.StatusOK, p
+	}
+	cfg := f.hostConfig()
+	cfg.Listings = []string{rentTestListing, second}
+	cfg.Models = []string{rentTestModel, "qwen3.8-27b"}
+	cfg.Offers = &rentListingOffers{}
+	cfg.Offers.set(map[string][]string{rentTestListing: {rentTestModel}, second: {"qwen3.8-27b", "not-served-here"}})
+	f.startHost(cfg)
+	f.waitAgents(rentTestListing, 1)
+
+	if res := f.forward(context.Background(), rentTestListing, "POST", "/v1/chat/completions", chatBody(rentTestModel, true)); res.StatusCode != http.StatusOK {
+		t.Fatalf("the listing's own model: %d", res.StatusCode)
+	}
+	res := f.forward(context.Background(), rentTestListing, "POST", "/v1/chat/completions", chatBody("qwen3.8-27b", true))
+	if res.StatusCode != http.StatusBadRequest || readErrorCode(t, res) != "model_not_available" {
+		t.Fatalf("another listing's model through this listing: %d", res.StatusCode)
+	}
+	if res := f.forward(context.Background(), second, "POST", "/v1/chat/completions", chatBody("qwen3.8-27b", true)); res.StatusCode != http.StatusOK {
+		t.Fatalf("the second listing's model: %d", res.StatusCode)
+	}
+	res = f.forward(context.Background(), second, "POST", "/v1/chat/completions", chatBody("not-served-here", true))
+	if res.StatusCode != http.StatusBadRequest || readErrorCode(t, res) != "model_not_available" {
+		t.Fatalf("offered by the listing but not served here: %d", res.StatusCode)
+	}
+	if n := targetHits.Load(); n != 2 {
+		t.Fatalf("the target saw %d requests, want the 2 allowed ones", n)
+	}
+	models := f.forward(context.Background(), second, "GET", "/v1/models", "")
+	defer models.Body.Close()
+	var list struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(models.Body).Decode(&list); err != nil || len(list.Data) != 1 || list.Data[0].ID != "qwen3.8-27b" {
+		t.Fatalf("the second listing's models: %+v (%v)", list, err)
+	}
+}
+
+// emx prices are USD per million tokens; listings are priced in credits ($0.01) per thousand.
+func TestCreditsPer1kFromEMXPrice(t *testing.T) {
+	for usdPerMillion, want := range map[float64]float64{3: 0.3, 12: 1.2, 0: 0, 0.15: 0.015, 2.5: 0.25} {
+		if got := creditsPer1k(usdPerMillion); got != want {
+			t.Errorf("$%v per 1M = %v credits per 1k, want %v", usdPerMillion, got, want)
+		}
+	}
+}

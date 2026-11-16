@@ -423,9 +423,25 @@ lmx rent host <listingId>
 lmx rent host <listingId> <listingId2> --target http://127.0.0.1:8000 \
   --model Qwen/Qwen3-8B --model Qwen/Qwen3-0.6B --max-concurrency 4
 
+# Prices: set the listing's models and their prices from emx
+emx price set qwen3.8-27b-q4 --prompt 3 --completion 12    # USD per 1M tokens
+EMX_API_KEY=<emx admin key> lmx rent publish <listingId>   # --dry-run to see first
+
 # Rent: a local OpenAI-compatible base URL for a listing
 lmx rent connect <listingId> --port 8000   # then use http://127.0.0.1:8000/v1
 ```
+
+**Models and prices.** A listing offers one or more models, each with its own
+input, cached-input and output price (credits per 1,000 tokens; 1 credit =
+$0.01) and context window. A renter names the model in `model`; the site
+refuses any model the listing does not offer before reserving credits or
+reaching the host, and bills at that model's prices. Set them on the site
+(`/rentals/<id>/edit`) or with `lmx rent publish <listingId>`, which reads the
+emx gateway (`EMX_API_KEY`, an admin or auditor key): the models running there
+(or `--model`), each at its `emx price` (USD per million tokens, converted:
+$3 per 1M = 0.3 credits per 1k) and served context. A model without an emx
+price is refused, never offered at an unset price. The site allows one listing
+update per minute.
 
 `lmx rent host` makes one **outbound** connection to the LocalMaxxing relay
 (`wss://<api-url host>/relay/v1/agent`; override with `--relay-url` or
@@ -438,12 +454,15 @@ enforces locally:
 - only `POST /v1/chat/completions`, `POST /v1/completions`,
   `POST /v1/embeddings` and `GET /v1/models` (everything else is 404, so a
   target's admin API is never reachable);
-- the `model` must be one of the advertised models: `--model` (repeatable or
+- the `model` must be one the request's listing offers (read from the site at
+  start and every 30 s) and one this host serves: `--model` (repeatable or
   comma-separated); by default, for the emx gateway, only the models
   running now (`lmx model loaded`; registered but stopped models are not rented
   out, since the gateway would start them on demand), and for any other target
-  every id its `/v1/models` lists. `GET /v1/models` answers with exactly that
-  list. Bodies with a duplicate key or a case variant of `model` (`Model`,
+  every id its `/v1/models` lists. So a listing priced for one model is never a
+  way to reach another the host serves for a different listing. `GET /v1/models`
+  answers with the listing's models this host serves. At start it says which
+  offered models it does not serve. Bodies with a duplicate key or a case variant of `model` (`Model`,
   `MODEL`) are refused with 400, and the target receives the body re-encoded
   with that single `model` key, so every parser sees the checked model;
 - renter headers are dropped except `Content-Type`, `Accept`, `User-Agent`;
