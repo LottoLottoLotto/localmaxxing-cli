@@ -846,3 +846,24 @@ func TestRentRenterTagReachesTheGatewayAsItsClient(t *testing.T) {
 		t.Fatalf("X-Emx-Client at the target: %q", seen)
 	}
 }
+
+// A listing hosted with --shared-cache names one cache group for all of its renters.
+func TestRentSharedCacheListingNamesOneCacheGroup(t *testing.T) {
+	groups := make(chan string, 4)
+	f := newRentFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		groups <- r.Header.Get("X-Emx-Cache-Group") + "|" + r.Header.Get("X-Emx-Client")
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	cfg := f.hostConfig()
+	cfg.SharedCache = []string{rentTestListing}
+	f.startHost(cfg)
+	f.waitAgents(rentTestListing, 1)
+	f.renter = "a1b2c3d4e5f6a7b8"
+	res := f.forward(context.Background(), rentTestListing, "POST", "/v1/chat/completions", chatBody(rentTestModel, true))
+	io.Copy(io.Discard, res.Body)
+	res.Body.Close()
+	if got := <-groups; got != "listing-"+rentTestListing+"|renter-a1b2c3d4e5f6a7b8" {
+		t.Fatalf("group|client at the target: %q", got)
+	}
+}

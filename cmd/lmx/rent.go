@@ -132,6 +132,9 @@ type rentHostConfig struct {
 	Status         func(event string, fields map[string]any)
 	// Offers holds the models each hosted listing offers, as the site says (refreshed while hosting).
 	Offers *rentListingOffers
+	// SharedCache lists the listings whose renters share one prompt cache at the emx target
+	// (--shared-cache): renters that trust each other, such as one team on a private listing.
+	SharedCache []string
 }
 
 // rentListingOffers is, per listing, the models it offers renters. A request through a listing is served
@@ -233,6 +236,12 @@ func handleRentHost(args cliArgs) error {
 		Client: &http.Client{}, Status: func(event string, fields map[string]any) { printStatus(args, event, fields) },
 	}
 	cfg.Models = optValues(args, "model")
+	cfg.SharedCache = optValues(args, "shared-cache")
+	for _, l := range cfg.SharedCache {
+		if !sliceContainsString(cfg.Listings, l) {
+			return cliError{"invalid_option", "--shared-cache " + l + " is not one of the listings this host serves.", nil, nil}
+		}
+	}
 	if len(cfg.Models) == 0 {
 		models, err := rentTargetModels(cfg)
 		if err != nil {
@@ -394,10 +403,11 @@ func rentTargetCacheIsolation(cfg rentHostConfig) (isolated, isEMX bool) {
 	}
 	for _, m := range list.Data {
 		if m.EMX != nil {
-			return m.EMX.CacheIsolation, true
+			isEMX = true
+			isolated = isolated || m.EMX.CacheIsolation // aliases may not carry it
 		}
 	}
-	return false, false
+	return isolated, isEMX
 }
 
 // rentDiscoveryWait bounds how long discovery waits for unhealthy instances.
@@ -816,6 +826,10 @@ func (h *rentHost) handle(out io.Writer, reader *bufio.Reader, req *http.Request
 	// gateway.cache_isolation no renter learns from another's prompt-cache hits.
 	if renter := req.Header.Get(relayproto.HeaderRenter); relayproto.RenterTagRe.MatchString(renter) {
 		upstream.Header.Set("X-Emx-Client", "renter-"+renter)
+	}
+	// A listing whose renters trust each other shares one prompt cache (still recorded per renter).
+	if listing := req.Header.Get(relayproto.HeaderListing); sliceContainsString(h.cfg.SharedCache, listing) {
+		upstream.Header.Set("X-Emx-Cache-Group", "listing-"+listing)
 	}
 	res, err := h.cfg.Client.Do(upstream)
 	if err != nil {

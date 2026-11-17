@@ -12530,6 +12530,7 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --target <url>           lmx rent host: local OpenAI-compatible server to serve rentals from (default: the emx gateway; without --model, rents out only its running models)
   --relay-url <wss-url>    lmx rent host: relay WebSocket URL (LMX_RELAY_URL; default: wss://<api-url host>/relay/v1/agent; ws:// only for localhost)
   --target-key <key>       lmx rent host: bearer sent with renter requests to --target (LMX_RENT_TARGET_KEY; EMX_API_KEY is used only to discover models)
+  --shared-cache <id>      lmx rent host: this listing's renters share one prompt cache at the emx target (they trust each other); repeatable
   --rental-token <token>   lmx rent connect: send as x-rental-token on every rental request
   --mine                   lmx rent list: list your own listings (all statuses; needs your API key)
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)

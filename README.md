@@ -472,8 +472,12 @@ enforces locally:
   a delegating emx key (`emx key add rentals --delegate`) and
   `gateway.cache_isolation: true`, emx records each renter apart and keeps
   each renter's prompt cache to itself: no renter sees another's cache hits,
-  in its usage, its bill, or how fast its answers start. `lmx rent host`
-  warns at start when the emx target does not isolate;
+  in its usage, its bill, or how fast its answers start. A prompt prefix
+  several renters sent (a common system prompt) is shared by all (emx
+  `gateway.cache_share_after`, default 5). `--shared-cache <listingId>` lets
+  one listing's renters share all of their cache (for renters that trust each
+  other, such as a team's private listing; each is still recorded apart).
+  `lmx rent host` warns at start when the emx target does not isolate;
 - at most `--max-concurrency` (default 4) requests at a time; more get 429.
 
 Target keys: renter requests carry `--target-key` / `LMX_RENT_TARGET_KEY` (if
