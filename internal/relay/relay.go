@@ -1080,6 +1080,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, ag *agent, meth
 	}
 	req.Header.Set(relayproto.HeaderListing, listing)
 	req.Header.Set(relayproto.HeaderSession, sessionID)
+	if renter := r.Header.Get(relayproto.HeaderRenter); relayproto.RenterTagRe.MatchString(renter) {
+		req.Header.Set(relayproto.HeaderRenter, renter)
+	}
 	_ = stream.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if err := req.Write(stream); err != nil {
 		writeError(w, http.StatusBadGateway, "agent_failed", "could not send the request to the host")

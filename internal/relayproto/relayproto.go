@@ -20,6 +20,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 
@@ -51,8 +52,11 @@ const (
 const (
 	HeaderListing = "X-Lmx-Listing"
 	HeaderSession = "X-Lmx-Session"
-	HeaderMethod  = "X-Lmx-Method"
-	HeaderPath    = "X-Lmx-Path"
+	// HeaderRenter is an opaque per-renter, per-listing tag the site sets (not the renter's identity): the
+	// host passes it to its gateway, which keeps each renter's prompt cache to itself.
+	HeaderRenter = "X-Lmx-Renter"
+	HeaderMethod = "X-Lmx-Method"
+	HeaderPath   = "X-Lmx-Path"
 )
 
 // HeaderRelayError marks a relay-originated error response with its code.
@@ -252,3 +256,6 @@ func WriteError(w http.ResponseWriter, status int, code, message string) {
 	w.WriteHeader(status)
 	_, _ = w.Write(ErrorJSON(code, message))
 }
+
+// RenterTagRe is what a renter tag looks like.
+var RenterTagRe = regexp.MustCompile(`^[a-z0-9]{8,48}$`)

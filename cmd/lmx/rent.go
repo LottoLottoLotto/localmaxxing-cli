@@ -266,6 +266,11 @@ func handleRentHost(args cliArgs) error {
 				"note": "The listing offers these models but this host does not serve them; renters asking for them are refused. Load them, or update the listing (lmx rent publish " + listing + ")."})
 		}
 	}
+	if isolated, isEMX := rentTargetCacheIsolation(cfg); isEMX && !isolated {
+		cfg.Status("rent_host_cache_shared", map[string]any{
+			"note": "The emx gateway at " + cfg.Target + " lets clients see each other's prompt-cache hits: a renter could learn what another recently sent. Set gateway.cache_isolation: true in its config.yaml, and give this host a delegating key (emx key add rentals --delegate) so each renter is its own client.",
+		})
+	}
 	if cfg.TargetKey == "" && cfg.DiscoveryKey != "" {
 		cfg.Status("rent_host_target_key_unset", map[string]any{
 			"note": "EMX_API_KEY is used only to discover models; renter requests reach --target without a key. If the target needs one, set LMX_RENT_TARGET_KEY (or --target-key) to a client key limited to the rented models: emx key add rentals --models '" + strings.Join(cfg.Models, ",") + "'.",
@@ -367,6 +372,33 @@ func rentTargetModels(cfg rentHostConfig) ([]string, error) {
 
 // rentOffersRefresh is how often a host re-reads which models its listings offer.
 var rentOffersRefresh = 30 * time.Second
+
+// rentTargetCacheIsolation reports whether the target is an emx gateway (isEMX) and keeps each client's
+// prompt cache to itself (gateway.cache_isolation).
+func rentTargetCacheIsolation(cfg rentHostConfig) (isolated, isEMX bool) {
+	res, cancel, err := rentTargetGet(cfg, "/v1/models")
+	if err != nil {
+		return false, false
+	}
+	defer cancel()
+	defer res.Body.Close()
+	var list struct {
+		Data []struct {
+			EMX *struct {
+				CacheIsolation bool `json:"cache_isolation"`
+			} `json:"emx"`
+		} `json:"data"`
+	}
+	if res.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(res.Body, 8<<20)).Decode(&list) != nil {
+		return false, false
+	}
+	for _, m := range list.Data {
+		if m.EMX != nil {
+			return m.EMX.CacheIsolation, true
+		}
+	}
+	return false, false
+}
 
 // rentDiscoveryWait bounds how long discovery waits for unhealthy instances.
 var rentDiscoveryWait = 20 * time.Second
@@ -779,6 +811,11 @@ func (h *rentHost) handle(out io.Writer, reader *bufio.Reader, req *http.Request
 	}
 	if h.cfg.TargetKey != "" {
 		upstream.Header.Set("Authorization", "Bearer "+h.cfg.TargetKey)
+	}
+	// Each renter is its own client at an emx gateway (a delegating target key): recorded apart, and with
+	// gateway.cache_isolation no renter learns from another's prompt-cache hits.
+	if renter := req.Header.Get(relayproto.HeaderRenter); relayproto.RenterTagRe.MatchString(renter) {
+		upstream.Header.Set("X-Emx-Client", "renter-"+renter)
 	}
 	res, err := h.cfg.Client.Do(upstream)
 	if err != nil {

@@ -466,6 +466,14 @@ enforces locally:
   `MODEL`) are refused with 400, and the target receives the body re-encoded
   with that single `model` key, so every parser sees the checked model;
 - renter headers are dropped except `Content-Type`, `Accept`, `User-Agent`;
+- each renter reaches the target as its own client: the site sends an opaque
+  tag per renter and listing (never the renter's identity, and different on
+  each listing), which the host passes as `X-Emx-Client: renter-<tag>`. With
+  a delegating emx key (`emx key add rentals --delegate`) and
+  `gateway.cache_isolation: true`, emx records each renter apart and keeps
+  each renter's prompt cache to itself: no renter sees another's cache hits,
+  in its usage, its bill, or how fast its answers start. `lmx rent host`
+  warns at start when the emx target does not isolate;
 - at most `--max-concurrency` (default 4) requests at a time; more get 429.
 
 Target keys: renter requests carry `--target-key` / `LMX_RENT_TARGET_KEY` (if

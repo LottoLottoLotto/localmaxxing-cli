@@ -44,6 +44,8 @@ type rentFixture struct {
 	authCalls     atomic.Int32
 	// authorize decides the site's answer; default: Pro owner of every listing.
 	authorize func(apiKey string, listings []string) (int, any)
+	// renter is the site's renter tag sent with forwarded requests ("" none).
+	renter string
 }
 
 func newRentFixture(t *testing.T, target http.Handler) *rentFixture {
@@ -169,6 +171,9 @@ func (f *rentFixture) forward(ctx context.Context, listing, method, path, body s
 	req.Header.Set(relayproto.HeaderMethod, method)
 	req.Header.Set(relayproto.HeaderPath, path)
 	req.Header.Set("Content-Type", "application/json")
+	if f.renter != "" {
+		req.Header.Set(relayproto.HeaderRenter, f.renter)
+	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		f.t.Fatal(err)
@@ -812,5 +817,32 @@ func TestCreditsPer1kFromEMXPrice(t *testing.T) {
 		if got := creditsPer1k(usdPerMillion); got != want {
 			t.Errorf("$%v per 1M = %v credits per 1k, want %v", usdPerMillion, got, want)
 		}
+	}
+}
+
+// The site's per-renter tag reaches the host's gateway as the client a delegating key acts for, so each
+// renter is recorded apart and keeps its prompt cache to itself; a malformed tag is dropped on the way.
+func TestRentRenterTagReachesTheGatewayAsItsClient(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	f := newRentFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Header.Get("X-Emx-Client"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	f.startHost(f.hostConfig())
+	f.waitAgents(rentTestListing, 1)
+	for _, tag := range []string{"a1b2c3d4e5f6a7b8", "", "Bad Tag!"} {
+		f.renter = tag
+		res := f.forward(context.Background(), rentTestListing, "POST", "/v1/chat/completions", chatBody(rentTestModel, true))
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 3 || seen[0] != "renter-a1b2c3d4e5f6a7b8" || seen[1] != "" || seen[2] != "" {
+		t.Fatalf("X-Emx-Client at the target: %q", seen)
 	}
 }
