@@ -1121,7 +1121,7 @@ func handleRentList(args cliArgs) error {
 		printInfo(args, "no_rentals", map[string]any{"next": next})
 		return nil
 	}
-	headers := []string{"ID", "TITLE", "MODEL", "IN/1K", "CACHED/1K", "OUT/1K", "SESSIONS"}
+	headers := []string{"ID", "TITLE", "MODEL", "IN/1M", "CACHED/1M", "OUT/1M", "SESSIONS"}
 	if mine {
 		headers = append([]string{headers[0], "STATUS"}, headers[1:]...)
 	} else {
@@ -1130,20 +1130,20 @@ func handleRentList(args cliArgs) error {
 	rows := [][]string{}
 	for _, listing := range listings {
 		model := firstNonEmpty(stringValue(asObject(listing["model"])["hfId"]), stringValue(listing["modelLabel"]), "-")
-		// Credits per 1k tokens; a null cached-input price means the input price applies.
-		input := numberField(listing, "pricePer1kInputTokens")
+		// US dollars per 1M tokens; a null cached-input price means the input price applies.
+		input := numberField(listing, "pricePer1MInputTokens")
 		cached := input
-		if value, ok := listing["pricePer1kCachedInputTokens"].(float64); ok {
+		if value, ok := listing["pricePer1MCachedInputTokens"].(float64); ok {
 			cached = value
 		}
-		output := numberField(listing, "pricePer1kOutputTokens")
+		output := numberField(listing, "pricePer1MOutputTokens")
 		sessions := "0"
 		if value, ok := asObject(listing["_count"])["sessions"].(float64); ok {
 			sessions = strconv.Itoa(int(value))
 		}
 		row := []string{
 			stringValue(listing["id"]), truncateRentCell(stringValue(listing["title"]), 40), model,
-			strconv.FormatFloat(input, 'f', -1, 64), strconv.FormatFloat(cached, 'f', -1, 64), strconv.FormatFloat(output, 'f', -1, 64),
+			usdPrice(input), usdPrice(cached), usdPrice(output),
 			sessions,
 		}
 		if mine {

@@ -691,9 +691,9 @@ func TestRentListShowsInputCachedOutputPrices(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"listings":[
-			{"id":"lst_cached","title":"Cached","modelLabel":"m1","pricePer1kInputTokens":0.5,"pricePer1kCachedInputTokens":0.1,"pricePer1kOutputTokens":2,"_count":{"sessions":3}},
-			{"id":"lst_inherit","title":"Inherit","modelLabel":"m2","pricePer1kInputTokens":0.75,"pricePer1kCachedInputTokens":null,"pricePer1kOutputTokens":1.5,"_count":{"sessions":0}},
-			{"id":"lst_free","title":"Free","modelLabel":"m3","pricePer1kInputTokens":0,"pricePer1kCachedInputTokens":null,"pricePer1kOutputTokens":0,"_count":{"sessions":1}}
+			{"id":"lst_cached","title":"Cached","modelLabel":"m1","pricePer1MInputTokens":5,"pricePer1MCachedInputTokens":1,"pricePer1MOutputTokens":20,"_count":{"sessions":3}},
+			{"id":"lst_inherit","title":"Inherit","modelLabel":"m2","pricePer1MInputTokens":7.5,"pricePer1MCachedInputTokens":null,"pricePer1MOutputTokens":15,"_count":{"sessions":0}},
+			{"id":"lst_free","title":"Free","modelLabel":"m3","pricePer1MInputTokens":0,"pricePer1MCachedInputTokens":null,"pricePer1MOutputTokens":0,"_count":{"sessions":1}}
 		]}`)
 	}))
 	defer site.Close()
@@ -730,13 +730,13 @@ func TestRentListShowsInputCachedOutputPrices(t *testing.T) {
 			rowFields[fields[0]] = fields
 		}
 	}
-	if strings.Join(header[:7], " ") != "ID TITLE MODEL IN/1K CACHED/1K OUT/1K SESSIONS" {
+	if strings.Join(header[:7], " ") != "ID TITLE MODEL IN/1M CACHED/1M OUT/1M SESSIONS" {
 		t.Fatalf("header = %v", header)
 	}
 	for id, want := range map[string]string{
-		"lst_cached":  "0.5 0.1 2",
-		"lst_inherit": "0.75 0.75 1.5",
-		"lst_free":    "0 0 0",
+		"lst_cached":  "$5 $1 $20",
+		"lst_inherit": "$7.5 $7.5 $15",
+		"lst_free":    "$0 $0 $0",
 	} {
 		if got := strings.Join(rowFields[id][3:6], " "); got != want {
 			t.Fatalf("%s prices = %q, want %q (row %v)", id, got, want, rowFields[id])
@@ -749,10 +749,10 @@ func TestRentListShowsInputCachedOutputPrices(t *testing.T) {
 	if err := json.Unmarshal([]byte(run("--json")), &payload); err != nil {
 		t.Fatalf("--json output: %v", err)
 	}
-	if len(payload.Listings) != 3 || payload.Listings[0]["pricePer1kCachedInputTokens"] != 0.1 {
+	if len(payload.Listings) != 3 || payload.Listings[0]["pricePer1MCachedInputTokens"] != 1.0 {
 		t.Fatalf("--json listings = %#v", payload.Listings)
 	}
-	if value, ok := payload.Listings[1]["pricePer1kCachedInputTokens"]; !ok || value != nil {
+	if value, ok := payload.Listings[1]["pricePer1MCachedInputTokens"]; !ok || value != nil {
 		t.Fatalf("--json must pass through a null cached price, got %#v", payload.Listings[1])
 	}
 }
@@ -808,15 +808,6 @@ func TestRentHostServesOnlyEachListingsModels(t *testing.T) {
 	}
 	if err := json.NewDecoder(models.Body).Decode(&list); err != nil || len(list.Data) != 1 || list.Data[0].ID != "qwen3.8-27b" {
 		t.Fatalf("the second listing's models: %+v (%v)", list, err)
-	}
-}
-
-// emx prices are USD per million tokens; listings are priced in credits ($0.01) per thousand.
-func TestCreditsPer1kFromEMXPrice(t *testing.T) {
-	for usdPerMillion, want := range map[float64]float64{3: 0.3, 12: 1.2, 0: 0, 0.15: 0.015, 2.5: 0.25} {
-		if got := creditsPer1k(usdPerMillion); got != want {
-			t.Errorf("$%v per 1M = %v credits per 1k, want %v", usdPerMillion, got, want)
-		}
 	}
 }
 

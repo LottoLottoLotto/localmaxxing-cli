@@ -6,22 +6,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // ── rent publish ────────────────────────────────────────────────────────────
 
-// rentPublishedModel is one model of a listing as the site stores it: credits per 1,000 tokens.
+// rentPublishedModel is one model of a listing as the site stores it: US dollars per 1M tokens.
 type rentPublishedModel struct {
 	Model                       string   `json:"model"`
-	PricePer1kInputTokens       float64  `json:"pricePer1kInputTokens"`
-	PricePer1kCachedInputTokens *float64 `json:"pricePer1kCachedInputTokens"`
-	PricePer1kOutputTokens      float64  `json:"pricePer1kOutputTokens"`
+	PricePer1MInputTokens       float64  `json:"pricePer1MInputTokens"`
+	PricePer1MCachedInputTokens *float64 `json:"pricePer1MCachedInputTokens"`
+	PricePer1MOutputTokens      float64  `json:"pricePer1MOutputTokens"`
 	ContextLength               *int     `json:"contextLength"`
 }
 
@@ -39,14 +39,8 @@ type emxPricedModel struct {
 	} `json:"emx"`
 }
 
-// creditsPer1k turns an emx price (per million tokens, in USD) into the site's unit: credits per 1,000
-// tokens, 1 credit = $0.01. $3 per million = $0.003 per thousand = 0.3 credits per thousand.
-func creditsPer1k(usdPerMillion float64) float64 {
-	return math.Round(usdPerMillion/10*1e6) / 1e6
-}
-
 // handleRentPublish sets a listing's models and their prices from the emx gateway: the models running
-// there (or --model), each at its `emx price`, converted to credits per 1k tokens, with its context
+// there (or --model), each at its `emx price` (US dollars per 1M tokens, the site's unit too), with its context
 // window. The site then bills each renter request at the price of the model it names and refuses the rest.
 func handleRentPublish(args cliArgs) error {
 	listing := positional(args, 2)
@@ -86,12 +80,12 @@ func handleRentPublish(args cliArgs) error {
 			continue
 		}
 		if cur := strings.ToUpper(m.EMX.Price.Currency); cur != "USD" {
-			return cliError{"price_currency", "emx prices are in " + m.EMX.Price.Currency + "; rentals are paid in credits worth $0.01, so set them in USD.", []string{"emx price set " + name + " --prompt <USD per 1M> --completion <USD per 1M> --currency USD"}, nil}
+			return cliError{"price_currency", "emx prices are in " + m.EMX.Price.Currency + "; rentals are priced in US dollars, so set them in USD.", []string{"emx price set " + name + " --prompt <USD per 1M> --completion <USD per 1M> --currency USD"}, nil}
 		}
-		pm := rentPublishedModel{Model: name, PricePer1kInputTokens: creditsPer1k(m.EMX.Price.Prompt), PricePer1kOutputTokens: creditsPer1k(m.EMX.Price.Completion)}
+		pm := rentPublishedModel{Model: name, PricePer1MInputTokens: m.EMX.Price.Prompt, PricePer1MOutputTokens: m.EMX.Price.Completion}
 		if m.EMX.Price.Cached != nil {
-			cached := creditsPer1k(*m.EMX.Price.Cached)
-			pm.PricePer1kCachedInputTokens = &cached
+			cached := *m.EMX.Price.Cached
+			pm.PricePer1MCachedInputTokens = &cached
 		}
 		if m.MaxModelLen > 0 {
 			ctx := m.MaxModelLen
@@ -123,19 +117,24 @@ func handleRentPublish(args cliArgs) error {
 	if hasFlag(args, "dry-run") {
 		verb = "Would set listing " + listing + " to offer"
 	}
-	fmt.Printf("%s (credits per 1k tokens; 1 credit = $0.01):\n", verb)
+	fmt.Printf("%s (US dollars per 1M tokens):\n", verb)
 	fmt.Printf("  %-32s %10s %10s %10s %9s\n", "MODEL", "INPUT", "CACHED", "OUTPUT", "CONTEXT")
 	for _, m := range out {
 		cached, ctx := "= input", "-"
-		if m.PricePer1kCachedInputTokens != nil {
-			cached = fmt.Sprint(*m.PricePer1kCachedInputTokens)
+		if m.PricePer1MCachedInputTokens != nil {
+			cached = usdPrice(*m.PricePer1MCachedInputTokens)
 		}
 		if m.ContextLength != nil {
 			ctx = fmt.Sprint(*m.ContextLength)
 		}
-		fmt.Printf("  %-32s %10v %10s %10v %9s\n", m.Model, m.PricePer1kInputTokens, cached, m.PricePer1kOutputTokens, ctx)
+		fmt.Printf("  %-32s %10s %10s %10s %9s\n", m.Model, usdPrice(m.PricePer1MInputTokens), cached, usdPrice(m.PricePer1MOutputTokens), ctx)
 	}
 	return nil
+}
+
+// usdPrice prints a price in US dollars per 1M tokens: 3 → "$3", 0.15 → "$0.15".
+func usdPrice(v float64) string {
+	return "$" + strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 // rentEMXPrices reads the gateway's models with their prices and context windows (admin view).

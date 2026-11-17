@@ -432,14 +432,14 @@ lmx rent connect <listingId> --port 8000   # then use http://127.0.0.1:8000/v1
 ```
 
 **Models and prices.** A listing offers one or more models, each with its own
-input, cached-input and output price (credits per 1,000 tokens; 1 credit =
-$0.01) and context window. A renter names the model in `model`; the site
-refuses any model the listing does not offer before reserving credits or
+input, cached-input and output price (US dollars per million tokens) and
+context window. A renter names the model in `model`; the site refuses any
+model the listing does not offer before reserving the renter's balance or
 reaching the host, and bills at that model's prices. Set them on the site
 (`/rentals/<id>/edit`) or with `lmx rent publish <listingId>`, which reads the
 emx gateway (`EMX_API_KEY`, an admin or auditor key): the models running there
-(or `--model`), each at its `emx price` (USD per million tokens, converted:
-$3 per 1M = 0.3 credits per 1k) and served context. A model without an emx
+(or `--model`), each at its `emx price` (USD per million tokens, published
+as is) and served context. A model without an emx
 price is refused, never offered at an unset price. The site allows one listing
 update per minute.
 
@@ -511,7 +511,7 @@ who can reach it spends your credits.
 
 ### Billing
 
-Listings price three kinds of token in credits per 1k (1 credit = $0.01):
+Listings price three kinds of token in US dollars per million tokens:
 input (prompt) tokens, cached input tokens (prompt tokens served from the
 host's prefix cache; empty = input price, never above it), and output tokens.
 Chat completions, completions and embeddings are billed; `GET /v1/models` is
