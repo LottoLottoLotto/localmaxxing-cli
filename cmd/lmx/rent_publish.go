@@ -16,16 +16,35 @@ import (
 
 // ── rent publish ────────────────────────────────────────────────────────────
 
-// rentPublishedModel is one model of a listing as the site stores it: US dollars per 1M tokens.
+// rentPublishedModel is one model of a listing as the site stores it: US dollars per 1M tokens, and the
+// weights the host serves it from (emx's report; the site verifies them against Hugging Face). Weights are
+// always sent, null when emx has none ready, so the site never keeps weights from an earlier publish.
 type rentPublishedModel struct {
-	Model                       string   `json:"model"`
-	PricePer1MInputTokens       float64  `json:"pricePer1MInputTokens"`
-	PricePer1MCachedInputTokens *float64 `json:"pricePer1MCachedInputTokens"`
-	PricePer1MOutputTokens      float64  `json:"pricePer1MOutputTokens"`
-	ContextLength               *int     `json:"contextLength"`
+	Model                       string           `json:"model"`
+	PricePer1MInputTokens       float64          `json:"pricePer1MInputTokens"`
+	PricePer1MCachedInputTokens *float64         `json:"pricePer1MCachedInputTokens"`
+	PricePer1MOutputTokens      float64          `json:"pricePer1MOutputTokens"`
+	ContextLength               *int             `json:"contextLength"`
+	Weights                     json.RawMessage  `json:"weights"`
+	Source                      *rentModelSource `json:"source,omitempty"`
 }
 
-// emxPricedModel is a model in an emx gateway's /v1/models, with the price an admin key sees (emx price).
+// rentModelSource is the Hugging Face repo (and commit) a model's weights claim to come from.
+type rentModelSource struct {
+	Repo     string `json:"repo"`
+	Revision string `json:"revision,omitempty"`
+}
+
+// emxWeights is the part of emx's `weights` report lmx reads; the whole object is published as reported.
+type emxWeights struct {
+	Status string           `json:"status"`
+	ID     string           `json:"id"`
+	Origin *rentModelSource `json:"origin"`
+	Error  string           `json:"error"`
+}
+
+// emxPricedModel is a model in an emx gateway's /v1/models, with the price an admin key sees (emx price)
+// and the identity of its weight files (emx hashes them; absent on gateways that do not).
 type emxPricedModel struct {
 	ID          string `json:"id"`
 	MaxModelLen int    `json:"max_model_len"`
@@ -36,12 +55,75 @@ type emxPricedModel struct {
 			Cached     *float64 `json:"cached"`
 			Currency   string   `json:"currency"`
 		} `json:"price"`
+		Weights json.RawMessage `json:"weights"`
 	} `json:"emx"`
+}
+
+// weights parses the model's emx weights report (nil when emx reports none).
+func (m emxPricedModel) weights() *emxWeights {
+	if len(m.EMX.Weights) == 0 || string(m.EMX.Weights) == "null" {
+		return nil
+	}
+	var w emxWeights
+	if json.Unmarshal(m.EMX.Weights, &w) != nil {
+		return nil
+	}
+	return &w
+}
+
+// weightsStatus is the model's weights status for display: ready, hashing, error, or "-" (not reported).
+func (m emxPricedModel) weightsStatus() string {
+	if w := m.weights(); w != nil && w.Status != "" {
+		return w.Status
+	}
+	return "-"
+}
+
+// rentHashingPoll is how often rent publish re-reads emx while it waits for weights to finish hashing.
+var rentHashingPoll = 2 * time.Second
+
+// rentParseSources reads --source <model>=<repo>[@<revision>] (repeatable).
+func rentParseSources(args cliArgs) (map[string]rentModelSource, error) {
+	out := map[string]rentModelSource{}
+	for _, value := range optValues(args, "source") {
+		model, ref, ok := strings.Cut(value, "=")
+		repo, revision, _ := strings.Cut(strings.TrimSpace(ref), "@")
+		model, repo, revision = strings.TrimSpace(model), strings.TrimSpace(repo), strings.TrimSpace(revision)
+		owner, name, slash := strings.Cut(repo, "/")
+		if !ok || model == "" || !slash || owner == "" || name == "" || strings.Contains(name, "/") || (strings.Contains(ref, "@") && revision == "") {
+			return nil, cliError{"invalid_option", "--source must be <model>=<owner>/<repo>[@<revision>], e.g. qwen3-0.6b=unsloth/Qwen3-0.6B-GGUF.", nil, value}
+		}
+		out[model] = rentModelSource{Repo: repo, Revision: revision}
+	}
+	return out, nil
+}
+
+// rentEMXPricesSettled reads the gateway's models, waiting up to wait while any of models still has its
+// weights hashing.
+func rentEMXPricesSettled(cfg rentHostConfig, models []string, wait time.Duration) (map[string]emxPricedModel, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		priced, err := rentEMXPrices(cfg)
+		if err != nil {
+			return nil, err
+		}
+		hashing := false
+		for _, name := range models {
+			if m, ok := priced[name]; ok && m.weightsStatus() == "hashing" {
+				hashing = true
+			}
+		}
+		if !hashing || !time.Now().Before(deadline) {
+			return priced, nil
+		}
+		time.Sleep(min(rentHashingPoll, time.Until(deadline)))
+	}
 }
 
 // handleRentPublish sets a listing's models and their prices from the emx gateway: the models running
 // there (or --model), each at its `emx price` (US dollars per 1M tokens, the site's unit too), with its context
-// window. The site then bills each renter request at the price of the model it names and refuses the rest.
+// window and the weights emx hashed (the site checks them against Hugging Face: Verified, else Custom).
+// The site then bills each renter request at the price of the model it names and refuses the rest.
 func handleRentPublish(args cliArgs) error {
 	listing := positional(args, 2)
 	if listing == "" {
@@ -64,12 +146,28 @@ func handleRentPublish(args cliArgs) error {
 			return err
 		}
 	}
-	priced, err := rentEMXPrices(cfg)
+	sources, err := rentParseSources(args)
+	if err != nil {
+		return err
+	}
+	for model := range sources {
+		if !sliceContainsString(models, model) {
+			return cliError{"invalid_option", "--source names " + model + ", which this listing would not offer.", []string{"Publishing: " + strings.Join(models, ", ") + "."}, nil}
+		}
+	}
+	wait := 120 * time.Second
+	if value := opt(args, "wait-hashing"); value == "0" {
+		wait = 0
+	} else if wait, err = authDurationOption(args, "wait-hashing", wait); err != nil {
+		return err
+	}
+	priced, err := rentEMXPricesSettled(cfg, models, wait)
 	if err != nil {
 		return err
 	}
 	out := []rentPublishedModel{}
 	unpriced := []string{}
+	weightsStatus := map[string]string{}
 	for _, name := range models {
 		m, ok := priced[name]
 		if !ok {
@@ -91,6 +189,26 @@ func handleRentPublish(args cliArgs) error {
 			ctx := m.MaxModelLen
 			pm.ContextLength = &ctx
 		}
+		weights := m.weights()
+		if weights != nil && weights.Status == "ready" && weights.ID != "" {
+			pm.Weights = m.EMX.Weights
+			if weights.Origin != nil && weights.Origin.Repo != "" {
+				origin := *weights.Origin
+				pm.Source = &origin
+			}
+		}
+		if source, ok := sources[name]; ok {
+			pm.Source = &source
+		}
+		weightsStatus[name] = m.weightsStatus()
+		switch weightsStatus[name] {
+		case "hashing":
+			printStatus(args, "rent_publish_weights_hashing", map[string]any{"model": name,
+				"note": "emx is still hashing this model's weight files, so it is published without them and listed as Custom. Run lmx rent publish " + listing + " again once emx models shows them ready to have it verified."})
+		case "error":
+			printStatus(args, "rent_publish_weights_error", map[string]any{"model": name, "error": weights.Error,
+				"note": "emx could not hash this model's weight files, so it is published without them and listed as Custom."})
+		}
 		out = append(out, pm)
 	}
 	if len(unpriced) > 0 {
@@ -102,7 +220,7 @@ func handleRentPublish(args cliArgs) error {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
 
-	result := map[string]any{"listing": listing, "models": out, "applied": false}
+	result := map[string]any{"listing": listing, "models": out, "weightsStatus": weightsStatus, "applied": false}
 	if !hasFlag(args, "dry-run") {
 		if err := rentPatchListingModels(cfg.Client, apiURL(args), key, listing, out); err != nil {
 			return err
@@ -118,16 +236,22 @@ func handleRentPublish(args cliArgs) error {
 		verb = "Would set listing " + listing + " to offer"
 	}
 	fmt.Printf("%s (US dollars per 1M tokens):\n", verb)
-	fmt.Printf("  %-32s %10s %10s %10s %9s\n", "MODEL", "INPUT", "CACHED", "OUTPUT", "CONTEXT")
+	fmt.Printf("  %-32s %10s %10s %10s %9s  %-8s %s\n", "MODEL", "INPUT", "CACHED", "OUTPUT", "CONTEXT", "WEIGHTS", "SOURCE")
 	for _, m := range out {
-		cached, ctx := "= input", "-"
+		cached, ctx, source := "= input", "-", "-"
 		if m.PricePer1MCachedInputTokens != nil {
 			cached = usdPrice(*m.PricePer1MCachedInputTokens)
 		}
 		if m.ContextLength != nil {
 			ctx = fmt.Sprint(*m.ContextLength)
 		}
-		fmt.Printf("  %-32s %10s %10s %10s %9s\n", m.Model, usdPrice(m.PricePer1MInputTokens), cached, usdPrice(m.PricePer1MOutputTokens), ctx)
+		if m.Source != nil {
+			source = m.Source.Repo
+			if m.Source.Revision != "" {
+				source += "@" + m.Source.Revision[:min(12, len(m.Source.Revision))]
+			}
+		}
+		fmt.Printf("  %-32s %10s %10s %10s %9s  %-8s %s\n", m.Model, usdPrice(m.PricePer1MInputTokens), cached, usdPrice(m.PricePer1MOutputTokens), ctx, weightsStatus[m.Model], source)
 	}
 	return nil
 }

@@ -858,3 +858,199 @@ func TestRentSharedCacheListingNamesOneCacheGroup(t *testing.T) {
 		t.Fatalf("group|client at the target: %q", got)
 	}
 }
+
+// rentCaptureStdout runs the CLI and returns what it printed to stdout.
+func rentCaptureStdout(t *testing.T, argv ...string) string {
+	t.Helper()
+	original := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = writer
+	code := runCLI(argv)
+	_ = writer.Close()
+	os.Stdout = original
+	data, _ := io.ReadAll(reader)
+	_ = reader.Close()
+	if code != 0 {
+		t.Fatalf("runCLI %v exit = %d, output = %s", argv, code, data)
+	}
+	return string(data)
+}
+
+// rent publish sends each model's weights as emx reports them (only once hashed) and their source: emx's
+// origin, else --source, which also overrides it.
+func TestRentPublishSendsWeightsAndSource(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("EMX_API_KEY", "admin-key")
+	previousPoll := rentHashingPoll
+	rentHashingPoll = 5 * time.Millisecond
+	t.Cleanup(func() { rentHashingPoll = previousPoll })
+
+	idA, idB, idC := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	var modelsCalls atomic.Int32
+	emx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" || r.Header.Get("Authorization") != "Bearer admin-key" {
+			http.NotFound(w, r)
+			return
+		}
+		// "hashed-late" finishes hashing on the third read; "never-hashed" never does.
+		late := `{"status":"hashing"}`
+		if modelsCalls.Add(1) >= 3 {
+			late = `{"status":"ready","id":"` + idC + `","files":[{"path":"late.gguf","bytes":3,"sha256":"` + idC + `","weight":true}]}`
+		}
+		price := `"price":{"prompt":1,"completion":2,"currency":"USD"}`
+		fmt.Fprint(w, `{"data":[
+			{"id":"with-origin","max_model_len":4096,"emx":{`+price+`,"weights":{"status":"ready","id":"`+idA+`","files":[{"path":"Qwen3-0.6B-Q8_0.gguf","bytes":639447744,"sha256":"`+idA+`","weight":true}],"origin":{"repo":"unsloth/Qwen3-0.6B-GGUF","revision":"50968a4468"}}}},
+			{"id":"no-origin","emx":{`+price+`,"weights":{"status":"ready","id":"`+idB+`","files":[{"path":"b.gguf","bytes":2,"sha256":"`+idB+`","weight":true}]}}},
+			{"id":"hashed-late","emx":{`+price+`,"weights":`+late+`}},
+			{"id":"never-hashed","emx":{`+price+`,"weights":{"status":"hashing"}}},
+			{"id":"no-report","emx":{`+price+`}}
+		]}`)
+	}))
+	defer emx.Close()
+	patches := make(chan []map[string]any, 4)
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/api/rentals/"+rentTestListing || r.Header.Get("Authorization") != "Bearer "+rentTestKey {
+			http.Error(w, "unexpected", http.StatusBadRequest)
+			return
+		}
+		var body struct {
+			Models []map[string]any `json:"models"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		patches <- body.Models
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer site.Close()
+
+	publish := func(extra ...string) map[string]map[string]any {
+		t.Helper()
+		argv := append([]string{"rent", "publish", rentTestListing, "--api-url", site.URL, "--api-key", rentTestKey, "--target", emx.URL}, extra...)
+		output := rentCaptureStdout(t, argv...)
+		if !strings.Contains(output, "WEIGHTS") {
+			t.Fatalf("no weights column:\n%s", output)
+		}
+		byModel := map[string]map[string]any{}
+		for _, m := range <-patches {
+			byModel[m["model"].(string)] = m
+		}
+		return byModel
+	}
+
+	got := publish("--model", "with-origin,no-origin,hashed-late,no-report", "--source", "no-origin=Qwen/Qwen3-8B-GGUF@0123456789abcdef")
+	weightsID := func(m map[string]any) string {
+		w, _ := m["weights"].(map[string]any)
+		id, _ := w["id"].(string)
+		return id
+	}
+	source := func(m map[string]any) string {
+		s, ok := m["source"].(map[string]any)
+		if !ok {
+			return ""
+		}
+		out := s["repo"].(string)
+		if rev, ok := s["revision"].(string); ok {
+			out += "@" + rev
+		}
+		return out
+	}
+	if weightsID(got["with-origin"]) != idA || source(got["with-origin"]) != "unsloth/Qwen3-0.6B-GGUF@50968a4468" {
+		t.Fatalf("with-origin = %#v", got["with-origin"])
+	}
+	if files := got["with-origin"]["weights"].(map[string]any)["files"].([]any); len(files) != 1 || files[0].(map[string]any)["path"] != "Qwen3-0.6B-Q8_0.gguf" {
+		t.Fatalf("weights must be published as emx reports them: %#v", got["with-origin"]["weights"])
+	}
+	if weightsID(got["no-origin"]) != idB || source(got["no-origin"]) != "Qwen/Qwen3-8B-GGUF@0123456789abcdef" {
+		t.Fatalf("no-origin with --source = %#v", got["no-origin"])
+	}
+	if weightsID(got["hashed-late"]) != idC {
+		t.Fatalf("publish must wait for hashing to finish: %#v", got["hashed-late"])
+	}
+	// Without weights ready, weights go out as null, so the site drops any from an earlier publish.
+	if w, ok := got["no-report"]["weights"]; !ok || w != nil || source(got["no-report"]) != "" {
+		t.Fatalf("no-report = %#v", got["no-report"])
+	}
+
+	// --source overrides emx's origin; a model still hashing after --wait-hashing goes out with null weights.
+	got = publish("--model", "with-origin,never-hashed", "--source", "with-origin=someone/fork", "--wait-hashing", "20ms")
+	if weightsID(got["with-origin"]) != idA || source(got["with-origin"]) != "someone/fork" {
+		t.Fatalf("--source override = %#v", got["with-origin"])
+	}
+	if w, ok := got["never-hashed"]["weights"]; !ok || w != nil {
+		t.Fatalf("never-hashed must be published without weights: %#v", got["never-hashed"])
+	}
+
+	if code := runCLI([]string{"rent", "publish", rentTestListing, "--api-url", site.URL, "--api-key", rentTestKey, "--target", emx.URL, "--model", "with-origin", "--source", "other=a/b", "--dry-run", "--quiet"}); code == 0 {
+		t.Fatal("--source for a model not published must fail")
+	}
+	if code := runCLI([]string{"rent", "publish", rentTestListing, "--api-url", site.URL, "--api-key", rentTestKey, "--target", emx.URL, "--model", "with-origin", "--source", "with-origin=no-slash", "--dry-run", "--quiet"}); code == 0 {
+		t.Fatal("--source without owner/repo must fail")
+	}
+}
+
+// A listing model published with a weights id is served only while emx reports the same weights for it;
+// a listing model without one is served as before.
+func TestRentHostSkipsModelWhoseWeightsChanged(t *testing.T) {
+	published, live := strings.Repeat("a", 64), atomic.Value{}
+	live.Store(strings.Repeat("d", 64))
+	emx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"data":[
+			{"id":"same","emx":{"weights":{"status":"ready","id":"`+published+`"}}},
+			{"id":"swapped","emx":{"weights":{"status":"ready","id":"`+live.Load().(string)+`"}}},
+			{"id":"unhashed","emx":{"weights":{"status":"hashing"}}},
+			{"id":"plain","emx":{}}
+		]}`)
+	}))
+	defer emx.Close()
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/rentals/mine" || r.Header.Get("Authorization") != "Bearer "+rentTestKey {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		fmt.Fprint(w, `{"listings":[{"id":"`+rentTestListing+`","models":[
+			{"model":"same","weightsId":"`+published+`","weightsStatus":"VERIFIED"},
+			{"model":"swapped","weightsId":"`+published+`","weightsStatus":"VERIFIED"},
+			{"model":"unhashed","weightsId":"`+published+`","weightsStatus":"CUSTOM"},
+			{"model":"plain","weightsId":null,"weightsStatus":"PENDING"}
+		]}]}`)
+	}))
+	defer site.Close()
+
+	var notices []map[string]any
+	cfg := rentHostConfig{Target: emx.URL, APIKey: rentTestKey, SiteURL: site.URL, Listings: []string{rentTestListing},
+		Models: []string{"same", "swapped", "unhashed", "plain"}, Client: &http.Client{},
+		Status: func(event string, fields map[string]any) {
+			if event == "rent_host_weights_changed" {
+				notices = append(notices, fields)
+			}
+		}}
+	warned := map[string]bool{}
+	offers, checked, err := rentLoadOffers(cfg, warned)
+	if err != nil || !checked {
+		t.Fatalf("rentLoadOffers: %v (checked %v)", err, checked)
+	}
+	cfg.Offers = &rentListingOffers{}
+	cfg.Offers.set(offers)
+	if got := strings.Join(cfg.Offers.allowed(rentTestListing, cfg.Models), ","); got != "same,plain" {
+		t.Fatalf("served = %s, want same,plain", got)
+	}
+	if len(notices) != 1 || notices[0]["models"] != "swapped, unhashed" || !strings.Contains(notices[0]["note"].(string), "lmx rent publish "+rentTestListing) {
+		t.Fatalf("notices = %#v", notices)
+	}
+
+	// The next refresh does not repeat the notice; once the weights match again the model is served.
+	if _, _, err := rentLoadOffers(cfg, warned); err != nil || len(notices) != 1 {
+		t.Fatalf("repeated notice: %#v (%v)", notices, err)
+	}
+	live.Store(published)
+	offers, _, _ = rentLoadOffers(cfg, warned)
+	if got := strings.Join(offers[rentTestListing], ","); got != "same,swapped,plain" {
+		t.Fatalf("served after the weights match again = %s", got)
+	}
+}

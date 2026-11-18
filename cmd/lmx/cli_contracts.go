@@ -299,7 +299,7 @@ func commandSideEffects(name string) []string {
 	case name == "rent list":
 		return []string{"performs a read-only network request"}
 	case name == "rent publish":
-		return []string{"replaces the listing's models and prices on LocalMaxxing (--dry-run: read-only); reads the emx gateway with EMX_API_KEY"}
+		return []string{"replaces the listing's models, prices and reported weights (emx weights per model, with --source) on LocalMaxxing (--dry-run: read-only); reads the emx gateway with EMX_API_KEY"}
 	case name == "context":
 		return []string{"performs a read-only network request"}
 	default:

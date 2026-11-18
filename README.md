@@ -443,6 +443,25 @@ as is) and served context. A model without an emx
 price is refused, never offered at an unset price. The site allows one listing
 update per minute.
 
+**Weights.** Each model is published with the weights it is served from, as
+emx reports them: the sha256 of every weight file (`.gguf`, `.safetensors`,
+…) and a weights id derived from them, so hosts serving identical files share
+one id. The site checks the files against Hugging Face, which publishes a
+sha256 for every large file at every revision: a model whose files match a
+repo at some commit is listed as **Verified** with that repo and commit,
+any other as **Custom** (still rentable). emx usually knows the repo the files
+came from; otherwise name it with `--source <model>=<owner>/<repo>[@<commit>]`
+(repeatable; it also overrides emx's guess). emx hashes weight files in the
+background after a model is registered; `lmx rent publish` waits up to
+`--wait-hashing` (default 120s) for them, then publishes models still being
+hashed without weights, as Custom (publish again later to have them
+verified). Its table shows each model's weights status and source.
+`lmx rent host` serves a model published with weights only while emx reports
+the same weights id for it (checked at start and every 30 s): if the files
+changed (another quant, a re-download, still hashing), renters asking for it
+are refused and the host prints `rent_host_weights_changed`; run
+`lmx rent publish <listingId>` again to list the weights served now.
+
 `lmx rent host` makes one **outbound** connection to the LocalMaxxing relay
 (`wss://<api-url host>/relay/v1/agent`; override with `--relay-url` or
 `LMX_RELAY_URL`; `ws://` is refused except to localhost, since it would send

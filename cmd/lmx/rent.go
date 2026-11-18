@@ -165,9 +165,16 @@ func (o *rentListingOffers) allowed(listing string, served []string) []string {
 	return out
 }
 
+// rentOfferedModel is a model a listing offers, with the weights id it was published with ("" when the
+// listing carries none).
+type rentOfferedModel struct {
+	Model     string
+	WeightsID string
+}
+
 // rentFetchOffers asks the site which models each of the given listings offers (the owner's listings,
 // authenticated with the owner's API key).
-func rentFetchOffers(client *http.Client, siteURL, apiKey string, listings []string) (map[string][]string, error) {
+func rentFetchOffers(client *http.Client, siteURL, apiKey string, listings []string) (map[string][]rentOfferedModel, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(siteURL, "/")+"/api/rentals/mine", nil)
@@ -187,25 +194,94 @@ func rentFetchOffers(client *http.Client, siteURL, apiKey string, listings []str
 		Listings []struct {
 			ID     string `json:"id"`
 			Models []struct {
-				Model string `json:"model"`
+				Model     string `json:"model"`
+				WeightsID string `json:"weightsId"`
 			} `json:"models"`
 		} `json:"listings"`
 	}
 	if err := json.NewDecoder(io.LimitReader(res.Body, 8<<20)).Decode(&mine); err != nil {
 		return nil, fmt.Errorf("reading your listings: %w", err)
 	}
-	out := map[string][]string{}
+	out := map[string][]rentOfferedModel{}
 	for _, l := range mine.Listings {
 		if !sliceContainsString(listings, l.ID) {
 			continue
 		}
-		models := []string{}
+		models := []rentOfferedModel{}
 		for _, m := range l.Models {
-			models = append(models, m.Model)
+			models = append(models, rentOfferedModel{Model: m.Model, WeightsID: m.WeightsID})
 		}
 		out[l.ID] = models
 	}
 	return out, nil
+}
+
+// rentEMXWeightIDs reads the weights id emx reports now for each model at the target ("" until its weights
+// are hashed; absent for models without a report).
+func rentEMXWeightIDs(cfg rentHostConfig) (map[string]string, error) {
+	priced, err := rentEMXPrices(cfg)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for name, m := range priced {
+		if w := m.weights(); w != nil && w.Status == "ready" {
+			out[name] = w.ID
+		}
+	}
+	return out, nil
+}
+
+// rentLoadOffers reads the models each listing offers and keeps those this host may serve: a model published
+// with a weights id is served only while the target's emx reports the same weights for it, so a listing
+// verified for some weights is never answered by others. It reports models whose weights changed once,
+// until they match again (warned remembers them). checked is false when the target's weights could not be
+// read: those models are then left out.
+func rentLoadOffers(cfg rentHostConfig, warned map[string]bool) (served map[string][]string, checked bool, err error) {
+	offers, err := rentFetchOffers(cfg.Client, cfg.SiteURL, cfg.APIKey, cfg.Listings)
+	if err != nil {
+		return nil, false, err
+	}
+	var live map[string]string
+	checked = true
+	for _, models := range offers {
+		for _, m := range models {
+			if m.WeightsID != "" && live == nil {
+				if live, err = rentEMXWeightIDs(cfg); err != nil {
+					live, checked = map[string]string{}, false
+				}
+			}
+		}
+	}
+	served = map[string][]string{}
+	for _, listing := range cfg.Listings {
+		models, ok := offers[listing]
+		if !ok {
+			continue
+		}
+		names, changed := []string{}, []string{}
+		for _, m := range models {
+			key := listing + "\x00" + m.Model
+			if m.WeightsID != "" && !strings.EqualFold(live[m.Model], m.WeightsID) {
+				if !warned[key] {
+					changed = append(changed, m.Model)
+				}
+				warned[key] = true
+				continue
+			}
+			delete(warned, key)
+			names = append(names, m.Model)
+		}
+		served[listing] = names
+		if len(changed) > 0 {
+			note := "These models were published with other weights than the target serves now (or emx reports none for them yet), so renters asking for them are refused. Run lmx rent publish " + listing + " again to list the weights served now."
+			if !checked {
+				note = "Could not read the target's weights, so these models, published with known weights, are not served. Check the emx gateway at " + cfg.Target + " and EMX_API_KEY."
+			}
+			cfg.Status("rent_host_weights_changed", map[string]any{"listing": listing, "models": strings.Join(changed, ", "), "note": note})
+		}
+	}
+	return served, checked, nil
 }
 
 func handleRentHost(args cliArgs) error {
@@ -249,7 +325,8 @@ func handleRentHost(args cliArgs) error {
 		}
 		cfg.Models = models
 	}
-	offers, err := rentFetchOffers(cfg.Client, cfg.SiteURL, cfg.APIKey, cfg.Listings)
+	weightsWarned := map[string]bool{}
+	offers, _, err := rentLoadOffers(cfg, weightsWarned)
 	if err != nil {
 		return cliError{"listing_models_failed", "Could not read the models your listings offer: " + err.Error(), []string{"Check --api-url and your API key (lmx rent list --mine)."}, nil}
 	}
@@ -266,8 +343,12 @@ func handleRentHost(args cliArgs) error {
 				missing = append(missing, model)
 			}
 		}
+		weightsChanged := false
+		for key := range weightsWarned {
+			weightsChanged = weightsChanged || strings.HasPrefix(key, listing+"\x00")
+		}
 		switch {
-		case len(offered) == 0:
+		case len(offered) == 0 && !weightsChanged:
 			cfg.Status("rent_host_listing_without_models", map[string]any{"listing": listing,
 				"note": "This listing offers no model, so renters cannot use it. Set its models and prices: lmx rent publish " + listing})
 		case len(missing) > 0:
@@ -306,7 +387,7 @@ func handleRentHost(args cliArgs) error {
 				return
 			case <-time.After(rentOffersRefresh):
 			}
-			if offers, err := rentFetchOffers(cfg.Client, cfg.SiteURL, cfg.APIKey, cfg.Listings); err == nil {
+			if offers, checked, err := rentLoadOffers(cfg, weightsWarned); err == nil && checked {
 				cfg.Offers.set(offers)
 			}
 		}

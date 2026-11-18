@@ -12252,6 +12252,7 @@ var usageExamples = []string{
 	`lmx rent host <listingId> <listingId2> --target http://127.0.0.1:8000 --model Qwen/Qwen3-8B --max-concurrency 4`,
 	`lmx rent connect <listingId> --port 8000`,
 	`EMX_API_KEY=<emx admin key> lmx rent publish <listingId> --dry-run`,
+	`EMX_API_KEY=<emx admin key> lmx rent publish <listingId> --source qwen3-0.6b=unsloth/Qwen3-0.6B-GGUF@<commit>`,
 	`lmx eval storage upload traces.jsonl --kind artifact --format jsonl --out artifact-bundle.json`,
 	`lmx eval storage download <storageKey> --out traces.jsonl`,
 	`lmx eval lm-eval <approved-suite-slug> --model Qwen/Qwen3-8B --backend hf --hardware hardware.json --dry-run`,
@@ -12533,6 +12534,8 @@ const usageOptions = `  --api-url <url>          LocalMaxxing origin (default: h
   --shared-cache <id>      lmx rent host: this listing's renters share one prompt cache at the emx target (they trust each other); repeatable
   --rental-token <token>   lmx rent connect: send as x-rental-token on every rental request
   --mine                   lmx rent list: list your own listings (all statuses; needs your API key)
+  --source <model>=<owner>/<repo>[@<rev>] lmx rent publish: the Hugging Face repo (and commit) a model's weights come from (default: the origin emx found); the site checks the weights against it (repeatable)
+  --wait-hashing <duration> lmx rent publish: wait this long for emx to finish hashing weight files (default 120s; 0: do not wait); models still hashing are listed as Custom
   --dir <dir>              Target skills directory for lmx skill install (default: .claude/skills)
   --hardware <path>        JSON hardware object required when submitting
   --quantization <label>   Quantization label (auto-detected from the endpoint for remote speed-test and eval-shard runs when omitted)
@@ -12615,7 +12618,7 @@ var commandDescriptions = map[string]string{
 	"rent host":               "Experimental: serve your listings from this machine through the LocalMaxxing relay over one outbound connection.",
 	"rent connect":            "Experimental: expose a rented listing as a local OpenAI-compatible base URL using your API key.",
 	"rent list":               "List public rental listings, or your own with --mine.",
-	"rent publish":            "Set a listing's models and per-model prices from the emx gateway's running models and emx prices (--dry-run shows them first).",
+	"rent publish":            "Set a listing's models and per-model prices from the emx gateway's running models and emx prices, with the weights emx hashed so the site can verify them against Hugging Face (--dry-run shows them first).",
 	"model search":            "Search LocalMaxxing model records.",
 	"model resolve-remote":    "Resolve a remote endpoint alias to likely HF candidates.",
 	"eval":                    "Run LocalMaxxing evals (Terminal-Bench, CRUDBench, GSM8K, ...) on an endpoint, track coverage and runs, submit results.",
