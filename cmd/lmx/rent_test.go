@@ -1030,8 +1030,8 @@ func TestRentHostSkipsModelWhoseWeightsChanged(t *testing.T) {
 				notices = append(notices, fields)
 			}
 		}}
-	warned := map[string]bool{}
-	offers, checked, err := rentLoadOffers(cfg, warned)
+	seen := newRentHostNotices()
+	offers, checked, err := rentLoadOffers(cfg, seen)
 	if err != nil || !checked {
 		t.Fatalf("rentLoadOffers: %v (checked %v)", err, checked)
 	}
@@ -1045,12 +1045,159 @@ func TestRentHostSkipsModelWhoseWeightsChanged(t *testing.T) {
 	}
 
 	// The next refresh does not repeat the notice; once the weights match again the model is served.
-	if _, _, err := rentLoadOffers(cfg, warned); err != nil || len(notices) != 1 {
+	if _, _, err := rentLoadOffers(cfg, seen); err != nil || len(notices) != 1 {
 		t.Fatalf("repeated notice: %#v (%v)", notices, err)
 	}
 	live.Store(published)
-	offers, _, _ = rentLoadOffers(cfg, warned)
+	offers, _, _ = rentLoadOffers(cfg, seen)
 	if got := strings.Join(offers[rentTestListing], ","); got != "same,swapped,plain" {
 		t.Fatalf("served after the weights match again = %s", got)
+	}
+}
+
+// The host tells the owner about the site's weights checks once per change of state: nothing while ok, a
+// warning at the first failure, a failure notice when the model is out of pools, again after a restore and
+// a new failure, and at start when a model is already failed. A failed model is still served directly.
+func TestRentHostReportsWeightsChecksOncePerChange(t *testing.T) {
+	const reason = "Its answers to recent test requests did not match the majority of 4 hosts checked with these weights (difference 0.51, allowed 0.18; 42% of answers differed early, allowed 25%), so it is most likely not serving the file it reports."
+	steps := `["Serve the exact file this model was published with. If you changed the file or its quantization, run ` + "`lmx rent publish " + rentTestListing + "`" + ` again so the listing reports what you serve.","Run it with the engine settings and chat template that are the defaults for that file."]`
+	failure := `"lastFailure":{"day":"2026-11-17","score":0.51,"maxScore":0.18,"divergedPercent":42,"maxDivergedPercent":25,"comparedWithHosts":3,"basis":"majority of 4 hosts"}`
+	states := map[string]string{
+		"ok":        `{"state":"ok","lastCheckedDay":"2026-11-16","failuresInARow":0,"voidedEarningsUsd":0,"reason":"Its answers matched.","whatToDo":[]}`,
+		"warning":   `{"state":"warning","lastCheckedDay":"2026-11-17","failuresInARow":1,` + failure + `,"voidedEarningsUsd":0,"reason":"` + reason + `","whatToDo":` + steps + `}`,
+		"failed":    `{"state":"failed","lastCheckedDay":"2026-11-17","failuresInARow":2,` + failure + `,"voidedEarningsUsd":12.345,"reason":"` + reason + `","whatToDo":` + steps + `}`,
+		"requested": `{"state":"failed","lastCheckedDay":"2026-11-17","failuresInARow":2,` + failure + `,"voidedEarningsUsd":12.345,"reviewRequestedAt":"2026-11-18T09:30:00.000Z","reason":"` + reason + `","whatToDo":` + steps + `}`,
+	}
+	var current atomic.Value
+	current.Store("ok")
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/rentals/mine" || r.Header.Get("Authorization") != "Bearer "+rentTestKey {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		fmt.Fprint(w, `{"listings":[{"id":"`+rentTestListing+`","models":[{"model":"`+rentTestModel+`","weightsId":null,"weightsCheck":`+states[current.Load().(string)]+`}]}]}`)
+	}))
+	defer site.Close()
+
+	type notice struct {
+		event string
+		note  string
+	}
+	var printed []notice
+	cfg := rentHostConfig{APIKey: rentTestKey, SiteURL: site.URL, Listings: []string{rentTestListing}, Models: []string{rentTestModel}, Client: &http.Client{},
+		Status: func(event string, fields map[string]any) {
+			if strings.HasPrefix(event, "rent_host_check_") {
+				if fields["listing"] != rentTestListing || fields["model"] != rentTestModel {
+					t.Errorf("%s fields = %#v", event, fields)
+				}
+				printed = append(printed, notice{event, fields["note"].(string)})
+				t.Logf("%s\n%s", event, fields["note"])
+			}
+		}}
+	seen := newRentHostNotices()
+	refresh := func(state string, want int) map[string][]string {
+		t.Helper()
+		current.Store(state)
+		served, _, err := rentLoadOffers(cfg, seen)
+		if err != nil {
+			t.Fatalf("rentLoadOffers (%s): %v", state, err)
+		}
+		if len(printed) != want {
+			t.Fatalf("after %s: %d notices, want %d: %#v", state, len(printed), want, printed)
+		}
+		return served
+	}
+
+	refresh("ok", 0)
+	refresh("ok", 0)
+	refresh("warning", 1)
+	refresh("warning", 1)
+	warning := printed[0]
+	if warning.event != "rent_host_check_warning" {
+		t.Fatalf("first notice = %s", warning.event)
+	}
+	for _, want := range []string{
+		"Failed a hidden weights check (answers compared with other hosts serving the same weights).",
+		reason,
+		"Failed check of 2026-11-17, judged against the majority of 4 hosts (3 compared); 1 failed in a row.",
+		"One more failure removes it from pools and voids its held earnings.",
+		"What to do:\n  1. Serve the exact file this model was published with. If you changed the file or its quantization, run lmx rent publish " + rentTestListing + " again",
+		"\n  2. Run it with the engine settings and chat template",
+		"Details: " + site.URL + "/rentals/" + rentTestListing,
+	} {
+		if !strings.Contains(warning.note, want) {
+			t.Fatalf("warning note lacks %q:\n%s", want, warning.note)
+		}
+	}
+
+	served := refresh("failed", 2)
+	refresh("failed", 2)
+	// A review request does not change the state: no new notice.
+	refresh("requested", 2)
+	failed := printed[1]
+	if failed.event != "rent_host_check_failed" {
+		t.Fatalf("second notice = %s", failed.event)
+	}
+	for _, want := range []string{
+		"Removed from pools: failed hidden weights checks",
+		reason,
+		"2 failed in a row.",
+		"Out of pools until an admin restores it; held earnings voided: $12.35. Requests sent to this listing directly are still served.",
+		"What to do:\n  1. Serve the exact file",
+		"Request a review once fixed: " + site.URL + "/rentals/" + rentTestListing,
+	} {
+		if !strings.Contains(failed.note, want) {
+			t.Fatalf("failed note lacks %q:\n%s", want, failed.note)
+		}
+	}
+	if got := strings.Join(served[rentTestListing], ","); got != rentTestModel {
+		t.Fatalf("a failed model is still served directly, got %q", got)
+	}
+
+	// Restored by an admin (ok, silent), then failing again: warned again.
+	refresh("ok", 2)
+	refresh("warning", 3)
+
+	// A host starting while the model is failed (review requested) says so at once.
+	seen = newRentHostNotices()
+	refresh("requested", 4)
+	if printed[3].event != "rent_host_check_failed" || !strings.Contains(printed[3].note, "Review requested on 2026-11-18; details: "+site.URL+"/rentals/"+rentTestListing) {
+		t.Fatalf("notice at start = %#v", printed[3])
+	}
+}
+
+// lmx rent list --mine sums up each listing's weights checks in a CHECK column.
+func TestRentListMineShowsWeightsChecks(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	check := func(state string) string { return `{"state":"` + state + `","whatToDo":[]}` }
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/rentals/mine" || r.Header.Get("Authorization") != "Bearer "+rentTestKey {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		fmt.Fprint(w, `{"listings":[
+			{"id":"lst_bad","title":"Bad","status":"ACTIVE","models":[
+				{"model":"big","weightsCheck":`+check("failed")+`},{"model":"mid","weightsCheck":`+check("warning")+`},{"model":"small","weightsCheck":`+check("ok")+`}]},
+			{"id":"lst_good","title":"Good","status":"ACTIVE","models":[{"model":"small","weightsCheck":`+check("ok")+`},{"model":"custom","weightsCheck":`+check("unchecked")+`}]},
+			{"id":"lst_new","title":"New","status":"DRAFT","models":[{"model":"custom","weightsCheck":`+check("unchecked")+`}]}
+		]}`)
+	}))
+	defer site.Close()
+
+	output := rentCaptureStdout(t, "rent", "list", "--mine", "--api-url", site.URL, "--api-key", rentTestKey)
+	rows := map[string]string{}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(strings.ReplaceAll(line, "|", " "))
+		if len(fields) > 0 {
+			rows[fields[0]] = line
+		}
+	}
+	if !strings.Contains(rows["ID"], "CHECK") {
+		t.Fatalf("no CHECK column:\n%s", output)
+	}
+	for id, want := range map[string]string{"lst_bad": "failed: big; warning: mid", "lst_good": " ok ", "lst_new": " - "} {
+		if !strings.Contains(rows[id]+" ", want) {
+			t.Fatalf("%s CHECK: want %q in %q\n%s", id, want, rows[id], output)
+		}
 	}
 }

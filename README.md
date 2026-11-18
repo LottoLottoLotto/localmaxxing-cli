@@ -416,7 +416,7 @@ need none). Create a listing on the site first (`/rentals/new`).
 
 ```bash
 lmx rent list                      # public listings
-lmx rent list --mine               # your listings, all statuses (needs your API key)
+lmx rent list --mine               # your listings, all statuses, with a CHECK column (needs your API key)
 
 # Host: serve listings from this machine (default target: the emx gateway)
 lmx rent host <listingId>
@@ -461,6 +461,33 @@ the same weights id for it (checked at start and every 30 s): if the files
 changed (another quant, a re-download, still hashing), renters asking for it
 are refused and the host prints `rent_host_weights_changed`; run
 `lmx rent publish <listingId>` again to list the weights served now.
+
+**Weights checks.** The site also checks that hosts serve the weights they
+report: it sends hidden requests, indistinguishable from renters', to every
+online host of the same verified weights and compares the answers. `lmx rent
+host` reads each model's result with the listing (at start and every 30 s)
+and prints a notice once per change, not on every refresh (and at start when a
+model is already warned or failed):
+
+- `rent_host_check_warning`: the model failed one check. It shows why, with
+  the numbers (the difference score and the share of answers that differed
+  early, each with the allowed maximum), the day, how many hosts it was
+  compared with and on what basis (a reference host, or the majority of the
+  hosts checked), and what to do. One more failure in a row removes it from
+  pools and voids its held earnings; the next passed check clears the warning.
+- `rent_host_check_failed`: two failures in a row. The model is out of pools
+  (`/api/pools/v1`) until an admin restores it, and its held earnings since
+  its last passed check are voided (the amount is shown). Requests sent to
+  the listing directly are still served. Once fixed, request a review with the
+  button on the listing page (the notice prints its URL).
+
+In both cases: serve the exact file the model was published with (run
+`lmx rent publish <listingId>` again if you changed it), with the engine
+settings and chat template that are the defaults for that file (no custom
+template, no further quantization, KV cache included). `lmx rent list --mine`
+shows each listing's state in its CHECK column: `ok`, `-` (not checked), or
+the models that are `failed:` or `warning:`. Probe prompts, times and the
+other hosts are never shown.
 
 `lmx rent host` makes one **outbound** connection to the LocalMaxxing relay
 (`wss://<api-url host>/relay/v1/agent`; override with `--relay-url` or

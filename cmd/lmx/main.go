@@ -12073,11 +12073,18 @@ func printStatus(args cliArgs, event string, fields map[string]any) {
 		return
 	}
 	fmt.Fprintln(os.Stderr, "[localmaxxing] "+event)
-	for key, value := range fields {
+	// Fields in a stable order; continuation lines of a multi-line value are indented under it.
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := fields[key]
 		if value == nil || fmt.Sprint(value) == "" {
 			continue
 		}
-		fmt.Fprintf(os.Stderr, "  %s: %v\n", key, value)
+		fmt.Fprintf(os.Stderr, "  %s: %s\n", key, strings.ReplaceAll(fmt.Sprint(value), "\n", "\n    "))
 	}
 }
 

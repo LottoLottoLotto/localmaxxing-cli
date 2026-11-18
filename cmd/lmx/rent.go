@@ -166,10 +166,33 @@ func (o *rentListingOffers) allowed(listing string, served []string) []string {
 }
 
 // rentOfferedModel is a model a listing offers, with the weights id it was published with ("" when the
-// listing carries none).
+// listing carries none) and how the site's weights checks judge it (nil when the site sends none).
 type rentOfferedModel struct {
 	Model     string
 	WeightsID string
+	Check     *rentWeightsCheck
+}
+
+// rentWeightsCheck is a listing model's weightsCheck as the site tells its owner: the site compares the
+// answers of every host serving the same weights on hidden requests. state is ok, warning (one failed
+// check), failed (out of pools, held earnings voided) or unchecked.
+type rentWeightsCheck struct {
+	State          string `json:"state"`
+	LastCheckedDay string `json:"lastCheckedDay"`
+	FailuresInARow int    `json:"failuresInARow"`
+	LastFailure    *struct {
+		Day                string   `json:"day"`
+		Score              *float64 `json:"score"`
+		MaxScore           float64  `json:"maxScore"`
+		DivergedPercent    int      `json:"divergedPercent"`
+		MaxDivergedPercent int      `json:"maxDivergedPercent"`
+		ComparedWithHosts  int      `json:"comparedWithHosts"`
+		Basis              string   `json:"basis"`
+	} `json:"lastFailure"`
+	VoidedEarningsUSD float64  `json:"voidedEarningsUsd"`
+	ReviewRequestedAt string   `json:"reviewRequestedAt"`
+	Reason            string   `json:"reason"`
+	WhatToDo          []string `json:"whatToDo"`
 }
 
 // rentFetchOffers asks the site which models each of the given listings offers (the owner's listings,
@@ -194,8 +217,9 @@ func rentFetchOffers(client *http.Client, siteURL, apiKey string, listings []str
 		Listings []struct {
 			ID     string `json:"id"`
 			Models []struct {
-				Model     string `json:"model"`
-				WeightsID string `json:"weightsId"`
+				Model        string            `json:"model"`
+				WeightsID    string            `json:"weightsId"`
+				WeightsCheck *rentWeightsCheck `json:"weightsCheck"`
 			} `json:"models"`
 		} `json:"listings"`
 	}
@@ -209,7 +233,7 @@ func rentFetchOffers(client *http.Client, siteURL, apiKey string, listings []str
 		}
 		models := []rentOfferedModel{}
 		for _, m := range l.Models {
-			models = append(models, rentOfferedModel{Model: m.Model, WeightsID: m.WeightsID})
+			models = append(models, rentOfferedModel{Model: m.Model, WeightsID: m.WeightsID, Check: m.WeightsCheck})
 		}
 		out[l.ID] = models
 	}
@@ -232,12 +256,27 @@ func rentEMXWeightIDs(cfg rentHostConfig) (map[string]string, error) {
 	return out, nil
 }
 
+// rentHostNotices remembers what the host already told the owner, so each notice prints once per change
+// rather than on every refresh. Keys are listing + "\x00" + model.
+type rentHostNotices struct {
+	// weights holds the models whose served weights differ from the published ones.
+	weights map[string]bool
+	// checks holds each model's weights-check state as last seen.
+	checks map[string]string
+}
+
+func newRentHostNotices() *rentHostNotices {
+	return &rentHostNotices{weights: map[string]bool{}, checks: map[string]string{}}
+}
+
 // rentLoadOffers reads the models each listing offers and keeps those this host may serve: a model published
 // with a weights id is served only while the target's emx reports the same weights for it, so a listing
 // verified for some weights is never answered by others. It reports models whose weights changed once,
-// until they match again (warned remembers them). checked is false when the target's weights could not be
-// read: those models are then left out.
-func rentLoadOffers(cfg rentHostConfig, warned map[string]bool) (served map[string][]string, checked bool, err error) {
+// until they match again, and each change of a model's weights-check state to warning or failed (also the
+// state found at start). checked is false when the target's weights could not be read: those models are
+// then left out. A model that failed weights checks is still served: it is out of pools, but renters of
+// the listing may use it directly.
+func rentLoadOffers(cfg rentHostConfig, notices *rentHostNotices) (served map[string][]string, checked bool, err error) {
 	offers, err := rentFetchOffers(cfg.Client, cfg.SiteURL, cfg.APIKey, cfg.Listings)
 	if err != nil {
 		return nil, false, err
@@ -262,14 +301,18 @@ func rentLoadOffers(cfg rentHostConfig, warned map[string]bool) (served map[stri
 		names, changed := []string{}, []string{}
 		for _, m := range models {
 			key := listing + "\x00" + m.Model
+			if m.Check != nil && notices.checks[key] != m.Check.State {
+				notices.checks[key] = m.Check.State
+				rentReportCheck(cfg, listing, m.Model, m.Check)
+			}
 			if m.WeightsID != "" && !strings.EqualFold(live[m.Model], m.WeightsID) {
-				if !warned[key] {
+				if !notices.weights[key] {
 					changed = append(changed, m.Model)
 				}
-				warned[key] = true
+				notices.weights[key] = true
 				continue
 			}
-			delete(warned, key)
+			delete(notices.weights, key)
 			names = append(names, m.Model)
 		}
 		served[listing] = names
@@ -282,6 +325,62 @@ func rentLoadOffers(cfg rentHostConfig, warned map[string]bool) (served map[stri
 		}
 	}
 	return served, checked, nil
+}
+
+// rentReportCheck prints a model's weights-check state when it is warning (rent_host_check_warning) or
+// failed (rent_host_check_failed): why with the numbers (the site's reason), what it cost and what to do.
+func rentReportCheck(cfg rentHostConfig, listing, model string, check *rentWeightsCheck) {
+	var event string
+	lines := []string{}
+	switch check.State {
+	case "warning":
+		event = "rent_host_check_warning"
+		lines = append(lines, "Failed a hidden weights check (answers compared with other hosts serving the same weights).")
+	case "failed":
+		event = "rent_host_check_failed"
+		lines = append(lines, "Removed from pools: failed hidden weights checks (answers compared with other hosts serving the same weights).")
+	default:
+		return
+	}
+	if check.Reason != "" {
+		lines = append(lines, check.Reason)
+	}
+	if f := check.LastFailure; f != nil {
+		basis := "the " + f.Basis
+		if f.Basis == "reference host" {
+			basis = "a reference host"
+		}
+		lines = append(lines, fmt.Sprintf("Failed check of %s, judged against %s (%d compared); %d failed in a row.", f.Day, basis, f.ComparedWithHosts, check.FailuresInARow))
+	}
+	page := strings.TrimRight(cfg.SiteURL, "/") + "/rentals/" + listing
+	if check.State == "warning" {
+		lines = append(lines, "One more failure removes it from pools and voids its held earnings.")
+	} else {
+		lines = append(lines, "Out of pools until an admin restores it; held earnings voided: "+rentUSDAmount(check.VoidedEarningsUSD)+". Requests sent to this listing directly are still served.")
+	}
+	if len(check.WhatToDo) > 0 {
+		lines = append(lines, "What to do:")
+		for i, step := range check.WhatToDo {
+			lines = append(lines, fmt.Sprintf("  %d. %s", i+1, strings.ReplaceAll(step, "`", "")))
+		}
+	}
+	switch {
+	case check.State == "warning":
+		lines = append(lines, "Details: "+page)
+	case check.ReviewRequestedAt != "":
+		lines = append(lines, "Review requested on "+check.ReviewRequestedAt[:min(10, len(check.ReviewRequestedAt))]+"; details: "+page)
+	default:
+		lines = append(lines, "Request a review once fixed: "+page)
+	}
+	cfg.Status(event, map[string]any{"listing": listing, "model": model, "note": strings.Join(lines, "\n")})
+}
+
+// rentUSDAmount formats dollars for people: cents, or two significant digits below a cent.
+func rentUSDAmount(usd float64) string {
+	if usd == 0 || usd >= 0.01 {
+		return fmt.Sprintf("$%.2f", usd)
+	}
+	return "$" + strconv.FormatFloat(usd, 'g', 2, 64)
 }
 
 func handleRentHost(args cliArgs) error {
@@ -325,8 +424,8 @@ func handleRentHost(args cliArgs) error {
 		}
 		cfg.Models = models
 	}
-	weightsWarned := map[string]bool{}
-	offers, _, err := rentLoadOffers(cfg, weightsWarned)
+	notices := newRentHostNotices()
+	offers, _, err := rentLoadOffers(cfg, notices)
 	if err != nil {
 		return cliError{"listing_models_failed", "Could not read the models your listings offer: " + err.Error(), []string{"Check --api-url and your API key (lmx rent list --mine)."}, nil}
 	}
@@ -344,7 +443,7 @@ func handleRentHost(args cliArgs) error {
 			}
 		}
 		weightsChanged := false
-		for key := range weightsWarned {
+		for key := range notices.weights {
 			weightsChanged = weightsChanged || strings.HasPrefix(key, listing+"\x00")
 		}
 		switch {
@@ -379,7 +478,8 @@ func handleRentHost(args cliArgs) error {
 		<-signals
 		os.Exit(130)
 	}()
-	// The owner may change a listing's models and prices while hosting (lmx rent publish): follow them.
+	// The owner may change a listing's models and prices while hosting (lmx rent publish): follow them, and
+	// the site's weights checks of them.
 	go func() {
 		for {
 			select {
@@ -387,7 +487,7 @@ func handleRentHost(args cliArgs) error {
 				return
 			case <-time.After(rentOffersRefresh):
 			}
-			if offers, checked, err := rentLoadOffers(cfg, weightsWarned); err == nil && checked {
+			if offers, checked, err := rentLoadOffers(cfg, notices); err == nil && checked {
 				cfg.Offers.set(offers)
 			}
 		}
@@ -1204,7 +1304,7 @@ func handleRentList(args cliArgs) error {
 	}
 	headers := []string{"ID", "TITLE", "MODEL", "IN/1M", "CACHED/1M", "OUT/1M", "SESSIONS"}
 	if mine {
-		headers = append([]string{headers[0], "STATUS"}, headers[1:]...)
+		headers = append(append([]string{headers[0], "STATUS"}, headers[1:]...), "CHECK")
 	} else {
 		headers = append(headers, "HARDWARE", "OWNER")
 	}
@@ -1228,7 +1328,7 @@ func handleRentList(args cliArgs) error {
 			sessions,
 		}
 		if mine {
-			row = append([]string{row[0], stringValue(listing["status"])}, row[1:]...)
+			row = append(append([]string{row[0], stringValue(listing["status"])}, row[1:]...), rentListingCheck(listing))
 		} else {
 			hardware := firstNonEmpty(stringValue(listing["hardwareLabel"]), stringValue(asObject(listing["hardware"])["gpuName"]), "-")
 			owner := firstNonEmpty(stringValue(asObject(listing["owner"])["username"]), stringValue(asObject(listing["owner"])["name"]), "-")
@@ -1238,6 +1338,37 @@ func handleRentList(args cliArgs) error {
 	}
 	fmt.Print(asciiTable(headers, rows))
 	return nil
+}
+
+// rentListingCheck sums up the weights checks of a listing's models for lmx rent list --mine: the failed
+// and warning models by name, else ok when one passed, else "-" (none checked yet).
+func rentListingCheck(listing map[string]any) string {
+	failed, warning, ok := []string{}, []string{}, false
+	for _, item := range anySlice(listing["models"]) {
+		model := asObject(item)
+		switch stringValue(asObject(model["weightsCheck"])["state"]) {
+		case "failed":
+			failed = append(failed, stringValue(model["model"]))
+		case "warning":
+			warning = append(warning, stringValue(model["model"]))
+		case "ok":
+			ok = true
+		}
+	}
+	parts := []string{}
+	if len(failed) > 0 {
+		parts = append(parts, "failed: "+strings.Join(failed, ", "))
+	}
+	if len(warning) > 0 {
+		parts = append(parts, "warning: "+strings.Join(warning, ", "))
+	}
+	switch {
+	case len(parts) > 0:
+		return truncateRentCell(strings.Join(parts, "; "), 50)
+	case ok:
+		return "ok"
+	}
+	return "-"
 }
 
 func truncateRentCell(value string, limit int) string {
