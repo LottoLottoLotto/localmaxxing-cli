@@ -221,11 +221,21 @@ func handleRentPublish(args cliArgs) error {
 	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
 
 	result := map[string]any{"listing": listing, "models": out, "weightsStatus": weightsStatus, "applied": false}
+	scheduled := map[string]*rentScheduledPrice{}
+	inForce := map[string]rentListingPrices{}
 	if !hasFlag(args, "dry-run") {
-		if err := rentPatchListingModels(cfg.Client, apiURL(args), key, listing, out); err != nil {
+		listed, err := rentPatchListingModels(cfg.Client, apiURL(args), key, listing, out)
+		if err != nil {
 			return err
 		}
+		for _, m := range listed {
+			inForce[m.Model] = m
+			if m.ScheduledPrice != nil {
+				scheduled[m.Model] = m.ScheduledPrice
+			}
+		}
 		result["applied"] = true
+		result["scheduledPrices"] = scheduled
 	}
 	if hasFlag(args, "json") {
 		printJSON(args, result)
@@ -238,9 +248,14 @@ func handleRentPublish(args cliArgs) error {
 	fmt.Printf("%s (US dollars per 1M tokens):\n", verb)
 	fmt.Printf("  %-32s %10s %10s %10s %9s  %-8s %s\n", "MODEL", "INPUT", "CACHED", "OUTPUT", "CONTEXT", "WEIGHTS", "SOURCE")
 	for _, m := range out {
+		// The table shows the prices in force: an increase waits for notice (listed below).
+		price := rentListingPrices{PricePer1MInputTokens: m.PricePer1MInputTokens, PricePer1MCachedInputTokens: m.PricePer1MCachedInputTokens, PricePer1MOutputTokens: m.PricePer1MOutputTokens}
+		if site, ok := inForce[m.Model]; ok {
+			price = site
+		}
 		cached, ctx, source := "= input", "-", "-"
-		if m.PricePer1MCachedInputTokens != nil {
-			cached = usdPrice(*m.PricePer1MCachedInputTokens)
+		if price.PricePer1MCachedInputTokens != nil {
+			cached = usdPrice(*price.PricePer1MCachedInputTokens)
 		}
 		if m.ContextLength != nil {
 			ctx = fmt.Sprint(*m.ContextLength)
@@ -251,7 +266,27 @@ func handleRentPublish(args cliArgs) error {
 				source += "@" + m.Source.Revision[:min(12, len(m.Source.Revision))]
 			}
 		}
-		fmt.Printf("  %-32s %10s %10s %10s %9s  %-8s %s\n", m.Model, usdPrice(m.PricePer1MInputTokens), cached, usdPrice(m.PricePer1MOutputTokens), ctx, weightsStatus[m.Model], source)
+		fmt.Printf("  %-32s %10s %10s %10s %9s  %-8s %s\n", m.Model, usdPrice(price.PricePer1MInputTokens), cached, usdPrice(price.PricePer1MOutputTokens), ctx, weightsStatus[m.Model], source)
+	}
+	if len(scheduled) > 0 {
+		names := make([]string, 0, len(scheduled))
+		for name := range scheduled {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		fmt.Println("Price increases wait for notice: renters of this listing in the last 30 days were messaged; the prices above stay in force until then.")
+		for _, name := range names {
+			next := scheduled[name]
+			at := next.EffectiveAt
+			if t, err := time.Parse(time.RFC3339, at); err == nil {
+				at = t.UTC().Format("2006-01-02 15:04 UTC")
+			}
+			cached := "= input"
+			if next.PricePer1MCachedInputTokens != nil {
+				cached = usdPrice(*next.PricePer1MCachedInputTokens)
+			}
+			fmt.Printf("  %-32s %10s %10s %10s  from %s\n", name, usdPrice(next.PricePer1MInputTokens), cached, usdPrice(next.PricePer1MOutputTokens), at)
+		}
 	}
 	return nil
 }
@@ -283,24 +318,46 @@ func rentEMXPrices(cfg rentHostConfig) (map[string]emxPricedModel, error) {
 }
 
 // rentPatchListingModels replaces the listing's models and prices on the site.
-func rentPatchListingModels(client *http.Client, siteURL, key, listing string, models []rentPublishedModel) error {
+// rentScheduledPrice is a price increase the site holds back until effectiveAt, after notice to renters.
+type rentScheduledPrice struct {
+	EffectiveAt                 string   `json:"effectiveAt"`
+	PricePer1MInputTokens       float64  `json:"pricePer1MInputTokens"`
+	PricePer1MCachedInputTokens *float64 `json:"pricePer1MCachedInputTokens"`
+	PricePer1MOutputTokens      float64  `json:"pricePer1MOutputTokens"`
+}
+
+// rentListingPrices is a listing model as the site answers it: the prices in force and any scheduled increase.
+type rentListingPrices struct {
+	Model                       string              `json:"model"`
+	PricePer1MInputTokens       float64             `json:"pricePer1MInputTokens"`
+	PricePer1MCachedInputTokens *float64            `json:"pricePer1MCachedInputTokens"`
+	PricePer1MOutputTokens      float64             `json:"pricePer1MOutputTokens"`
+	ScheduledPrice              *rentScheduledPrice `json:"scheduledPrice"`
+}
+
+// rentPatchListingModels sets the listing's models and returns them as the site now has them.
+func rentPatchListingModels(client *http.Client, siteURL, key, listing string, models []rentPublishedModel) ([]rentListingPrices, error) {
 	body, _ := json.Marshal(map[string]any{"models": models})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, strings.TrimRight(siteURL, "/")+"/api/rentals/"+listing, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 	res, err := client.Do(req)
 	if err != nil {
-		return cliError{"site_unreachable", "Could not reach " + siteURL + ": " + err.Error(), nil, nil}
+		return nil, cliError{"site_unreachable", "Could not reach " + siteURL + ": " + err.Error(), nil, nil}
 	}
 	defer res.Body.Close()
 	answer, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if res.StatusCode != http.StatusOK {
-		return cliError{"publish_failed", fmt.Sprintf("The site refused the update (HTTP %d): %s", res.StatusCode, strings.TrimSpace(string(answer))), []string{"The site allows one listing update per minute."}, nil}
+		return nil, cliError{"publish_failed", fmt.Sprintf("The site refused the update (HTTP %d): %s", res.StatusCode, strings.TrimSpace(string(answer))), []string{"The site allows one listing update per minute."}, nil}
 	}
-	return nil
+	var listed struct {
+		Models []rentListingPrices `json:"models"`
+	}
+	_ = json.Unmarshal(answer, &listed) // older sites answer without models: nothing is scheduled then
+	return listed.Models, nil
 }
