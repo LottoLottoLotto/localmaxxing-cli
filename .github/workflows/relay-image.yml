@@ -1,0 +1,65 @@
+name: Relay image
+
+# Builds cmd/lmx-relay into ghcr.io/<owner>/lmx-relay: `latest` and `sha-<commit>` from main, and the
+# version tag from a v* tag. Deploy a pinned tag (sha-… or v…), not latest.
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+    paths:
+      - "cmd/lmx-relay/**"
+      - "internal/relay/**"
+      - "internal/relayproto/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/relay-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test the relay
+        run: go test ./internal/relay/... ./internal/relayproto/... ./cmd/lmx-relay/...
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/lmx-relay" >> "$GITHUB_OUTPUT"
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+            type=ref,event=tag
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./cmd/lmx-relay/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
