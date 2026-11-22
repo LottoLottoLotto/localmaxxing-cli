@@ -403,11 +403,7 @@ selection to resume. Only completed snapshots can be selected for serving.
 Removal preserves shared artifacts/cache files, and referenced artifacts cannot
 be removed until their snapshots are removed.
 
-## Rentals (experimental)
-
-> Rentals are not finished. The commands are in this release so they can be
-> tried, but hosting and connecting depend on a LocalMaxxing relay that is not
-> in service yet, and the commands, prices and behaviour may change.
+## Rentals
 
 Owners rent out local inference; renters use it through LocalMaxxing, which
 handles access, capacity and billing. **Hosting needs LocalMaxxing Pro**
@@ -1174,7 +1170,7 @@ lmx eval suite resubmit <submission-id> \
 The lower-level `eval suite init`, `import`, `validate`, `audit`, `check`, and
 `submit` commands remain available for authors who need full control.
 
-## Rental relay (deployment, experimental)
+## Rental relay (deployment)
 
 `cmd/lmx-relay` is the transport between the site and `lmx rent host` agents.
 It listens on two ports:

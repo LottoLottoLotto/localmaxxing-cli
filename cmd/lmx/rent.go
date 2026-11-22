@@ -36,10 +36,6 @@ import (
 // publish` sets a listing's models and prices from the emx gateway's.
 
 func handleRent(action string, args cliArgs) error {
-	if action == "host" || action == "connect" {
-		// Said on stderr, so --json output on stdout stays as it is.
-		fmt.Fprintln(os.Stderr, "lmx rent is experimental: rentals are not finished and the relay they use may not be in service yet.")
-	}
 	switch action {
 	case "host":
 		return handleRentHost(args)
