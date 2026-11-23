@@ -405,6 +405,11 @@ be removed until their snapshots are removed.
 
 ## Rentals
 
+**Hosting for the first time? Follow the step-by-step guide:
+[cmd/lmx/skill/references/hosting.md](cmd/lmx/skill/references/hosting.md)**
+(also at <https://www.localmaxxing.com/hosting>, and in `lmx skill` for
+agents). This section is the reference.
+
 Owners rent out local inference; renters use it through LocalMaxxing, which
 handles access, capacity and billing. **Hosting needs LocalMaxxing Pro**
 (<https://www.localmaxxing.com/pro>); **renting needs credits** (free listings
