@@ -415,6 +415,7 @@ lmx rent list                      # public listings
 lmx rent list --mine               # your listings, all statuses, with a CHECK column (needs your API key)
 
 # Host: serve listings from this machine (default target: the emx gateway)
+lmx rent stats    # what your listings sold and earned, per listing model
 lmx rent host <listingId>
 lmx rent host <listingId> <listingId2> --target http://127.0.0.1:8000 \
   --model Qwen/Qwen3-8B --model Qwen/Qwen3-0.6B --max-concurrency 4

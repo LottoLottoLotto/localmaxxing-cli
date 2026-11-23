@@ -45,10 +45,12 @@ func handleRent(action string, args cliArgs) error {
 		return handleRentList(args)
 	case "publish":
 		return handleRentPublish(args)
+	case "stats":
+		return handleRentStats(args)
 	case "":
-		return cliError{"missing_subcommand", "lmx rent needs a subcommand.", []string{"Use lmx rent host <listingId>, lmx rent connect <listingId>, lmx rent publish <listingId>, or lmx rent list [--mine]."}, nil}
+		return cliError{"missing_subcommand", "lmx rent needs a subcommand.", []string{"Use lmx rent host <listingId>, lmx rent connect <listingId>, lmx rent publish <listingId>, lmx rent list [--mine], or lmx rent stats."}, nil}
 	}
-	return cliError{"unknown_subcommand", "Unknown rent subcommand: " + action, []string{"Use lmx rent host, lmx rent connect, lmx rent publish, or lmx rent list."}, map[string]any{"subcommand": action}}
+	return cliError{"unknown_subcommand", "Unknown rent subcommand: " + action, []string{"Use lmx rent host, lmx rent connect, lmx rent publish, lmx rent list, or lmx rent stats."}, map[string]any{"subcommand": action}}
 }
 
 // optValues returns every value of a repeatable option, also splitting
