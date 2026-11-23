@@ -489,7 +489,12 @@ other hosts are never shown.
 (`wss://<api-url host>/relay/v1/agent`; override with `--relay-url` or
 `LMX_RELAY_URL`; `ws://` is refused except to localhost, since it would send
 your API key unencrypted) using your saved API key; no port forwarding or
-public endpoint is needed. Renter requests arrive over that connection and go
+public endpoint is needed. On a machine that only hosts, use a **rental host
+key** (Dashboard → API Keys → tick *Rental host key*) instead of your account
+key: it can only connect `lmx rent host`, list your listings and run
+`lmx rent publish`, so a copy taken from the host machine cannot touch the
+rest of your account. Give it to lmx with `LMX_API_KEY=<host key>` (or
+`lmx auth --key-stdin`). Renter requests arrive over that connection and go
 to `--target` (default: the emx gateway, `lmx gateway start`). The host
 enforces locally:
 
