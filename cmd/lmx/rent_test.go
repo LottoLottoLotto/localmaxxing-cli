@@ -371,6 +371,35 @@ func TestRentHostEnforcesAllowlistHeadersAndConcurrency(t *testing.T) {
 	}
 }
 
+// A free account's agent naming a listing that charges is refused for good: it stops at once with the
+// site's message and how to fix it, instead of reconnecting forever.
+func TestRentHostFreePlanPaidListingStopsWithoutRetry(t *testing.T) {
+	f := newRentFixture(t, http.NotFoundHandler())
+	f.authorize = func(string, []string) (int, any) {
+		return http.StatusForbidden, map[string]any{"code": "free_plan_paid_listing", "message": "Listing l1 charges for requests"}
+	}
+	done, _ := f.startHost(f.hostConfig())
+	select {
+	case err := <-done:
+		var cliErr cliError
+		if !errors.As(err, &cliErr) || cliErr.Code != "free_plan_paid_listing" {
+			t.Fatalf("err = %v, want free_plan_paid_listing cliError", err)
+		}
+		if !strings.Contains(cliErr.Message, "Listing l1 charges for requests") {
+			t.Fatalf("message = %q, want the site's", cliErr.Message)
+		}
+		if len(cliErr.Hints) == 0 || !strings.Contains(cliErr.Hints[0], "price to 0") {
+			t.Fatalf("hints = %v", cliErr.Hints)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rent host kept retrying after free_plan_paid_listing")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if calls := f.authCalls.Load(); calls != 1 {
+		t.Fatalf("authorize calls = %d, want 1", calls)
+	}
+}
+
 func TestRentHostProRequiredStopsWithoutRetry(t *testing.T) {
 	f := newRentFixture(t, http.NotFoundHandler())
 	f.authorize = func(string, []string) (int, any) {

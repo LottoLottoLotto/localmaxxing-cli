@@ -12622,7 +12622,7 @@ var commandDescriptions = map[string]string{
 	"skill install":           "Write the bundled skill files into a skills directory (default .claude/skills).",
 	"model":                   "List, show, download, load and unload local models; search or resolve HuggingFace model IDs.",
 	"gateway":                 "Run the emx gateway: one OpenAI/Anthropic-compatible endpoint that routes requests to every loaded model by name.",
-	"rent":                    "Rent out local inference (host, needs Pro) or use a rented listing locally (connect, needs credits).",
+	"rent":                    "Rent out local inference (host: one free listing on a free account, paid ones with Pro) or use a rented listing locally (connect, needs credits).",
 	"rent host":               "Serve your listings from this machine through the LocalMaxxing relay over one outbound connection.",
 	"rent connect":            "Expose a rented listing as a local OpenAI-compatible base URL using your API key.",
 	"rent list":               "List public rental listings, or your own with --mine.",

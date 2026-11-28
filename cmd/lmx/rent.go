@@ -708,12 +708,13 @@ func rentBackoff(base, maxDelay time.Duration, attempt int) time.Duration {
 func rentTerminalError(cfg rentHostConfig, code, message string) error {
 	site := strings.TrimRight(firstNonEmpty(cfg.SiteURL, defaultAPIURL), "/")
 	hints := map[string][]string{
-		relayproto.CodeProRequired:      {"Hosting rentals needs LocalMaxxing Pro: " + site + "/pro"},
-		relayproto.CodeUnauthorized:     {"Run lmx auth login, lmx auth --key bhk_..., or set LMX_API_KEY."},
-		relayproto.CodeListingNotOwned:  {"Host only your own listings: lmx rent list --mine."},
-		relayproto.CodeListingNotFound:  {"Check the IDs with lmx rent list --mine, or create a listing at " + site + "/rentals/new."},
-		relayproto.CodeProtoUnsupported: {"Update the CLI: lmx update."},
-		relayproto.CodeRevoked:          {"Use a current API key (lmx auth login, lmx auth --key bhk_..., or LMX_API_KEY) on an account with LocalMaxxing Pro: " + site + "/pro"},
+		relayproto.CodeProRequired:         {"Hosting rentals needs LocalMaxxing Pro: " + site + "/pro"},
+		relayproto.CodeFreePlanPaidListing: {"Free accounts host one free listing: set every price to 0 (emx price set <model> --prompt 0 --completion 0, then lmx rent publish), or upgrade to Pro to charge: " + site + "/pro"},
+		relayproto.CodeUnauthorized:        {"Run lmx auth login, lmx auth --key bhk_..., or set LMX_API_KEY."},
+		relayproto.CodeListingNotOwned:     {"Host only your own listings: lmx rent list --mine."},
+		relayproto.CodeListingNotFound:     {"Check the IDs with lmx rent list --mine, or create a listing at " + site + "/rentals/new."},
+		relayproto.CodeProtoUnsupported:    {"Update the CLI: lmx update."},
+		relayproto.CodeRevoked:             {"Use a current API key (lmx auth login, lmx auth --key bhk_..., or LMX_API_KEY) on an account with LocalMaxxing Pro: " + site + "/pro"},
 	}[code]
 	if message == "" {
 		message = "The relay refused this host (" + code + ")."

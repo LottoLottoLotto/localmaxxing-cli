@@ -76,11 +76,14 @@ const (
 
 // Error codes carried by error/revoked messages and the authorize endpoint.
 const (
-	CodeProRequired      = "pro_required"
-	CodeUnauthorized     = "unauthorized"
-	CodeListingNotOwned  = "listing_not_owned"
-	CodeListingNotFound  = "listing_not_found"
-	CodeProtoUnsupported = "proto_unsupported"
+	CodeProRequired = "pro_required"
+	// CodeFreePlanPaidListing: a free account's agent named a listing that charges for requests (free
+	// accounts host one free listing; charging needs Pro).
+	CodeFreePlanPaidListing = "free_plan_paid_listing"
+	CodeUnauthorized        = "unauthorized"
+	CodeListingNotOwned     = "listing_not_owned"
+	CodeListingNotFound     = "listing_not_found"
+	CodeProtoUnsupported    = "proto_unsupported"
 	// CodeSiteUnavailable is a transient authorize failure; agents retry it.
 	CodeSiteUnavailable = "site_unavailable"
 	// CodeRelayDraining rejects new agents while the relay shuts down.
@@ -99,7 +102,7 @@ const (
 // of reconnecting: retrying cannot succeed until the owner changes something.
 func Terminal(code string) bool {
 	switch code {
-	case CodeProRequired, CodeUnauthorized, CodeListingNotOwned, CodeListingNotFound, CodeProtoUnsupported, CodeRevoked:
+	case CodeProRequired, CodeFreePlanPaidListing, CodeUnauthorized, CodeListingNotOwned, CodeListingNotFound, CodeProtoUnsupported, CodeRevoked:
 		return true
 	}
 	return false
